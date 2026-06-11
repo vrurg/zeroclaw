@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -230,36 +307,24 @@
 </table>
 </div>
 <p>後方互換性のために意図的に Cloud API モードを優先させたい場合を除き、同じチャネルで両方のセレクターを設定しないでください。</p>
+<h2 id="エージェントと対話できるユーザー"><a class="header" href="#エージェントと対話できるユーザー">エージェントと対話できるユーザー</a></h2>
+<p>受信側の送信者は、バインドされたエージェントに対して解決された<strong>ピアセット</strong>に照らして制御されます。これはエージェントが所属する <code>peer_groups</code> 設定から導出されます。照合では先頭の <code>@</code> を取り除き、チャネルのネイティブな送信者識別子に対して大文字・小文字を区別せずに行われます。<strong>空</strong>のセットはすべてを拒否し、<code>"*"</code> を含むセットはすべてを受け入れます。それ以外の場合は、リストに記載された外部ピア（およびピアエージェント）のみが受け入れられます。これはゲートウェイのペアリング（<code>gateway.require_pairing</code>）とは別物であり、ペアリングはチャットチャネルの送信者ではなく HTTP/WebSocket クライアントを認証します。</p>
+<p>whatsapp 用のピアグループでは、<code>channel</code> を <code>whatsapp</code> に設定し、許可する送信者を <code>external_peers</code> に列挙します（whatsapp の場合は電話番号識別子（Cloud API）または JID のユーザー部分（Web モード）。<code>["*"]</code> は誰でも受け入れます）。オプションで、エージェント間ディスパッチ用のピア <code>agents</code>、<code>ignore</code> ブロックリスト、<code>output_modality</code>（<code>mirror</code>、<code>voice</code>、または <code>text</code>）を指定できます。フィールドのリファレンスについては <a href="peer-groups.html">Peer Groups</a> を参照してください。</p>
+<p>この設定の場所:</p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード"><a class="header" href="#ゲートウェイダッシュボード">ゲートウェイダッシュボード</a></h4>
+<p>Web ダッシュボードで <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a> を開きます。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p><strong>Config</strong> ペインの <strong>Peer groups</strong> の下。</p>
+</div>
+
 <h2 id="クラウド-api-モード"><a class="header" href="#クラウド-api-モード">クラウド API モード</a></h2>
 <p>Cloud APIモードはMeta Business Platformとの統合です。Meta Businessアカウント、WhatsApp Businessアプリ、電話番号ID、検証トークン、アクセストークンが必要です。Metaのwebhook経由でメッセージを受信するビジネス展開に適したモードです。</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-enabled = true
-phone_number_id = "&lt;meta-phone-number-id&gt;"
-verify_token = "&lt;webhook-verify-token&gt;"
-access_token = "&lt;meta-access-token&gt;"
-# app_secret = "&lt;meta-app-secret&gt;" # webhook署名検証に推奨
-</code></pre>
-<p>The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel via <code>zeroclaw config set gateway.tunnel.provider=&lt;ngrok|cloudflare&gt;</code> and the related <code>gateway.tunnel.*</code> fields (see the <a href="../reference/config.html">Config reference</a>), or front the gateway with your own reverse proxy when developing locally.</p>
+<p>ゲートウェイは、受信 Webhook のために Meta から到達可能である必要があります。トップレベルの <code>[tunnel]</code> セクション（<code>tunnel_provider</code> と関連するプロバイダーブロック、<a href="../reference/config.html#tunnel">設定リファレンス</a>を参照）でトンネルを設定するか、ローカルで開発する場合は独自のリバースプロキシをゲートウェイの前段に配置してください。</p>
 <h2 id="webモード"><a class="header" href="#webモード">Webモード</a></h2>
 <p>WhatsApp Web モードでは、オプションの Web バックエンドを介して通常の WhatsApp アカウントをリンクします。Meta Business アカウントは不要です。ただし、<code>whatsapp-web</code> フィーチャーを有効にした ZeroClaw ビルドと、永続的なセッションデータベースのパスが必要です。</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-enabled = true
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
-mode = "personal"
-dm_policy = "allowlist"
-group_policy = "allowlist"
-mention_only = true
-
-[agents.assistant]
-enabled = true
-channels = ["whatsapp.default"]
-</code></pre>
-<p>初回起動時、Web バックエンドは QR またはペアコードリンクを使用してアカウントをペアリングします。<code>pair_phone</code> でペアコードリンクをシードできますが、QR ペアリングを使用したい場合は未設定のままにしてください:</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-pair_phone = "&lt;country-code-and-number-without-plus&gt;"
-</code></pre>
-<p><code>session_path</code> は永続ストレージ上に保持してください。削除すると、デバイスの再リンクが必要になります。</p>
-<p><code>channels</code>エントリは、チャンネルのエイリアスを、それに応答すべきエージェントにバインドします。<code>assistant</code>の代わりに、実際のエージェントエイリアスを使用してください。</p>
+<p>初回起動時、Web バックエンドは QR またはペアコードによるリンク方式でアカウントをペアリングします（<code>pair_phone</code> はペアコードリンクのシードとなり、QR を使う場合は未設定のままにします）。<code>session_path</code> は永続ストレージ上に保持してください。これを削除すると、デバイスの再リンクが強制されます。チャネルは、対象エージェントの <code>channels</code> リストを介してそのエージェントにバインドします。</p>
+<p>The shared <code>interrupt_on_new_message</code> option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.</p>
 <h2 id="個人およびビジネスの行動"><a class="header" href="#個人およびビジネスの行動">個人およびビジネスの行動</a></h2>
 <p>Web モードでは、<code>mode = "personal"</code> を指定すると、DM、グループ、セルフチャットそれぞれに個別のポリシーが適用されます。</p>
 <div class="table-wrapper">
@@ -276,24 +341,438 @@ pair_phone = "&lt;country-code-and-number-without-plus&gt;"
 </table>
 </div>
 <p>デフォルトの <code>mode = "business"</code> では、個人向けの DM/グループポリシー分割は適用されません。ピアによるゲート制御を行う通常アカウントのデプロイでは、<code>mode = "personal"</code> を <code>dm_policy = "allowlist"</code> および <code>group_policy = "allowlist"</code> とともに使用してください。</p>
-<h2 id="エージェントと対話できる相手を制限する"><a class="header" href="#エージェントと対話できる相手を制限する">エージェントと対話できる相手を制限する</a></h2>
-<p>受信ピアの認可は <code>peer_groups</code> で管理されます。グループは <code>channel = "whatsapp"</code> ですべての WhatsApp エイリアスを対象にするか、<code>channel = "whatsapp.default"</code> で単一のエイリアスを対象にできます。</p>
-<pre><code class="language-toml">[peer_groups.whatsapp_ops]
-channel = "whatsapp.default"
-agents = []
-external_peers = ["&lt;allowed-whatsapp-peer&gt;"]
-ignore = []
+<h2 id="設定サーフェス"><a class="header" href="#設定サーフェス">設定サーフェス</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>access_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Meta Business Suite からのアクセストークン（Cloud API モード）</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-1"><a class="header" href="#ゲートウェイダッシュボード-1">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.access_token</code> フィールドを設定します。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.access_token</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.access_token    # マスクされた入力、暗号化して保存
 </code></pre>
-<p>アクティブなバックエンドが報告するピア識別子の形式を使用してください。Cloud API は通常、webhook ペイロードから送信者の電話番号識別子を報告します。Web モードでは、チャットまたは JID 形式の識別子を報告する場合があります。例やフィクスチャは中立的な状態を保ち、実際の電話番号、アカウント ID、チャット ID をコミットしないでください。</p>
-<h2 id="cli-からの構成"><a class="header" href="#cli-からの構成">CLI からの構成</a></h2>
-<p>Prefer <code>zeroclaw config set</code> for WhatsApp fields:</p>
-<pre><code class="language-bash">zeroclaw config set channels.whatsapp.default.session-path ~/.zeroclaw/state/whatsapp-web/session.db
+<h4 id="環境変数"><a class="header" href="#環境変数">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__access_token=
 </code></pre>
-<p><code>zeroclaw channel add &lt;type&gt; &lt;CONFIG&gt;</code> is not the recommended setup path for WhatsApp. It takes a JSON object at the CLI layer, but current channel setup is routed through <code>zeroclaw config set</code> so secret handling, pairing, and peer authorization stay explicit.</p>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>app_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Meta Business Suite からのアプリシークレット（webhook 署名検証用）<code>ZEROCLAW_WHATSAPP_APP_SECRET</code> 環境変数でも設定可能 Cloud API モードでのみ使用されます</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-2"><a class="header" href="#ゲートウェイダッシュボード-2">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.app_secret</code> フィールドを設定してください。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.app_secret</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.app_secret    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-1"><a class="header" href="#環境変数-1">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__app_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>approval_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>300</code></span></summary>
+<p><code>always_ask</code> ツールに対するオペレーターの承認を待機する秒数。これを過ぎると自動的に拒否されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-3"><a class="header" href="#ゲートウェイダッシュボード-3">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.approval_timeout_secs</code> フィールドを設定します。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.approval_timeout_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.approval_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-2"><a class="header" href="#環境変数-2">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__approval_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>dm_mention_patterns</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>DM メンションゲーティング用の正規表現パターン（大文字小文字を区別しません）。空でない場合、少なくとも1つのパターンに一致するダイレクトメッセージのみが処理されます。一致した部分は転送されるコンテンツから除去されます。例: <code>["@?ZeroClaw", "\\+?15555550123"]</code></p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-4"><a class="header" href="#ゲートウェイダッシュボード-4">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.dm_mention_patterns</code> フィールドを設定します。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.dm_mention_patterns</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.dm_mention_patterns &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-3"><a class="header" href="#環境変数-3">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__dm_mention_patterns=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>dm_policy</code> <span class="cfg-field-meta"><code>WhatsAppChatPolicy</code> · default <code>"allowlist"</code></span></summary>
+<p>mode = “personal” の場合のダイレクトメッセージのポリシー。“allowlist”（デフォルト）| “ignore” | “all”。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-5"><a class="header" href="#ゲートウェイダッシュボード-5">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.dm_policy</code> フィールドを設定してください。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.dm_policy</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.dm_policy &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-4"><a class="header" href="#環境変数-4">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__dm_policy=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>このチャネルのツール仕様から除外されるツールです。設定すると、これらのツールはこのチャネル経由で応答する際にモデルに公開されません。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-6"><a class="header" href="#ゲートウェイダッシュボード-6">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.excluded_tools</code> フィールドを設定します。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.excluded_tools</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-5"><a class="header" href="#環境変数-5">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>group_mention_patterns</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>グループチャットでのメンション制御用の正規表現パターン（大文字小文字を区別しません）。空でない場合、少なくとも1つのパターンに一致するグループメッセージのみが処理され、一致した部分は転送されるコンテンツから除去されます。例: <code>["@?ZeroClaw", "\\+?15555550123"]</code></p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-7"><a class="header" href="#ゲートウェイダッシュボード-7">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.group_mention_patterns</code> フィールドを設定してください。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.group_mention_patterns</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.group_mention_patterns &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-6"><a class="header" href="#環境変数-6">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__group_mention_patterns=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>group_policy</code> <span class="cfg-field-meta"><code>WhatsAppChatPolicy</code> · default <code>"allowlist"</code></span></summary>
+<p>モード = “personal” の場合のグループチャットのポリシー。“allowlist”（デフォルト） | “ignore” | “all”。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-8"><a class="header" href="#ゲートウェイダッシュボード-8">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.group_policy</code> フィールドを設定します。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>channels.whatsapp.&lt;alias&gt;.group_policy</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.group_policy &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-7"><a class="header" href="#環境変数-7">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__group_policy=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Cancel an in-flight response from this channel sender when a newer WhatsApp message arrives. Default: <code>false</code>.</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-9"><a class="header" href="#ゲートウェイダッシュボード-9">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-8"><a class="header" href="#環境変数-8">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>trueの場合、グループ内で@メンションされたメッセージにのみ応答します（Webモードのみ）。ダイレクトメッセージは常に処理されます。ボットのアイデンティティは実行時にwa-rsデバイスから解決され、<code>pair_phone</code>は初回接続時にこれをシードします。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-10"><a class="header" href="#ゲートウェイダッシュボード-10">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.mention_only</code> フィールドを設定してください。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.mention_only</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mention_only &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-9"><a class="header" href="#環境変数-9">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mention_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mode</code> <span class="cfg-field-meta"><code>WhatsAppWebMode</code> · default <code>"business"</code></span></summary>
+<p>WhatsApp Web の利用モード: “business”（デフォルト）または “personal”。personal モードでは、ボットが dm_policy、group_policy、self_chat_mode を適用して、どのチャットで応答するかを決定します。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-11"><a class="header" href="#ゲートウェイダッシュボード-11">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.mode</code> フィールドを設定します。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.mode</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mode &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-10"><a class="header" href="#環境変数-10">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pair_code</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>リンク用のカスタムペアコード（Webモード、任意）空欄にするとWhatsAppが自動生成します</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-12"><a class="header" href="#ゲートウェイダッシュボード-12">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.pair_code</code> フィールドを設定します。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.pair_code</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_code &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-11"><a class="header" href="#環境変数-11">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_code=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pair_phone</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>ペアコードによるリンク用の電話番号（Web モード、オプション）形式: 国番号 + 番号（例: “15551234567”）未設定の場合は、QR コードによるペアリングが使用されます</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-13"><a class="header" href="#ゲートウェイダッシュボード-13">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.pair_phone</code> フィールドを設定してください。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.pair_phone</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_phone &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-12"><a class="header" href="#環境変数-12">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_phone=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>phone_number_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Meta Business API の電話番号 ID（Cloud API モード）</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-14"><a class="header" href="#ゲートウェイダッシュボード-14">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code> フィールドを設定します。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.phone_number_id &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-13"><a class="header" href="#環境変数-13">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__phone_number_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>proxy_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>チャンネルごとのプロキシURL（http、https、socks5、socks5h）。このチャンネルに対してのみ、グローバルな <code>[proxy]</code> 設定を上書きします。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-15"><a class="header" href="#ゲートウェイダッシュボード-15">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.proxy_url</code> フィールドを設定します。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.proxy_url</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.proxy_url &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-14"><a class="header" href="#環境変数-14">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__proxy_url=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>チャンネルと受信者の組み合わせごとの送信ペーシングの下限値（秒）。範囲: <code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code>（0 で無効化）。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-16"><a class="header" href="#ゲートウェイダッシュボード-16">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code> フィールドを設定します。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-15"><a class="header" href="#環境変数-15">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>(チャネル, 受信者)単位の送信ペーシングキューの深さ。範囲: <code>0..=REPLY_QUEUE_DEPTH_CEILING</code>。<code>reply_min_interval_secs &gt; 0</code> かつこの値が <code>0</code> の場合、ペーシングラッパーは <code>DEFAULT_REPLY_QUEUE_DEPTH</code> (16) で代替します。キューが満杯の場合、最新の送信が破棄され、<code>WARN</code> がログに記録されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-17"><a class="header" href="#ゲートウェイダッシュボード-17">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code> フィールドを設定します。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-16"><a class="header" href="#環境変数-16">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>self_chat_mode</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>true かつ mode = “personal” の場合、ユーザー自身のセルフチャット（Notes to Self）内のメッセージに常に応答します。デフォルトは false です。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-18"><a class="header" href="#ゲートウェイダッシュボード-18">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、<code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code> フィールドを設定します。</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.self_chat_mode &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-17"><a class="header" href="#環境変数-17">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__self_chat_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>session_path</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>WhatsApp Web クライアント（Web モード）のセッションデータベースパス。設定すると、wa-rs を使用したネイティブの WhatsApp Web モードが有効になります</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-19"><a class="header" href="#ゲートウェイダッシュボード-19">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.session_path</code> フィールドを設定します。</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>channels.whatsapp.&lt;alias&gt;.session_path</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.session_path &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-18"><a class="header" href="#環境変数-18">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__session_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>verify_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Webhook検証トークン（自分で定義し、Metaが検証のために返送します）Cloud APIモードでのみ使用されます</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-20"><a class="header" href="#ゲートウェイダッシュボード-20">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.verify_token</code> フィールドを設定します。</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.verify_token</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.verify_token    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-19"><a class="header" href="#環境変数-19">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__verify_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ws_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>WhatsApp Web の WebSocket URL を上書きします（Web モード、省略可能）。統合テストやプロキシ構成で使用します。設定しない場合は <code>wa-rs</code> に付属するデフォルトのエンドポイントを使用します。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-21"><a class="header" href="#ゲートウェイダッシュボード-21">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開いて、<code>channels.whatsapp.&lt;alias&gt;.ws_url</code> フィールドを設定します。</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.ws_url</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.ws_url &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-20"><a class="header" href="#環境変数-20">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__ws_url=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-22"><a class="header" href="#ゲートウェイダッシュボード-22">ゲートウェイダッシュボード</a></h4>
+<p>ウェブダッシュボードで <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開きます。</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p><strong>Config</strong> ペインの <strong>Channels</strong> 配下にあります。</p>
+</div>
+
+<blockquote>
+<p><strong><code>channels.whatsapp.&lt;alias&gt;.access_token</code> はシークレットです。</strong> 暗号化して保存され、平文の <code>config.toml</code> には保存されません。書き込み時に暗号化される以下のいずれかの方法で設定してください:</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-23"><a class="header" href="#ゲートウェイダッシュボード-23">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> を開き、そこで <code>channels.whatsapp.&lt;alias&gt;.access_token</code> フィールドを設定します。</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>channels.whatsapp.&lt;alias&gt;.access_token</code> フィールドを設定します（入力はマスクされます）。</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.access_token    # マスク入力のプロンプトを表示し、暗号化して保存
+</code></pre>
+</div>
+
+<p>同じことが <code>verify_token</code> と <code>app_secret</code>（Cloud API）にも当てはまります。</p>
 <h2 id="開始と確認"><a class="header" href="#開始と確認">開始と確認</a></h2>
 <p>1つのモードを設定したら、チャンネルランナーを起動します:</p>
-<pre><code class="language-bash">zeroclaw channel start
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw channel start
 </code></pre>
+</div>
+
 <p>まず最初のチェックとして <code>zeroclaw channel doctor</code> を使用してください。Web モードの場合は、バイナリが <code>whatsapp-web</code> でビルドされていることも確認してください。Cloud API モードの場合は、Webhook トンネルと Meta の verify token が一致していることを確認してください。</p>
 
                     </main>
@@ -340,6 +819,114 @@ ignore = []
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

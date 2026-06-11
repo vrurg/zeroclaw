@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,14 +294,14 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="cómo-contribuir"><a class="header" href="#cómo-contribuir">Cómo contribuir</a></h1>
-<p>Aceptamos código, documentación, informes de errores y comentarios de cualquier persona dispuesta a presentarlos de manera clara. Esta página cubre los aspectos prácticos: cómo introducir un cambio, qué buscamos durante la revisión y qué esperar después de abrir una PR.</p>
+<p>Aceptamos código, documentación, informes de errores y comentarios de cualquier persona dispuesta a presentarlos con claridad. Esta página cubre los aspectos prácticos: cómo lograr que un cambio sea incorporado, qué buscamos en la revisión y qué esperar después de abrir un PR.</p>
 <p>Consulta <a href="./communication.html">Comunicación</a> para contribuciones no relacionadas con el código (informar problemas, proporcionar comentarios, obtener ayuda).</p>
 <p>Consulta el <a href="./rfcs.html">proceso de RFC</a> para cambios más grandes que requieran discusión de diseño antes de la implementación.</p>
 <h2 id="antes-de-comenzar"><a class="header" href="#antes-de-comenzar">Antes de comenzar</a></h2>
 <p>Para cualquier cosa que no sea una corrección de errata:</p>
 <ol>
 <li><strong>Consulta el rastreador de problemas.</strong> Alguien podría estar trabajando en ello o haber iniciado una discusión relacionada.</li>
-<li><strong>Lee <code>AGENTS.md</code>.</strong> El archivo <code>AGENTS.md</code> en la raíz del repositorio es la fuente canónica de convenciones: los niveles de riesgo, la disciplina en las PR, las antipatrones y los estándares de revisión se encuentran allí.</li>
+<li><strong>Lee <code>AGENTS.md</code>.</strong> El archivo <code>AGENTS.md</code> raíz del repositorio es la fuente canónica de convenciones: los niveles de riesgo, la disciplina de PR, los antipatrones y los estándares de revisión se encuentran allí.</li>
 <li><strong>Usa el <a href="./architecture-map.html">Mapa de arquitectura y contribución</a></strong> para cualquier cosa relacionada con arquitectura, configuración, seguridad, flujo de trabajo, gobernanza, CI, comportamiento de lanzamiento o la política de contribución asistida por IA.</li>
 <li><strong>Selecciona una rama.</strong> Las PR se dirigen a <code>master</code>. Haz un fork del repositorio y crea una rama a partir de allí; no hay ninguna rama de desarrollo/integración que debas seguir.</li>
 </ol>
@@ -233,46 +310,46 @@
 </code></pre>
 <p>Los puntos clave:</p>
 <ul>
-<li><strong>Plantilla de PR</strong> — <code>.github/pull_request_template.md</code>. Complétala. Las secciones de resumen, evidencia de validación y compatibilidad son obligatorias.</li>
-<li><strong>CI</strong> — se ejecuta en cada PR. <code>ci.yml</code> es el filtro compuesto; todas las etapas deben pasar.</li>
-<li><strong>Labels</strong> — los mantenedores usan etiquetas para determinar la profundidad de la revisión. No necesitas conocer todas las familias de etiquetas antes de abrir un PR. Si las etiquetas parecen claramente incorrectas y no puedes editarlas, señala la discrepancia en un comentario; los mantenedores o revisores con permisos sobre etiquetas pueden corregir las discrepancias evidentes directamente.</li>
-<li><strong>Enrutamiento de revisiones</strong> — proporciona suficiente claridad sobre el alcance, las incidencias vinculadas, la validación y el contexto de riesgo/reversión para que los revisores puedan elegir rápidamente la ruta de revisión adecuada.</li>
-<li><strong>Revisión</strong> — los mantenedores revisan. Los hallazgos usan la taxonomía de revisión de PR: 🔴 bloqueante, 🟡 advertencia, 🔵 sugerencia, 🟢 elogio y ✅ resuelto. Atiende los bloqueantes; las advertencias deberían recibir una respuesta; las sugerencias son opcionales.</li>
+<li><strong>Plantilla de PR</strong>: <code>.github/pull_request_template.md</code>. Complétala. Las secciones de resumen, evidencia de validación y compatibilidad son innegociables.</li>
+<li><strong>CI</strong>: se ejecuta en cada PR. <code>ci.yml</code> es la puerta de control compuesta; todas las etapas deben pasar.</li>
+<li><strong>Etiquetas</strong>: los mantenedores usan etiquetas para dirigir la profundidad de la revisión. No necesitas conocer todas las familias de etiquetas antes de abrir un PR. Si las etiquetas parecen obviamente incorrectas y no puedes editarlas, señala la discrepancia en un comentario; los mantenedores o revisores con permisos de etiquetas pueden corregir las discrepancias obvias directamente.</li>
+<li><strong>Enrutamiento de revisión</strong>: haga que el alcance, los issues vinculados, la validación y el contexto de riesgo/reversión sean lo suficientemente claros para que los revisores puedan elegir rápidamente la ruta de revisión adecuada.</li>
+<li><strong>Revisión</strong>: revisión de los mantenedores. Los hallazgos utilizan la taxonomía de revisión de PR: 🔴 bloqueante, 🟡 advertencia, 🔵 sugerencia, 🟢 elogio y ✅ resuelto. Atienda los bloqueantes; las advertencias deben recibir una respuesta; las sugerencias son opcionales.</li>
 </ul>
 <h2 id="estilo-de-código"><a class="header" href="#estilo-de-código">Estilo de código</a></h2>
 <ul>
 <li><code>cargo fmt</code> limpio (verificado en CI)</li>
 <li><code>cargo clippy -D warnings</code> limpio (verificado en CI)</li>
-<li>Sin código de producción sin usar: elimínalo, intégralo en el comportamiento o registra una incidencia de seguimiento. No lo silencies con prefijos de guion bajo ni con <code>#[allow(dead_code)]</code>; reserva los nombres con guion bajo para parámetros de API, trait o callback que sean obligatorios pero que intencionadamente no se usen.</li>
-<li>Manejo de errores: <code>anyhow::Result</code> en los límites del binario, errores tipados en los crates de biblioteca. Sin <code>unwrap()</code> / <code>expect()</code> en las rutas de código de producción: propaga con <code>?</code> o documenta el invariante que hace imposible el panic.</li>
-<li>Dependencias mínimas: cada dependencia aumenta el tamaño del binario; evalúa el compromiso antes de agregar una.</li>
-<li>Trait-first — define la trait en <code>zeroclaw-api</code>, luego implementa en el crate de borde correspondiente</li>
-<li>Seguridad por defecto: listas de permitidos, no listas de bloqueo. La nueva superficie externa predeterminada está cerrada.</li>
-<li>Pruebas unitarias en línea — <code>#[cfg(test)] mod tests {}</code> al final del archivo o un <code>tests.rs</code> hermano</li>
-<li>No comprometas secretos, datos personales ni identidades de usuarios reales — la página <a href="./privacy.html">Disciplina de Privacidad y PII</a> es el control de fusión</li>
+<li>Sin código de producción sin usar: elimínalo, intégralo en el comportamiento o registra un issue de seguimiento. No lo silencies con prefijos de guion bajo ni con <code>#[allow(dead_code)]</code>; reserva los nombres con guion bajo para parámetros de API, traits o callbacks que sean requeridos pero intencionalmente sin usar.</li>
+<li>Manejo de errores: <code>anyhow::Result</code> en los límites de binarios, errores tipados en crates de biblioteca. Sin <code>unwrap()</code> / <code>expect()</code> en rutas de código de producción: propague con <code>?</code> o documente la invariante que hace imposible el panic.</li>
+<li>Dependencias mínimas: cada dependencia aumenta el tamaño del binario; evalúa la relación costo-beneficio antes de añadir una</li>
+<li>Primero el trait: define el trait en <code>zeroclaw-api</code>, luego impleméntalo en el edge crate correspondiente</li>
+<li>Seguridad por defecto: listas de permitidos, no listas de bloqueados. Las nuevas superficies externas se cierran por defecto</li>
+<li>Pruebas unitarias en línea: <code>#[cfg(test)] mod tests {}</code> al final del archivo o un archivo <code>tests.rs</code> hermano</li>
+<li>No haga commit de secretos, datos personales ni identidades de usuarios reales: la página <a href="./privacy.html">Privacy &amp; PII discipline</a> es el requisito obligatorio para el merge</li>
 </ul>
 <h2 id="pruebas"><a class="header" href="#pruebas">Pruebas</a></h2>
 <ul>
 <li>Pruebas unitarias ubicadas junto al código (<code>mod tests</code>)</li>
-<li>Tests de integración en <code>tests/</code> y tests unitarios locales del crate — se ejecutan mediante <code>cargo nextest run --locked --workspace --exclude zeroclaw-desktop</code></li>
+<li>Pruebas de integración en <code>tests/</code> y pruebas unitarias locales del crate: se ejecutan mediante <code>cargo nextest run --locked --workspace --exclude zeroclaw-desktop</code></li>
 <li>El código con características condicionales necesita pruebas con características condicionales</li>
-<li>No te burles de la base de datos para las pruebas que ejercitan el esquema o SQL: las pruebas de integración deben conectarse a una base de datos SQLite real.</li>
+<li>No simules la base de datos en tests que ejercitan el esquema o SQL: los tests de integración deben usar una SQLite real</li>
 </ul>
 <p>Para la taxonomía completa de cinco niveles (unidad / componente / integración / sistema / producción), la infraestructura compartida de simulación y el formato de fixture de trazas JSON, consulta <a href="./testing.html">Testing</a>.</p>
 <h2 id="cambios-en-la-documentación"><a class="header" href="#cambios-en-la-documentación">Cambios en la documentación</a></h2>
 <ul>
 <li>Los cambios en el texto van en <code>docs/book/src/**/*.md</code> (este mdBook)</li>
 <li>Rustdoc (<code>/ /</code>) actualiza automáticamente la referencia de la API durante el despliegue.</li>
-<li>Las páginas de referencia (<code>docs/book/src/reference/cli.md</code>, <code>config.md</code>) se generan automáticamente — no las edites manualmente. Ejecuta <code>cargo mdbook refs</code> y confirma los cambios.</li>
-<li>Localización: el markdown en inglés es la fuente de verdad. Los PRs rutinarios de documentación en inglés pueden omitir cambios amplios generados en archivos <code>.po</code>; usa la nota estándar para el cuerpo del PR en <a href="../developing/building-docs.html">Compilar la documentación localmente</a>.</li>
+<li>Las páginas de referencia (<code>docs/book/src/reference/cli.md</code>, <code>config.md</code>) son generadas; no las edite a mano. Ejecute <code>cargo mdbook refs</code> y confirme los cambios generados</li>
+<li>Localización: El markdown en inglés es la fuente de verdad. Los PRs rutinarios de documentación en inglés pueden omitir cambios masivos generados en archivos <code>.po</code>; use la nota estándar del cuerpo del PR en <a href="../developing/building-docs.html">Building the docs locally</a>.</li>
 <li>Los PRs de caché de traducción, los pases de traducción de versiones y las nuevas configuraciones regionales deben ejecutar <code>cargo mdbook sync</code>, confirmar los archivos <code>.po</code> resultantes y validarlos con <code>cargo mdbook check</code></li>
 </ul>
 <h2 id="publicar-metadatos-del-blog-o-sitio-web"><a class="header" href="#publicar-metadatos-del-blog-o-sitio-web">Publicar metadatos del blog o sitio web</a></h2>
 <p>Cuando publiques una entrada de blog o actualices de algún otro modo los metadatos públicos del blog, actualiza las marcas de tiempo del feed mantenidas manualmente en el mismo PR:</p>
 <ul>
-<li><code>web/public/blog/rss.xml</code> — establece <code>&lt;lastBuildDate&gt;</code> con la fecha de publicación de la entrada más reciente en formato RFC 2822 / GMT</li>
-<li><code>web/public/blog/atom.xml</code> — establecer <code>&lt;updated&gt;</code> con la hora de publicación de la última entrada en formato ISO 8601 UTC</li>
-<li><code>web/public/sitemap.xml</code> — establece el <code>&lt;lastmod&gt;</code> de la entrada <code>/blog</code> con la fecha de publicación más reciente</li>
+<li><code>web/public/blog/rss.xml</code>: establece <code>&lt;lastBuildDate&gt;</code> con la fecha de publicación más reciente de las entradas en formato RFC 2822 / GMT</li>
+<li><code>web/public/blog/atom.xml</code>: establece <code>&lt;updated&gt;</code> con la hora de publicación de la entrada más reciente en formato ISO 8601 UTC</li>
+<li><code>web/public/sitemap.xml</code>: establecer el <code>&lt;lastmod&gt;</code> de la entrada <code>/blog</code> a la fecha de publicación más reciente</li>
 </ul>
 <p>Mantén el descubrimiento de feeds local al entorno:</p>
 <ul>
@@ -292,15 +369,15 @@ chore: bump tokio to 1.43
 <p>El título refleja el commit de squash:</p>
 <pre><code>feat(scope): short description
 </code></pre>
-<p>El cuerpo usa la plantilla de PR. <strong>La sección de evidencia de validación es obligatoria</strong>: pega las comprobaciones que correspondan al cambio. Para los PR que solo modifican documentación, usa <code>scripts/ci/docs_quality_gate.sh</code> y <code>scripts/ci/docs_links_gate.sh</code> o explica por qué la verificación de enlaces no tenía enlaces nuevos que inspeccionar. Para los PR de Rust/código, incluye <code>cargo fmt --check</code>, <code>cargo clippy</code>, <code>cargo test</code>, además de cualquier verificación manual que hayas realizado. “Funciona en mi máquina” no es evidencia.</p>
+<p>El cuerpo usa la plantilla de PR. <strong>La sección de evidencia de validación es obligatoria</strong>: pega las comprobaciones que correspondan al cambio. Para PRs solo de documentación, usa <code>scripts/ci/docs_quality_gate.sh</code> y <code>scripts/ci/docs_links_gate.sh</code> o explica por qué la verificación de enlaces no tenía enlaces añadidos que inspeccionar. Para PRs de Rust/código, incluye <code>cargo fmt --check</code>, <code>cargo clippy</code>, <code>cargo test</code>, además de cualquier verificación manual que hayas realizado. “Funciona en mi máquina” no es evidencia.</p>
 <p>Etiquetas de riesgo:</p>
 <ul>
-<li><code>risk: low</code> — el rollback es una reversión; no se requiere acción del usuario</li>
-<li><code>risk: medium</code> — los usuarios pueden necesitar actualizar la configuración / el entorno / el uso de la CLI; se requiere un plan de reversión</li>
-<li><code>risk: high</code> — crítico para la seguridad, cambios de esquema, comportamiento incompatible. Se requieren plan de reversión, indicador de funcionalidad y síntomas de fallo observables</li>
+<li><code>risk: low</code>: la reversión es un revert; no se requiere ninguna acción del usuario</li>
+<li><code>risk: medium</code>: es posible que los usuarios deban actualizar la configuración / variables de entorno / uso de la CLI; se requiere un plan de reversión</li>
+<li><code>risk: high</code>: crítico para la seguridad, cambios de esquema, comportamiento disruptivo. Se requieren plan de reversión, feature flag y síntomas de fallo observables</li>
 </ul>
 <h2 id="después-del-pr"><a class="header" href="#después-del-pr">Después del PR</a></h2>
-<p><strong>Estrategia de fusión:</strong> squash-merge preservando el historial completo de commits en el cuerpo. Consulta <code>.claude/skills/squash-merge/SKILL.md</code> para el formato exacto — TL;DR: título del PR + <code>(#number)</code> como asunto, lista con viñetas de los commits originales como cuerpo.</p>
+<p><strong>Estrategia de fusión:</strong> squash-merge con el historial completo de commits preservado en el cuerpo. Consulta <code>.claude/skills/squash-merge/SKILL.md</code> para conocer el formato exacto: TL;DR: título del PR + <code>(#number)</code> como asunto, lista con viñetas de los commits originales como cuerpo.</p>
 <p><strong>Lanzamiento:</strong> los cambios se integran en <code>master</code>; <code>master</code> no se lanza automáticamente. Un mantenedor actualiza la versión y etiqueta <code>vX.Y.Z</code> cuando se publica una versión. Verás tu PR en el CHANGELOG.</p>
 <h2 id="áreas-que-necesitan-ayuda"><a class="header" href="#áreas-que-necesitan-ayuda">Áreas que necesitan ayuda</a></h2>
 <div class="table-wrapper">
@@ -309,22 +386,22 @@ chore: bump tokio to 1.43
 <tr><th>Área</th><th>Dónde empezar</th></tr>
 </thead>
 <tbody>
-<tr><td>Nuevo canal</td><td><code>crates/zeroclaw-channels/</code> — copia un canal existente de forma similar</td></tr>
-<tr><td>Nuevo proveedor</td><td><code>crates/zeroclaw-providers/</code> — <code>compatible.rs</code> cubre la mayoría de los compatibles con OpenAI</td></tr>
-<tr><td>Documentación</td><td><code>docs/book/src/</code> — todo lo marcado como desactualizado o faltante</td></tr>
-<tr><td>Traducciones</td><td><code>cargo fluent fill --locale &lt;code&gt;</code> — consulta <a href="../maintainers/docs-and-translations.html">Mantenedores → Documentación y Traducciones</a></td></tr>
-<tr><td>Hardware</td><td><code>crates/zeroclaw-hardware/</code> — nuevo soporte de placa, nuevos controladores de sensores</td></tr>
+<tr><td>Nuevo canal</td><td><code>crates/zeroclaw-channels/</code>: copia un canal existente de forma similar</td></tr>
+<tr><td>Nuevo proveedor</td><td><code>crates/zeroclaw-providers/</code>: <code>compatible.rs</code> cubre la mayoría de los similares a OpenAI</td></tr>
+<tr><td>Documentación</td><td><code>docs/book/src/</code>: cualquier cosa marcada como desactualizada o faltante</td></tr>
+<tr><td>Traducciones</td><td><code>cargo fluent fill --locale &lt;code&gt;</code>: consulte <a href="../maintainers/docs-and-translations.html">Maintainers → Docs &amp; Translations</a></td></tr>
+<tr><td>Hardware</td><td><code>crates/zeroclaw-hardware/</code>: compatibilidad con nuevas placas, nuevos controladores de sensores</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="código-de-conducta"><a class="header" href="#código-de-conducta">Código de conducta</a></h2>
-<p>No seas un idiota. Discrepa de las ideas, no de las personas. Acepta que los mantenedores cerrarán lo que no quieran mantener, generalmente con una explicación, y en ocasiones sin ella. Si un cierre te parece injustificado, pregunta; si la pregunta no lleva a ningún lado, sigue adelante.</p>
+<p>No seas grosero. Discrepa sobre las ideas, no sobre las personas. Acepta que los mantenedores cerrarán cosas que no quieren asumir, normalmente con una explicación, ocasionalmente sin ella. Si un cierre te parece injustificado, pregunta; si la pregunta no lleva a ninguna parte, sigue adelante.</p>
 <h2 id="ver-también"><a class="header" href="#ver-también">Ver también</a></h2>
 <ul>
-<li><a href="./rfcs.html">Proceso RFC</a> — para cualquier cosa más grande que un parche</li>
+<li><a href="./rfcs.html">Proceso de RFC</a>: para cualquier cosa más grande que un parche</li>
 <li><a href="./architecture-map.html">Mapa de arquitectura y contribución</a>: qué documentos de arquitectura, fundamentos y flujo de trabajo leer primero</li>
-<li><a href="./communication.html">Comunicación</a> — cómo contactar al equipo</li>
-<li><a href="../maintainers/index.html">Mantenedores → Descripción general</a> — lo que los mantenedores hacen día a día</li>
+<li><a href="./communication.html">Comunicación</a>: cómo contactar al equipo</li>
+<li><a href="../maintainers/index.html">Maintainers → Información general</a>: qué hacen los mantenedores en el día a día</li>
 </ul>
 
                     </main>
@@ -371,6 +448,114 @@ chore: bump tokio to 1.43
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

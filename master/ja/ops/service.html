@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,7 +294,7 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="サービスとデーモン"><a class="header" href="#サービスとデーモン">サービスとデーモン</a></h1>
-<p>このページは <a href="../setup/service.html">セットアップ → サービス管理</a> の運用側対応ページです。このページでは、サービスのインストールとアンインストールについて説明します。一方、このページでは、サービスの運用に関するチューニング、リソース制限、グレースフルな再起動、マルチワークスペース設定について取り扱います。</p>
+<p>このページは <a href="../setup/service.html">Setup → Service management</a> の運用面の補足です。あちらのページではサービスのインストールとアンインストールについて説明しています。このページでは、サービスの実行について説明します。チューニング、リソース制限、グレースフルリスタート、マルチワークスペース構成などです。</p>
 <h2 id="ユーザーとシステムの範囲の選択"><a class="header" href="#ユーザーとシステムの範囲の選択">ユーザーとシステムの範囲の選択</a></h2>
 <div class="table-wrapper">
 <table>
@@ -231,55 +308,64 @@
 </table>
 </div>
 <p>デスクトップLinuxでは、ユーザーサービスがログアウト後も継続して動作するように、ユーザーサービスのlingeringを有効にしてください。</p>
-<pre><code class="language-bash">loginctl enable-linger $USER
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">loginctl enable-linger $USER
 </code></pre>
+</div>
+
 <p>ユーザースコープのsystemdサービスは、最後のセッションが終了すると停止します。</p>
 <h2 id="再起動動作"><a class="header" href="#再起動動作">再起動動作</a></h2>
-<p>デフォルトのユニット（<code>~/.config/systemd/user/zeroclaw.service</code>）は以下を使用します：</p>
-<pre><code class="language-ini">Restart=on-failure
-RestartSec=10s
+<p>インストールされた systemd ユーザーユニット (<code>~/.config/systemd/user/zeroclaw.service</code>) は以下を使用します:</p>
+<pre><code class="language-ini">Restart=always
+RestartSec=3
 </code></pre>
-<p>エージェントは設定エラー時にクリーンに終了し（<code>exit 2</code>）、再起動されません。これにより、設定を修正している間にサービスが頻繁に再起動して CPU を消費するのを防ぎます。その他の終了コードについては、systemd が 10 秒のバックオフを設けて再起動します。</p>
-<p>macOS では、LaunchAgent の plist に <code>KeepAlive = true</code> と <code>SuccessfulExit = false</code> が設定されています。これは <code>on-failure</code> と同じ意味になります。</p>
-<p>Windows では、タスク スケジューラのタスクは「タスクが失敗した場合に再起動する」ように構成されており、10 秒ごとに再試行し、最大 10 回まで行われます。</p>
+<p>systemd は終了時に毎回 3 秒のバックオフをおいてデーモンを再起動します。終了コードの許可リストはないため、不正な設定で即座に失敗するデーモンはフラッピングを起こします。サービスがあきらめるのを当てにするのではなく、設定を修正して <code>systemctl --user restart zeroclaw</code> を実行してください。</p>
+<p>macOS では、LaunchAgent（<code>~/Library/LaunchAgents/com.zeroclaw.daemon.plist</code>）が <code>RunAtLoad</code> と <code>KeepAlive</code> を <code>true</code> に設定するため、launchd はデーモンを実行し続け、終了するたびに再起動します。</p>
+<p>Windows では、<code>zeroclaw service install</code> は <code>LIMITED</code> 実行レベルで <code>ONLOGON</code> をトリガーとするタスク スケジューラ タスクを登録します。これはログオン時にデーモンを起動しますが、障害時の自動再起動ポリシーは追加しません。</p>
 <h2 id="グレースフルシャットダウン"><a class="header" href="#グレースフルシャットダウン">グレースフルシャットダウン</a></h2>
-<p>デーモンは <code>SIGTERM</code> (Unix) または <code>CTRL_CLOSE_EVENT</code> (Windows) をトラップします:</p>
-<ol>
-<li>新しいチャンネルイベントの受信を停止する</li>
-<li>フロー中のエージェントループを排水する（最大 <code>[daemon] shutdown_grace_secs</code>、デフォルトは30秒）</li>
-<li>ツールレシートと会話履歴をSQLiteにフラッシュ</li>
-<li>チャネルを切断し、ゲートウェイリスナーを閉じます</li>
-<li>終了コード 0</li>
-</ol>
-<p>シャットダウン開始時にエージェントがツール呼び出しの最中だった場合、ツールには終了までの猶予期間が与えられます。その後、<code>SIGKILL</code> によってプロセスが終了し、レシートは中断済みとしてマークされます。</p>
-<p>やむを得ない場合は <code>SIGKILL</code> で即時終了させても構いませんが、進行中のセッションの会話履歴が不完全になる可能性があることにご注意ください。</p>
+<p>Unix では、デーモンは <code>SIGINT</code> と <code>SIGTERM</code> をトラップします。Windows では Ctrl+C (<code>ctrl_c</code>) をトラップします。これらのいずれかによってクリーンシャットダウンがトリガーされます。デーモンはチャネルサーバーとゲートウェイリスナーを停止して終了します。</p>
+<p><code>SIGHUP</code> は無視されます（デーモンは実行され続けます）。<code>/admin/reload</code> エンドポイント経由でリクエストされたリロードは、終了するのではなくデーモンループをその場で再起動します。</p>
+<p>会話メモリとセッション状態は、動作中にSQLiteへ逐次書き込まれ、シャットダウン時までバッファリングされることはないため、正常な停止はフラッシュ処理に依存しません。ツールのレシートは、別途ディスク上に記録されるログではなく、会話内のインバンドHMACトークンです。強制的な<code>SIGKILL</code>は正常なチャネルのteardownをスキップしますが、すでにコミット済みのメモリを破損させることはありません。失われるのは、書き込み途中だったエージェントのターンのみです。</p>
 <h2 id="デバッグ用の手動起動"><a class="header" href="#デバッグ用の手動起動">デバッグ用の手動起動</a></h2>
 <p>サービスをスキップしてデーモンを直接実行する:</p>
-<pre><code class="language-bash">zeroclaw service stop     # サービスが実行中の場合はゲートウェイポートを解放する
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service stop     # サービスが実行中の場合はゲートウェイポートを解放する
 zeroclaw daemon
 </code></pre>
-<p><code>zeroclaw daemon</code> はフォアグラウンドで実行され、ログは stderr に出力されます。これはサービスが実行するプロセスと同じですが、サービスハーネスなしで動作します。以下の場合に便利です：</p>
+</div>
+
+<p><code>zeroclaw daemon</code> はフォアグラウンドで実行され、stderr にログを出力します。これはサービスが実行するプロセスと同じで、サービスハーネスが付いていないだけです。次のような場合に便利です。</p>
 <ul>
 <li>サービスが飲み込んでしまう起動失敗の診断</li>
 <li><code>gdb</code> / <code>lldb</code> 上で実行中</li>
 <li>コミットする前に設定変更をテストする</li>
 </ul>
-<p>Ctrl-C で終了 — SIGTERM と同じ graceful shutdown のセマンティクス。</p>
+<p>Ctrl-C で終了します。SIGTERM と同じグレースフルシャットダウンのセマンティクスです。</p>
 <h2 id="リソース制限"><a class="header" href="#リソース制限">リソース制限</a></h2>
-<h3 id="linux--systemd"><a class="header" href="#linux--systemd">Linux — systemd</a></h3>
+<h3 id="linux-systemd"><a class="header" href="#linux-systemd">Linux: systemd</a></h3>
 <p>ドロップインに追加する:</p>
-<pre><code class="language-bash">systemctl --user edit zeroclaw.service
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">systemctl --user edit zeroclaw.service
 </code></pre>
+</div>
+
 <pre><code class="language-ini">[Service]
 MemoryMax=2G
 CPUQuota=200%            # two cores
 LimitNOFILE=16384        # if opening many channel sockets
 </code></pre>
 <p>再読み込みして再起動:</p>
-<pre><code class="language-bash">systemctl --user daemon-reload
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">systemctl --user daemon-reload
 systemctl --user restart zeroclaw
 </code></pre>
-<h3 id="macos--launchd"><a class="header" href="#macos--launchd">macOS — launchd</a></h3>
+</div>
+
+<h3 id="macos-launchd"><a class="header" href="#macos-launchd">macOS: launchd</a></h3>
 <p><code>~/Library/LaunchAgents/com.zeroclaw.daemon.plist</code> を編集します:</p>
 <pre><code class="language-xml">&lt;key&gt;SoftResourceLimits&lt;/key&gt;
 &lt;dict&gt;
@@ -288,9 +374,13 @@ systemctl --user restart zeroclaw
 &lt;/dict&gt;
 </code></pre>
 <p>plistをアンロードしてロードし、変更を適用する：</p>
-<pre><code class="language-bash">launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 </code></pre>
+</div>
+
 <h3 id="docker"><a class="header" href="#docker">Docker</a></h3>
 <p>Compose:</p>
 <pre><code class="language-yaml">サービス:
@@ -302,24 +392,28 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
       nofile: 16384
 </code></pre>
 <h2 id="複数のワークスペースを実行する"><a class="header" href="#複数のワークスペースを実行する">複数のワークスペースを実行する</a></h2>
-<p>各ZeroClawインスタンスは1つのワークスペースを所有しています。2つを実行するには:</p>
-<ol>
-<li>バイナリを1回インストールする</li>
-<li><code>~/.zeroclaw-home/</code> と <code>~/.zeroclaw-work/</code>（または任意の場所）を作成します。</li>
-<li>異なるワークスペースを指す2つのサービスを実行します：</li>
-</ol>
-<pre><code class="language-bash">ZEROCLAW_WORKSPACE=~/.zeroclaw-home zeroclaw service install --name zeroclaw-home
-ZEROCLAW_WORKSPACE=~/.zeroclaw-work zeroclaw service install --name zeroclaw-work
+<p>各 ZeroClaw デーモンは、1 つの設定ディレクトリ（その中に <code>data/</code> ディレクトリを含む）を所有します。2 つを並行して実行するには、<code>--config-dir</code>（または <code>ZEROCLAW_CONFIG_DIR</code> 環境変数）を使って、それぞれに専用の設定ディレクトリを指定します。</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">zeroclaw --config-dir ~/.zeroclaw-home daemon
+zeroclaw --config-dir ~/.zeroclaw-work daemon
 </code></pre>
-<p>それぞれが独自のユニットファイル/plist、独自のゲートウェイポート（各設定で構成可能）、および独自のチャネルバインディングを持ちます。メモリは分離されており、あるワークスペースのTelegramボットは他のワークスペースを認識しません。</p>
-<p>同じワークスペースを2つのデーモンで共有しないでください。SQLiteは単一ライターなので、2つ目のデーモンは起動時に失敗します。</p>
+</div>
+
+<p>各インスタンスは、それぞれ独自の設定、独自の <code>data/</code>（メモリ、セッション）、独自のゲートウェイポート（設定ごとに指定）、独自のチャネルバインディングを読み込みます。メモリは分離されたままで、ある設定ディレクトリ内の Telegram ボットは他のものを認識しません。</p>
+<p><code>zeroclaw service install</code> は常にデフォルトの設定ディレクトリを指す単一のユニットをインストールします。インスタンスに名前を付けたりパラメーター化したりするフラグはありません。複数のインスタンスを永続的なサービスとして実行するには、2つ目のユニットファイルを手動で作成し（<code>~/.config/systemd/user/zeroclaw.service</code> を新しい名前にコピー）、その <code>ExecStart</code> で <code>--config-dir &lt;dir&gt;</code> を渡すようにしてから、個別に有効化してください。</p>
+<p>2つのデーモンを同じ設定ディレクトリに向けないでください。SQLite はシングルライターであるため、2つ目は起動時に失敗します。</p>
 <h2 id="再起動とクラッシュの観察"><a class="header" href="#再起動とクラッシュの観察">再起動とクラッシュの観察</a></h2>
-<pre><code class="language-bash"># Linux
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh"># Linux
 journalctl --user -u zeroclaw --since 1日前 | grep -E 「開始|停止|失敗」
 
 # macOS
 log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'start|stop|error'
 </code></pre>
+</div>
+
 <p>再起動が繰り返される場合は、デバッグログを有効にして（unit ファイルの <code>Environment=</code> 経由で <code>RUST_LOG=debug</code> を設定）、もう一度クラッシュを発生させて完全なトレースをキャプチャしてください。</p>
 <h2 id="関連項目も参照してください"><a class="header" href="#関連項目も参照してください">関連項目も参照してください</a></h2>
 <ul>
@@ -372,6 +466,114 @@ log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'start|stop|err
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

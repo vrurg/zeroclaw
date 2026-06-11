@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,22 +296,7 @@
                         <h1 id="transmisión"><a class="header" href="#transmisión">Transmisión</a></h1>
 <p>Cada proveedor en ZeroClaw que utiliza una API de streaming transmite los tokens uno por uno. El tiempo de ejecución reenvía esas transmisiones a adaptadores de canal que admiten actualizaciones parciales (Discord, Slack, Telegram, el WebSocket del gateway), de modo que el usuario ve aparecer el texto a medida que el modelo lo genera.</p>
 <h2 id="qué-se-transmite"><a class="header" href="#qué-se-transmite">¿Qué se transmite?</a></h2>
-<p>El rasgo <code>provider</code> emite valores de <code>StreamEvent</code>:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Evento</th><th>Cuando</th></tr>
-</thead>
-<tbody>
-<tr><td><code>TextDelta(String)</code></td><td>Nuevos tokens de texto del asistente</td></tr>
-<tr><td><code>ReasoningDelta(String)</code></td><td>Tokens de razonamiento / cadena de pensamiento (o-series, DeepSeek-R1, Qwen-thinking)</td></tr>
-<tr><td><code>ToolCall { name, args }</code></td><td>El modelo ha decidido llamar a una herramienta</td></tr>
-<tr><td><code>PreExecutedToolCall</code></td><td>Una llamada de herramienta pre-ejecutada del lado del proveedor (por ejemplo, búsqueda fundamentada de Gemini)</td></tr>
-<tr><td><code>PreExecutedToolResult</code></td><td>Su resultado</td></tr>
-<tr><td><code>Final { usage }</code></td><td>Transmisión completa; totales de uso de tokens</td></tr>
-</tbody>
-</table>
-</div>
+<p>El trait de proveedor emite valores <code>StreamEvent</code> a medida que el modelo genera salida: deltas de texto, llamadas a herramientas estructuradas, llamadas a herramientas preejecutadas del lado del proveedor y sus resultados, informes de uso de tokens y un marcador final de finalización. Las definiciones autoritativas por variante se encuentran junto al tipo en <code>crates/zeroclaw-api/src/model_provider.rs</code> (<code>enum StreamEvent</code>); los tokens de razonamiento llegan como deltas de texto, no como una variante separada.</p>
 <p>Los canales consumen estos eventos a través del gancho de flujo saliente del rasgo <code>Channel</code>.</p>
 <h2 id="banderas-de-capacidad"><a class="header" href="#banderas-de-capacidad">Banderas de capacidad</a></h2>
 <p>Un proveedor expone dos indicadores para que el tiempo de ejecución sepa qué puede esperar:</p>
@@ -244,68 +306,58 @@
 fn supports_streaming_tool_events(&amp;self) -&gt; bool { true }
 <span class="boring">}</span></code></pre>
 <ul>
-<li><strong><code>supports_streaming</code></strong> — verdadero para todos los proveedores activamente mantenidos</li>
-<li><strong><code>supports_streaming_tool_events</code></strong> — <code>true</code> cuando el proveedor emite eventos <code>ToolCall</code> durante el flujo en lugar de al final</li>
+<li><strong><code>supports_streaming</code></strong>: true para todos los proveedores con mantenimiento activo</li>
+<li><strong><code>supports_streaming_tool_events</code></strong>: true cuando el proveedor emite eventos <code>ToolCall</code> durante el stream en lugar de al final</li>
 </ul>
 <p>Los proveedores compatibles con OpenAI difieren: algunos transmiten los deltas de los argumentos de la llamada a la herramienta por fragmentos, mientras que otros solo emiten la llamada una vez que está completa. El analizador SSE de <code>compatible.rs</code> maneja ambos casos.</p>
 <h2 id="transmisión-por-el-lado-del-canal"><a class="header" href="#transmisión-por-el-lado-del-canal">Transmisión por el lado del canal</a></h2>
-<p>Los canales anuncian sus propias capacidades de transmisión:</p>
+<p>Los canales anuncian sus propias capacidades de streaming a través del trait <code>Channel</code>:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>fn supports_draft_updates(&amp;self) -&gt; bool;           // editar un mensaje en su lugar
 fn supports_multi_message_streaming(&amp;self) -&gt; bool; // dividir una respuesta en varios mensajes
 <span class="boring">}</span></code></pre>
+<p>La capacidad de un canal se deriva de su configuración: un canal con el enum <code>stream_mode</code> (off / partial / multi_message) admite tanto actualizaciones de borradores como multi-mensaje; un canal con el booleano <code>stream_drafts</code> admite solo actualizaciones de borradores. Esta tabla se genera a partir del esquema de configuración del canal, por lo que se mantiene correcta a medida que los canales ganan o pierden soporte de streaming:</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Canal</th><th style="text-align: center">Actualizaciones de borrador</th><th style="text-align: center">Mensajes múltiples</th></tr>
 </thead>
 <tbody>
-<tr><td>CLI</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Discord</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Slack</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Telegram</td><td style="text-align: center">✓</td><td style="text-align: center">parcial</td></tr>
-<tr><td>Matriz</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Mattermost</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Correo electrónico</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>SMS / voz</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>Puerta de enlace (WebSocket)</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>discord</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>lark</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>matrix</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>nextcloud_talk</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>slack</code></td><td style="text-align: center">✓</td><td style="text-align: center"></td></tr>
+<tr><td><code>telegram</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>wecom_ws</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
 </tbody>
 </table>
 </div>
 <p>Cuando tanto el proveedor como el canal admiten transmisión, el flujo es: el proveedor emite <code>TextDelta</code> → el tiempo de ejecución lo pasa al canal → el canal edita el mensaje enviado. La frecuencia de edición está limitada por <code>draft_update_interval_ms</code> en la configuración del canal (predeterminado: 500 ms) para evitar la limitación de velocidad.</p>
 <h2 id="bloques-de-razonamiento"><a class="header" href="#bloques-de-razonamiento">Bloques de razonamiento</a></h2>
-<p>Los modelos de razonamiento (serie o de OpenAI, DeepSeek-R1, variantes de Qwen-thinking) emiten eventos <code>ReasoningDelta</code> separados del texto normal. Por defecto, el tiempo de ejecución elimina estos eventos de los flujos de salida — consulta el manejo de <code>&lt;think&gt;…&lt;/think&gt;</code> en <code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>. Los usuarios ven la respuesta final, no la cadena de pensamiento.</p>
-<p>Para mostrar el razonamiento al usuario:</p>
-<pre><code class="language-toml">[channels.&lt;name&gt;]
-show_reasoning = true
-</code></pre>
-<p>Esto está desactivado por defecto porque el contenido del razonamiento (a) suele ser extenso y (b) a veces revela la deliberación interna que puede resultar confusa para un usuario final.</p>
-<p>Desactivar el razonamiento por completo en un modelo con capacidad de razonamiento:</p>
-<pre><code class="language-toml">[providers.models.&lt;name&gt;]
-think = false
-reasoning_effort = "none"
-</code></pre>
-<p>Ambos campos son de nivel superior; el nombre correcto depende del proveedor o punto de conexión. Configurar ambos cubre Ollama nativo, la compatibilidad de Ollama con OpenAI y las APIs upstream que respetan <code>reasoning_effort</code>.</p>
+<p>Los modelos de razonamiento (OpenAI serie o, DeepSeek-R1, variantes Qwen-thinking) emiten eventos <code>ReasoningDelta</code> separados del texto regular. Por defecto, el runtime los elimina de los flujos salientes, consulte el manejo de <code>&lt;think&gt;…&lt;/think&gt;</code> en <code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>. Los usuarios ven la respuesta final, no la cadena de pensamiento.</p>
+<p>Para mostrar el razonamiento al usuario, actívelo en la entrada del alias. Esto está desactivado de forma predeterminada porque el contenido de razonamiento es (a) a menudo extenso y (b) a veces revela deliberaciones internas que pueden resultar confusas para un usuario final.</p>
+<p>Para desactivar completamente el razonamiento en un modelo con capacidad de razonamiento, establezca el campo de razonamiento correspondiente en off. Ambos campos son de nivel superior; el nombre correcto depende del proveedor/endpoint. Establecer ambos cubre Ollama nativo, Ollama compatible con OpenAI y las API upstream que respetan <code>reasoning_effort</code>.</p>
 <h2 id="llamadas-de-herramientas-en-medio-del-flujo"><a class="header" href="#llamadas-de-herramientas-en-medio-del-flujo">Llamadas de herramientas en medio del flujo</a></h2>
 <p>Cuando un modelo decide llamar a una herramienta, el proveedor emite <code>ToolCall</code>. El tiempo de ejecución:</p>
 <ol>
 <li>Pausa la lectura desde el flujo del proveedor</li>
 <li>Vacía cualquier texto en búfer al canal</li>
-<li>Ejecuta la herramienta (sujeta a validación de seguridad — consulta <a href="../security/overview.html">Seguridad → Descripción general</a>)</li>
+<li>Ejecuta la herramienta (sujeto a validación de seguridad, consulta <a href="../security/overview.html">Seguridad → Resumen</a>)</li>
 <li>Reanuda la conversación con el resultado de la herramienta añadido</li>
 <li>Abre una nueva llamada de streaming al proveedor para el siguiente turno del asistente</li>
 </ol>
 <p>Desde la perspectiva del usuario: texto, luego un indicador visible de que el agente ejecutó una herramienta (mediante pistas específicas del canal), y después más texto. Para los canales sin indicadores de escritura, la brecha entre la llamada a la herramienta y el siguiente fragmento de texto es la única señal.</p>
 <h2 id="proveedores-no-basados-en-streaming"><a class="header" href="#proveedores-no-basados-en-streaming">Proveedores no basados en streaming</a></h2>
-<p>Si un proveedor devuelve toda la respuesta de una sola vez (extremos más antiguos compatibles con OpenAI, Gemini heredado), el tiempo de ejecución sintetiza un único <code>TextDelta</code> que contiene la respuesta completa seguido de <code>Final</code>. Los adaptadores de canal siguen funcionando, pero no ven fragmentos parciales.</p>
+<p>Si un proveedor devuelve la respuesta completa de una sola vez (endpoints OpenAI-compat antiguos, Gemini legacy), el runtime sintetiza un único <code>TextDelta</code> que contiene la respuesta completa seguido de <code>Final</code>. Los adaptadores de canal siguen funcionando; simplemente no ven los parciales.</p>
 <h2 id="referencias-de-código"><a class="header" href="#referencias-de-código">Referencias de código</a></h2>
 <ul>
-<li><code>crates/zeroclaw-api/src/model_provider.rs</code> — <code>ModelProvider</code> trait, <code>StreamEvent</code> enum</li>
-<li><code>crates/zeroclaw-providers/src/compatible.rs</code> — Analizador SSE compatible con OpenAI</li>
-<li><code>crates/zeroclaw-providers/src/anthropic.rs</code> — Transmisión de Anthropic</li>
-<li><code>crates/zeroclaw-providers/src/ollama.rs</code> — Transmisión de Ollama</li>
-<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> — consumo de flujo por parte del canal</li>
+<li><code>crates/zeroclaw-api/src/model_provider.rs</code>: trait <code>ModelProvider</code>, enum <code>StreamEvent</code></li>
+<li><code>crates/zeroclaw-providers/src/compatible.rs</code>: analizador SSE compatible con OpenAI</li>
+<li><code>crates/zeroclaw-providers/src/anthropic.rs</code>: streaming de Anthropic</li>
+<li><code>crates/zeroclaw-providers/src/ollama.rs</code>: Streaming de Ollama</li>
+<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>: consumo de streams del lado del canal</li>
 </ul>
 
                     </main>
@@ -352,6 +404,114 @@ reasoning_effort = "none"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

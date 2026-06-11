@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -216,16 +293,15 @@
                 <div id="mdbook-content" class="content">
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
-                        <h1 id="zeroclaw成熟度フレームワーク"><a class="header" href="#zeroclaw成熟度フレームワーク">ZeroClaw成熟度フレームワーク</a></h1>
+                        <h1 id="zeroclaw-maturity-framework"><a class="header" href="#zeroclaw-maturity-framework">ZeroClaw Maturity Framework</a></h1>
 <p><em>これを見つけた人へ。</em></p>
 <hr>
-<p>これをお読みいただいているということは、あなたはこのチームが心から誇りに思っているフォルダに辿り着いたことになります。ここにあるドキュメントが完璧だからではなく、正直であるからこそです。</p>
+<p>これを読んでいるあなたは、このチームが心から誇りに思える何かを表すフォルダーにたどり着いたことになります。ここにある文書が完璧だからではなく、誠実だからこそ誇れるのです。</p>
 <p>ZeroClaw は偶然から始まりました。既存のコードベースからブートストラップされ、AI ツールが誰も完全に理解できる速度よりも速く動作する中で形作られ、驚くべき機能性とアーキテクチャの計画のなさを備えたコードベースへと成長しました。誰もこの結果を選んだわけではありません。それは蓄積されたものでした。ほとんどのソフトウェアがそうであるように。</p>
-<p>次に起きたことは、それほど一般的ではありません。多くのメンバーが学生、キャリア初期のエンジニア、そして初めてパブリックに学習過程を公開する人々からなる小さなチームは、立ち止まって自分たちが構築したものをはっきりと見つめ直し、その上で異なる方向性で構築することを選びました。それは以前の成果を捨て去るのではなく、それを取り巻く意図を明確にして成長させることでした。これらの文書は、その選択の記録です。</p>
-<p>このシリーズは「成熟度フレームワーク」と呼ばれています。なぜなら、それはまさにそのものだからです：このチームがどのようにソフトウェアを共同で構築するかについての考え方を記した基礎文書のセットです。従うべきルールではなく、内面化するべき思考です。従うべきプロセスではなく、あなたが参加するあらゆる言語、ツール、チームを通じて携わるべき思考モデルのセットです。なぜなら、それは特定の技術に関するものではなく、職人技、判断力、そして配慮に関するものだからです。</p>
-<p>これらは、経験の幅が広いチームのために書かれました。何人かは数十年の専門的な実践経験を持っています。また、初めて本番環境のコードを書く人もいました。彼らはすべて、AIツールが可能なことを変えるのに十分な力を持ち始めた時期に、そしてそれらのツールとどのようにうまく連携するかという問いがまだ開かれていた時期に作業していました。彼らは、人への投資がコードへの投資よりも優れた投資だと信じていました。なぜなら、人は学んだことを次に活かすことができる一方、コードはそうではないからです。</p>
+<p>次に起こったことは、あまり一般的ではありません。学生や駆け出しのエンジニア、そして初めて公の場で学ぶ人々を含む小さなチームが、自分たちが作り上げてきたものを立ち止まって明確に見つめ直し、そして別の方法で作ることを選びました。それまでの成果を捨て去るのではなく、その周りに意図を育てていくことによってです。これらのドキュメントは、その選択の記録です。</p>
+<p>このシリーズは Maturity Framework と呼ばれていますが、それはまさにその通りのものだからです。つまり、このチームがソフトウェアをともに構築する際の考え方を記した基礎的なドキュメント群です。従うべきルールではなく、内面化すべき思考です。準拠すべきプロセスではなく、あらゆる言語、あらゆるツール、これから参加するあらゆるチームを通じて、あなたとともに歩む一連のメンタルモデルです。なぜなら、それらは特定の技術についてではなく、技巧と判断と気配りについてのものだからです。</p>
+<p>これらは、幅広い経験を持つチームのために書かれました。数十年にわたる専門的な実践を積んだ人もいれば、初めて本番コードを書く人もいました。彼らは皆、AIツールが可能なことを変えるほど強力になりつつあり、それらのツールとうまく協働する方法という問いが本当に未解決であった時代に働いていました。これらは、人への投資はコードへの投資よりも優れた投資であると信じる人々によって書かれました。なぜなら、人は学んだことを未来へと持ち運ぶのに対し、コードはそうではないからです。</p>
 <hr>
-<h2 id="読み順"><a class="header" href="#読み順">読み順</a></h2>
 <p>可能であれば、これらの文書を順番に読んでください。各文書は前の文書に基づいて構築されており、その順序は一つの物語を形成します。どこから始めても有益なことを学べますが、最初から読むことで、アーキテクチャの形状から、記録、調整、配信、コラボレーションの方法、そして文レベルでコードをどのように書くべきかという意味に至るまでの全体像を把握できます。</p>
 <p>特定の変更にどの基盤が適用されるかを判断しようとしている場合は、<a href="../contributing/architecture-map.html">Architecture and contribution map</a>から始めてください。</p>
 <div class="table-wrapper">
@@ -234,28 +310,26 @@
 <tr><th>#</th><th>ドキュメント</th><th>これが回答する内容</th><th>ディスカッションスレッド</th></tr>
 </thead>
 <tbody>
-<tr><td>1</td><td><a href="./fnd-001-intentional-architecture.html">意図的なアーキテクチャ — マイクロカーネルへの移行</a></td><td>私たちは何を作っているのか、そしてどのような形にするべきでしょうか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a></td></tr>
+<tr><td>1</td><td><a href="./fnd-001-intentional-architecture.html">意図的アーキテクチャ: マイクロカーネルへの移行</a></td><td>私たちは何を作っているのか、そしてどのような形にするべきでしょうか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a></td></tr>
 <tr><td>2</td><td><a href="./fnd-002-documentation-standards.html">ドキュメントの標準と知識アーキテクチャ</a></td><td>私たちはどのようにして知識を記録し、共有するのか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5576">#5576</a></td></tr>
 <tr><td>3</td><td><a href="./fnd-003-governance.html">チーム編成とプロジェクトガバナンス</a></td><td>私たちはどのように協調し、一緒に意思決定を行うのでしょうか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5577">#5577</a></td></tr>
-<tr><td>4</td><td><a href="./fnd-004-engineering-infrastructure.html">エンジニアリングインフラ — CI/CD パイプライン</a></td><td>どのようにして、ビルド、テスト、および出荷を確実に実行するか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5579">#5579</a></td></tr>
-<tr><td>5</td><td><a href="./fnd-005-contribution-culture.html">貢献文化 — 人間の協働とAIパートナーシップ</a></td><td>私たちはどのように協力し、成長していくのでしょうか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></td></tr>
-<tr><td>6</td><td><a href="./fnd-006-zero-compromise-in-practice.html">実践におけるゼロコンプライズ — コードの健全性、エラーの規律、および本番環境対応基準</a></td><td>永続するコードをどのように記述するか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></td></tr>
+<tr><td>4</td><td><a href="./fnd-004-engineering-infrastructure.html">エンジニアリングインフラ: CI/CD パイプライン</a></td><td>どのようにして、ビルド、テスト、および出荷を確実に実行するか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5579">#5579</a></td></tr>
+<tr><td>5</td><td><a href="./fnd-005-contribution-culture.html">コントリビューション文化: 人間の協力とAIパートナーシップ</a></td><td>私たちはどのように協力し、成長していくのでしょうか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5615">#5615</a></td></tr>
+<tr><td>6</td><td><a href="./fnd-006-zero-compromise-in-practice.html">実践におけるゼロ妥協: コードの健全性、エラー処理の規律、本番環境対応の基準</a></td><td>永続するコードをどのように記述するか？</td><td><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></td></tr>
 </tbody>
 </table>
 </div>
-<p>最初の5つの文書は、構造的および人的な問いに答えます。6番目の文書は、それらすべてに内在する問いに答えます。すなわち、構造が与えられ、チームが与えられ、ツールが与えられた場合、どのようにしてコードを適切に記述するのかということです。</p>
+<p>最初の5つのドキュメントは、構造的および人的な問いに答えます。6つ目は、それらすべての中に潜む問いに答えます。すなわち、この構造のもとで、このチームのもとで、これらのツールのもとで、コードをうまく書くとはどういうことか、という問いです。</p>
 <hr>
-<h2 id="これらのドキュメントがどのようにしてここに来たか"><a class="header" href="#これらのドキュメントがどのようにしてここに来たか">これらのドキュメントがどのようにしてここに来たか</a></h2>
-<p>このシリーズの各文書は、GitHubのイシューとして始まりました。これはRFCであり、チーム全員による議論、挑戦、そして洗練のために公開されていました。上記のリンクされたディスカッションスレッドは、そのプロセスの生きた記録です：投げられた質問、反対意見、そして最終的な形を形作った思考が含まれています。</p>
-<p>このフォルダ内のファイルは、承認されたバージョンです。チームが議論し、支持し、正統な参照として引き継ぐことを選んだ文書です。これらはリポジトリ内に保存され、コードとともにバージョン管理されています。なぜなら、これらの文書が表す考え方は、リポジトリ内でなされるすべての決定に影響を与えるからです。このコードベースを読む AI アシスタント、足場を固める新しいコントリビューター、あるいは2年前に行われた決定を再確認するメンテナーは、すべてコードからそれに影響を与えた理由へと遡ることができます。</p>
-<p>GitHubのイシューは永続的な議論の記録としてオープンに維持されます。質問、異議、またはこれらの文書で捉えきれない視点がございましたら、それらのスレッドのいずれか、またはそれらの会話が終了してから長い時間が経過している場合はコミュニティ内の新しいディスカッションが適切な場所となります。これらの文書は参照資料であり、最終的な判断ではありません。これらの文書が始めた会話は継続されるべきものです。</p>
+<p>このシリーズの各ドキュメントは、GitHub issue、すなわちRFCとして始まり、チーム全体による議論、異議、そして改良のために公開されました。上記のリンク先のディスカッションスレッドは、そのプロセスの生きた記録です。すなわち、投げかけられた疑問、提示された反論、そして最終的な形を形作った思考の数々です。</p>
+<p>このフォルダー内のファイルは、承認済みのバージョンであり、チームが議論し、支持し、正式なリファレンスとして引き継いでいくと決定したドキュメントです。これらはこのリポジトリ内に存在し、コードと並行してバージョン管理されています。なぜなら、それらが表す思考が、その中で行われるすべての意思決定に影響を与えるからです。このコードベースを読むAIアシスタント、足場を固めようとしている新しいコントリビューター、あるいは2年前に下した決定を見直すメンテナーは、いずれもコードからそれを形作った論理までの筋道をたどれるべきです。</p>
+<p>GitHub の issue は、恒久的な議論の記録として開かれたままになっています。疑問や異論、あるいはこれらのドキュメントが捉えきれていない視点がある場合は、それらのスレッドのいずれかが適切な場所です。もしこれらの議論が終了してからずっと後にこれを読んでいるのであれば、コミュニティで新しいディスカッションを始めるのが適切です。これらのドキュメントは参考資料であって、最終判断ではありません。これらが始めた対話は、続いていくことを意図しています。</p>
 <hr>
-<h2 id="将来のコントリビューターへの注意"><a class="header" href="#将来のコントリビューターへの注意">将来のコントリビューターへの注意</a></h2>
 <p>このプロジェクトに参加するのは、これらの文書が書かれてから数年後かもしれません。ツールは変化しているでしょう。コードベースも異なる外観をしているでしょう。ここで説明されている内容の一部は、後に作成された文書によって置き換えられたり、洗練されたりしている可能性があります。</p>
-<p>これらのドキュメントがあなたに育もうとしている判断は、変わっておらず、これからも変わりません。それらが問いかけていること――これが失敗したときにどうすべきか、このインターフェースは何を保証するのか、私のテストは実際に何を証明するのか、この問題を引き継ぐ人が何を知る必要があるのか――は、Rust の質問でもソフトウェアの質問でもありません。それらは、他の人が信頼できるものを構築する方法に関する質問です。これらの質問は、あなたが携わるあらゆる言語、システム、分野で同じです。それらを問い続ける限り、静かに、背景で積み重なります。</p>
+<p>これらのドキュメントがあなたの中に育もうとしている判断力は変わっていませんし、これからも変わりません。それらが問いかけている問い、すなわち、これが失敗したとき何が起こるべきか、このインターフェースは何を約束しているのか、自分のテストは実際に何を証明しているのか、この問題を引き継ぐ人は何を知っておく必要があるのか、といった問いは、Rust の問いでもソフトウェアの問いでもありません。それらは、他の人が信頼できるものをどう作るかについての問いです。これらの問いは、あなたが今後携わるあらゆる言語、あらゆるシステム、あらゆる分野において同じです。それらは、あなたが問い続ける限り、背後で静かに積み重なっていきます。</p>
 <p>これは、このシリーズがあなたに対して行う投資です。チームへようこそ。</p>
 <hr>
-<p>ZeroClaw成熟度フレームワークは、継続的に更新される文書群です。チームが保存に値する知見を得た際、新しい文書が追加されます。各文書は公開されたRFCの議論として始まり、上記の6つの文書と同じプロセスを経てここに掲載されます。それは、オープンな対話、率直な意見の相違、そしてチームがそれを継続して発展させるという集団的な判断によって成り立っています。</p>
+<p>ZeroClaw Maturity Frameworkは、継続的に更新される文書群です。チームが保存に値する知見を得た際、新しい文書が追加されます。各文書は公開されたRFCの議論として始まり、上記の6つの文書と同じプロセスを経てここに掲載されます。それは、オープンな対話、率直な意見の相違、そしてチームがそれを継続して発展させるという集団的な判断によって成り立っています。</p>
 
                     </main>
 
@@ -301,6 +375,114 @@
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

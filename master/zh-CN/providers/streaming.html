@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,22 +296,7 @@
                         <h1 id="流式传输"><a class="header" href="#流式传输">流式传输</a></h1>
 <p>ZeroClaw 中所有支持流式 API 的提供商都会以 token 为单位进行流式传输。运行时会将这些流转发给支持部分更新的通道适配器（如 Discord、Slack、Telegram 以及网关的 WebSocket），从而让用户在模型生成文本时实时看到内容逐步呈现。</p>
 <h2 id="流式传输的内容"><a class="header" href="#流式传输的内容">流式传输的内容</a></h2>
-<p>该 provider 特性会发出 <code>StreamEvent</code> 值：</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>事件</th><th>当</th></tr>
-</thead>
-<tbody>
-<tr><td><code>TextDelta(String)</code></td><td>助手文本的新令牌</td></tr>
-<tr><td><code>ReasoningDelta(String)</code></td><td>推理/思维链令牌（o系列、DeepSeek-R1、Qwen-thinking）</td></tr>
-<tr><td><code>ToolCall { name, args }</code></td><td>模型决定调用一个工具</td></tr>
-<tr><td><code>PreExecutedToolCall</code></td><td>一个预执行的提供商端工具调用（例如 Gemini 地面搜索）</td></tr>
-<tr><td><code>PreExecutedToolResult</code></td><td>其结果</td></tr>
-<tr><td><code>最终 { usage }</code></td><td>流完成；令牌使用总量</td></tr>
-</tbody>
-</table>
-</div>
+<p>提供方 trait 会在模型生成输出时发出 <code>StreamEvent</code> 值：文本增量、结构化工具调用、提供方侧预执行的工具调用及其结果、令牌用量报告，以及最终的完成标记。各变体的权威定义随类型一起位于 <code>crates/zeroclaw-api/src/model_provider.rs</code>（<code>enum StreamEvent</code>）中；推理令牌作为文本增量到达，而非单独的变体。</p>
 <p>通道通过 <code>Channel</code> 特性的出站流钩子消费这些事件。</p>
 <h2 id="功能标志"><a class="header" href="#功能标志">功能标志</a></h2>
 <p>一个提供程序暴露了两个标志，以便运行时知道它可以期望什么：</p>
@@ -244,68 +306,58 @@
 fn supports_streaming_tool_events(&amp;self) -&gt; bool { true }
 <span class="boring">}</span></code></pre>
 <ul>
-<li><strong><code>supports_streaming</code></strong> — 对于所有正在积极维护的提供商，该值为 true</li>
-<li><strong><code>supports_streaming_tool_events</code></strong> — 当提供者在流式传输期间发出 <code>ToolCall</code> 事件（而不是在结束时）时，此值为 true</li>
+<li><strong><code>supports_streaming</code></strong>：对于每个积极维护的提供商均为 true</li>
+<li><strong><code>supports_streaming_tool_events</code></strong>：当提供方在流式传输过程中（而非结束时）发出 <code>ToolCall</code> 事件时为 true</li>
 </ul>
 <p>OpenAI 兼容提供商的行为存在差异：有些提供商会逐块流式传输工具调用参数增量，而另一些提供商仅在调用完成后才发出调用。<code>compatible.rs</code> 中的 SSE 解析器能够处理这两种情况。</p>
 <h2 id="通道侧流式传输"><a class="header" href="#通道侧流式传输">通道侧流式传输</a></h2>
-<p>通道会宣传其自身的流媒体功能：</p>
+<p>通道通过 <code>Channel</code> trait 来声明自身的流式传输能力：</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>fn supports_draft_updates(&amp;self) -&gt; bool;           // 就地编辑消息
 fn supports_multi_message_streaming(&amp;self) -&gt; bool; // 将一条回复拆分为多条消息
 <span class="boring">}</span></code></pre>
+<p>通道的能力由其配置决定：带有 <code>stream_mode</code> 枚举（off / partial / multi_message）的通道同时支持草稿更新和多消息；带有 <code>stream_drafts</code> 布尔值的通道仅支持草稿更新。此表由通道配置 schema 生成，因此当通道获得或失去流式传输支持时，它能始终保持正确：</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>通道</th><th style="text-align: center">草稿更新</th><th style="text-align: center">多消息</th></tr>
 </thead>
 <tbody>
-<tr><td>命令行界面</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Discord</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Slack</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Telegram</td><td style="text-align: center">✓</td><td style="text-align: center">部分</td></tr>
-<tr><td>矩阵</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Mattermost</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>电子邮件</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>短信 / 语音</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>网关（WebSocket）</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>discord</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>lark</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>matrix</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>nextcloud_talk</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>slack</code></td><td style="text-align: center">✓</td><td style="text-align: center"></td></tr>
+<tr><td><code>telegram</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>wecom_ws</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
 </tbody>
 </table>
 </div>
 <p>当提供者和通道均支持流式传输时，流程如下：提供者发出 <code>TextDelta</code> → 运行时将其传递给通道 → 通道编辑已发送的消息。编辑频率受通道配置中的 <code>draft_update_interval_ms</code> 限制（默认值：500 毫秒），以避免触发速率限制。</p>
 <h2 id="推理块"><a class="header" href="#推理块">推理块</a></h2>
-<p>推理模型（OpenAI o 系列、DeepSeek-R1、Qwen-thinking 变体）会发出与常规文本分离的 <code>ReasoningDelta</code> 事件。默认情况下，运行时会将这些事件从出站流中剥离——参见 <code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> 中的 <code>&lt;think&gt;…&lt;/think&gt;</code> 处理逻辑。用户看到的是最终答案，而非思维链。</p>
-<p>向用户展示推理过程：</p>
-<pre><code class="language-toml">[channels.&lt;name&gt;]
-show_reasoning = true
-</code></pre>
-<p>默认情况下，此功能处于关闭状态，因为推理内容（a）通常冗长，且（b）有时会暴露内部思考过程，这可能会让最终用户感到困惑。</p>
-<p>在具备推理能力的模型上完全禁用推理：</p>
-<pre><code class="language-toml">[providers.models.&lt;name&gt;]
-think = false
-reasoning_effort = "none"
-</code></pre>
-<p>这两个字段都是顶层字段；右侧的名称取决于提供商/端点。同时设置这两个字段可以覆盖 Ollama 原生、Ollama OpenAI 兼容以及支持 <code>reasoning_effort</code> 的上游 API。</p>
+<p>推理模型（OpenAI o-series、DeepSeek-R1、Qwen-thinking 变体）会发出独立于常规文本的 <code>ReasoningDelta</code> 事件。默认情况下，运行时会将这些内容从出站流中剥离，参见 <code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> 中的 <code>&lt;think&gt;…&lt;/think&gt;</code> 处理逻辑。用户看到的是最终答案，而非思维链。</p>
+<p>为了向用户展示推理过程，请在别名条目上启用它。该功能默认关闭，因为推理内容（a）通常比较冗长，（b）有时会暴露内部的思考过程，可能让最终用户感到困惑。</p>
+<p>要在支持推理的模型上完全禁用推理，请将相关的推理字段设置为 off。这两个字段都是顶级字段；具体使用哪个名称取决于提供方/端点。同时设置这两个字段可覆盖 Ollama 原生、Ollama OpenAI 兼容以及遵循 <code>reasoning_effort</code> 的上游 API。</p>
 <h2 id="中途工具调用"><a class="header" href="#中途工具调用">中途工具调用</a></h2>
 <p>当模型决定调用工具时，提供者会发出 <code>ToolCall</code>。运行时：</p>
 <ol>
 <li>暂停从提供者的流中读取</li>
 <li>将任何缓冲的文本刷新到通道</li>
-<li>运行该工具（受安全验证约束 — 详见 <a href="../security/overview.html">安全 → 概述</a>）</li>
+<li>运行该工具（需通过安全验证，详见 <a href="../security/overview.html">安全 → 概述</a>）</li>
 <li>恢复对话，并附加工具结果</li>
 <li>为下一个助手回合打开一个新的流式调用</li>
 </ol>
 <p>从用户的角度来看：文本，然后是一个可见的指示器，表明代理通过特定于频道的提示运行了工具，然后是更多文本。对于没有输入指示器的频道，工具调用与下一个文本块之间的间隙是唯一的信号。</p>
 <h2 id="非流式提供商"><a class="header" href="#非流式提供商">非流式提供商</a></h2>
-<p>如果某个提供商一次性返回整个响应（较旧的 OpenAI 兼容端点、旧版 Gemini），运行时将合成一个包含完整回复的 <code>TextDelta</code>，后跟 <code>Final</code>。通道适配器仍然可以正常工作——只是它们不会看到部分响应。</p>
+<p>如果某个提供方一次性返回整个响应（较旧的 OpenAI 兼容端点、旧版 Gemini），运行时会合成一个包含完整回复的 <code>TextDelta</code>，随后跟上 <code>Final</code>。通道适配器仍然可以正常工作；只是它们看不到中间的部分内容。</p>
 <h2 id="代码引用"><a class="header" href="#代码引用">代码引用</a></h2>
 <ul>
-<li><code>crates/zeroclaw-api/src/model_provider.rs</code> — <code>ModelProvider</code> trait, <code>StreamEvent</code> enum</li>
-<li><code>crates/zeroclaw-providers/src/compatible.rs</code> — OpenAI 兼容 SSE 解析器</li>
-<li><code>crates/zeroclaw-providers/src/anthropic.rs</code> — Anthropic 流式传输</li>
-<li><code>crates/zeroclaw-providers/src/ollama.rs</code> — Ollama 流式传输</li>
-<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> — 通道侧流消费</li>
+<li><code>crates/zeroclaw-api/src/model_provider.rs</code>：<code>ModelProvider</code> trait、<code>StreamEvent</code> 枚举</li>
+<li><code>crates/zeroclaw-providers/src/compatible.rs</code>：OpenAI 兼容的 SSE 解析器</li>
+<li><code>crates/zeroclaw-providers/src/anthropic.rs</code>：Anthropic 流式传输</li>
+<li><code>crates/zeroclaw-providers/src/ollama.rs</code>：Ollama 流式传输</li>
+<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>：通道侧的流消费</li>
 </ul>
 
                     </main>
@@ -352,6 +404,114 @@ reasoning_effort = "none"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,61 +294,40 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="日志记录架构"><a class="header" href="#日志记录架构">日志记录架构</a></h1>
-<p>ZeroClaw 只有一个日志记录入口：<code>zeroclaw_log::record!</code> 宏。工作区中的所有输出——代理循环活动、通道 I/O、cron 任务、工具调用、内存操作、会话生命周期、错误——都通过它流转。该宏接入单个 <code>LogCaptureLayer</code>，将结构化的 <code>LogEvent</code> 记录实例化，并同时路由到三个接收端：</p>
+<p>ZeroClaw 只有一个日志记录接口：<code>zeroclaw_log::record!</code> 宏。工作区中的每一次输出——智能体循环活动、通道 I/O、cron 运行、工具调用、内存操作、会话生命周期、错误——都通过它进行。该宏会触发一个 <code>tracing</code> 事件，已安装的订阅者将其传递给两个并列的层：stderr fmt 层（终端输出）和 <code>LogCaptureLayer</code>。fmt 层在 stderr 上打印带颜色、带别名前缀的行（除非使用 <code>--verbose</code>，否则会被静默）。<code>LogCaptureLayer</code> 会生成一个结构化的 <code>LogEvent</code> 并将其分发，经由 <code>writer::record_event</code>，发送到：</p>
 <ol>
-<li>终端（通过 <code>zeroclaw-log</code> 内部安装的 <code>tracing-subscriber</code> fmt 层），以便运维人员在 stderr 上看到带颜色、带别名前缀的日志行。</li>
-<li>位于 <code>&lt;workspace&gt;/state/runtime-trace.jsonl</code> 的持久化 JSONL 日志（当 <code>[observability] log_persistence</code> 为 <code>"rolling"</code> 或 <code>"full"</code> 时）。</li>
+<li>用于 Prometheus / OTel 类型化指标的 Observer 桥接器（<code>observer_bridge::forward</code>）。</li>
 <li>进程级广播通道，使仪表盘的 SSE 流能够实时接收每个事件。</li>
+<li>位于 <code>&lt;workspace&gt;/state/runtime-trace.jsonl</code> 的持久化 JSONL 日志（当 <code>[observability] log_persistence</code> 为 <code>"rolling"</code> 或 <code>"full"</code> 时）。</li>
 </ol>
-<p><code>tracing</code> crate 是 <code>zeroclaw-log</code> 的实现细节。没有其他工作区 crate 引用 <code>tracing</code>、<code>tracing-subscriber</code> 或 <code>tracing-attributes</code>。它们的 Cargo.toml 文件不依赖这些 crate，且 <code>crates/zeroclaw-log/</code> 之外的任何 <code>.rs</code> 文件都未使用 tracing 类型。</p>
-<h2 id="record-宏"><a class="header" href="#record-宏"><code>record!</code> 宏</a></h2>
-<p>宏是锁定形态的：它接受一个级别、一个 <code>Event</code> 表达式和一个消息字面量。</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
-
-record!(INFO, Event::new(module_path!(), Action::Start), 启动步骤);
-record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), 工具失败);
-<span class="boring">}</span></code></pre>
-<p><code>module_path!()</code> 是事件名称的规范来源——它是调用点的 Rust 模块路径（例如 <code>zeroclaw_channels::telegram</code>），因此事件可被搜索、可跳转到源码，且不会拼写错误。工作区中的每个 <code>record!</code> 调用点都使用相同的约定。</p>
-<p>宏会自动注入 <code>file!()</code> 和 <code>line!()</code>。<code>LogCaptureLayer</code> 将它们作为 <code>_file</code> 和 <code>_line</code> 附加到事件的 <code>attributes</code> 映射中，以便操作人员从日志查看器跳转到源代码。</p>
-<h3 id="调用点约定"><a class="header" href="#调用点约定">调用点约定</a></h3>
-<p>每次 <code>record!</code> 调用都是一行代码，用于说明<strong>发生了什么</strong>，而不是<strong>谁做的或在什么上下文下做的</strong>。</p>
-<ul>
-<li>级别后的单个位置参数是一个 <code>Event</code> 表达式。</li>
-<li>下一个参数是用于人类可读消息的字符串字面量。</li>
-<li>以上就是全部内容。Channel、agent_alias、provider、tool、session_key、cron_job_id、model——这些都不是调用点参数。它们从 span 中传入（参见<a href="#attribution">归因</a>）。</li>
-</ul>
-<p>形状由 <code>Event</code> 结构体强制约束：未知字段会导致编译错误。</p>
-<h3 id="需要属性时"><a class="header" href="#需要属性时">需要属性时</a></h3>
-<p><code>Event::with_attrs(serde_json::json!({...}))</code> 用于单个事件的测量值，以及周围作用域中不存在的临时数据。具体而言：</p>
-<ul>
-<li>每事件度量：<code>bytes_received</code>、<code>tokens_used</code>、<code>retry_count</code>、<code>status_code</code>、<code>queue_depth</code>。</li>
-<li>当错误本身就是事件时的错误负载：anyhow 链式文本、HTTP 错误正文、解析错误详情。</li>
-<li>外部系统标识符：远程 API 的 <code>request_id</code>、上游跟踪标头。</li>
-<li>此刻捕获的派生状态：进行中的请求数、retry-after 秒数。</li>
-</ul>
-<p><strong>Attrs 不适用于</strong>任何来自周围作用域的内容——channel composite、agent_alias、model_provider、tool、session_key、cron_job_id、sender、message_id 等。这些内容应放在外层的 <code>attribution_span!</code> 或 <code>scope!</code> 中。</p>
-<p>serde 规则：传递<strong>原始值</strong>，绝不要使用 <code>format!("{}", v)</code> 或 <code>format!("{:?}", v)</code>。<code>serde_json::json!</code> 会将字符串序列化为字符串，数字序列化为数字，<code>Vec&lt;T&gt;</code> 序列化为数组，<code>Option&lt;T&gt;</code> 序列化为 null 或值。仅当类型未实现 <code>impl Serialize</code> 时（例如 <code>anyhow::Error</code>、<code>reqwest::Error</code>、<code>std::io::Error</code>、<code>Path::Display</code>、<code>StatusCode</code>）才使用 <code>.to_string()</code> 包装。</p>
-<h3 id="占位符规则"><a class="header" href="#占位符规则">占位符规则</a></h3>
-<p>Rust 中类似 <code>"raw error body: {body}"</code> 的字符串字面量占位符在 <code>record!</code> 消息内是被禁止的。Rust 2021 的隐式格式字符串捕获不会传递到 <code>record!</code> 中——每个 <code>{var}</code> 都会变成字面子字符串，不会进行替换。转换规则：</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// 错误 — {body} 是字面量，绝不会被插值
-record!(WARN, Event::new(module_path!(), Action::Fail), raw error body: {body});
-
-// 正确 —— 正文位于 attrs 中，message 为纯文本说明
-record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), 原始错误正文);
-<span class="boring">}</span></code></pre>
-<h2 id="eventactioneventoutcomeeventcategory"><a class="header" href="#eventactioneventoutcomeeventcategory"><code>Event</code>、<code>Action</code>、<code>EventOutcome</code>、<code>EventCategory</code></a></h2>
-<p>这四个都是在 <code>crates/zeroclaw-log/src/event.rs</code> 中定义的封闭枚举。添加值是唯一的更改点——调用方不会自行创建字符串。</p>
-<ul>
-<li><code>Action</code> — 封闭动词集，通过 <code>strum::IntoStaticStr</code> 在磁盘上以蛇形命名（snake-case）存储：<code>Start</code>、<code>Complete</code>、<code>Fail</code>、<code>Cancel</code>、<code>Skip</code>、<code>Timeout</code>、<code>Retry</code>、<code>Inbound</code>、<code>Outbound</code>、<code>Send</code>、<code>Receive</code>、<code>Connect</code>、<code>Disconnect</code>、<code>Reconnect</code>、<code>Spawn</code>、<code>Kill</code>、<code>Tick</code>、<code>Trigger</code>、<code>Schedule</code>、<code>Approve</code>、<code>Reject</code>、<code>Defer</code>、<code>Read</code>、<code>Write</code>、<code>Delete</code>、<code>List</code>、<code>Query</code>、<code>Invoke</code>、<code>Dispatch</code>、<code>Resolve</code>、<code>Register</code>、<code>Unregister</code>、<code>Load</code>、<code>Save</code>、<code>Migrate</code>、<code>Validate</code>、<code>Note</code>。</li>
-<li><code>EventOutcome</code> — <code>Success</code>、<code>Failure</code>、<code>Unknown</code>（默认值——通过 <code>trace_id</code> 与匹配的 Start 关联的终止结果）。</li>
-<li><code>EventCategory</code> — <code>Agent</code>、<code>Channel</code>、<code>Cron</code>、<code>Memory</code>、<code>Tool</code>、<code>Provider</code>、<code>Session</code>、<code>System</code>、<code>Internal</code>。派生自最内层的角色跨度，除非通过 <code>Event::with_category(...)</code> 进行覆盖。</li>
-</ul>
-<h2 id="归属"><a class="header" href="#归属">归属</a></h2>
-<p>别名绑定的归因信息（channel 组合、agent_alias、model_provider、tool、cron_job_id 等）从来不是调用点参数。它通过在入口处开启的追踪跨度（tracing span）流转，并由该层逐级遍历。</p>
+<p>磁盘上的 JSONL 追加操作最后执行，且仅在启用持久化时进行；Observer 桥接和广播钩子则无条件触发。</p>
+<h2 id="请先阅读attribution-不是-attrs"><a class="header" href="#请先阅读attribution-不是-attrs">请先阅读：attribution 不是 attrs</a></h2>
+<p>每个日志事件都携带两条完全独立的结构化数据通道。混淆它们是调用点处最常见的错误，因此请在做其他事情之前先牢记这种区分：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>归属信息</strong>（<code>zeroclaw.*</code>）</th><th><strong>Attrs</strong> (<code>attributes.*</code>)</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>答案</strong></td><td><em>谁</em> 做的以及 <em>在什么情况下</em></td><td>具体发生了什么</td></tr>
+<tr><td><strong>示例</strong></td><td><code>channel</code>、<code>agent_alias</code>、<code>model_provider</code>、<code>tool</code>、<code>session_key</code>、<code>cron_job_id</code></td><td><code>bytes_received</code>、<code>tokens_used</code>、<code>status_code</code>、错误负载</td></tr>
+<tr><td><strong>源</strong></td><td><strong>Span（跨度）。</strong> 在入口点处打开，由该层遍历。</td><td><strong>调用点。</strong> <code>Event::with_attrs(json!({...}))</code>。</td></tr>
+<tr><td><strong>出现在调用位置？</strong></td><td><strong>永不。</strong> 不是 <code>record!</code> 参数。</td><td>是的，这是它唯一可能的来源。</td></tr>
+</tbody>
+</table>
+</div>
+<p>由此得出的规则：<strong>如果某个值标识了一个事件归属于谁或哪个作用域，那么它应当来自 span，而绝不能出现在调用点。</strong> 归属信息会从调用栈上层打开的 <code>attribution_span!</code> / <code>scope!</code> 包装器中自动流入；当事件触发时，该层会从叶到根遍历 span 作用域，并将每一项贡献合并到该事件的 <code>zeroclaw.*</code> 块中。触发 <code>record!</code> 的调用点不会指明其中任何内容。</p>
+<p>由于归因是这种拆分中起承重作用的那一半，也是最容易让人栽跟头的那一半，所以它排在最前面。</p>
+<h2 id="归因一切都源自-span"><a class="header" href="#归因一切都源自-span">归因：一切都源自 span</a></h2>
+<p><strong>归因属性从来不是调用点参数。</strong> 请再读一遍。Channel composite、agent_alias、model_provider、tool、session_key、cron_job_id：这些都不应被键入到 <code>record!</code> 调用中。它们通过在入口点开启的 tracing span 流入，并在事件触发时由该层遍历获取。如果你发现自己想把 <code>agent_alias</code> 或 <code>tool</code> 传给 <code>record!</code>，请停下：该值已经通过某个 span 处于作用域内，或者本应如此，正确的做法是开启或修复对应的 span，而不是把这个值穿入调用点。</p>
+<p>机制全流程：</p>
+<ol>
+<li>“事物”（通道、提供方、代理、工具、定时任务、内存后端……）在其结构体旁边实现一次 <code>Attributable</code> 即可。</li>
+<li>其入口点将工作封装在 <code>attribution_span!(self)</code> 中，这会打开一个追踪 span，携带该事物的角色和别名。</li>
+<li>在该 span 内任何位置触发的每个 <code>record!</code>，无论是直接触发还是任意深度的嵌套触发，都会自动继承该归属信息。</li>
+<li>当事件触发时，该层会按 <strong>leaf→root</strong>（叶到根）遍历 span 作用域，合并每个 <code>Attributable</code> 的贡献，并写入合并后的 <code>zeroclaw.*</code> 块。调用方对此一无所知。</li>
+</ol>
+<p>这正是该设计的核心要义：针对每个事物的日志代码为零。你只需实现一次该 trait 并对入口点进行一次包装；其下的每一次输出都会被自动归因，无需额外开销。</p>
 <h3 id="attributable-trait"><a class="header" href="#attributable-trait"><code>Attributable</code> trait</a></h3>
 <p>位于 <code>crates/zeroclaw-api/src/attribution.rs</code> 中，因此每个 crate 都可以实现它，而无需依赖 <code>zeroclaw-log</code>：</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
@@ -293,17 +349,18 @@ record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::js
     Tool(ToolKind),             // Shell、HttpRequest、FetchUrl 等……
     Cron(CronKind),             // 间隔、定时、Cron、单次
     Provider(ProviderKind),     // 模型、Tts、转录、隧道
-    Memory(MemoryKind),         // Sqlite、Json、InMemory
+    Memory(MemoryKind),         // Sqlite、Json、InMemory、Markdown、Qdrant 等……
     PeerGroup,
     Skill,
     Mcp,
+    Sop,
     Session,
     System,
 }
 <span class="boring">}</span></code></pre>
 <p><code>ChannelKind</code>、<code>ToolKind</code>、<code>CronKind</code>、<code>MemoryKind</code> 以及四个 <code>ProviderKind</code> 子枚举（<code>ModelProviderKind</code>、<code>TtsProviderKind</code>、<code>TranscriptionProviderKind</code>、<code>TunnelProviderKind</code>）都是封闭的。通过 <code>strum::IntoStaticStr</code> 得到的变体 snake_case 形式即为 <code>&lt;type&gt;.&lt;alias&gt;</code> 组合中规范的 <code>&lt;type&gt;</code> 部分。添加新实现：扩展相关的 <code>Kind</code> 枚举，仅此而已。</p>
-<h3 id="打开一个-span"><a class="header" href="#打开一个-span">打开一个 span</a></h3>
-<p>使用 <code>attribution_span!(thing)</code> 包装入口点的工作。该宏返回一个 <code>Span</code>，其中以结构化字段携带该事物的角色和别名。对 future 调用 <code>.instrument(span)</code>（在同步代码中则使用 <code>let _g = span.entered()</code>）。</p>
+<h3 id="打开一个跨度在每个入口点执行此操作"><a class="header" href="#打开一个跨度在每个入口点执行此操作">打开一个跨度，在每个入口点执行此操作</a></h3>
+<p>使用 <code>attribution_span!(thing)</code> 包裹入口点的工作。该宏返回一个 <code>Span</code>，以结构化字段携带该 thing 的角色和别名。对 future 调用 <code>.instrument(span)</code>（或在同步代码中使用 <code>let _g = span.entered()</code>）。<strong>未重新建立 span 的派生任务会丢失归属信息</strong>：每个会发出数据的 <code>tokio::spawn</code> 主体都必须携带与父级相同的 <code>attribution_span!</code> / <code>scope!</code>，否则其发出的数据将无法归属。</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use zeroclaw_log::Instrument;
@@ -316,8 +373,8 @@ async move {
 }.instrument(span).await
 <span class="boring">}</span></code></pre>
 <p>当事件触发时，该层会沿着 span 作用域从叶节点到根节点遍历，将每个 <code>Attributable</code> 的贡献合并到事件的 <code>zeroclaw.*</code> 归因块中，并发出复合属性（<code>channel = "telegram.clamps"</code>、<code>channel_type = "telegram"</code>、<code>channel_alias = "clamps"</code>），而调用方无需指定其中任何键。</p>
-<h3 id="scope-宏"><a class="header" href="#scope-宏"><code>scope!</code> 宏</a></h3>
-<p>对于不与承担角色的 <code>Attributable</code> 对象绑定的、按作用域划分的标识符（如 sender id、message id、turn id、request id），请使用 <code>scope!</code>：</p>
+<h3 id="scope-宏非角色上下文"><a class="header" href="#scope-宏非角色上下文"><code>scope!</code> 宏，非角色上下文</a></h3>
+<p><code>attribution_span!</code> 用于带角色的 <code>Attributable</code> 对象。对于不与某个对象绑定的按作用域标识符（发送者 id、消息 id、回合 id、请求 id），请使用 <code>scope!</code>：</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>zeroclaw_log::scope!(
@@ -326,27 +383,75 @@ async move {
     =&gt; async move { process_message(msg).await }
 ).await
 <span class="boring">}</span></code></pre>
-<p>匹配别名绑定的 <code>ATTRIBUTION_FIELDS</code> / <code>COMPOSITE_PREFIXES</code>（位于 <code>crates/zeroclaw-log/src/event.rs</code> 中）的字段键会进入类型化的归因槽；其余所有字段则会进入每个后代发射的事件 <code>attributes</code> 映射中。</p>
+<p><code>scope!</code> 刻意横跨 attribution/attrs 这条界线：凡是匹配别名绑定的 <code>ATTRIBUTION_FIELDS</code> / <code>COMPOSITE_PREFIXES</code>（位于 <code>crates/zeroclaw-log/src/event.rs</code>）的字段键，都会进入有类型的 <code>zeroclaw.*</code> 归因槽；其余字段则进入事件的 <code>attributes</code> 映射，应用于每一次后代发射。无论哪种情况，该值都会随每一个嵌套的 <code>record!</code> 一同传递，而无需作为调用点参数。</p>
+<h2 id="record-宏及其调用点约定"><a class="header" href="#record-宏及其调用点约定"><code>record!</code> 宏及其调用点约定</a></h2>
+<p><code>tracing</code> crate 是 <code>zeroclaw-log</code> 的实现细节：<code>record!</code> / <code>scope!</code> / <code>attribution_span!</code> 宏会展开为 <code>zeroclaw_log::__private::tracing</code>，因此调用点永远不会直接引用 tracing 类型。日志事件宏本身（<code>tracing::{trace,debug,info,warn,error}</code>、<code>log::*</code>、<code>std::dbg</code>，以及裸用的 <code>anyhow::anyhow!</code>）在 <code>clippy.toml</code> 中被作为 <code>disallowed-macros</code> <strong>在整个 workspace 范围内硬性禁用</strong>。由于 CI 中启用了 <code>-D warnings</code>，任何直接使用 <code>tracing::info!</code> 等的代码都会<strong>导致构建失败</strong>，并附带一条 clippy 消息，指明应改用 <code>::zeroclaw_log::record!</code>。这并非约定，而是强制执行的规则。</p>
+<p>唯一的例外是 <code>crates/zeroclaw-log/</code> 内少数用于引导流水线的文件，它们带有本地的 <code>#![allow(clippy::disallowed_macros)]</code>。少数几个 crate（<code>zeroclaw-api</code>、<code>zeroclaw-spawn</code>、<code>zeroclaw-providers</code>、<code>zeroclaw-hardware</code>、<code>zeroclaw-log</code>）仍在 <code>Cargo.toml</code> 中列出了 <code>tracing</code> / <code>tracing-subscriber</code>，但仅用于 span 和 subscriber 的底层连接，而非用于发出日志宏。依赖项的存在并不意味着可以调用被禁用的宏。（<code>tokio::spawn</code> 同样通过 <code>disallowed-methods</code> 被禁用；请使用 <code>::zeroclaw_spawn::spawn!</code>，以便派生的任务继承调用方的归因 span。）</p>
+<p>宏是锁定形态的：它接受一个级别、一个 <code>Event</code> 表达式和一个消息字面量。</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
+
+record!(INFO, Event::new(module_path!(), Action::Start), 启动步骤);
+record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), 工具失败);
+<span class="boring">}</span></code></pre>
+<p><code>module_path!()</code> 是事件名称的规范来源：它是调用点的 Rust 模块路径（例如 <code>zeroclaw_channels::telegram</code>），因此事件可被搜索、可跳转到源代码，且不可能拼写错误。工作区中的每个 <code>record!</code> 调用点都使用相同的约定。</p>
+<p>宏会自动注入 <code>file!()</code> 和 <code>line!()</code>。<code>LogCaptureLayer</code> 将它们作为 <code>_file</code> 和 <code>_line</code> 附加到事件的 <code>attributes</code> 映射中，以便操作人员从日志查看器跳转到源代码。</p>
+<h3 id="调用点约定"><a class="header" href="#调用点约定">调用点约定</a></h3>
+<p>每次 <code>record!</code> 调用都是一行代码，用于说明<strong>发生了什么</strong>，而不是<strong>谁做的或在什么上下文下做的</strong>。</p>
+<ul>
+<li>级别后的单个位置参数是一个 <code>Event</code> 表达式。</li>
+<li>下一个参数是用于人类可读消息的字符串字面量。</li>
+<li>以上就是全部内容。Channel、agent_alias、provider、tool、session_key、cron_job_id、model：这些都不是调用点参数。它们都从 span 中流入（参见 <a href="#attribution-it-all-comes-from-spans">Attribution: it all comes from spans</a>）。</li>
+</ul>
+<p>形状由 <code>Event</code> 结构体强制约束：未知字段会导致编译错误。</p>
+<h3 id="需要属性时"><a class="header" href="#需要属性时">需要属性时</a></h3>
+<p><code>Event::with_attrs(serde_json::json!({...}))</code> 用于单个事件的测量值，以及周围作用域中不存在的临时数据。具体而言：</p>
+<ul>
+<li>每事件度量：<code>bytes_received</code>、<code>tokens_used</code>、<code>retry_count</code>、<code>status_code</code>、<code>queue_depth</code>。</li>
+<li>当错误本身就是事件时的错误负载：anyhow 链式文本、HTTP 错误正文、解析错误详情。</li>
+<li>外部系统标识符：远程 API 的 <code>request_id</code>、上游跟踪标头。</li>
+<li>此刻捕获的派生状态：进行中的请求数、retry-after 秒数。</li>
+</ul>
+<p><strong>Attrs 不适用于</strong>任何来自周围作用域的内容：channel composite、agent_alias、model_provider、tool、session_key、cron_job_id、sender、message_id 等。这些应放在外层的 <code>attribution_span!</code> 或 <code>scope!</code> 中。</p>
+<p>serde 规则：传递<strong>原始值</strong>，绝不要使用 <code>format!("{}", v)</code> 或 <code>format!("{:?}", v)</code>。<code>serde_json::json!</code> 会将字符串序列化为字符串，数字序列化为数字，<code>Vec&lt;T&gt;</code> 序列化为数组，<code>Option&lt;T&gt;</code> 序列化为 null 或值。仅当类型未实现 <code>impl Serialize</code> 时（例如 <code>anyhow::Error</code>、<code>reqwest::Error</code>、<code>std::io::Error</code>、<code>Path::Display</code>、<code>StatusCode</code>）才使用 <code>.to_string()</code> 包装。</p>
+<h3 id="占位符规则"><a class="header" href="#占位符规则">占位符规则</a></h3>
+<p>Rust 字符串字面量占位符（如 <code>"raw error body: {body}"</code>）禁止在 <code>record!</code> 消息中使用。Rust 2021 的隐式格式字符串捕获不会穿透 <code>record!</code>：每个 <code>{var}</code> 都会变成字面子串，不进行替换。转换规则：</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// 错误 — {body} 是字面量，绝不会被插值
+record!(WARN, Event::new(module_path!(), Action::Fail), raw error body: {body});
+
+// 正确 —— 正文位于 attrs 中，message 为纯文本说明
+record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), 原始错误正文);
+<span class="boring">}</span></code></pre>
+<h2 id="eventactioneventoutcomeeventcategory"><a class="header" href="#eventactioneventoutcomeeventcategory"><code>Event</code>、<code>Action</code>、<code>EventOutcome</code>、<code>EventCategory</code></a></h2>
+<p>这四个都是定义在 <code>crates/zeroclaw-log/src/event.rs</code> 中的封闭枚举。添加值是唯一的更改点：调用点不会自行创建字符串。</p>
+<ul>
+<li><code>Action</code>：封闭动词集合，通过 <code>strum::IntoStaticStr</code> 以 snake_case 形式存储于磁盘：<code>Start</code>、<code>Complete</code>、<code>Fail</code>、<code>Cancel</code>、<code>Skip</code>、<code>Timeout</code>、<code>Retry</code>、<code>Inbound</code>、<code>Outbound</code>、<code>Send</code>、<code>Receive</code>、<code>Connect</code>、<code>Disconnect</code>、<code>Reconnect</code>、<code>Spawn</code>、<code>Kill</code>、<code>Tick</code>、<code>Trigger</code>、<code>Schedule</code>、<code>Approve</code>、<code>Reject</code>、<code>Defer</code>、<code>Read</code>、<code>Write</code>、<code>Delete</code>、<code>List</code>、<code>Query</code>、<code>Invoke</code>、<code>Dispatch</code>、<code>Resolve</code>、<code>Register</code>、<code>Unregister</code>、<code>Load</code>、<code>Save</code>、<code>Migrate</code>、<code>Validate</code>、<code>Note</code>。</li>
+<li><code>EventOutcome</code>：<code>Success</code>、<code>Failure</code>、<code>Unknown</code>。<code>Unknown</code> 是默认值，在序列化时会被跳过（不会写入磁盘上的 <code>event.outcome</code>），因此没有 <code>outcome</code> 键的行隐式表示 <code>Unknown</code>。</li>
+<li><code>EventCategory</code>：<code>Agent</code>、<code>Channel</code>、<code>Cron</code>、<code>Memory</code>、<code>Tool</code>、<code>Provider</code>、<code>Session</code>、<code>System</code>、<code>Internal</code>。除非通过 <code>Event::with_category(...)</code> 覆盖，否则派生自最内层的角色范围。</li>
+</ul>
 <h2 id="工具输入输出传递"><a class="header" href="#工具输入输出传递">工具输入/输出传递</a></h2>
-<p>中央工具执行器（<code>crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool</code>）会将每次 <code>Tool::execute(args)</code> 调用包装上 start/complete/fail 事件：</p>
+<p>中央工具执行器（<code>crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool</code>）会用 invoke/complete/fail 事件包裹每一次 <code>Tool::execute(args)</code> 调用。每个事件的名称是 <code>module_path!()</code>（即执行器自身的模块），而非硬编码字符串；通过 <code>Action</code> 和严重程度来区分它们：</p>
 <ol>
-<li>在 attrs 中携带 <code>args</code>，发出 <code>Event::new("tool.invoke.start", Action::Invoke)</code>。</li>
+<li>在运行之前：<code>record!(DEBUG, Event::new(module_path!(), Action::Invoke).with_category(EventCategory::Tool).with_attrs(...))</code>，并在 attrs 中包含 <code>tool</code>、<code>tool_call_id</code> 以及完整的 <code>input</code>。</li>
 <li>运行 <code>execute(args).await</code>。</li>
-<li>成功时：<code>Event::new("tool.invoke.complete", Action::Complete)</code>，并在 attrs 中包含 <code>Outcome::Success</code>、持续时间和输出。</li>
-<li>失败时：<code>Event::new("tool.invoke.fail", Action::Fail)</code>，带有 <code>Outcome::Failure</code>、持续时间以及 attrs 中的错误/输出。</li>
-<li>发生 panic / 返回 <code>Err</code> 时：发出相同的失败事件，错误链记录在 attrs 中。</li>
+<li>成功时（<code>r.success</code>）：调用 <code>record!(DEBUG, ... Action::Complete)</code>，并在 attrs 中记录 <code>Outcome::Success</code>、持续时间以及 <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>output</code>。</li>
+<li>工具报告失败时（<code>!r.success</code>）：使用 <code>record!(WARN, ... Action::Fail)</code>，并在 attrs 中记录 <code>Outcome::Failure</code>、持续时间以及 <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>error</code> / <code>output</code>。</li>
+<li>在 <code>execute</code> 返回 <code>Err</code> 时：使用 <code>Outcome::Failure</code>、持续时间以及 attrs 中以 debug 格式化的错误调用 <code>record!(ERROR, ... Action::Fail)</code>。</li>
 </ol>
-<p>各工具的 <code>Tool::execute</code> 实现无需添加任何日志代码。配对的事件（start ↔ complete/fail）通过外层 span 作用域共享同一个 <code>trace_id</code>，因此仪表盘查询可以将它们关联起来。</p>
+<p>这些事件是在围绕调用打开的 <code>scope!</code> 风格的 span 内发出的（<code>target = "zeroclaw_log_internal_scope"</code>，字段 <code>tool = &lt;name&gt;</code>），因此 <code>tool</code> 字段也会随每个后代发出项一同传递。各工具的 <code>Tool::execute</code> 实现无需添加任何日志代码。</p>
 <h2 id="logcapturelayer-与磁盘存储架构"><a class="header" href="#logcapturelayer-与磁盘存储架构"><code>LogCaptureLayer</code> 与磁盘存储架构</a></h2>
 <p><code>crates/zeroclaw-log/src/layer.rs</code> 中的 layer 是一个 <code>tracing-subscriber</code> Layer，它：</p>
 <ol>
 <li>在创建/记录目标为 <code>"zeroclaw_log_internal_attribution"</code> 的 span 时（即 <code>attribution_span!</code> 宏所开启的目标）：将 role 和 alias 字段解析为 <code>ZeroclawAttribution</code> 快照，并存储在该 span 的 extensions 中。</li>
 <li>在以目标 <code>"zeroclaw_log_internal_scope"</code> 创建/记录 span 时（由 <code>scope!</code> 打开）：解析临时 kvp 并以类似方式暂存它们。</li>
-<li>在目标为 <code>"zeroclaw_log_event"</code> 的事件发射时（即 <code>record!</code> 宏所触发的目标）：从 <code>zc_*</code> 字段集构建 <code>LogEvent</code>，从叶子到根遍历 span 作用域并合并所找到的每个归因快照，将 <code>zc_attrs</code> JSON 数据块解析到事件的 <code>attributes</code> 中，附加来自自动捕获源位置的 <code>_file</code>/<code>_line</code>，并将最终事件写入：
+<li>在事件发出时，目标为 <code>"zeroclaw_log_event"</code>（<code>record!</code> 宏触发所经过的目标）：从 <code>zc_*</code> 字段集构建一个 <code>LogEvent</code>，从叶节点到根节点遍历 span 作用域并合并找到的每个归因快照，将 <code>zc_attrs</code> JSON 数据块解析为事件的 <code>attributes</code>，附加来自自动捕获的源代码位置的 <code>_file</code>/<code>_line</code>，然后将最终事件交给 <code>writer::record_event</code>，它按以下顺序进行分发：
 <ul>
-<li>JSONL 持久化（<code>writer.rs</code>）。</li>
-<li>广播钩子（<code>broadcast.rs</code>），用于 SSE/dashboard 订阅者。</li>
-<li>用于 Prometheus / OTel 类型化指标的 Observer 桥接（<code>observer_bridge.rs</code>）。</li>
+<li>Prometheus / OTel 类型化指标的 Observer 桥接（<code>observer_bridge.rs</code>）（无条件）。</li>
+<li>广播钩子（<code>broadcast.rs</code>），用于 SSE/仪表板订阅者（无条件）。</li>
+<li>JSONL 持久化（<code>writer.rs</code>），仅在启用 <code>log_persistence</code> 时最后追加。</li>
 </ul>
 </li>
 </ol>
@@ -377,14 +482,18 @@ async move {
 </code></pre>
 <p><code>@timestamp</code> 是 <code>chrono::DateTime&lt;Utc&gt;</code>，序列化为带 <code>Z</code> 的 RFC 3339 格式。架构版本为 <code>2</code>；较旧的 <code>version: 1</code> 行会在守护进程启动时由 <code>migrate::migrate_legacy_jsonl_in_place</code> 就地迁移。</p>
 <h2 id="logconfig-与-observabilityconfig"><a class="header" href="#logconfig-与-observabilityconfig"><code>LogConfig</code> 与 <code>ObservabilityConfig</code></a></h2>
-<p><code>zeroclaw-log</code> 定义了自己的精简版 <code>LogConfig</code>（位于 <code>crates/zeroclaw-log/src/config.rs</code>）——包含 <code>log_persistence</code>、<code>log_persistence_path</code>、<code>log_persistence_max_entries</code>、<code>log_tool_io</code>、<code>log_tool_io_truncate_bytes</code>、<code>log_tool_io_denylist</code>。这打破了原本会形成的依赖循环：<code>zeroclaw-config::ObservabilityConfig</code> 携带完整 schema（包含 TOML 反序列化和验证），而运行时在启动时通过 <code>crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config</code> 将其转换为 <code>LogConfig</code>。结果是：<code>zeroclaw-config</code> 可以使用 <code>record!</code> 而无需反转依赖树。</p>
+<p><code>zeroclaw-log</code> 定义了自己精简的 <code>LogConfig</code>（位于 <code>crates/zeroclaw-log/src/config.rs</code>）：<code>log_persistence</code>、<code>log_persistence_path</code>、<code>log_persistence_max_entries</code>、<code>log_tool_io</code>、<code>log_tool_io_truncate_bytes</code>、<code>log_tool_io_denylist</code>。这打破了原本会出现的依赖循环：<code>zeroclaw-config::ObservabilityConfig</code> 承载完整的 schema（包含 TOML 反序列化和验证），而运行时在启动时通过 <code>crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config</code> 将其转换为 <code>LogConfig</code>。其结果是：<code>zeroclaw-config</code> 可以使用 <code>record!</code> 而无需颠倒依赖树。</p>
 <h2 id="订阅者安装"><a class="header" href="#订阅者安装">订阅者安装</a></h2>
 <p>守护进程通过以下方式安装全局订阅者：</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>zeroclaw_log::install_global_subscriber("info,matrix_sdk=warn,matrix_sdk_base=warn");
+</span>zeroclaw_log::install_global_subscriber(
+    recording_filter.as_deref(),   // Option&lt;&amp;str&gt; — --log-level 标志（如果已设置）
+    &amp;default_filter,               // &amp;str — 在没有标志和 RUST_LOG 时的后备过滤器
+    cli.verbose,                   // bool — 控制 stderr fmt（终端）层
+);
 <span class="boring">}</span></code></pre>
-<p>这个单次调用会在 <code>tracing-subscriber::Registry</code> 之上设置带 agent-alias 前缀的终端格式化器和 <code>LogCaptureLayer</code>。<code>src/main.rs</code> 是唯一调用它的地方。测试使用 <code>zeroclaw_log::try_install_capture_subscriber()</code> 和 <code>zeroclaw_log::subscribe_or_install()</code>，通过广播钩子来导出发出的事件，而无需在测试 crate 中命名任何 tracing 类型。</p>
+<p>两个独立的轴：<strong>录制底线</strong>（到达 <code>LogCaptureLayer</code> 的内容，按 flag → <code>RUST_LOG</code> → 默认值的顺序解析）与<strong>终端显示</strong>（stderr fmt 层，除非 <code>verbose</code> 为 true，否则完全静默）。这一次调用即可在 <code>tracing-subscriber::Registry</code> 之上设置带 agent 别名前缀的终端格式化器以及 <code>LogCaptureLayer</code>。<code>src/main.rs</code> 是唯一调用它的地方。测试使用 <code>zeroclaw_log::try_install_capture_subscriber()</code> + <code>zeroclaw_log::subscribe_or_install()</code>，通过广播钩子抽取已发出的事件，而无需在测试 crate 中命名任何 tracing 类型。</p>
 <h2 id="何时扩展封闭枚举"><a class="header" href="#何时扩展封闭枚举">何时扩展封闭枚举</a></h2>
 <ul>
 <li><strong>新增通道实现</strong>：向 <code>ChannelKind</code> 添加一个变体。其 snake_case 形式即为磁盘上的 <code>channel_type</code> 字符串。仅当变体名称 snake_case 后无法得到期望值时（例如 <code>OpenAi</code> → <code>"openai"</code>），才需添加 <code>#[strum(serialize = "...")]</code>。</li>
@@ -392,7 +501,7 @@ async move {
 <li><strong>新增 cron 调度结构</strong>：添加到 <code>CronKind</code>。</li>
 <li><strong>新模型 / TTS / 转录 / 隧道提供方</strong>：将其添加到 <code>ProviderKind</code> 下相关的 <code>*ProviderKind</code> 子枚举中。</li>
 <li><strong>新增内存后端</strong>：添加到 <code>MemoryKind</code>。</li>
-<li><strong>全新的 <code>Role</code> 系列</strong>（PeerGroup / Skill / Mcp 获得子类型）：可即时嵌套各自的 <code>Kind</code>——模式是统一的。</li>
+<li><strong>全新的 <code>Role</code> 系列</strong>（PeerGroup / Skill / Mcp 获得子类型）：随时使用其自身的 <code>Kind</code> 进行嵌套：模式是统一的。</li>
 </ul>
 <p>然后在新结构体旁添加 <code>impl Attributable for X</code>（<code>fn role() -&gt; Role::Family(Kind::Variant)</code>、<code>fn alias() -&gt; &amp;str { &amp;self.alias }</code>），并用 <code>attribution_span!(self)</code> 包裹其入口点。其余部分该层会自动处理。</p>
 <h2 id="操作符注意事项"><a class="header" href="#操作符注意事项">操作符注意事项</a></h2>
@@ -406,7 +515,7 @@ async move {
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../architecture/multi-agent.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../architecture/rpc-socket.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -420,7 +529,7 @@ async move {
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../architecture/multi-agent.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../architecture/rpc-socket.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -442,6 +551,114 @@ async move {
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

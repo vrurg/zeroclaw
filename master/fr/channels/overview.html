@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -216,14 +293,19 @@
                 <div id="mdbook-content" class="content">
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
-                        <h1 id="chaînes--vue-densemble"><a class="header" href="#chaînes--vue-densemble">Chaînes — Vue d’ensemble</a></h1>
-<p>Un <strong>canal</strong> est une surface de messagerie par laquelle l’agent communique. Une instance de ZeroClaw peut lier plusieurs canaux simultanément — le même agent peut répondre sur Discord, Telegram, par e-mail et via la passerelle REST sans que vous ayez à exécuter des processus séparés.</p>
+                        <h1 id="canaux--aperçu"><a class="header" href="#canaux--aperçu">Canaux : aperçu</a></h1>
+<p>Un <strong>channel</strong> est une surface de messagerie par laquelle l’agent communique. Une seule instance ZeroClaw peut lier plusieurs channels simultanément : le même agent peut répondre dans Discord, Telegram, par e-mail et via la passerelle REST sans que vous ayez à exécuter des processus séparés.</p>
+<p>Un agent liste les canaux sur lesquels il répond ; consultez <a href="../agents/overview.html">Agents</a> pour savoir comment les canaux sont rattachés à un agent (et comment un <a href="./peer-groups.html">groupe de pairs</a> permet aux agents d’un canal partagé de s’adresser les uns aux autres).</p>
 <p>Les canaux sont des implémentations du trait <code>Channel</code> dans <code>zeroclaw-api</code>. Chaque canal est conditionné par une fonctionnalité au moment de la compilation, de sorte qu’une compilation minimale n’inclut que les canaux que vous souhaitez.</p>
 <p>La build par défaut de ZeroClaw inclut un bundle de canaux léger : ACP, webhook, email et Telegram. Ceux-ci couvrent les sessions locales/éditeur, l’entrée de la passerelle et la messagerie externe courante au premier lancement, sans compiler chaque intégration de plateforme du bundle. Les binaires précompilés utilisent ce paramètre léger par défaut. Pour les installations depuis les sources nécessitant l’ensemble historique étendu de canaux, exécutez <code>install.sh --source --preset full</code>, compilez avec <code>--features channels-full</code>, ou utilisez les fonctionnalités individuelles <code>channel-*</code> pour des builds sélectives :</p>
-<pre><code class="language-bash">./install.sh --source --preset full
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">./install.sh --source --preset full
 cargo build --features channels-full
 cargo build --no-default-features --features agent-runtime,gateway,channel-discord
 </code></pre>
+</div>
+
 <h2 id="catégories"><a class="header" href="#catégories">Catégories</a></h2>
 <h3 id="plateformes-de-chat"><a class="header" href="#plateformes-de-chat">Plateformes de chat</a></h3>
 <p>Messagerie en temps réel où l’agent peut maintenir une conversation, recevoir des notifications de nouveaux messages via push ou long-poll, et répondre en tant qu’utilisateur bot.</p>
@@ -240,7 +322,7 @@ cargo build --no-default-features --features agent-runtime,gateway,channel-disco
 <tr><td>Signal</td><td><code>channel-signal</code></td><td><a href="./signal.html">Signal</a></td></tr>
 <tr><td>API Cloud WhatsApp</td><td><code>channel-whatsapp-cloud</code></td><td><a href="./whatsapp.html">WhatsApp</a></td></tr>
 <tr><td>WhatsApp Web</td><td><code>whatsapp-web</code></td><td><a href="./whatsapp.html">WhatsApp</a></td></tr>
-<tr><td>Discord, Slack, Telegram, iMessage, WeCom Bot Webhook, WeCom AI Bot Long Connection, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion</td><td>par canal</td><td><a href="./chat-others.html">Autres plateformes de chat</a></td></tr>
+<tr><td>Discord, Slack, Telegram, iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion</td><td>par canal</td><td><a href="./chat-others.html">Autres plateformes de chat</a></td></tr>
 </tbody>
 </table>
 </div>
@@ -268,7 +350,7 @@ cargo build --no-default-features --features agent-runtime,gateway,channel-disco
 </thead>
 <tbody>
 <tr><td>IMAP / SMTP</td><td><code>channel-email</code></td><td>Boîte de réception classique basée sur les sondages</td></tr>
-<tr><td>Gmail Push</td><td><code>channel-email</code></td><td>Notifications push Google Pub/Sub — en temps réel, sans interrogation</td></tr>
+<tr><td>Gmail Push</td><td><code>channel-email</code></td><td>Notifications push Google Pub/Sub : en temps réel, sans interrogation (polling)</td></tr>
 </tbody>
 </table>
 </div>
@@ -298,46 +380,41 @@ cargo build --no-default-features --features agent-runtime,gateway,channel-disco
 <tr><td>Webhook</td><td><code>channel-webhook</code></td><td>HTTP entrant → agent</td></tr>
 <tr><td>CLI</td><td>toujours activé</td><td>Entrée/sortie standard locale</td></tr>
 <tr><td>Passerelle REST/WS</td><td>toujours activé</td><td>HTTP + WebSocket</td></tr>
-<tr><td>ACP (Agent Client Protocol)</td><td><code>channel-acp-server</code></td><td>JSON-RPC 2.0 via stdio — sessions éditeur/IDE</td></tr>
+<tr><td>ACP (Agent Client Protocol)</td><td><code>channel-acp-server</code></td><td>JSON-RPC 2.0 via stdio : sessions éditeur/IDE</td></tr>
 </tbody>
 </table>
 </div>
 <p>Voir <a href="./webhook.html">Webhooks</a> et <a href="./acp.html">ACP</a>.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Les instances de canaux modernes sont configurées sous <code>[channels.&lt;type&gt;.&lt;alias&gt;]</code>, avec <code>default</code> comme premier alias courant :</p>
-<pre><code class="language-toml">[channels.discord.default]
-enabled = true
-bot_token = "..."
-allowed_users = ["123456789012345678"]
-reply_to_mentions_only = false
+<p>Les instances de canal modernes sont configurées sous <code>[channels.&lt;type&gt;.&lt;alias&gt;]</code>, avec <code>default</code> comme premier alias courant. Définissez-les via n’importe quelle surface de configuration :</p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle"><a class="header" href="#tableau-de-bord-de-la-passerelle">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/channels"><code>/config/channels</code></a> dans le tableau de bord web.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, sous <strong>Channels</strong>.</p>
+</div>
 
-[agents.assistant]
-enabled = true
-channels = ["discord.default"]
-</code></pre>
-<p>L’entrée <code>channels</code> associe l’alias du canal à l’agent qui doit y répondre. Certains guides plus anciens spécifiques à un canal affichent encore des exemples plats hérités ; privilégiez la forme avec alias ci-dessus pour les nouvelles configurations. Les options spécifiques à un canal se trouvent dans le même bloc. Clés communes à tous les canaux :</p>
+<p>Les secrets (jetons de bot, clés API, mots de passe) sont stockés chiffrés ; définissez-les via la gateway, zerocode ou <code>zeroclaw config set</code> (masqué), jamais en texte clair. L’entrée <code>channels</code> d’un agent lie un alias de canal à cet agent. Les noms de champs diffèrent selon le canal ; <code>zeroclaw config schema</code> constitue la liste de référence. Champs récurrents dans de nombreux canaux :</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Clé</th><th>Ce que cela fait</th></tr>
 </thead>
 <tbody>
-<tr><td><code>activé</code></td><td>Activer/désactiver sans supprimer la section</td></tr>
-<tr><td><code>allowed_users</code></td><td>Liste blanche — vide signifie autoriser tout</td></tr>
-<tr><td><code>destinations_autorisées</code></td><td>Restreindre les salles/canaux/fils dans lesquels le bot répond</td></tr>
-<tr><td><code>reply_to_mentions_only</code></td><td>Ignorer les messages qui ne @mentionnent pas le bot</td></tr>
-<tr><td><code>provider</code></td><td>Remplacer le modèle par défaut pour ce canal</td></tr>
+<tr><td><code>enabled</code></td><td>Activer/désactiver sans supprimer la section</td></tr>
+<tr><td><code>mention_only</code></td><td>Ignorer les messages qui ne mentionnent pas le bot avec @ (plateformes de chat)</td></tr>
+<tr><td><code>proxy_url</code></td><td>Proxy par canal (http/https/socks5/socks5h) ; remplace la configuration globale <code>[proxy]</code></td></tr>
+<tr><td><code>excluded_tools</code></td><td>Outils non mis à la disposition du modèle lors de la réponse sur ce canal</td></tr>
 <tr><td><code>draft_update_interval_ms</code></td><td>Cadence d’édition en streaming (par défaut 500 ms)</td></tr>
+<tr><td><code>approval_timeout_secs</code></td><td>Secondes d’attente pour l’approbation de l’opérateur sur les outils <code>always_ask</code> avant le refus automatique</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="appairage"><a class="header" href="#appairage">Appairage</a></h2>
-<p>Most channels require <strong>pairing</strong> — a one-time handshake that binds an incoming message source to the agent’s policy. Each channel’s setup guide (linked from the matrix above) walks through that channel’s pairing flow; <code>zeroclaw channel bind-telegram</code> handles Telegram-specific identities. Without pairing, the channel rejects everything.</p>
-<p>La justification : un agent disposant d’un jeton de bot Telegram public et sans appairage constitue un shell accessible publiquement. L’appairage est la porte d’entrée.</p>
+<p>Les expéditeurs entrants sont contrôlés via les <a href="./peer-groups.html">groupes de pairs</a>, et non par un champ par canal.</p>
 <h2 id="capacité-de-streaming"><a class="header" href="#capacité-de-streaming">Capacité de streaming</a></h2>
-<p>Les canaux déclarent le type de streaming qu’ils prennent en charge — consultez <a href="../providers/streaming.html">Fournisseurs → Streaming</a> pour la matrice des capacités et la signification de <code>supports_draft_updates</code> / <code>supports_multi_message_streaming</code>.</p>
+<p>Les canaux déclarent le type de streaming qu’ils prennent en charge : consultez <a href="../providers/streaming.html">Providers → Streaming</a> pour la matrice des capacités et la signification de <code>supports_draft_updates</code> / <code>supports_multi_message_streaming</code>.</p>
 <h2 id="ajout-dun-canal"><a class="header" href="#ajout-dun-canal">Ajout d’un canal</a></h2>
-<p>Implémenter un nouveau canal consiste à ajouter un fichier dans <code>crates/zeroclaw-channels/src/</code> qui implémente le trait <code>Channel</code>. La référence canonique est n’importe quel canal existant de forme similaire — <code>discord.rs</code> pour les canaux basés sur la poussée, <code>email_channel.rs</code> pour le sondage, <code>webhook.rs</code> pour les canaux pilotés par HTTP.</p>
+<p>Implémenter un nouveau canal consiste à ajouter un fichier dans <code>crates/zeroclaw-channels/src/</code> qui implémente le trait <code>Channel</code>. La référence canonique est n’importe quel canal existant de forme similaire : <code>discord.rs</code> pour le mode push, <code>email_channel.rs</code> pour l’interrogation (polling), <code>webhook.rs</code> pour le mode piloté par HTTP.</p>
 
                     </main>
 
@@ -347,7 +424,7 @@ channels = ["discord.default"]
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../channels/matrix.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../channels/peer-groups.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -361,7 +438,7 @@ channels = ["discord.default"]
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../channels/matrix.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../channels/peer-groups.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -383,6 +460,114 @@ channels = ["discord.default"]
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

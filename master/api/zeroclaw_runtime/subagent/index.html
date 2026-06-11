@@ -19,7 +19,7 @@ escalation.</p>
 <code>[agents.&lt;alias&gt;]</code> config keys), not backend storage identifiers.
 Consumers that build an <a href="../../zeroclaw_memory/agent_scoped/struct.AgentScopedMemory.html" title="struct zeroclaw_memory::agent_scoped::AgentScopedMemory"><code>zeroclaw_memory::AgentScopedMemory</code></a> must resolve aliases
 to backend identifiers via
-[<code>zeroclaw_memory::Memory::ensure_agent_uuid</code>] first — SQL-backed
+<a href="../../zeroclaw_api/memory_traits/trait.Memory.html#method.ensure_agent_uuid" title="method zeroclaw_api::memory_traits::Memory::ensure_agent_uuid"><code>zeroclaw_memory::Memory::ensure_agent_uuid</code></a> first — SQL-backed
 stores use UUIDs from the <code>agents</code> table; Markdown / Qdrant / None
 use the alias verbatim per the trait default. Holding aliases at
 this layer means <a href="struct.SubAgentSpawn.html#method.for_agent" title="associated function zeroclaw_runtime::subagent::SubAgentSpawn::for_agent"><code>SubAgentSpawn::for_agent</code></a> does not need a

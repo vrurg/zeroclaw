@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -223,83 +300,400 @@
 <li><strong>Usa los slots de servidor local de primera clase</strong> (<code>lmstudio</code>, <code>llamacpp</code>, <code>sglang</code>, <code>vllm</code>, <code>osaurus</code>, <code>litellm</code>). Envoltorios ligeros con valores predeterminados sensatos.</li>
 <li><strong>Implementa el trait <code>ModelProvider</code></strong> en Rust. Para cualquier cosa que no sea compatible con OpenAI.</li>
 </ol>
-<h2 id="endpoint-compatible-con-openai-usa-la-ranura-custom"><a class="header" href="#endpoint-compatible-con-openai-usa-la-ranura-custom">Endpoint compatible con OpenAI: usa la ranura <code>custom</code></a></h2>
-<p>Si el servicio habla de completados de chat de OpenAI, este es un cambio solo de configuración:</p>
-<pre><code class="language-toml">[providers.models.custom.gateway]
-uri     = "https://my-gateway.example.com/v1"
-model   = "my-model-id"
-api_key = "..."                          # omitir si el endpoint no requiere autenticación
-</code></pre>
-<p>La ranura <code>custom</code> requiere <code>uri</code> (el enum de endpoint de la familia no tiene un valor predeterminado). Haz referencia a ella desde un agente:</p>
-<pre><code class="language-toml">[agents.assistant]
-model_provider = "custom.gateway"
-risk_profile   = "hardened"
-</code></pre>
-<p>Esta es la misma implementación en runtime de <code>OpenAiCompatibleModelProvider</code> que utilizan <code>groq</code>, <code>mistral</code>, <code>xai</code> y cualquier otro proveedor con su propio slot canónico en el <a href="./catalog.html">catalog</a>. La diferencia radica en qué slot de familia usas: <code>custom</code> es el comodín para endpoints que no están representados por un slot de proveedor.</p>
+<h2 id="endpoint-compatible-con-openai-use-el-slot-custom"><a class="header" href="#endpoint-compatible-con-openai-use-el-slot-custom">Endpoint compatible con OpenAI: use el slot <code>custom</code></a></h2>
+<p>Si el servicio habla chat-completions de OpenAI, este es un cambio que solo afecta a la configuración. El slot <code>custom</code> requiere <code>uri</code> (el enum de endpoint de la familia no tiene valor predeterminado); referéncielo desde el <code>model_provider</code> de un agente.</p>
+<p>Esta es la misma implementación en tiempo de ejecución de <code>OpenAiCompatibleModelProvider</code> utilizada por <code>groq</code>, <code>mistral</code>, <code>xai</code> y cualquier otro proveedor con su propio espacio canónico en el <a href="./catalog.html">catálogo</a>. La diferencia está en qué espacio de familia usas: <code>custom</code> es el comodín para endpoints no representados por un espacio de proveedor.</p>
 <h2 id="servidores-de-inferencia-local-de-primera-clase"><a class="header" href="#servidores-de-inferencia-local-de-primera-clase">Servidores de inferencia local de primera clase</a></h2>
 <p>ZeroClaw incluye slots canónicos para los stacks de inferencia local más populares. Internamente todos son compatibles con OpenAI, pero con valores <code>uri</code> predeterminados ya aplicados, por lo que normalmente puedes omitir <code>uri</code> por completo.</p>
-<h3 id="llamacpp--espacio-llamacpp"><a class="header" href="#llamacpp--espacio-llamacpp">llama.cpp — espacio <code>llamacpp</code></a></h3>
-<pre><code class="language-bash">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+<h3 id="llamacpp-slot-llamacpp"><a class="header" href="#llamacpp-slot-llamacpp">llama.cpp: slot <code>llamacpp</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 </code></pre>
-<pre><code class="language-toml">[providers.models.llamacpp.local]
-uri   = "http://127.0.0.1:8033/v1"       # omitir para usar el http://localhost:8080/v1 predeterminado de la familia
-model = "ggml-org/gpt-oss-20b-GGUF"
-# api_key solo es necesario si llama-server se inició con --api-key
-</code></pre>
-<p><strong>Campos opcionales</strong> (se aplican a cualquier familia compat-slot, incluido <code>llamacpp</code>):</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Campo</th><th>Tipo</th><th>Predeterminado</th><th>Descripción</th></tr>
-</thead>
-<tbody>
-<tr><td><code>think</code></td><td><code>bool</code></td><td>—</td><td>Establece <code>enable_thinking</code> en el nivel superior del cuerpo de la solicitud. <code>false</code> indica a los modelos con capacidad de razonamiento que omitan la cadena de pensamiento.</td></tr>
-<tr><td><code>chat_template_kwargs</code></td><td>tabla</td><td>—</td><td>Se pasa textualmente como <code>chat_template_kwargs</code> a la plantilla de chat de Jinja. Se utiliza para variables de plantilla específicas de la familia de modelos.</td></tr>
-<tr><td><code>max_tokens</code></td><td><code>u32</code></td><td>—</td><td>Máximo de tokens de salida por respuesta.</td></tr>
-<tr><td><code>timeout_secs</code></td><td><code>u64</code></td><td>120</td><td>Tiempo de espera de la solicitud para llamadas sin streaming.</td></tr>
-</tbody>
-</table>
 </div>
+
+<p><strong>Campos opcionales</strong> se aplican a cualquier familia de compat-slot (incluyendo <code>llamacpp</code>). El conjunto completo, derivado del esquema:</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>api_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>Token API secreto para este model_provider. Obténgalo desde el panel de control del model_provider (plataforma de OpenAI, consola de Anthropic, página de claves de OpenRouter, etc.). Se almacena mediante el keyring del sistema operativo cuando es posible; nunca lo incluya directamente en config.toml.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway"><a class="header" href="#panel-de-control-del-gateway">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configure el campo <code>providers.models.custom.&lt;alias&gt;.api_key</code>.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>providers.models.custom.&lt;alias&gt;.api_key</code>.</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.api_key    # entrada enmascarada, almacenada cifrada
+</code></pre>
+<h4 id="variable-de-entorno"><a class="header" href="#variable-de-entorno">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__api_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>chat_template_kwargs</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>Pares clave/valor arbitrarios reenviados textualmente como <code>chat_template_kwargs</code> en el cuerpo de la solicitud (específico de llama.cpp). Use esto para pasar variables de plantilla de la familia del modelo que controlan comportamientos no expuestos por otros campos. Ejemplo (supresión de razonamiento en Qwen3): <code>chat_template_kwargs = { enable_thinking = false }</code></p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-1"><a class="header" href="#panel-de-control-del-gateway-1">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code>.</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code>.</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.chat_template_kwargs &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-1"><a class="header" href="#variable-de-entorno-1">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__chat_template_kwargs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>extra_headers</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>Encabezados HTTP adicionales que se envían con cada solicitud. Caso de nicho: se usa para puentes de autenticación, proxies corporativos o gateways personalizados que exigen un encabezado de rastreo. La mayoría de los usuarios nunca lo modifican; edite <code>config.toml</code> directamente si lo necesita.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-2"><a class="header" href="#panel-de-control-del-gateway-2">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.extra_headers</code>.</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>providers.models.custom.&lt;alias&gt;.extra_headers</code>.</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.extra_headers    # entrada enmascarada, almacenada cifrada
+</code></pre>
+<h4 id="variable-de-entorno-2"><a class="header" href="#variable-de-entorno-2">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__extra_headers=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback</code> <span class="cfg-field-meta"><code>ModelProviderRef[]</code> · default <code>—</code></span></summary>
+<p>Lista ordenada de otros alias de proveedor que se intentarán cuando todos los modelos de este alias hayan fallado. Cada entrada es una referencia con puntos <code>&lt;type&gt;.&lt;alias&gt;</code> dentro de <code>providers.models</code> y se resuelve con sus propias credenciales, endpoint y modelo. Un fallback nunca hereda la clave de este alias. El recorrido es en profundidad: primero se agotan los modelos de este alias, luego se desciende por cada alias de fallback en orden (aplicando sus propios <code>fallback_models</code> y <code>fallback</code>). Vacío significa que no hay fallback a nivel de proveedor.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-3"><a class="header" href="#panel-de-control-del-gateway-3">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y establece el campo <code>providers.models.custom.&lt;alias&gt;.fallback</code>.</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configura el campo <code>providers.models.custom.&lt;alias&gt;.fallback</code>.</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-3"><a class="header" href="#variable-de-entorno-3">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback_models</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>—</code></span></summary>
+<p>Modelos alternativos ordenados para probar en ESTE proveedor antes de recurrir a los alias de <code>fallback</code>. Mismo endpoint, clave y encabezados que el <code>model</code> principal. Solo cambia el identificador del modelo. Usa esto cuando un proveedor ofrece un modelo de respaldo (p. ej., una variante más pequeña o antigua) que debería probarse antes de abandonar el proveedor por completo. Vacío significa que solo se prueba <code>model</code>.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-4"><a class="header" href="#panel-de-control-del-gateway-4">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configure el campo <code>providers.models.custom.&lt;alias&gt;.fallback_models</code>.</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>providers.models.custom.&lt;alias&gt;.fallback_models</code>.</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback_models &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-4"><a class="header" href="#variable-de-entorno-4">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback_models=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>kind</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Implementación de proveedor a instanciar para este perfil. Use esto cuando un slot tipado canónico deba ejecutarse a través de una implementación compatible, p. ej. <code>[providers.models.openai.proxy] kind = "openai-compatible"</code>.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-5"><a class="header" href="#panel-de-control-del-gateway-5">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.kind</code>.</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.kind</code>.</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.kind &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-5"><a class="header" href="#variable-de-entorno-5">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__kind=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_tokens</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>Límite estricto de la longitud de respuesta en tokens. La mayoría de los modelos ya aplican límites integrados razonables; déjelo sin configurar a menos que necesite específicamente recortar salidas largas por razones de costo o latencia.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-6"><a class="header" href="#panel-de-control-del-gateway-6">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.max_tokens</code>.</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.max_tokens</code>.</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.max_tokens &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-6"><a class="header" href="#variable-de-entorno-6">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__max_tokens=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>merge_system_into_user</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>Particularidad específica de ModelProvider: incorpora el prompt del sistema en el primer mensaje del usuario en lugar de enviar un rol system separado. Solo es necesario para modelos que rechazan (o manejan incorrectamente) un rol system independiente, p. ej., ciertas variantes antiguas de Mistral.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-7"><a class="header" href="#panel-de-control-del-gateway-7">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code>.</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code>.</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.merge_system_into_user &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-7"><a class="header" href="#variable-de-entorno-7">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__merge_system_into_user=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>model</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>Identificador de modelo que se envía con cada solicitud: la cadena de ID del catálogo del model_provider (p. ej. <code>gpt-4o</code>, <code>claude-sonnet-4-5</code>, <code>llama-3.3-70b</code>). Debe coincidir con un modelo que el model_provider realmente sirva en esta cuenta.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-8"><a class="header" href="#panel-de-control-del-gateway-8">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.model</code>.</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.model</code>.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.model &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-8"><a class="header" href="#variable-de-entorno-8">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__model=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>native_tools</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>Anula el valor predeterminado del proveedor para las llamadas nativas a herramientas. <code>None</code> (predeterminado) respeta la opción integrada del proveedor. <code>Some(true)</code> fuerza la activación de las llamadas nativas a herramientas, <code>Some(false)</code> fuerza el fallback a texto. Actualmente solo lo consulta la factory de Groq, que usa por defecto el fallback a texto porque los modelos de Groq de la familia llama rechazan las llamadas nativas a herramientas con HTTP 400. Establecer <code>native_tools = true</code> vuelve a habilitar las llamadas nativas a herramientas para los modelos de Groq que las admiten.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-9"><a class="header" href="#panel-de-control-del-gateway-9">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.native_tools</code>.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.native_tools</code>.</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.native_tools &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-9"><a class="header" href="#variable-de-entorno-9">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__native_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pricing</code> <span class="cfg-field-meta"><code>map</code> · default <code>—</code></span></summary>
+<p>Precios por modelo para el seguimiento de costos, en USD por 1M de tokens. Mapa de clave/valor de formato libre. Las claves son identificadores de modelo definidos por el usuario; un sufijo opcional <code>.input</code> / <code>.output</code> codifica la dimensión de precios cuando el operador desea dividir las tarifas. Una clave sin sufijo se usa como tarifa plana por token cuando no se especifica ninguna dimensión. El valor predeterminado es vacío: el seguimiento de costos recurre a tarifas “unknown” y solo se registra el uso de tokens. Ejemplo: <code>pricing = { opus = 15.0, sonnet = 3.0 }</code> O dividido: <code>pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }</code></p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-10"><a class="header" href="#panel-de-control-del-gateway-10">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.pricing</code>.</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.pricing</code>.</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.pricing &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-10"><a class="header" href="#variable-de-entorno-10">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__pricing=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>provider_extra</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>Parámetros JSON adicionales para incluir en las solicitudes a la API. Se fusionan en el nivel superior del cuerpo de la solicitud, lo que permite funciones específicas del proveedor (enrutamiento, transformaciones, etc.) sin cambios en el código. Ejemplo: <code>provider_extra = { model_provider = { only = ["Anthropic"] } }</code></p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-11"><a class="header" href="#panel-de-control-del-gateway-11">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.provider_extra</code>.</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establezca el campo <code>providers.models.custom.&lt;alias&gt;.provider_extra</code>.</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.provider_extra &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-11"><a class="header" href="#variable-de-entorno-11">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__provider_extra=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>requires_openai_auth</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>Cuando es true, el cliente obtiene las credenciales desde <code>OPENAI_API_KEY</code> o <code>~/.codex/auth.json</code> en lugar del campo <code>api_key</code> anterior. Actívelo solo para el model_provider de OpenAI Codex; déjelo desactivado para los model_providers estándar con clave de API.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-12"><a class="header" href="#panel-de-control-del-gateway-12">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code>.</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code>.</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.requires_openai_auth &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-12"><a class="header" href="#variable-de-entorno-12">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__requires_openai_auth=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>temperature</code> <span class="cfg-field-meta"><code>number?</code> · default <code>—</code></span></summary>
+<p>Temperatura de muestreo que se pasa al modelo. Los valores más bajos (0.0–0.3) producen una salida determinista, casi literal, adecuada para código, enrutamiento y resúmenes. Los valores más altos (0.7–1.2) producen una salida más variada, adecuada para conversaciones abiertas.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-13"><a class="header" href="#panel-de-control-del-gateway-13">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configure el campo <code>providers.models.custom.&lt;alias&gt;.temperature</code>.</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.temperature</code>.</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.temperature &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-13"><a class="header" href="#variable-de-entorno-13">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__temperature=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>think</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>Habilita o deshabilita el pensamiento en cadena (chain-of-thought) para los modelos que lo admiten (p. ej., Qwen3, GLM-4). <code>true</code> activa el pensamiento, <code>false</code> lo desactiva. <code>None</code> (predeterminado) deja que el modelo decida. Se envía como <code>enable_thinking</code> en el cuerpo de la solicitud; refleja el campo <code>think</code> del proveedor Ollama.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-14"><a class="header" href="#panel-de-control-del-gateway-14">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.think</code>.</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.think</code>.</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.think &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-14"><a class="header" href="#variable-de-entorno-14">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__think=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>timeout_secs</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>Tiempo de espera de la solicitud HTTP en segundos. Aumenta este valor para model_providers locales lentos (Ollama en CPU, modelos locales grandes) o redes de alta latencia; déjalo sin configurar en caso contrario.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-15"><a class="header" href="#panel-de-control-del-gateway-15">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configura el campo <code>providers.models.custom.&lt;alias&gt;.timeout_secs</code>.</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.timeout_secs</code>.</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-15"><a class="header" href="#variable-de-entorno-15">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uri</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>URI del endpoint al que accede el cliente. Sobrescriba el endpoint predeterminado de la familia cuando apunte a un gateway autoalojado (LiteLLM, vLLM, Ollama), un proxy personalizado o cualquier URL no estándar. Déjelo sin definir para usar el URI predeterminado de la familia desde su implementación de <code>ModelEndpoint</code>. Establezca aquí la URL COMPLETA del endpoint; no existe un campo separado para el sufijo de ruta.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-16"><a class="header" href="#panel-de-control-del-gateway-16">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configure el campo <code>providers.models.custom.&lt;alias&gt;.uri</code>.</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>providers.models.custom.&lt;alias&gt;.uri</code>.</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.uri &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-16"><a class="header" href="#variable-de-entorno-16">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__uri=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>wire_api</code> <span class="cfg-field-meta"><code>WireApi</code> · default <code>—</code></span></summary>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-17"><a class="header" href="#panel-de-control-del-gateway-17">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> y configure el campo <code>providers.models.custom.&lt;alias&gt;.wire_api</code>.</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configura el campo <code>providers.models.custom.&lt;alias&gt;.wire_api</code>.</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.wire_api &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-17"><a class="header" href="#variable-de-entorno-17">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__wire_api=
+</code></pre>
+</div>
+
+</details>
+</div>
+
 <p><strong>Controlar el modo de pensamiento</strong> varía según la familia de modelos. <code>think = false</code> establece el campo <code>enable_thinking</code> de nivel superior en la solicitud. Algunos modelos (p. ej. Qwen3) leen esta marca desde la plantilla Jinja mediante <code>chat_template_kwargs</code> en su lugar:</p>
-<pre><code class="language-toml">[providers.models.llamacpp.qwen3]
-uri = "http://127.0.0.1:8033/v1"
-model = "Qwen/Qwen3-30B-A3B-GGUF"
-think = false
-# Qwen3 lee enable_thinking desde la plantilla Jinja, no desde el campo de nivel superior:
-chat_template_kwargs = { enable_thinking = false }
+<p>Otras familias de modelos usan nombres de variables de plantilla diferentes; consulte la plantilla de chat de su modelo y configure la clave apropiada en <code>chat_template_kwargs</code>.</p>
+<h3 id="sglang-ranura-sglang"><a class="header" href="#sglang-ranura-sglang">SGLang: ranura <code>sglang</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
 </code></pre>
-<p>Otras familias de modelos usan diferentes nombres de variables de plantilla — comprueba la plantilla de chat de tu modelo y establece la clave apropiada en <code>chat_template_kwargs</code>.</p>
-<h3 id="sglang--slot-sglang"><a class="header" href="#sglang--slot-sglang">SGLang — slot <code>sglang</code></a></h3>
-<pre><code class="language-bash">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+</div>
+
+<h3 id="vllm-ranura-vllm"><a class="header" href="#vllm-ranura-vllm">vLLM: ranura <code>vllm</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">vllm serve meta-llama/Llama-3.1-8B-Instruct
 </code></pre>
-<pre><code class="language-toml">[providers.models.sglang.local]
-uri   = "http://localhost:30000/v1"      # family default
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
-<h3 id="vllm--ranura-vllm"><a class="header" href="#vllm--ranura-vllm">vLLM — ranura <code>vllm</code></a></h3>
-<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct
-</code></pre>
-<pre><code class="language-toml">[providers.models.vllm.local]
-uri   = "http://localhost:8000/v1"       # predeterminado de la familia
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
+</div>
+
 <h3 id="lm-studio-osaurus-litellm"><a class="header" href="#lm-studio-osaurus-litellm">LM Studio, Osaurus, LiteLLM</a></h3>
-<p>Los slots <code>lmstudio</code>, <code>osaurus</code>, <code>litellm</code> siguen el mismo patrón — consulta el <a href="./catalog.html">catálogo</a>.</p>
-<h2 id="wire-protocol--wire_api--responses"><a class="header" href="#wire-protocol--wire_api--responses">Wire protocol — <code>wire_api = "responses"</code></a></h2>
-<p>Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI <strong>responses</strong> wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:</p>
-<pre><code class="language-toml">[providers.models.custom.vllm]
-uri      = "http://10.0.0.15:8000/v1"
-model    = "Qwen/Qwen3-30B-A3B"
-wire_api = "responses"                  # default is "chat_completions"
+<p>Los slots <code>lmstudio</code>, <code>osaurus</code>, <code>litellm</code> siguen el mismo patrón, consulte el <a href="./catalog.html">catálogo</a>.</p>
+<h2 id="protocolo-de-comunicación-wire_api--responses"><a class="header" href="#protocolo-de-comunicación-wire_api--responses">Protocolo de comunicación: <code>wire_api = "responses"</code></a></h2>
+<p>Los slots de bring-your-own-endpoint usan de forma predeterminada el protocolo chat-completions de OpenAI. Un endpoint que solo admite el protocolo <strong>responses</strong> de OpenAI (algunas implementaciones autoalojadas de vLLM / TGI) necesita una habilitación explícita mediante <code>wire_api = "responses"</code> en la entrada del alias.</p>
+<p>Cuando se establece en <code>"responses"</code>, el proveedor se construye como un <code>OpenAiResponsesModelProvider</code> (llamadas a herramientas con streaming completo sobre el protocolo responses) en lugar de un proveedor de chat-completions. Omita el campo, o establezca <code>"chat_completions"</code>, para el protocolo de transmisión predeterminado.</p>
+<p><code>wire_api</code> is honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field, with one exception: <code>opencode</code> honors <code>wire_api = "responses"</code> because OpenCode Zen serves both wires. With no <code>uri</code> override, the OpenCode responses route targets <code>https://opencode.ai/zen/v1/responses</code>:</p>
+<pre><code class="language-toml">[providers.models.opencode.default]
+model    = "big-pickle"
+wire_api = "responses"
 </code></pre>
-<p>When set to <code>"responses"</code>, the provider is built as an <code>OpenAiResponsesModelProvider</code> (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set <code>"chat_completions"</code>, for the default wire.</p>
-<p><code>wire_api</code> is only honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field. The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
+<p>The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
 <h2 id="validación"><a class="header" href="#validación">Validación</a></h2>
 <p>Independientemente del enfoque:</p>
-<pre><code class="language-bash">zeroclaw config list                          # carga la configuración; cualquier fallo de validación se imprime en stderr
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">zeroclaw config list                          # carga la configuración; cualquier fallo de validación se imprime en stderr
 zeroclaw models refresh --provider &lt;type&gt;.&lt;alias&gt;   # list models the endpoint advertises
 zeroclaw agent -a &lt;alias&gt; -m "hello"          # prueba de humo contra el agente en `[agents.&lt;alias&gt;]`
 </code></pre>
+</div>
+
 <h2 id="implementación-de-un-nuevo-trait-modelprovider"><a class="header" href="#implementación-de-un-nuevo-trait-modelprovider">Implementación de un nuevo trait <code>ModelProvider</code></a></h2>
 <p>Si el endpoint no es compatible con OpenAI y no es uno de los slots de servidor local, necesitas código.</p>
 <p>El trait se encuentra en <code>crates/zeroclaw-api/src/model_provider.rs</code>:</p>
@@ -357,45 +751,43 @@ impl ModelEndpoint for MyProviderEndpoint {
 <h2 id="solución-de-problemas"><a class="header" href="#solución-de-problemas">Solución de problemas</a></h2>
 <h3 id="errores-de-autenticación"><a class="header" href="#errores-de-autenticación">Errores de autenticación</a></h3>
 <ul>
-<li>Verifica que la clave de API coincida con el endpoint (muchos proveedores usan prefijos de clave — <code>sk-</code>, <code>gsk_</code>, <code>sk-ant-</code>).</li>
+<li>Verifica que la clave de API coincida con el endpoint (muchos proveedores usan prefijos de clave: <code>sk-</code>, <code>gsk_</code>, <code>sk-ant-</code>).</li>
 <li>Comprueba que <code>uri</code> incluya el esquema (<code>http://</code> / <code>https://</code>) y la ruta <code>/v1</code> si el endpoint lo espera.</li>
 <li>¿Endpoints detrás de una VPN o proxy? Confirma el enrutamiento desde el host de ZeroClaw.</li>
 </ul>
 <h3 id="modelo-no-encontrado"><a class="header" href="#modelo-no-encontrado">Modelo no encontrado</a></h3>
 <ul>
-<li>
-<p>Lista lo que anuncia el endpoint:</p>
-<pre><code class="language-bash">curl -sS "$URI/models" -H "Authorization: Bearer $API_KEY" | jq
-</code></pre>
-</li>
-<li>
-<p>Si el endpoint no implementa <code>/models</code>, envía una solicitud de chat directa y lee el error: la mayoría de los endpoints devuelven la familia de modelos esperada en el cuerpo del error.</p>
-</li>
-<li>
-<p>Los servicios de gateway a menudo exponen solo un subconjunto de los modelos upstream.</p>
-</li>
+<li>Lista lo que anuncia el endpoint:</li>
 </ul>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">  curl -sS "$URI/models" -H "Authorization: Bearer $API_KEY" | jq
+</code></pre>
+</div>
+
+- If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
+- Gateway services often expose only a subset of upstream models.
 <h3 id="problemas-de-conexión"><a class="header" href="#problemas-de-conexión">Problemas de conexión</a></h3>
 <ul>
-<li><code>curl -I $URI</code> — ¿responde?</li>
+<li><code>curl -I $URI</code>, ¿responde?</li>
 <li>¿Firewall, proxy, reglas de salida? Los proveedores de VPS a veces bloquean los puertos altos salientes.</li>
 <li>Página de estado del proveedor si es un servicio alojado.</li>
 </ul>
-<h3 id="gateway-rejects-temperature"><a class="header" href="#gateway-rejects-temperature">Gateway rejects <code>temperature</code></a></h3>
-<p>Some gateways (e.g. a LiteLLM proxy fronting <code>claude-opus-4-7</code>) return an error when a <code>temperature</code> field is present at all. ZeroClaw honors the <code>Option</code> contract: if you leave <code>temperature</code> unset in config, the field is <strong>omitted</strong> from the request body entirely and the backend picks its own default. Only set <code>temperature</code> explicitly when the endpoint accepts it.</p>
+<h3 id="el-gateway-rechaza-temperature"><a class="header" href="#el-gateway-rechaza-temperature">El gateway rechaza <code>temperature</code></a></h3>
+<p>Algunos gateways (p. ej., un proxy de LiteLLM que actúa como frontal de <code>claude-opus-4-7</code>) devuelven un error cuando el campo <code>temperature</code> está presente de cualquier forma. ZeroClaw respeta el contrato de <code>Option</code>: si dejas <code>temperature</code> sin establecer en la configuración, el campo se <strong>omite</strong> por completo del cuerpo de la solicitud y el backend elige su propio valor predeterminado. Establece <code>temperature</code> explícitamente solo cuando el endpoint lo acepte.</p>
 <h2 id="ver-también"><a class="header" href="#ver-también">Ver también</a></h2>
 <ul>
-<li><a href="./overview.html">Descripción general</a> — modelo de proveedor y cómo funciona el despacho por agente</li>
-<li><a href="./configuration.html">Configuración</a> — esquema completo de <code>[providers.*]</code>, configuración tipada de Azure, variantes regionales y de OAuth</li>
-<li><a href="./catalog.html">Catalog</a> — cada ranura canónica con un ejemplo práctico en TOML</li>
-<li><a href="../developing/plugin-protocol.html">Desarrollo → Protocolo del plugin</a> — si un plugin funciona mejor que un crate de primera clase</li>
+<li><a href="./overview.html">Overview</a>: modelo de proveedor y cómo funciona el despacho por agente</li>
+<li><a href="./configuration.html">Configuración</a>: esquema completo de <code>[providers.*]</code>, configuración tipada de Azure, variantes regionales y de OAuth</li>
+<li><a href="./catalog.html">Catálogo</a>: cada slot canónico con un ejemplo TOML resuelto</li>
+<li><a href="../developing/plugin-protocol.html">Developing → Protocolo de plugins</a>: si un plugin funciona mejor que un crate de primera clase</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../providers/catalog.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../providers/routing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -409,7 +801,7 @@ impl ModelEndpoint for MyProviderEndpoint {
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../providers/catalog.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../providers/routing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -435,6 +827,114 @@ impl ModelEndpoint for MyProviderEndpoint {
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

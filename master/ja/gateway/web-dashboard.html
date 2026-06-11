@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,16 +296,20 @@
                         <h1 id="web-ダッシュボード-gatewayweb_dist_dir"><a class="header" href="#web-ダッシュボード-gatewayweb_dist_dir">Web ダッシュボード (<code>gateway.web_dist_dir</code>)</a></h1>
 <p>ゲートウェイデーモンはHTTP APIをバイナリに同梱していますが、WebダッシュボードのHTML/JS/CSSは、Viteによって生成される<code>web/dist/</code>ディレクトリ内のディスク上に配置されています。<code>gateway.web_dist_dir</code>設定（およびそのスキーマミラー環境変数オーバーライドである<code>ZEROCLAW_gateway__web_dist_dir</code>）は、そのディレクトリの場所をデーモンに伝えます。この設定にも既知のフォールバック場所にもビルド済みの<code>index.html</code>が含まれていない場合、ゲートウェイは<strong>APIのみモード</strong>で起動し、ダッシュボードのURLは「利用不可」というメッセージを返します。</p>
 <h2 id="要約"><a class="header" href="#要約">要約</a></h2>
-<pre><code class="language-toml"># config.toml
-[gateway]
-web_dist_dir = "/absolute/path/to/zeroclaw/web/dist"   # 注意: ~ や $HOME は使用不可
-</code></pre>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
 <pre><code class="language-sh"># 同等の環境変数オーバーライド（メモリ内のみ、永続化されない）
 export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
 </code></pre>
+</div>
+
 <p>バンドルを一度ビルドします:</p>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
 <pre><code class="language-sh">cargo web build
 </code></pre>
+</div>
+
 <p>…そしてデーモンを再起動します。起動ログが次のように変わります</p>
 <pre><code class="language-text">Web dashboard: not available — no web/dist found. Build with `cargo web build` …
 </code></pre>
@@ -238,14 +319,14 @@ export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
 <h2 id="設定の機能"><a class="header" href="#設定の機能">設定の機能</a></h2>
 <p><code>gateway.web_dist_dir</code> は、ビルド済みの <code>index.html</code> を含むディレクトリを指す <code>Option&lt;String&gt;</code> です。ゲートウェイ起動時に、デーモンは次を行います:</p>
 <ol>
-<li><code>config.toml</code>（または環境変数によるオーバーライド）から値を読み取ります。</li>
+<li>設定された値（または環境変数による上書き）を読み取ります。</li>
 <li>このマシン上にディレクトリが存在し、かつ <code>index.html</code> を含んでいることを確認します。</li>
-<li>「yes」の場合 — そのパスからダッシュボードを提供します。</li>
-<li>いいえの場合 — WARN ログを出力し（「path にはこのマシン上に <code>index.html</code> が含まれていません。以下の自動検出候補にフォールバックします」）、以下の自動検出候補を試行します。</li>
-<li>自動検出でも何も見つからない場合、ゲートウェイは API 専用モードで動作し、<code>GET /</code> は「利用できません」というメッセージを返してここを参照するよう案内します。</li>
+<li>「yes」の場合、そのパスからダッシュボードを提供します。</li>
+<li>いいえの場合、WARN（「このマシンではパスに <code>index.html</code> が含まれていません。以下の自動検出にフォールバックします」）をログに記録し、以下の自動検出候補を試します。</li>
+<li>自動検出でも何も見つからない場合、ゲートウェイはAPI専用モードで動作し、<code>GET /</code> は「利用できません」というメッセージを返し、ここに戻るよう案内します。</li>
 </ol>
 <p>値はハードな要件ではなくヒントとして扱われます。古いパス（タイプミス、別のマシンからコピーされたホスト固有のパス、ビルドの欠落）は、ダッシュボードのすべてのリクエストをクラッシュさせるのではなく、自動検出にフォールバックします。</p>
-<h2 id="デフォルト--自動検出順"><a class="header" href="#デフォルト--自動検出順">デフォルト — 自動検出順</a></h2>
+<h2 id="デフォルト-順序を自動検出"><a class="header" href="#デフォルト-順序を自動検出">デフォルト: 順序を自動検出</a></h2>
 <p><code>gateway.web_dist_dir</code> が未設定の場合（または <code>index.html</code> が存在しないパスが設定されている場合）、デーモンは次の場所を順番に調べ、<code>index.html</code> を含む最初の場所から配信します:</p>
 <div class="table-wrapper">
 <table>
@@ -261,15 +342,19 @@ export ZEROCLAW_gateway__web_dist_dir="/absolute/path/to/zeroclaw/web/dist"
 </tbody>
 </table>
 </div>
-<p>これらのディストリビューションのいずれかを使用していて、ダッシュボードが「そのまま動作する」場合は、<code>gateway.web_dist_dir</code> を設定する必要はまったくありません。自動検出によって見つかっています。</p>
+<p>お使いのディストリビューションがこれらのいずれかで、ダッシュボードが「そのまま動作する」場合は、<code>gateway.web_dist_dir</code> を設定する必要はまったくありません。自動検出が見つけてくれています。</p>
 <h2 id="webdist-を取得する方法"><a class="header" href="#webdist-を取得する方法"><code>web/dist</code> を取得する方法</a></h2>
 <p>ZeroClawをインストールした方法に応じて、3つのオプションから選択してください。</p>
 <h3 id="a-ソースのチェックアウト開発者パッケージャー向け"><a class="header" href="#a-ソースのチェックアウト開発者パッケージャー向け">A) ソースのチェックアウト（開発者・パッケージャー向け）</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
 <pre><code class="language-sh">git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 cargo web build           # `cargo run -p xtask --bin web -- build` のエイリアス
                           # 初回実行時に `npm install` を自動実行します
 </code></pre>
+</div>
+
 <p>バンドルは <code>web/dist/</code> に出力されます。<code>web_dist_dir</code> をそのディレクトリの絶対パスに設定するか、リポジトリのルートからデーモンを実行して自動検出の候補 1 に検出させてください。</p>
 <p><code>cargo web</code> のサブコマンド一式（<code>dev</code>、<code>check</code>、<code>gen-api</code> など）については、<a href="../developing/web.html">Web ダッシュボードのビルド</a>で説明しています。</p>
 <h3 id="b-ビルド済みのリリース成果物"><a class="header" href="#b-ビルド済みのリリース成果物">B) ビルド済みのリリース成果物</a></h3>
@@ -280,11 +365,11 @@ cargo web build           # `cargo run -p xtask --bin web -- build` のエイリ
 <p>値は標準の config レイヤー順で解決されます:</p>
 <ol>
 <li><code>ZEROCLAW_gateway__web_dist_dir</code>（スキーマミラー環境変数。<a href="../reference/env-vars.html">環境変数</a>を参照）</li>
-<li><code>config.toml</code> の <code>gateway.web_dist_dir</code></li>
+<li>設定された <code>gateway.web_dist_dir</code></li>
 <li>自動検出（上記の5つの候補）</li>
 </ol>
-<p>環境変数によるオーバーライドはメモリ上の <code>Config</code> にのみ適用され、<code>config.toml</code> に書き戻されることはありません。</p>
-<h2 id="スキーマミラー文法--zeroclaw_gateway__web_dist_dir-の導出"><a class="header" href="#スキーマミラー文法--zeroclaw_gateway__web_dist_dir-の導出">スキーマミラー文法 — <code>ZEROCLAW_gateway__web_dist_dir</code> の導出</a></h2>
+<p>環境変数によるオーバーライドは、メモリ上の <code>Config</code> にのみ適用され、永続化されることはありません。</p>
+<h2 id="スキーマミラー文法zeroclaw_gateway__web_dist_dir-の導出"><a class="header" href="#スキーマミラー文法zeroclaw_gateway__web_dist_dir-の導出">スキーマミラー文法：<code>ZEROCLAW_gateway__web_dist_dir</code> の導出</a></h2>
 <p>一般的な演算子オーバーライド文法（<a href="../reference/env-vars.html">環境変数</a>を参照）は、ドット区切りのTOMLパスを機械的に環境変数名にマッピングします。</p>
 <pre><code class="language-text">TOML path:  gateway.web_dist_dir
             ─────── ─────────────
@@ -295,26 +380,23 @@ Env var:    ZEROCLAW_gateway__web_dist_dir
             prefix          path-separator  field-name
                             (`.` → `__`)    (unchanged)
 </code></pre>
-<p>同じ3つの手順で、他のすべてのゲートウェイ設定の環境変数名が生成されます。例えば、<code>gateway.request_timeout_secs</code> は <code>ZEROCLAW_gateway__request_timeout_secs</code> になります。</p>
+<p>同じ3つの手順により、他のすべてのゲートウェイ設定項目についても環境変数名が生成されます。例えば <code>gateway.request_timeout_secs</code> は <code>ZEROCLAW_gateway__request_timeout_secs</code> になります。</p>
 <h2 id="よくある落とし穴"><a class="header" href="#よくある落とし穴">よくある落とし穴</a></h2>
 <h3 id="-や-home-を使用しないでください"><a class="header" href="#-や-home-を使用しないでください"><code>~</code> や <code>$HOME</code> を使用しないでください</a></h3>
-<p>リテラルのチルダはゲートウェイによって<strong>展開されません</strong>：</p>
-<pre><code class="language-toml"># 不正 — ゲートウェイは文字どおり "~" という名前のディレクトリを探します
-web_dist_dir = "~/zeroclaw/web/dist"
-</code></pre>
-<pre><code class="language-toml"># 正しい
-web_dist_dir = "/home/alice/zeroclaw/web/dist"
-</code></pre>
-<p>シェル変数（<code>$HOME</code>、<code>%USERPROFILE%</code>）も同様に展開されません。その方法で値を設定する場合は、環境変数内で事前に展開してください：</p>
+<p>リテラルのチルダはゲートウェイによって展開<strong>されません</strong>。<code>gateway.web_dist_dir</code> には絶対パスを使用してください。シェル変数（<code>$HOME</code>、<code>%USERPROFILE%</code>）も同様に展開されません。その方法で値を設定する場合は、環境変数内であらかじめ展開してください。</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
 <pre><code class="language-sh">export ZEROCLAW_gateway__web_dist_dir="$HOME/zeroclaw/web/dist"   # シェルが $HOME を展開する
 </code></pre>
-<p>関連の <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/6961">PR #6961</a> では、<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6079">issue #6079</a> で追跡されている「展開されていない <code>~</code> / <code>$VAR</code> のようです — この値を書き込む前に <a href="https://crates.io/crates/shellexpand"><code>shellexpand</code></a> してください」という的を絞ったチェックを、<code>zeroclaw doctor</code> と <code>zeroclaw self-test</code> の両方に Warn 重大度の診断として追加します。現在の <code>master</code> ではどちらのコマンドもこれを表示しません。#6961 がマージされるまでは、<code>gateway.web_dist_dir</code> を書き込む前に <code>~</code> / <code>$VAR</code> を自分で展開してください（例えば <code>~/zeroclaw/web/dist</code> の代わりに <code>/home/alice/zeroclaw/web/dist</code> と書いてください）。</p>
+</div>
+
+<p>関連する <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/6961">PR #6961</a> は、<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6079">issue #6079</a> で追跡されている「展開されていない <code>~</code> / <code>$VAR</code> のように見えるため、この値を書き込む前に <a href="https://crates.io/crates/shellexpand"><code>shellexpand</code></a> してください」という対象を絞ったチェックを、Warn 重大度の診断として <code>zeroclaw doctor</code> と <code>zeroclaw self-test</code> の両方に追加します。現在の <code>master</code> ではどちらのコマンドもこれを表示しないため、#6961 がマージされるまでは、<code>gateway.web_dist_dir</code> を書き込む前に <code>~</code> / <code>$VAR</code> を自分で展開してください（例えば <code>~/zeroclaw/web/dist</code> の代わりに <code>/home/alice/zeroclaw/web/dist</code> と書きます）。</p>
 <h3 id="相対パスは設定ファイルではなく-cwd-を基準に解決されます"><a class="header" href="#相対パスは設定ファイルではなく-cwd-を基準に解決されます">相対パスは設定ファイルではなく CWD を基準に解決されます</a></h3>
-<p><code>web_dist_dir = "web/dist"</code> は、<code>config.toml</code> の場所からの相対パスではなく、起動時のデーモンの作業ディレクトリからの相対パスとして解釈されます。設定を別のホストに移したり、異なるディレクトリからデーモンを呼び出したりすると（例: systemd 経由）、相対形式では誤った場所を参照してしまいます。<strong><code>config.toml</code> では絶対パスを使用してください。</strong></p>
+<p><code>web_dist_dir = "web/dist"</code> は、設定ファイルの場所ではなく、起動時のデーモンの作業ディレクトリからの相対パスとして解釈されます。設定ファイルを別のホストに配布したり、異なるディレクトリからデーモンを起動したり（例: systemd 経由）すると、相対パス形式では誤った場所を参照してしまいます。<strong><code>web_dist_dir</code> には絶対パスを使用してください。</strong></p>
 <h3 id="起動時の-stale-path-警告"><a class="header" href="#起動時の-stale-path-警告">起動時の “Stale path” 警告</a></h3>
 <pre><code class="language-text">WARN gateway.web_dist_dir points at a path that doesn't contain index.html
 on this machine; falling back to auto-detect. Update or remove the setting
-in config.toml to silence this warning.
+to silence this warning.
 </code></pre>
 <p>これはパスが構文的には有効であるものの、ファイルがまだ存在しないことを意味します。<code>cargo web build</code> を実行するか、パスを修正するか、設定を完全に削除して自動検出に任せてください。</p>
 <h3 id="起動時のweb-dashboard-not-available"><a class="header" href="#起動時のweb-dashboard-not-available">起動時の「Web dashboard: not available」</a></h3>
@@ -322,12 +404,12 @@ in config.toml to silence this warning.
 `cargo web build` and point gateway.web_dist_dir at the resulting
 web/dist directory.
 </code></pre>
-<p>APIエンドポイントは引き続き動作します — HTML/JSバンドルのみが欠落しています。ビルドする（上記のオプションA/B/C）か、パスを設定してください。</p>
+<p>APIエンドポイントは引き続き動作しており、HTML/JSバンドルのみが欠落しています。ビルドするか（上記のオプションA/B/C）、パスを設定してください。</p>
 <h2 id="関連項目も参照してください"><a class="header" href="#関連項目も参照してください">関連項目も参照してください</a></h2>
 <ul>
-<li><a href="../reference/env-vars.html">環境変数</a> — 完全なスキーマミラー文法</li>
-<li><a href="./api.html">Gateway HTTP API</a> — ダッシュボードが通信する対象</li>
-<li><a href="../developing/web.html">Web ダッシュボードのビルド</a> — <code>cargo web</code> サブコマンドと生成される内容</li>
+<li><a href="../reference/env-vars.html">環境変数</a>: 完全なスキーマミラー文法</li>
+<li><a href="./api.html">Gateway HTTP API</a>: ダッシュボードの通信先</li>
+<li><a href="../developing/web.html">Web ダッシュボードのビルド</a>: <code>cargo web</code> サブコマンドと生成される内容</li>
 </ul>
 
                     </main>
@@ -338,7 +420,7 @@ web/dist directory.
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../providers/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../agents/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -352,7 +434,7 @@ web/dist directory.
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../providers/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../agents/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -374,6 +456,114 @@ web/dist directory.
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

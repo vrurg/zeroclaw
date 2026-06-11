@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,6 +296,18 @@
                         <h1 id="信号"><a class="header" href="#信号">信号</a></h1>
 <p>ZeroClaw 的 Signal 通道与正在运行的 <code>signal-cli</code> HTTP 守护进程通信。Signal 未提供官方机器人 API，因此 ZeroClaw 通过本地 HTTP 连接到 <code>signal-cli</code>，并由 <code>signal-cli</code> 负责管理 Signal 账户、设备密钥和消息传输。</p>
 <p>当你已经通过 <code>signal-cli</code> 运行 Signal 账户，或者你可以在 ZeroClaw 旁边运行守护进程时，请使用此通道。如果你只安装了 Signal 桌面端或移动端应用，这本身是不够的；ZeroClaw 需要 HTTP 守护进程端点。</p>
+<h2 id="谁可以与代理通信"><a class="header" href="#谁可以与代理通信">谁可以与代理通信</a></h2>
+<p>入站发送方会根据为绑定代理解析出的<strong>对等集合</strong>进行限制，该集合来自代理所属的 <code>peer_groups</code> 配置。匹配时会去除开头的 <code>@</code>，并对通道的原生发送方标识符执行不区分大小写的比对。<strong>空</strong>集合会拒绝所有人；包含 <code>"*"</code> 的集合会接受所有人；否则仅接受列出的外部对等方（以及对等代理）。这与网关配对（<code>gateway.require_pairing</code>）不同，后者验证的是 HTTP/WebSocket 客户端，而非聊天通道的发送方。</p>
+<p>signal 的对等组将 <code>channel</code> 设置为 <code>signal</code>，在 <code>external_peers</code> 中列出允许的发送者（对于 signal，是 E.164 电话号码或 signal-cli 源标识符；<code>["*"]</code> 接受任何人），可选地为跨代理调度命名对等 <code>agents</code>，一个 <code>ignore</code> 屏蔽列表，以及一个 <code>output_modality</code>（<code>mirror</code>、<code>voice</code> 或 <code>text</code>）。字段参考请参阅 <a href="peer-groups.html">Peer Groups</a>。</p>
+<p>在何处设置：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>在 Web 仪表板中打开 <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a>。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中的 <strong>Peer groups</strong> 下。</p>
+</div>
+
+<p>你还可以在频道级别收窄流量：<code>dm_only = true</code> 会忽略群组；<code>group_ids = ["&lt;signal-group-id&gt;"]</code> 仅接受列出的群组，同时仍接受私信；<code>ignore_attachments</code> 和 <code>ignore_stories</code> 会在这些消息类型到达代理之前将其丢弃。</p>
 <h2 id="前置条件"><a class="header" href="#前置条件">前置条件</a></h2>
 <ul>
 <li>在 <code>signal-cli</code> 中已关联或注册的 Signal 账户。</li>
@@ -227,40 +316,235 @@
 </ul>
 <p>除非你已将守护进程置于自己经过身份验证的网络边界之后，否则请将其绑定到 localhost。该守护进程能够以关联的 Signal 账户身份收发消息。</p>
 <h2 id="配置通道"><a class="header" href="#配置通道">配置通道</a></h2>
-<p>Set the required Signal channel fields with <code>zeroclaw config set</code> (see the manual config block below for the full field list), or create the block directly in <code>~/.zeroclaw/config.toml</code>.</p>
-<p>对于手动配置，请创建或更新 Signal 通道块：</p>
-<pre><code class="language-toml">[channels.signal.default]
-enabled = true
-http_url = "http://127.0.0.1:8686"
-account = "&lt;your-signal-e164-number&gt;"
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>account</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
+<p>signal-cli 账户的 E.164 电话号码（例如 “+1234567890”）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.account</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.account</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.account &lt;value&gt;
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__account=
+</code></pre>
+</div>
 
-[agents.assistant]
-enabled = true
-channels = ["signal.default"]
+</details>
+<details class="cfg-field">
+<summary><code>approval_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>300</code></span></summary>
+<p>对 <code>always_ask</code> 工具等待操作员批准的秒数，超时后自动拒绝。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.approval_timeout_secs</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.approval_timeout_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.approval_timeout_secs &lt;value&gt;
 </code></pre>
-<p><code>http_url</code> 是 <code>signal-cli</code> 守护进程的基础 URL。<code>account</code> 是 <code>signal-cli</code> 用于关联 Signal 账号的账号标识符，通常是你在 Signal 注册时使用的 E.164 电话号码。</p>
-<p><code>channels</code> 条目将通道别名绑定到应当响应它的代理。请使用你真实的代理别名，而非 <code>assistant</code>。</p>
-<h2 id="限制可以与代理对话的人员"><a class="header" href="#限制可以与代理对话的人员">限制可以与代理对话的人员</a></h2>
-<p>入站对等授权位于 <code>peer_groups</code> 中。一个群组可以通过 <code>channel = "signal"</code> 定位每个 Signal 别名，或通过 <code>channel = "signal.default"</code> 定位单个别名。</p>
-<pre><code class="language-toml">[peer_groups.signal_ops]
-channel = "signal.default"
-agents = []
-external_peers = ["&lt;allowed-signal-sender&gt;"]
-ignore = []
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__approval_timeout_secs=
 </code></pre>
-<p>Signal 发送者标识符可能是 E.164 电话号码，也可能是 UUID/源标识符，具体取决于 <code>signal-cli</code> 为该事件报告的内容。请使用守护进程日志或事件负载中的标识符格式。</p>
-<p>您还可以在通道级别缩小流量范围：</p>
-<pre><code class="language-toml">[channels.signal.default]
-dm_only = true
-ignore_attachments = true
-ignore_stories = true
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>dm_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>为 true 时，仅接受直接消息并忽略所有群组流量。与 <code>group_ids</code> 互斥（设置此项时将忽略 <code>group_ids</code>）。从旧版 <code>group_id = "dm"</code> 标记迁移而来。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.dm_only</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.dm_only</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.dm_only &lt;value&gt;
 </code></pre>
-<p><code>dm_only = true</code> 会忽略群组。<code>group_ids = ["&lt;signal-group-id&gt;"]</code> 仅接受列出的群组，同时仍接受私信。<code>ignore_attachments</code> 和 <code>ignore_stories</code> 可减少转发给 agent 的消息类型。</p>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__dm_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>从此通道的工具规范中排除的工具。设置后，通过此通道响应时不会向模型公开这些工具。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>group_ids</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>用于筛选消息的群组 ID。留空 = 接受所有消息（私聊和群组）。当非空时，仅接受来自所列群组的消息（私聊仍会被接受，除非 <code>dm_only</code> 将策略切换为仅私聊）。从旧版单数字段 <code>group_id</code> 迁移而来。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.group_ids</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.group_ids</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.group_ids &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__group_ids=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>http_url</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
+<p>signal-cli HTTP 守护进程的基础 URL（例如 <code>"http://127.0.0.1:8686"</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.http_url</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.http_url</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.http_url &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__http_url=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ignore_attachments</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>跳过仅包含附件（无正文）的消息。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.ignore_attachments</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.ignore_attachments</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.ignore_attachments &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__ignore_attachments=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ignore_stories</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>跳过传入的快拍消息。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.ignore_stories</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.ignore_stories</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.ignore_stories &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__ignore_stories=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>proxy_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>每个通道的代理 URL（http、https、socks5、socks5h）。仅为此通道覆盖全局 <code>[proxy]</code> 设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.proxy_url</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.proxy_url</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.proxy_url &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__proxy_url=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（通道，接收方）出站节流下限（秒）。范围：<code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code>（0 表示禁用）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（channel, recipient）出站节流队列的深度。取值范围：<code>0..=REPLY_QUEUE_DEPTH_CEILING</code>。当 <code>reply_min_interval_secs &gt; 0</code> 且此值为 <code>0</code> 时，节流封装器会使用 <code>DEFAULT_REPLY_QUEUE_DEPTH</code>（16）作为替代值。当队列已满时，最新的发送会被丢弃，并记录一条 <code>WARN</code> 日志。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a> 并设置 <code>channels.signal.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.signal.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.signal.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__signal__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>在 Web 仪表板中打开 <a href="http://127.0.0.1:42617/config/channels/signal"><code>/config/channels/signal</code></a>。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，<strong>Channels</strong> 下。</p>
+</div>
+
+<p>通过该 agent 的 <code>channels</code> 列表将通道绑定到该 agent。</p>
 <h2 id="启动并检查"><a class="header" href="#启动并检查">启动并检查</a></h2>
 <p>首先启动守护进程，然后启动 ZeroClaw 通道：</p>
-<pre><code class="language-bash">signal-cli daemon --http 127.0.0.1:8686
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">signal-cli daemon --http 127.0.0.1:8686
 zeroclaw channel start
 </code></pre>
+</div>
+
 <p>使用 <code>zeroclaw channel doctor</code> 确认 ZeroClaw 能够加载已配置的通道。如果通道在运行时失败，请检查 <code>http_url</code> 是否指向守护进程、账户是否已在 <code>signal-cli</code> 中注册，以及构建是否包含 <code>channel-signal</code>。</p>
 <h2 id="常见困惑"><a class="header" href="#常见困惑">常见困惑</a></h2>
 <p><code>signal-cli</code> 项目主要以 CLI 工具而广为人知，但 ZeroClaw 需要使用其 HTTP 守护进程模式。如果你只安装了命令行二进制文件而从未启动守护进程，那么 ZeroClaw 将无法连接到任何服务。</p>
@@ -309,6 +593,114 @@ zeroclaw channel start
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

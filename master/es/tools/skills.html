@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -224,9 +301,13 @@
 <p>Para skills locales escritas manualmente, usa <code>SKILL.md</code> o <code>SKILL.toml</code>. Usa <code>SKILL.md</code> para instrucciones junto con metadatos simples. Usa <code>SKILL.toml</code> cuando la skill necesite prompts estructurados o definiciones de herramientas. ZeroClaw también admite <code>manifest.toml</code> para paquetes de skills al estilo de registro, pero <code>SKILL.md</code> y <code>SKILL.toml</code> son los formatos de creación local recomendados.</p>
 <h2 id="crear-una-skill-de-markdown"><a class="header" href="#crear-una-skill-de-markdown">Crear una skill de Markdown</a></h2>
 <p>Una skill mínima de solo instrucciones puede ser simplemente un archivo Markdown:</p>
-<pre><code class="language-bash">mkdir -p ~/.zeroclaw/workspace/skills/release-check
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">mkdir -p ~/.zeroclaw/workspace/skills/release-check
 $EDITOR ~/.zeroclaw/workspace/skills/release-check/SKILL.md
 </code></pre>
+</div>
+
 <pre><code class="language-markdown"># Release check
 
 Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready.
@@ -247,73 +328,60 @@ Review the release notes, changelog, version tags, and migration notes before co
 </code></pre>
 <p>Los campos de frontmatter compatibles son <code>name</code>, <code>description</code>, <code>version</code>, <code>author</code> y <code>tags</code>.</p>
 <h2 id="crear-una-skill-de-toml"><a class="header" href="#crear-una-skill-de-toml">Crear una skill de TOML</a></h2>
-<p>Aquí está la misma habilidad como un manifiesto TOML estructurado:</p>
-<pre><code class="language-toml">[skill]
-name = "release-check"
-description = "Comprobar la preparación de la versión antes de etiquetar"
-version = "0.1.0"
-author = "zeroclaw_user"
-tags = ["release", "docs"]
-prompts = [
-  "Revisa las notas de la versión, el registro de cambios, las etiquetas de versión y las notas de migración antes de confirmar que una versión está lista."
-]
-
-[[tools]]
-name = "show_latest_tag"
-description = "Imprimir la última etiqueta local de git"
-kind = "shell"
-command = "git describe --tags --abbrev=0"
-</code></pre>
-<p>La tabla <code>[skill]</code> requiere <code>name</code> y <code>description</code>. <code>version</code> toma el valor predeterminado <code>0.1.0</code> cuando se omite. <code>author</code>, <code>tags</code> y <code>prompts</code> son opcionales.</p>
-<p>Las entradas de herramientas pueden usar <code>kind = "shell"</code>, <code>kind = "http"</code> o <code>kind = "script"</code>. Mantén las descripciones de herramientas precisas y concretas para que el modelo sepa cuándo usarlas.</p>
+<p>Una habilidad también puede ser un manifiesto TOML estructurado (<code>SKILL.toml</code>). La tabla <code>[skill]</code> requiere <code>name</code> y <code>description</code>; <code>version</code> toma el valor predeterminado <code>0.1.0</code> cuando se omite; <code>author</code>, <code>tags</code> y <code>prompts</code> son opcionales. Las entradas de herramientas pueden usar <code>kind = "shell"</code>, <code>kind = "http"</code> o <code>kind = "script"</code>. Mantenga las descripciones de las herramientas específicas y concretas para que el modelo sepa cuándo usarlas.</p>
 <h2 id="gestionar-habilidades-instaladas"><a class="header" href="#gestionar-habilidades-instaladas">Gestionar habilidades instaladas</a></h2>
 <p>Listar skills instaladas:</p>
-<pre><code class="language-bash">zeroclaw skills list
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">zeroclaw skills list
 </code></pre>
+</div>
+
 <p>Audita una skill instalada o un directorio de skill local:</p>
-<pre><code class="language-bash">zeroclaw skills audit release-check
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">zeroclaw skills audit release-check
 zeroclaw skills audit ./release-check
 </code></pre>
+</div>
+
 <p>Instala una skill desde un directorio local, una URL de Git, un nombre de registro o una fuente de ClawHub:</p>
-<pre><code class="language-bash">zeroclaw skills install ./release-check
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">zeroclaw skills install ./release-check
 zeroclaw skills install https://example.com/zeroclaw-release-check.git
 zeroclaw skills install release-check
 zeroclaw skills install clawhub:release-check
 </code></pre>
+</div>
+
 <p>Eliminar una skill instalada:</p>
-<pre><code class="language-bash">zeroclaw skills remove release-check
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">zeroclaw skills remove release-check
 </code></pre>
+</div>
+
 <p>Ejecuta la validación de <code>TEST.sh</code> para una skill, u omite el nombre para probar todas las skills instaladas:</p>
-<pre><code class="language-bash">zeroclaw skills test release-check
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">zeroclaw skills test release-check
 zeroclaw skills test --verbose
 </code></pre>
+</div>
+
 <p><code>zeroclaw skills test</code> ejecuta el archivo <code>TEST.sh</code> de la skill cuando existe. Inspecciona <code>TEST.sh</code> antes de ejecutar pruebas de un origen de skill en el que aún no confías.</p>
 <h2 id="sugerencias-de-funcionalidades-activadas-por-prompts"><a class="header" href="#sugerencias-de-funcionalidades-activadas-por-prompts">Sugerencias de funcionalidades activadas por prompts</a></h2>
 <p>ZeroClaw puede sugerir opcionalmente una capacidad de skill instalable cuando un prompt enviado nombra claramente algo que existe en los metadatos de registro en caché pero que no está instalado. La ruta del lado del servidor se ejecuta después del envío y antes del turno normal del LLM. Solo devuelve una sugerencia; no instala el skill, no lo habilita, no escribe en memoria ni trata el cuerpo del skill como instrucciones globales.</p>
-<p>Actívalo en la configuración:</p>
-<pre><code class="language-toml">[skills.install_suggestions]
-enabled = true
-</code></pre>
-<p>El comparador de sugerencias usa los nombres de skills instaladas y los metadatos del registro en caché, como nombres, alias y frontmatter. Evita intencionadamente comparar cuerpos de skills no aprobadas. La detección a nivel de plugin/paquete queda como alcance de seguimiento hasta que esté disponible la superficie de búsqueda/instalación del registro de plugins. Las sugerencias exactas en tiempo de composición mientras el usuario aún está escribiendo requieren compatibilidad con ACP, gateway o la interfaz del cliente, y quedan fuera de esta ruta exclusiva del servidor.</p>
+<p>Habilítalo mediante la configuración <code>skills</code> (gateway, zerocode o <code>zeroclaw config set</code>). El comparador de sugerencias utiliza los nombres de las skills instaladas y los metadatos del registro en caché, como nombres, alias y frontmatter. Evita intencionadamente hacer coincidencias con los cuerpos de skills no aprobadas. El descubrimiento a nivel de plugin/paquete sigue siendo un trabajo pendiente hasta que esté disponible la interfaz de búsqueda/instalación del registro de plugins. Las sugerencias exactas en tiempo de composición, mientras el usuario aún está escribiendo, requieren compatibilidad con ACP, gateway o la interfaz de usuario del cliente, y quedan fuera de esta ruta exclusiva del servidor.</p>
 <h2 id="seguridad-de-scripts"><a class="header" href="#seguridad-de-scripts">Seguridad de scripts</a></h2>
 <p>ZeroClaw audita las skills antes de cargarlas o instalarlas. Los archivos similares a scripts como <code>.sh</code>, <code>.bash</code>, <code>.ps1</code> y los archivos con shebangs de shell se bloquean de forma predeterminada.</p>
-<p>Si usas intencionalmente skills con scripts, habilítalos en la configuración de ZeroClaw:</p>
-<pre><code class="language-toml">[skills]
-allow_scripts = true
-</code></pre>
-<p>Mantén esto deshabilitado a menos que confíes en la fuente de la skill y hayas revisado lo que hacen los scripts.</p>
+<p>Si usa intencionalmente skills que contienen scripts, habilite <code>skills.allow_scripts</code>. Mantenga esto deshabilitado a menos que confíe en la fuente del skill y haya revisado lo que hacen los scripts.</p>
 <p>Para conocer los patrones de ejecución específicos de Python, la política del intérprete y las ventajas e inconvenientes entre la ejecución nativa y Docker, consulta <a href="./python-skills.html">Running Python skills</a>.</p>
 <h2 id="cargando-habilidades-de-la-comunidad"><a class="header" href="#cargando-habilidades-de-la-comunidad">Cargando habilidades de la comunidad</a></h2>
-<p>La carga de open-skills de la comunidad es opcional:</p>
-<pre><code class="language-toml">[skills]
-open_skills_enabled = true
-</code></pre>
-<p>Cuando está habilitado, ZeroClaw carga las habilidades desde el <code>open_skills_dir</code> configurado o desde <code>$HOME/open-skills</code> cuando no se ha establecido ningún directorio. Si ese directorio no existe, ZeroClaw puede clonar el repositorio comunitario open-skills; si existe y es un checkout de git, ZeroClaw puede extraer actualizaciones. Habilita esto únicamente para fuentes comunitarias en las que confíes, o haz que <code>open_skills_dir</code> apunte a una copia local revisada.</p>
+<p>La carga de open-skills de la comunidad es opcional y se activa mediante la configuración <code>skills</code>. Cuando está habilitada, ZeroClaw carga las skills desde el <code>open_skills_dir</code> configurado, o desde <code>$HOME/open-skills</code> cuando no se ha establecido ningún directorio. Si ese directorio no existe, ZeroClaw puede clonar el repositorio de open-skills de la comunidad; si existe y es un checkout de git, ZeroClaw puede descargar actualizaciones. Habilite esto solo para fuentes de la comunidad en las que confíe, o apunte <code>open_skills_dir</code> a una copia local revisada.</p>
 <h2 id="configuración-avanzada"><a class="header" href="#configuración-avanzada">Configuración avanzada</a></h2>
 <p>El modo de inyección de prompt predeterminado es <code>full</code>, que incluye las instrucciones completas de la skill en el system prompt. Usa <code>compact</code> para mantener solo metadatos compactos en el contexto y cargar los detalles de la skill bajo demanda:</p>
-<pre><code class="language-toml">[skills]
-prompt_injection_mode = "compact"
-</code></pre>
 <h2 id="ver-también"><a class="header" href="#ver-también">Ver también</a></h2>
 <ul>
 <li><a href="./overview.html">Resumen de herramientas</a></li>
@@ -365,6 +433,114 @@ prompt_injection_mode = "compact"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,37 +294,53 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="configuración-de-raspberry-pi"><a class="header" href="#configuración-de-raspberry-pi">Configuración de Raspberry Pi</a></h1>
-<p>Esta guía cubre la instalación y ejecución de ZeroClaw en Raspberry Pi (Pi 3, Pi 4, Pi 5, Pi Zero 2 W).</p>
-<p>La afirmación del README de que “se ejecuta en hardware de &lt;$10 con &lt;5 MB de RAM” es cierta para el <strong>runtime</strong>. El tiempo de compilación es otra historia: el compilador y el enlazador de Rust necesitan considerablemente más RAM que el binario resultante, por lo que la ruta de compilación en el dispositivo necesita swap y un perfil ajustado para evitar OOM-kills durante el enlazado.</p>
-<p>Para la mayoría de los usuarios de Pi, el <strong>binario precompilado es la opción de menor resistencia</strong>.</p>
+<p>Esta guía cubre la instalación y ejecución de ZeroClaw en Raspberry Pi.</p>
+<p>El runtime es lo suficientemente pequeño como para ejecutarse cómodamente en cualquier Pi. La única limitación es <strong>compilar desde el código fuente en el dispositivo</strong>: el enlazador de Rust consume mucha memoria (el fat LTO puede provocar un OOM en una placa con poca RAM), por lo que la ruta de compilación en el dispositivo necesita swap y un perfil más ligero. La mayoría de los usuarios deberían usar el <strong>binario precompilado</strong> y omitir todo eso.</p>
 <h2 id="compatibilidad-de-hardware"><a class="header" href="#compatibilidad-de-hardware">Compatibilidad de hardware</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Modelo</th><th>RAM</th><th>Binario precompilado</th><th>Compilar desde el código fuente</th></tr>
-</thead>
-<tbody>
-<tr><td>Pi 5 (16 GB)</td><td>16 GB</td><td>✅</td><td>✅ cómodo</td></tr>
-<tr><td>Pi 5 (8 GB)</td><td>8 GB</td><td>✅</td><td>✅ con swap o el perfil <code>release-fast</code></td></tr>
-<tr><td>Pi 5 (4 GB)</td><td>4 GB</td><td>✅</td><td>✅ con swap + perfil <code>release-fast</code></td></tr>
-<tr><td>Pi 4 (8 GB)</td><td>8 GB</td><td>✅</td><td>✅ con el perfil <code>release-fast</code></td></tr>
-<tr><td>Pi 4 (4 GB)</td><td>4 GB</td><td>✅</td><td>✅ con swap + perfil <code>release-fast</code></td></tr>
-<tr><td>Pi 4 (2 GB)</td><td>2 GB</td><td>✅</td><td>Marginal: se requiere swap, lento</td></tr>
-<tr><td>Pi 3 (1 GB)</td><td>1 GB</td><td>✅</td><td>❌ No recomendado</td></tr>
-<tr><td>Pi Zero 2 W</td><td>512 MB</td><td>✅</td><td>❌</td></tr>
-</tbody>
-</table>
-</div>
-<p><strong>El uso de memoria en tiempo de ejecución es mínimo.</strong> Incluso en una Pi Zero 2 W, el agente principal se ejecuta con bastante menos de 5 MB de RSS una vez iniciado. La escala de hardware anterior se refiere a si puedes compilar en el dispositivo, no a si ZeroClaw puede ejecutarse en él.</p>
+<p>Cualquier Pi que pueda ejecutar Raspberry Pi OS de 64 bits (<code>aarch64</code>) o de 32 bits (<code>armv7</code>) ejecuta el binario precompilado; no hay un mínimo de memoria significativo para el runtime. Los binarios precompilados para Pi provienen de estos targets de release (<code>aarch64</code> de 64 bits para Raspberry Pi OS de 64 bits, <code>armv7</code>/<code>arm</code> de 32 bits para el OS de 32 bits):</p>
+<!--
+  GENERATED by `cargo xtask mdbook` from canonical hardware source
+  (registry.rs, transport.rs, catalog.rs, release workflow). Derived +
+  gitignored: do not edit, do not commit. Regenerated on every docs build.
+-->
+<ul>
+<li><code>aarch64-unknown-linux-gnu</code> (64 bits)</li>
+<li><code>arm-unknown-linux-gnueabihf</code> (32 bits)</li>
+<li><code>armv7-unknown-linux-gnueabihf</code> (32 bits)</li>
+</ul>
 <h2 id="opción-1-binario-precompilado-recomendado"><a class="header" href="#opción-1-binario-precompilado-recomendado">Opción 1: Binario precompilado (recomendado)</a></h2>
 <p>Ruta más rápida. Sin compilador, sin swap, sin riesgo de OOM.</p>
 <h3 id="usar-el-script-de-instalación"><a class="header" href="#usar-el-script-de-instalación">Usar el script de instalación</a></h3>
-<pre><code class="language-bash">curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
+<h3 id="linux"><a class="header" href="#linux">Linux</a></h3>
+<p><strong>Instalación en una línea (<code>install.sh</code> mediante curl):</strong></p>
+<pre><code class="language-sh">curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 </code></pre>
-<p>El script detecta automáticamente tu arquitectura (<code>aarch64</code> o <code>armv7</code>) e instala el binario de la versión correspondiente en <code>$CARGO_HOME/bin/zeroclaw</code> (que por defecto es <code>~/.cargo/bin/zeroclaw</code>). Asegúrate de que ese directorio esté en tu <code>PATH</code>.</p>
+<p><strong>Desde un clon:</strong></p>
+<pre><code class="language-sh">./install.sh
+</code></pre>
+<p><strong>Homebrew (Linuxbrew):</strong></p>
+<pre><code class="language-sh">brew install zeroclaw
+</code></pre>
+<p>El script detecta automáticamente tu arquitectura (<code>aarch64</code>, <code>armv7</code> o <code>armv6</code>) e instala el binario de la versión correspondiente en <code>$CARGO_HOME/bin/zeroclaw</code> (por defecto <code>~/.cargo/bin/zeroclaw</code>). Asegúrate de que ese directorio esté en tu <code>PATH</code>.</p>
+<p>Cuando el script compila desde el código fuente en lugar de usar un binario precompilado, también adapta la compilación a la memoria disponible de la placa:</p>
+<!--
+  GENERATED by `cargo xtask mdbook` from canonical hardware source
+  (registry.rs, transport.rs, catalog.rs, release workflow). Derived +
+  gitignored: do not edit, do not commit. Regenerated on every docs build.
+-->
+<p>Cuando <code>install.sh</code> compila desde el código fuente en Linux, lee <code>MemTotal</code> de <code>/proc/meminfo</code> y, en hosts con <strong>menos de 12 GiB</strong> de RAM, exporta <code>CARGO_PROFILE_RELEASE_LTO=thin</code> antes de compilar. El LTO completo (el valor predeterminado de <code>[profile.release]</code>) puede superar los 7 GB de RSS durante la fase de tipos entre crates y provocar un OOM en una placa con poca RAM; el LTO thin sacrifica un pequeño aumento en el tamaño del binario a cambio de un pico de memoria mucho menor durante la compilación.</p>
+<p>El cambio solo se aplica cuando aún no has fijado la variable. Anula explícitamente en cualquiera de las dos direcciones:</p>
+<pre><code class="language-sh"># Forzar LTO completo (fat) incluso en un host con poca RAM (binario más pequeño, mayor uso de RAM durante la compilación)
+export CARGO_PROFILE_RELEASE_LTO=fat
+
+# Forzar thin LTO en un host con mucha RAM (menor RAM de compilación)
+export CARGO_PROFILE_RELEASE_LTO=delgado
+</code></pre>
 <h3 id="descarga-manual"><a class="header" href="#descarga-manual">Descarga manual</a></h3>
 <p>Elige el tarball correspondiente de la <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest">última versión</a>:</p>
-<pre><code class="language-bash"># 64 bits (Pi 4/5 con Raspberry Pi OS de 64 bits)
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh"># 64 bits (Pi 4/5 con Raspberry Pi OS de 64 bits)
 curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-unknown-linux-gnu.tar.gz
 tar xzf zeroclaw-aarch64-unknown-linux-gnu.tar.gz
 sudo install -m 0755 zeroclaw /usr/local/bin/
@@ -257,16 +350,23 @@ curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zero
 tar xzf zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz
 sudo install -m 0755 zeroclaw /usr/local/bin/
 </code></pre>
+</div>
+
 <h3 id="verifica-tu-arquitectura"><a class="header" href="#verifica-tu-arquitectura">Verifica tu arquitectura</a></h3>
-<pre><code class="language-bash">uname -m
-# aarch64 → 64-bit (usa el binario aarch64)
-# armv7l  → 32-bit (use the armv7 binary)
-# armv6l  → Pi 1 / Zero (no compatible actualmente, ver #4623)
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">uname -m
+# aarch64 → 64 bits (use el binario aarch64-unknown-linux-gnu)
+# armv7l  → 32-bit (use the armv7-unknown-linux-gnueabihf binary)
+# armv6l  → Pi 1 / Zero / Zero W (use el binario arm-unknown-linux-gnueabihf)
 </code></pre>
+</div>
+
 <h2 id="opción-2-compilación-cruzada-desde-otra-máquina"><a class="header" href="#opción-2-compilación-cruzada-desde-otra-máquina">Opción 2: Compilación cruzada desde otra máquina</a></h2>
 <p>Si ya tienes una máquina más potente, la compilación cruzada es más rápida que compilar en la Pi.</p>
-<h3 id="desde-macos-apple-silicon-o-intel"><a class="header" href="#desde-macos-apple-silicon-o-intel">Desde macOS (Apple Silicon o Intel)</a></h3>
-<pre><code class="language-bash"># Instalar el target de compilación cruzada
+<div class="os-tabs-src">
+<h4 id="macos-apple-silicon-o-intel"><a class="header" href="#macos-apple-silicon-o-intel">macOS (Apple Silicon o Intel)</a></h4>
+<pre><code class="language-sh"># Instalar el target de compilación cruzada
 rustup target add aarch64-unknown-linux-gnu
 
 # Instalar una cadena de herramientas cruzada GNU para Linux — el mismo patrón utilizado por la guía de Arduino Uno Q
@@ -282,16 +382,16 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 </code></pre>
 <blockquote>
-<p><strong>Nota:</strong> versiones anteriores de esta guía sugerían <code>aarch64-elf-gcc</code> de Homebrew. Esa cadena de herramientas produce binarios ELF bare-metal y enlaza con newlib, no con glibc — no producirá un binario funcional de Raspberry Pi OS. Usa el tap <code>messense/macos-cross-toolchains</code> indicado arriba (una cadena de herramientas Linux GNU/glibc real), o recurre a la Opción 3 (compilar en la Pi).</p>
+<p><strong>Nota:</strong> los borradores anteriores de esta guía sugerían <code>aarch64-elf-gcc</code> de Homebrew. Esa toolchain produce binarios ELF bare-metal y enlaza contra newlib, no glibc. No producirá un binario funcional para Raspberry Pi OS. Usa el tap <code>messense/macos-cross-toolchains</code> indicado arriba (una toolchain Linux GNU/glibc real), o recurre a la Opción 3 (compilar en la Pi).</p>
 </blockquote>
-<h3 id="desde-linux-x86_64"><a class="header" href="#desde-linux-x86_64">Desde Linux x86_64</a></h3>
-<pre><code class="language-bash"># Instalar la cadena de herramientas de compilación cruzada
+<h4 id="linux-x86_64"><a class="header" href="#linux-x86_64">Linux x86_64</a></h4>
+<pre><code class="language-sh"># Instalar la cadena de herramientas de compilación cruzada
 sudo apt-get install -y gcc-aarch64-linux-gnu
 
 # Agregar destino
 rustup target add aarch64-unknown-linux-gnu
 
-# Configurar el enlazador (~/.cargo/config.toml)
+# Configurar el enlazador
 # [target.aarch64-unknown-linux-gnu]
 # linker = "aarch64-linux-gnu-gcc"
 
@@ -301,15 +401,23 @@ cargo build --release --target aarch64-unknown-linux-gnu
 # Copiar a la Pi
 scp target/aarch64-unknown-linux-gnu/release/zeroclaw pi@raspberrypi:~/
 </code></pre>
+</div>
+
 <h2 id="opción-3-compilar-en-la-pi"><a class="header" href="#opción-3-compilar-en-la-pi">Opción 3: Compilar en la Pi</a></h2>
-<p>Posible en Pi 4/5 si configuras la swap y eliges el perfil adecuado. Espera de 20 a 40 minutos en una Pi 5 (8 GB), más en Pi 4.</p>
+<p>El agente compilándose a sí mismo en el dispositivo. Funciona en cualquier Pi con swap y el perfil de compilación adecuado; más lento en placas con menos RAM.</p>
 <h3 id="paso-1-instalar-la-cadena-de-herramientas-de-rust"><a class="header" href="#paso-1-instalar-la-cadena-de-herramientas-de-rust">Paso 1: Instalar la cadena de herramientas de Rust</a></h3>
-<pre><code class="language-bash">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 </code></pre>
-<h3 id="paso-2-añadir-swap-crítico-para-pi-5-con--8-gb-o-cualquier-pi-4"><a class="header" href="#paso-2-añadir-swap-crítico-para-pi-5-con--8-gb-o-cualquier-pi-4">Paso 2: Añadir swap (crítico para Pi 5 con ≤ 8 GB o cualquier Pi 4)</a></h3>
-<p>El perfil <code>release</code> predeterminado alcanza un pico de entre 8 y 10 GB de RSS durante el enlazado con fat LTO. Sin swap, esto activa el OOM-killer a mitad del enlazado.</p>
-<pre><code class="language-bash"># Crear un archivo de intercambio de 4 GB
+</div>
+
+<h3 id="paso-2-agregar-swap"><a class="header" href="#paso-2-agregar-swap">Paso 2: Agregar swap</a></h3>
+<p>Fat LTO alcanza su pico de consumo durante el enlazado final; sin swap, una placa con poca RAM mata el proceso por OOM a mitad del enlazado.</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh"># Crear un archivo de intercambio de 4 GB
 sudo fallocate -l 4G /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
@@ -321,61 +429,50 @@ free -h
 # Hacer persistente entre reinicios
 echo /swapfile none swap sw 0 0 | sudo tee -a /etc/fstab
 </code></pre>
-<h3 id="paso-3-elige-un-perfil-de-compilación"><a class="header" href="#paso-3-elige-un-perfil-de-compilación">Paso 3: Elige un perfil de compilación</a></h3>
-<p>El perfil <code>release</code> predeterminado usa <code>lto = "fat"</code> y <code>codegen-units = 1</code>: el mejor rendimiento en tiempo de ejecución, pero el peor consumo de memoria al compilar. El perfil <code>release-fast</code> (<code>codegen-units = 8</code>, <code>lto = "thin"</code>) reduce el pico de RAM a la mitad aproximadamente, con solo un impacto menor en el tiempo de ejecución.</p>
-<pre><code class="language-bash">git clone https://github.com/zeroclaw-labs/zeroclaw.git
+</div>
+
+<h3 id="paso-3-compilación"><a class="header" href="#paso-3-compilación">Paso 3: Compilación</a></h3>
+<p>Elige un perfil según la RAM disponible. <code>release</code> usa LTO completo (mejor binario, enlazado más pesado); <code>release-fast</code> aumenta codegen-units para un enlazado más ligero; <code>ci</code> usa LTO thin para el enlazado con menor consumo de memoria. (<code>install.sh</code> lo selecciona automáticamente; consulta <a href="#using-the-install-script">Using the install script</a>.)</p>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">git clone https://github.com/zeroclaw-labs/zeroclaw.git
 cd zeroclaw
 
-# Pi 5 (8 GB, con swap): la versión predeterminada funciona
-cargo build --release
+cargo build --release           # placa con más RAM
+cargo build --profile release-fast   # Placa de RAM media
+cargo build --profile ci        # placa con poca RAM / recursos limitados
 
-# Pi 4 (4 GB, con swap): usar release-fast
-cargo build --profile release-fast
-
-# Pi 4 (2 GB) o con recursos limitados: usa el perfil ci (sin información de depuración, enlazado rápido)
-cargo build --profile ci
-</code></pre>
-<h3 id="paso-4-instalar-el-binario"><a class="header" href="#paso-4-instalar-el-binario">Paso 4: Instalar el binario</a></h3>
-<pre><code class="language-bash">## Desde el perfil de compilación que utilizaste:
+# Instala el binario que compilaste:
 sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
-# o target/release-fast/zeroclaw, o target/ci/zeroclaw
+# (o target/release-fast/zeroclaw, o target/ci/zeroclaw)
 </code></pre>
-<h3 id="compilación-con-soporte-para-gpio"><a class="header" href="#compilación-con-soporte-para-gpio">Compilación con soporte para GPIO</a></h3>
-<p>Si quieres usar periféricos GPIO de Pi desde skills, habilita el feature flag correspondiente (consulta el crate <code>peripherals</code>). La mayoría de los usuarios no necesitan esto para cargas de trabajo de agente típicas — solo es relevante si estás escribiendo skills que se comunican con hardware conectado.</p>
-<h2 id="despliegue-en-contenedores-se-recomienda-podman-en-lugar-de-docker"><a class="header" href="#despliegue-en-contenedores-se-recomienda-podman-en-lugar-de-docker">Despliegue en contenedores (se recomienda Podman en lugar de Docker)</a></h2>
-<p><strong>Las Pi tienen recursos de memoria limitados, y esa es la realidad operativa sobre la que está escrita esta sección.</strong> La Pi 4 de 2 GB es la unidad de prueba de referencia mínima para esta guía: si una configuración no deja margen en una máquina de 2 GB, no es una configuración que recomendemos. ZeroClaw en sí se ejecuta con bastante menos de 5 MB de RSS en tiempo de ejecución, pero todo lo que apiles junto a él (transportes de canal, control de navegador, servidores MCP, uno o dos agentes adyacentes, además del SO) compite por el mismo conjunto fijo de recursos. La memoria que no gastas en infraestructura de contenedores es memoria que ZeroClaw y sus herramientas pueden aprovechar.</p>
-<p>Presupuesto concreto en una Pi 4 de 2 GB ejecutando Raspberry Pi OS Bookworm/Trixie sin interfaz gráfica:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Componente</th><th>RSS aprox.</th></tr>
-</thead>
-<tbody>
-<tr><td>Kernel + espacio de usuario base + sshd</td><td>~150-250 MB</td></tr>
-<tr><td><code>dockerd</code> (inactivo, sin contenedores)</td><td>~150-200 MB</td></tr>
-<tr><td>Runtime ZeroClaw (solo gateway)</td><td>~5 MB</td></tr>
-<tr><td>Un contenedor de agente (p. ej. ghcr.io/zeroclaw-labs/zeroclaw)</td><td>~30-80 MB</td></tr>
-<tr><td><strong>Disponible con Docker</strong></td><td>~1.3-1.5 GB</td></tr>
-<tr><td><strong>Disponible con Podman (sin daemon)</strong></td><td>~1.5-1.7 GB</td></tr>
-</tbody>
-</table>
 </div>
-<p>El delta de Podman es del orden de ~150-200 MB liberados — pequeño en términos absolutos, grande como porcentaje de lo que queda después de que el SO se lleva su parte. En una unidad de 2 GB esa es la diferencia entre ejecutar cómodamente ZeroClaw + un transporte de canal pesado (Matrix con medios, skills de automatización de navegador) y sufrir OOM-killing bajo carga.</p>
-<p><strong>Tres razones por las que Podman es la mejor opción en Pi que Docker:</strong></p>
+
+<h3 id="compatibilidad-con-gpio"><a class="header" href="#compatibilidad-con-gpio">Compatibilidad con GPIO</a></h3>
+<p>Para controlar los GPIO de Pi desde skills, compila con el feature flag <code>peripherals</code> correspondiente. La mayoría de las cargas de trabajo de agentes no lo necesitan; consulta <a href="./hardware-peripherals-design.html">Diseño de periféricos</a>.</p>
+<h2 id="despliegue-en-contenedores-se-recomienda-podman-en-lugar-de-docker"><a class="header" href="#despliegue-en-contenedores-se-recomienda-podman-en-lugar-de-docker">Despliegue en contenedores (se recomienda Podman en lugar de Docker)</a></h2>
+<p>En una Pi con memoria limitada, la elección del runtime de contenedores importa: todo lo que apiles junto a ZeroClaw compite por el mismo grupo fijo, así que la memoria que no se gasta en infraestructura de contenedores es memoria que recibe el agente.</p>
+<p><strong>Por qué Podman en lugar de Docker en una Pi:</strong></p>
 <ol>
-<li><strong>Sin root por defecto → margen de seguridad.</strong> Podman no necesita un daemon root; los contenedores se ejecutan como tu usuario. En un dispositivo edge expuesto eso importa más que en el portátil de un desarrollador.</li>
-<li><strong>systemd-native mediante Quadlets → simplicidad operativa.</strong> Podman incluye archivos de unidad <code>.container</code> que systemd gestiona directamente: el mismo modelo de ciclo de vida, registro y dependencias que cualquier otra unidad. Sin un <code>docker.service</code> separado que vigilar, sin una capa de registro independiente.</li>
-<li><strong>Sin RSS de demonio → margen de memoria.</strong> Omitir los ~150-200 MB persistentes de <code>dockerd</code> es la palanca más significativa que puedes accionar en una Pi de 2 GB sin sacrificar el aislamiento.</li>
+<li><strong>Rootless por defecto.</strong> Sin daemon root; los contenedores se ejecutan como tu usuario, lo cual es importante en un dispositivo edge expuesto.</li>
+<li><strong>Nativo de systemd mediante Quadlets.</strong> Archivos de unidad <code>.container</code> que systemd gestiona directamente, sin un <code>docker.service</code> separado ni capa de registro.</li>
+<li><strong>Sin demonio persistente.</strong> Docker mantiene <code>dockerd</code> residente; Podman no, liberando el mayor bloque de memoria sin perder aislamiento.</li>
 </ol>
-<p>La contrapartida: el modelo de red rootless de Podman usa slirp4netns (o pasta en versiones más recientes), que es más lento que el bridge que configura el daemon de Docker. Para cargas de trabajo que mueven mucho tráfico HTTP entre contenedores en la misma Pi, vale la pena medirlo. Para el patrón típico de ZeroClaw de “uno o dos contenedores de agente de larga duración”, la diferencia es insignificante — y en hardware con restricciones de memoria, el ahorro de RSS del daemon domina el cálculo de todos modos.</p>
+<p>La contrapartida: la red rootless de Podman (slirp4netns/pasta) es más lenta que el bridge de Docker. Para el patrón de “uno o dos contenedores de agentes de larga duración” de ZeroClaw eso es insignificante, y el ahorro por la ausencia de daemon predomina en hardware con recursos limitados.</p>
 <h3 id="instalación-rápida-raspberry-pi-os-bookwormtrixie"><a class="header" href="#instalación-rápida-raspberry-pi-os-bookwormtrixie">Instalación rápida (Raspberry Pi OS Bookworm/Trixie)</a></h3>
-<pre><code class="language-bash">sudo apt-get install -y podman
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">sudo apt-get install -y podman
 # Opcional: alias más cortos — muchos flujos de docker-compose funcionan directamente con podman-compose
 sudo apt-get install -y podman-compose
 </code></pre>
+</div>
+
 <h3 id="ejecutar-zeroclaw-con-podman"><a class="header" href="#ejecutar-zeroclaw-con-podman">Ejecutar ZeroClaw con Podman</a></h3>
 <p>La imagen OCI publicada funciona bajo Podman sin modificaciones:</p>
-<pre><code class="language-bash">podman pull ghcr.io/zeroclaw-labs/zeroclaw:latest
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">podman pull ghcr.io/zeroclaw-labs/zeroclaw:latest
 
 podman run --rm -d \
   --name zeroclaw \
@@ -384,6 +481,8 @@ podman run --rm -d \
   ghcr.io/zeroclaw-labs/zeroclaw:latest \
   daemon --host 0.0.0.0 --port 42617
 </code></pre>
+</div>
+
 <blockquote>
 <p><strong>Problema con bind:</strong> ZeroClaw usa <code>127.0.0.1</code> de forma predeterminada para el gateway. Dentro de un contenedor, eso significa que el gateway es inaccesible desde el host. Pasa siempre <code>--host 0.0.0.0</code> (o define <code>ZEROCLAW_BIND=0.0.0.0</code>) cuando se ejecuta en un contenedor.</p>
 </blockquote>
@@ -410,31 +509,51 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target default.target
 </code></pre>
-<pre><code class="language-bash">systemctl --user daemon-reload
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">systemctl --user daemon-reload
 systemctl --user start zeroclaw.service
 </code></pre>
+</div>
+
 <p>Para configuraciones rootless, también ejecuta <code>loginctl enable-linger $USER</code> para que el servicio se inicie antes de iniciar sesión.</p>
 <h2 id="posterior-a-la-instalación-configuración-nativa-sin-contenedor"><a class="header" href="#posterior-a-la-instalación-configuración-nativa-sin-contenedor">Posterior a la instalación: Configuración nativa (sin contenedor)</a></h2>
 <h3 id="1-inicializar-zeroclaw"><a class="header" href="#1-inicializar-zeroclaw">1. Inicializar ZeroClaw</a></h3>
-<pre><code class="language-bash">zeroclaw quickstart
+<div class="os-tabs-src">
+<h4 id="sh-8"><a class="header" href="#sh-8">sh</a></h4>
+<pre><code class="language-sh">zeroclaw quickstart
 </code></pre>
-<p>Esto te guía a través de la autenticación del proveedor, la configuración del gateway, y crea <code>~/.zeroclaw/config.toml</code>.</p>
+</div>
+
+<p>Esto te guía a través de la autenticación del proveedor, la configuración del gateway y crea tu configuración de ZeroClaw.</p>
 <h3 id="2-verifica-que-funciona"><a class="header" href="#2-verifica-que-funciona">2. Verifica que funciona</a></h3>
-<pre><code class="language-bash">zeroclaw doctor
+<div class="os-tabs-src">
+<h4 id="sh-9"><a class="header" href="#sh-9">sh</a></h4>
+<pre><code class="language-sh">zeroclaw doctor
 zeroclaw agent -a assistant -m ¿cuánto es 2+2?
 </code></pre>
+</div>
+
 <h3 id="3-ejecutar-como-un-servicio-persistente"><a class="header" href="#3-ejecutar-como-un-servicio-persistente">3. Ejecutar como un servicio persistente</a></h3>
-<pre><code class="language-bash"># Instalar e iniciar el servicio de usuario systemd
+<div class="os-tabs-src">
+<h4 id="sh-10"><a class="header" href="#sh-10">sh</a></h4>
+<pre><code class="language-sh"># Instalar e iniciar el servicio de usuario systemd
 zeroclaw service install
 systemctl --user enable --now zeroclaw
 
 # Para que sobreviva al cierre de sesión / reinicio:
 loginctl enable-linger $USER
 </code></pre>
+</div>
+
 <h3 id="4-ejecutar-como-un-daemon-en-primer-plano"><a class="header" href="#4-ejecutar-como-un-daemon-en-primer-plano">4. Ejecutar como un daemon en primer plano</a></h3>
 <p>Para desarrollo / depuración:</p>
-<pre><code class="language-bash">zeroclaw daemon --host 0.0.0.0 --port 42617
+<div class="os-tabs-src">
+<h4 id="sh-11"><a class="header" href="#sh-11">sh</a></h4>
+<pre><code class="language-sh">zeroclaw daemon --host 0.0.0.0 --port 42617
 </code></pre>
+</div>
+
 <h3 id="5-habilitar-canales"><a class="header" href="#5-habilitar-canales">5. Habilitar canales</a></h3>
 <p>ZeroClaw puede conectarse a plataformas de chat (Matrix, Mattermost, Discord, Telegram, etc.). Consulta <a href="../channels/overview.html">Channels → Overview</a>. La mayoría de los transportes de canales funcionan bien en una Pi; el más pesado es la pila de WebRTC que usan algunos canales de voz, que puede provocar picos de CPU durante el establecimiento de llamadas.</p>
 <h2 id="gpio-y-periféricos-de-hardware"><a class="header" href="#gpio-y-periféricos-de-hardware">GPIO y periféricos de hardware</a></h2>
@@ -442,50 +561,40 @@ loginctl enable-linger $USER
 <ol>
 <li>
 <p>Agrega tu usuario al grupo <code>gpio</code>:</p>
-<pre><code class="language-bash">sudo usermod -aG gpio $USER
+<div class="os-tabs-src">
+<h4 id="sh-12"><a class="header" href="#sh-12">sh</a></h4>
+<pre><code class="language-sh">sudo usermod -aG gpio $USER
 # Cierra sesión y vuelve a iniciarla para que el cambio de grupo surta efecto
 </code></pre>
+</div>
+
 </li>
 <li>
 <p>Usa los enlaces GPIO del crate <code>peripherals</code> de tus habilidades. Consulta <a href="./hardware-peripherals-design.html">Hardware → Diseño de periféricos</a> para conocer el modelo de abstracción.</p>
 </li>
 </ol>
 <h2 id="solución-de-problemas"><a class="header" href="#solución-de-problemas">Solución de problemas</a></h2>
-<h3 id="terminado-por-oom-durante-la-compilación"><a class="header" href="#terminado-por-oom-durante-la-compilación">Terminado por OOM durante la compilación</a></h3>
-<p>El perfil <code>release</code> alcanza un pico de ~8-10 GB de RSS durante el enlace final. Cualquiera de las opciones:</p>
 <ul>
-<li>Cambia a <code>cargo build --profile release-fast</code> (reduce el pico a ~4-6 GB).</li>
-<li>Agregue un archivo de intercambio de 4 GB (Paso 2 anterior).</li>
-<li>Compilación cruzada desde una máquina más potente (Opción 2).</li>
+<li><strong>Terminado por OOM durante la compilación:</strong> agrega swap (Opción 3, Paso 2), cambia a un perfil más ligero (<code>release-fast</code> o <code>ci</code>), o usa el binario precompilado / compila de forma cruzada.</li>
+<li><strong>Compilación extremadamente lenta:</strong> es lo esperado en placas con poca RAM; realice compilación cruzada (Opción 2) si es importante.</li>
+<li><strong>“Exec format error” en binario precompilado:</strong> discrepancia de arquitectura. Ejecuta <code>uname -m</code> y descarga el binario correspondiente (<code>aarch64</code> = 64 bits, <code>armv7l</code> = 32 bits).</li>
+<li><strong>Permiso de GPIO denegado:</strong> no perteneces al grupo <code>gpio</code>; ejecuta <code>sudo usermod -aG gpio $USER</code> y luego vuelve a iniciar sesión.</li>
+<li><strong>El servicio no inicia después de reiniciar:</strong> <code>loginctl enable-linger $USER</code> para que el servicio de usuario sobreviva al cierre de sesión.</li>
+<li><strong>El contenedor no puede alcanzar el gateway desde el host:</strong> el gateway se vincula a <code>127.0.0.1</code>; pase <code>--host 0.0.0.0</code> (o <code>ZEROCLAW_BIND=0.0.0.0</code>).</li>
 </ul>
-<p>Si estás usando <code>release-fast</code> y aún tienes problemas de OOM en una Pi 4 (2 GB), cambia a <code>--profile ci</code> o usa el binario precompilado.</p>
-<h3 id="la-compilación-es-extremadamente-lenta"><a class="header" href="#la-compilación-es-extremadamente-lenta">La compilación es extremadamente lenta</a></h3>
-<p>Es lo esperado en una Pi 4. Una compilación limpia de release tarda entre 30 y 60 minutos; las compilaciones incrementales son razonables. Usa la compilación cruzada (Opción 2) si el tiempo de compilación es importante.</p>
-<h3 id="binario-precompilado-exec-format-error"><a class="header" href="#binario-precompilado-exec-format-error">Binario precompilado: “Exec format error”</a></h3>
-<p>Discrepancia de arquitectura. Comprueba <code>uname -m</code> y descarga el binario correspondiente. <code>aarch64</code> es de 64 bits (la mayoría de las Pi 4/5 con Raspberry Pi OS de 64 bits); <code>armv7l</code> es de 32 bits.</p>
-<h3 id="gpio-permiso-denegado"><a class="header" href="#gpio-permiso-denegado">GPIO: permiso denegado</a></h3>
-<pre><code class="language-bash">sudo usermod -aG gpio $USER
-# Cerrar sesión y volver a iniciarla
-</code></pre>
-<h3 id="el-servicio-no-se-inicia-tras-reiniciar"><a class="header" href="#el-servicio-no-se-inicia-tras-reiniciar">El servicio no se inicia tras reiniciar</a></h3>
-<p>Asegúrate de que systemd a nivel de usuario persista entre cierres de sesión:</p>
-<pre><code class="language-bash">loginctl enable-linger $USER
-</code></pre>
-<h3 id="el-contenedor-no-puede-alcanzar-la-puerta-de-enlace-desde-el-host"><a class="header" href="#el-contenedor-no-puede-alcanzar-la-puerta-de-enlace-desde-el-host">El contenedor no puede alcanzar la puerta de enlace desde el host</a></h3>
-<p>ZeroClaw enlaza <code>127.0.0.1</code> de forma predeterminada — dentro de un contenedor esto significa el localhost del contenedor. Pasa <code>--host 0.0.0.0</code> (o <code>ZEROCLAW_BIND=0.0.0.0</code>) al ejecutarlo en Podman/Docker.</p>
 <h2 id="consejos-de-rendimiento"><a class="header" href="#consejos-de-rendimiento">Consejos de rendimiento</a></h2>
 <ul>
-<li><strong>Usa un SSD o una tarjeta SD rápida.</strong> La compilación depende en gran medida de la E/S; un SSD USB 3.0 en una Pi 4/5 reduce significativamente el tiempo de compilación.</li>
-<li><strong>Ejecuta en modo headless.</strong> Detén el entorno de escritorio si no es necesario: <code>sudo systemctl set-default multi-user.target</code>.</li>
-<li><strong>tmpfs para artefactos de compilación</strong> (si tienes margen de RAM + swap): <code>export CARGO_TARGET_DIR=/tmp/zeroclaw-target</code>.</li>
-<li><strong>Comprueba que <code>clk_ignore_unused</code> no esté establecido</strong> en la cmdline del kernel si estás usando una imagen personalizada — esa opción (que se ve ocasionalmente en BSPs de proveedores) inhibe el clock gating y aumenta el consumo en reposo. Raspberry Pi OS de serie no la incluye.</li>
+<li><strong>Usa un SSD o una tarjeta SD rápida.</strong> La compilación está limitada por E/S; un SSD USB 3.0 en una Pi 4/5 reduce significativamente el tiempo de compilación.</li>
+<li><strong>Ejecutar sin interfaz gráfica:</strong> <code>sudo systemctl set-default multi-user.target</code>.</li>
+<li><strong>tmpfs para artefactos de compilación</strong> (con margen de RAM + swap): <code>export CARGO_TARGET_DIR=/tmp/zeroclaw-target</code>.</li>
+<li><strong>Verifica que <code>clk_ignore_unused</code></strong> no esté en la línea de comandos del kernel si usas una imagen personalizada; inhibe el clock gating y aumenta el consumo de energía en reposo. Raspberry Pi OS de fábrica no lo establece.</li>
 </ul>
 <h2 id="relacionado"><a class="header" href="#relacionado">Relacionado</a></h2>
 <ul>
-<li><a href="../setup/linux.html">Configuración de Linux</a> — configuración de Linux no específica de Pi, también aplicable aquí una vez instalado el binario</li>
-<li><a href="../setup/service.html">Gestión de servicios</a>: patrones de systemd, más detallados que lo anterior</li>
-<li><a href="./hardware-peripherals-design.html">Diseño de periféricos de hardware</a> — GPIO y el crate de periféricos</li>
-<li><a href="./adding-boards-and-tools.html">Hardware → Añadir placas y herramientas</a> — ampliar la compatibilidad de hardware</li>
+<li><a href="../setup/linux.html">Configuración de Linux</a>: configuración de Linux no específica de Pi, aplicable aquí también una vez que el binario esté instalado</li>
+<li><a href="../setup/service.html">Gestión de servicios</a>: patrones de systemd, más en profundidad que lo anterior</li>
+<li><a href="./hardware-peripherals-design.html">Hardware → Diseño de periféricos</a>: GPIO y el crate de periféricos</li>
+<li><a href="./adding-boards-and-tools.html">Hardware → Adding boards &amp; tools</a>: ampliación de la compatibilidad con hardware</li>
 </ul>
 
                     </main>
@@ -532,6 +641,114 @@ loginctl enable-linger $USER
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

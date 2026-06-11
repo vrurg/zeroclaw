@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -218,14 +295,20 @@
                     <main>
                         <h1 id="mattermost"><a class="header" href="#mattermost">Mattermost</a></h1>
 <p>REST v4 轮询客户端。自托管、本地部署或主权云的 Mattermost 服务器工作方式都相同：机器人每 3 秒轮询它可读取的频道以获取新帖子，回复帖子通过 <code>POST /api/v4/posts</code> 发送。</p>
+<h2 id="谁可以与代理通信"><a class="header" href="#谁可以与代理通信">谁可以与代理通信</a></h2>
+<p>入站发送方会根据为绑定代理解析出的<strong>对等集合</strong>进行限制，该集合来自代理所属的 <code>peer_groups</code> 配置。匹配时会去除开头的 <code>@</code>，并对通道的原生发送方标识符执行不区分大小写的比对。<strong>空</strong>集合会拒绝所有人；包含 <code>"*"</code> 的集合会接受所有人；否则仅接受列出的外部对等方（以及对等代理）。这与网关配对（<code>gateway.require_pairing</code>）不同，后者验证的是 HTTP/WebSocket 客户端，而非聊天通道的发送方。</p>
+<p>mattermost 的对等组将 <code>channel</code> 设置为 <code>mattermost</code>，在 <code>external_peers</code> 中列出允许的发送者（对于 mattermost，使用 Mattermost 用户 UUID（而非用户名）；<code>["*"]</code> 接受任何人），可选择性地命名对等 <code>agents</code> 以进行跨代理调度、一个 <code>ignore</code> 屏蔽列表，以及一个 <code>output_modality</code>（<code>mirror</code>、<code>voice</code> 或 <code>text</code>）。字段参考请参见 <a href="peer-groups.html">Peer Groups</a>。</p>
+<p>在何处设置：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>在 Web 仪表板中打开 <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a>。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中的 <strong>Peer groups</strong> 下。</p>
+</div>
+
+<p>如需将特定用户加入允许列表，请从 <strong>System Console → User Management</strong> 中复制其用户 ID。Mattermost 匹配的是用户 <strong>UUID</strong>，而非用户名，并且不会在接收消息时解析用户名。</p>
 <h2 id="快速开始"><a class="header" href="#快速开始">快速开始</a></h2>
-<p>多频道、支持私信的机器人的最低配置：</p>
-<pre><code class="language-toml">[channels.mattermost.work]
-enabled = true
-url = "https://mattermost.example.com"
-bot_token = "..."
-</code></pre>
-<p>仅凭这一点，你就能获得：</p>
+<p>通过下面的某个界面配置 Mattermost 频道（<code>url</code> 加上 <code>bot_token</code> 密钥，参见<a href="#authentication">身份验证</a>）。仅此一项即可为你提供：</p>
 <ol>
 <li>自动发现机器人在其所属的每个团队中可读取的所有频道。</li>
 <li>DM 和群组 DM 频道会与团队频道一起自动发现并轮询。</li>
@@ -234,46 +317,290 @@ bot_token = "..."
 </ol>
 <p>如需限制此机器人，可使用 <code>channel_ids</code>、<code>team_ids</code> 或 <code>discover_dms</code> 进行范围缩小。</p>
 <h2 id="配置"><a class="header" href="#配置">配置</a></h2>
-<pre><code class="language-toml">[channels.mattermost.&lt;alias&gt;]
-enabled            = true                            # 开关；必填
-url                = "https://mattermost.example.com" # 必填
-bot_token          = "..."                            # 密钥；或使用 login_id+password
-# login_id         = ""                               # 备用认证方式；仅在未设置 bot_token 时使用
-# password         = ""                               # 密钥；与 login_id 配对使用
-
-channel_ids        = []                               # [] 或 ["*"] = 自动发现
-team_ids           = []                               # [] = 所有团队
-discover_dms       = true                             # 包含 type=D 和 type=G
-thread_replies     = true                             # 在用户帖子下创建线程
-mention_only       = false                            # 过滤频道环境闲聊
-interrupt_on_new_message = false                      # 当发送者发布新帖时取消进行中的任务
-
-proxy_url          = ""                               # 可选的按频道代理
-excluded_tools     = []                               # 对此频道隐藏的工具
+<p><code>bot_token</code> 和 <code>password</code> 是机密信息：</p>
+<blockquote>
+<p><strong><code>channels.mattermost.&lt;alias&gt;.bot_token</code> 是一项机密信息。</strong> 以加密形式存储，绝不会以明文形式出现在 <code>config.toml</code> 中。请通过以下方式之一进行设置，这些方式会在写入时加密：</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并在其中设置 <code>channels.mattermost.&lt;alias&gt;.bot_token</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.bot_token</code> 字段（输入内容会被遮蔽）。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.bot_token    # 提示输入掩码内容，以加密形式存储
 </code></pre>
-<p>字段参考：</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>字段</th><th>类型</th><th>default</th><th>含义</th></tr>
-</thead>
-<tbody>
-<tr><td><code>enabled</code></td><td>布尔</td><td><code>false</code></td><td>仅在为 true 时加载。</td></tr>
-<tr><td><code>url</code></td><td>字符串</td><td>（必需）</td><td>Mattermost 服务器的基础 URL，结尾不带斜杠。</td></tr>
-<tr><td><code>bot_token</code></td><td>secret</td><td>无</td><td>Bot 账户访问令牌。推荐使用。</td></tr>
-<tr><td><code>login_id</code></td><td>字符串</td><td>无</td><td>用于密码登录的邮箱或用户名。仅在未设置 <code>bot_token</code> 时使用。</td></tr>
-<tr><td><code>password</code></td><td>secret</td><td>无</td><td>账户密码。必须与 <code>login_id</code> 搭配使用。</td></tr>
-<tr><td><code>channel_ids</code></td><td>列表</td><td><code>[]</code></td><td>为空或 <code>["*"]</code> 时触发自动发现。显式指定 ID 可将该 bot 固定为该精确集合。</td></tr>
-<tr><td><code>team_ids</code></td><td>列表</td><td><code>[]</code></td><td>团队频道的自动发现白名单。留空 = 机器人所属的每个团队。私信和群组私信频道不受影响（它们不携带 <code>team_id</code>）。</td></tr>
-<tr><td>discover_dms</td><td>布尔</td><td><code>true</code></td><td>自动发现时，包含 <code>type=D</code> 和 <code>type=G</code> 类型的频道。设置为 <code>false</code> 可将机器人限定为仅公开/私有团队频道。当 <code>channel_ids</code> 为显式指定时无效。</td></tr>
-<tr><td><code>thread_replies</code></td><td>布尔</td><td><code>true</code></td><td>新建顶层回复会创建一个以用户帖子为根的话题。已有话题内的回复将始终保留在该话题中，不受影响。</td></tr>
-<tr><td><code>mention_only</code></td><td>布尔</td><td><code>false</code></td><td>公共/私有团队频道：忽略未使用 <code>@mention</code> 提及机器人的消息。私信和群组私信始终绕过此过滤器。</td></tr>
-<tr><td><code>interrupt_on_new_message</code></td><td>布尔</td><td><code>false</code></td><td>同一频道中来自同一发送者的较新消息会取消正在处理中的回合。</td></tr>
-<tr><td><code>proxy_url</code></td><td>字符串</td><td>无</td><td>按通道的代理覆盖（<code>http</code>、<code>https</code>、<code>socks5</code>、<code>socks5h</code>）。</td></tr>
-<tr><td><code>excluded_tools</code></td><td>列表</td><td><code>[]</code></td><td>本频道对模型隐藏的工具名称。</td></tr>
-</tbody>
-</table>
 </div>
+
+<h3 id="字段参考"><a class="header" href="#字段参考">字段参考</a></h3>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>bot_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Mattermost 机器人访问令牌。未设置时，该通道将回退到使用 <code>login_id</code> + <code>password</code> 的登录流程。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.bot_token</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.bot_token</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.bot_token    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__bot_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>channel_ids</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>用于限制机器人的频道 ID。留空或 <code>["*"]</code> = 自动发现机器人可读取的每个频道（公开、私密、私信、群组私信）并轮询所有频道。指定明确的 ID 将禁用自动发现，并将机器人锁定到列出的频道。从旧版 <code>channel_id</code> 单数字段迁移而来。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.channel_ids</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.channel_ids</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.channel_ids &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__channel_ids=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>discover_dms</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>null</code></span></summary>
+<p>当为 true（默认值）时，自动发现包括私信（<code>type=D</code>）和群组私信（<code>type=G</code>）频道。设为 false 可将该机器人限制为仅访问公开和私有团队频道。当 <code>channel_ids</code> 中列出了明确的 ID 时，此项无效。在调用处通过 <code>discover_dms.unwrap_or(true)</code> 默认为 <code>true</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a>，并设置 <code>channels.mattermost.&lt;alias&gt;.discover_dms</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.discover_dms</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.discover_dms &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__discover_dms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>从此通道的工具规范中排除的工具。设置后，通过此通道响应时不会向模型公开这些工具。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>为 true 时，来自同一频道中同一发送者的较新 Mattermost 消息会取消正在处理的请求，并在保留历史记录的情况下重新开始响应。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.interrupt_on_new_message</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.interrupt_on_new_message</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>login_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>用于密码登录流程的登录 ID（邮箱或用户名）。仅在未设置 <code>bot_token</code> 时使用；<code>login_id</code> 和 <code>password</code> 必须同时设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.login_id</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.login_id</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.login_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__login_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>null</code></span></summary>
+<p>为 true 时，仅回应 @ 提及该机器人的消息。频道中的其他消息将被静默忽略。私信和群组私信频道始终绕过此过滤器：一对一（或小群组）的直接对话没有需要过滤的环境噪音，因此每条消息都被视为是发给机器人的。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.mention_only</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.mention_only</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.mention_only &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__mention_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>password</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>登录流程的账户密码。仅在未设置 <code>bot_token</code> 时使用；<code>login_id</code> 和 <code>password</code> 必须同时设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.password</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.password</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.password    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__password=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>proxy_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>每个通道的代理 URL（http、https、socks5、socks5h）。仅为此通道覆盖全局 <code>[proxy]</code> 设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.proxy_url</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.proxy_url</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.proxy_url &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__proxy_url=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（通道，接收方）出站节流下限（秒）。范围：<code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code>（0 表示禁用）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（channel, recipient）出站节流队列的深度。取值范围：<code>0..=REPLY_QUEUE_DEPTH_CEILING</code>。当 <code>reply_min_interval_secs &gt; 0</code> 且此值为 <code>0</code> 时，节流封装器会使用 <code>DEFAULT_REPLY_QUEUE_DEPTH</code>（16）作为替代值。当队列已满时，最新的发送会被丢弃，并记录一条 <code>WARN</code> 日志。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>team_ids</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>限制自动发现范围的团队 ID。留空 = 在机器人所属的每个团队中进行发现。非空 = 仅发现 <code>team_id</code> 在此列表中的公开/私有频道。私信和群组私信（没有所属团队）则由 <code>discover_dms</code> 控制。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-13"><a class="header" href="#网关仪表板-13">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.team_ids</code> 字段。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.team_ids</code> 字段。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.team_ids &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-11"><a class="header" href="#环境变量-11">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__team_ids=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>thread_replies</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>null</code></span></summary>
+<p>为 true 时（默认），回复以原帖为线程展开。为 false 时，回复将发送到频道根目录。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-14"><a class="header" href="#网关仪表板-14">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.thread_replies</code> 字段。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.thread_replies</code> 字段。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.thread_replies &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-12"><a class="header" href="#环境变量-12">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__thread_replies=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>url</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
+<p>Mattermost 服务器 URL（例如 <code>"https://mattermost.example.com"</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-15"><a class="header" href="#网关仪表板-15">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并设置 <code>channels.mattermost.&lt;alias&gt;.url</code> 字段。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.url</code> 字段。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.url &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-13"><a class="header" href="#环境变量-13">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__mattermost__&lt;alias&gt;__url=
+</code></pre>
+</div>
+
+</details>
+</div>
+
 <h2 id="频道发现"><a class="header" href="#频道发现">频道发现</a></h2>
 <p>有两种作用域模式。</p>
 <ol>
@@ -304,6 +631,29 @@ excluded_tools     = []                               # 对此频道隐藏的工
 <li>入站帖子为顶层帖子且 <code>thread_replies = true</code>（默认）→ 回复将开启一个以该入站帖子为根的话题串。</li>
 <li>入站帖子为顶层消息且 <code>thread_replies = false</code> → 回复将发布到频道根级别。</li>
 </ol>
+<h3 id="上下文管理"><a class="header" href="#上下文管理">上下文管理</a></h3>
+<p>当 Mattermost 中的对话发生在某个话题串（thread）中时，该话题串就是一个独立的对话。ZeroClaw 会为每个话题串派生出不同的会话键（session key），因此每个话题串都拥有各自独立的上下文窗口和历史记录：一个话题串中的消息绝不会渗入另一个话题串，代理也不会看到同级话题串中较早的对话轮次。在 Mattermost 中，这一行为由 <code>thread_replies</code> 控制：当其开启时，顶层消息会开启一个话题串，且每个话题串都是一个独立的对话；当其关闭时，回复会发布在频道根部，历史记录则按发送者和目标（target）而非按话题串进行索引。</p>
+<ul>
+<li><strong>隔离正是关键所在。</strong> 每个线程的上下文都是自包含的：它不会泄漏到线程之外，线程之外的任何内容也不会泄漏进来。并行线程持有各自独立的对话状态，因此互不相关的任务永远不会相互干扰。</li>
+<li><strong>长线程会增大上下文。</strong> 线程在保持活动状态期间会累积历史记录，因此与其他长对话一样，过长的线程最终会填满模型的上下文窗口。开始新线程即可重置。</li>
+<li><strong>进行中的工作以线程为单位进行隔离。</strong> 在某个线程中发送新消息不会取消另一个线程中进行中的响应；每个线程的任务都是独立的。</li>
+</ul>
+<p>为任意 surface 设置线程行为：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-16"><a class="header" href="#网关仪表板-16">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/mattermost"><code>/config/channels/mattermost</code></a> 并切换 <code>channels.mattermost.&lt;alias&gt;.thread_replies</code> 字段。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.mattermost.&lt;alias&gt;.thread_replies</code> 字段。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.mattermost.&lt;alias&gt;.thread_replies true     以下消息的回复
+
+Wait — let me reconsider. The phrase "thread replies on" appears to be a UI label, likely a toggle. Let me provide a more accurate translation.
+
+线程回复开启
+zeroclaw config set channels.mattermost.&lt;alias&gt;.thread_replies false    # 频道根目录的回复
+</code></pre>
+</div>
+
 <h2 id="身份验证"><a class="header" href="#身份验证">身份验证</a></h2>
 <p>两条路径：</p>
 <ol>
@@ -318,11 +668,9 @@ excluded_tools     = []                               # 对此频道隐藏的工
 <li>在 Mattermost 中：<strong>系统控制台 → 集成 → 机器人账号 → 添加机器人账号</strong>。设置用户名（例如 <code>zeroclaw</code>），并启用你需要的权限范围。</li>
 <li>复制访问令牌。将其存储在 ZeroClaw 密钥后端中。</li>
 <li>邀请机器人加入你希望它在其中运行的任意团队。对于私信自动发现功能，无需额外邀请：任何用户都可以私信该机器人。</li>
-<li>在 config.toml 中添加 <code>[channels.mattermost.&lt;alias&gt;]</code> 并引用该令牌。</li>
+<li>通过网关、zerocode 或 <code>zeroclaw config set</code> 创建引用该令牌的 <code>mattermost.&lt;alias&gt;</code> 频道。</li>
 <li>通过 <code>channels = ["mattermost.&lt;alias&gt;"]</code> 将该通道绑定到 <code>[agents.&lt;alias&gt;]</code> 中的代理。</li>
 </ol>
-<h2 id="身份与对等组"><a class="header" href="#身份与对等组">身份与对等组</a></h2>
-<p>入站 <code>ChannelMessage.sender</code> 是 Mattermost 用户 UUID（来自帖子负载的 <code>user_id</code>）。对等组授权将基于该 UUID 进行匹配。如果你想将某个特定用户加入允许列表，请从 <strong>System Console → User Management</strong> 复制其用户 ID，并将其添加到 <code>[peer_groups.&lt;group&gt;].external_peers</code> 中。该机器人目前不会在消息接收时解析用户名；这是一个与 Discord 及其他基于 UUID 的渠道共有的正交问题。</p>
 <h2 id="操作说明"><a class="header" href="#操作说明">操作说明</a></h2>
 <ol>
 <li>轮询频率为每个频道 3 秒。发现 N 个频道意味着每 3 秒对 Mattermost 服务器发起 N 次 HTTP 调用。自托管默认配置可轻松应对；如果你使用的是速率限制较严格的共享云租户，建议通过 <code>channel_ids</code> 或 <code>team_ids</code> 缩小范围。</li>
@@ -332,7 +680,7 @@ excluded_tools     = []                               # 对此频道隐藏的工
 <h2 id="另见"><a class="header" href="#另见">另见</a></h2>
 <ul>
 <li><a href="./overview.html">通道概述</a></li>
-<li><a href="../security/overview.html">安全性：对等组</a></li>
+<li><a href="./peer-groups.html">对等组</a></li>
 <li><a href="../reference/config.html">参考：配置架构</a></li>
 </ul>
 
@@ -340,7 +688,7 @@ excluded_tools     = []                               # 对此频道隐藏的工
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../channels/matrix.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../channels/slack.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -354,7 +702,7 @@ excluded_tools     = []                               # 对此频道隐藏的工
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../channels/matrix.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../channels/slack.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -380,6 +728,114 @@ excluded_tools     = []                               # 对此频道隐藏的工
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

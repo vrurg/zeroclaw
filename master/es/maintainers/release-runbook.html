@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -218,50 +295,53 @@
                     <main>
                         <h1 id="manual-de-lanzamiento"><a class="header" href="#manual-de-lanzamiento">Manual de lanzamiento</a></h1>
 <blockquote>
-<p><strong>Proceso manual provisional.</strong> Este runbook explica cómo publicar una versión estable hoy usando <code>release-stable-manual.yml</code>. Solo existe hasta que release-plz se integre en v0.7.5 y lo reemplace por completo.</p>
-<p>Si algo aquí parece pesado, esa fricción es intencional: aún no tenemos la disciplina de automatización para eliminarlo de forma segura.</p>
+<p><strong>Proceso manual provisional.</strong> Este runbook cubre cómo publicar una versión estable hoy usando <code>release-stable-manual.yml</code>. Sigue siendo el proceso vigente hasta que release-plz llegue y lo reemplace; esa migración aún no ha ocurrido (consulte <a href="#where-this-is-going">Hacia dónde se dirige esto</a>).</p>
+<p>Si algo aquí se siente pesado, es fricción intencional; todavía no tenemos la disciplina de automatización necesaria para eliminarla de forma segura.</p>
 </blockquote>
-<p>Última verificación: <strong>mayo de 2026</strong> (ciclo v0.7.4).</p>
+<p>Última verificación realizada con el ciclo <code>0.8.0-beta</code>.</p>
 <hr>
-<h2 id="el-proceso-en-seis-pasos"><a class="header" href="#el-proceso-en-seis-pasos">El proceso en seis pasos</a></h2>
+<h2 id="el-proceso-en-siete-pasos"><a class="header" href="#el-proceso-en-siete-pasos">El proceso en siete pasos</a></h2>
 <ol>
 <li>Genera <code>CHANGELOG-next.md</code> utilizando la skill de changelog</li>
 <li>Abrir y fusionar un PR de incremento de versión</li>
 <li>Ejecuta los workflows de release localmente en modo dry-run con <code>act</code></li>
 <li>Activa el flujo de trabajo <code>Release Stable</code> mediante despacho manual</li>
-<li>Aprueba las tres barreras de entorno cuando se te solicite</li>
+<li>Apruebe las dos puertas de entorno cuando se le solicite</li>
 <li>Verifica que la versión exista y que los recursos se puedan descargar</li>
+<li>Despliegue de documentación versionada</li>
 </ol>
-<p>Ese es todo el proceso. Todo lo demás (Docker, crates.io, Scoop, AUR, Homebrew, Discord, tweet) se ejecuta automáticamente como trabajos posteriores. No necesitas hacer nada para esos a menos que un trabajo falle explícitamente.</p>
+<p>Ese es todo el proceso. Todo lo demás (Docker, redespliegue del sitio web, Scoop, AUR, Homebrew, Discord, tweet) se ejecuta automáticamente como trabajos posteriores. No necesitas hacer nada para esos a menos que un trabajo falle explícitamente.</p>
 <hr>
-<h2 id="paso-1--generar-changelog-nextmd"><a class="header" href="#paso-1--generar-changelog-nextmd">Paso 1 — Generar CHANGELOG-next.md</a></h2>
-<p>Usa la skill changelog-generation para generar <code>CHANGELOG-next.md</code>:</p>
-<pre><code class="language-text">.claude/skills/changelog-generation/SKILL.md
-</code></pre>
+<h2 id="paso-1-generar-changelog-nextmd"><a class="header" href="#paso-1-generar-changelog-nextmd">Paso 1: Generar CHANGELOG-next.md</a></h2>
+<p>Ejecuta el skill <code>changelog-generation</code> para generar <code>CHANGELOG-next.md</code>. Su procedimiento completo se encuentra en <code>.claude/skills/changelog-generation/SKILL.md</code>.</p>
 <p>La skill genera el changelog a partir del git log entre la última etiqueta estable y HEAD, resuelve los contribuyentes mediante GitHub GraphQL y escribe el archivo. Confirma el resultado directamente en una rama de corta duración e inclúyelo en el PR de incremento de versión (paso 2), o ábrelo como un PR previo independiente si el diff es grande.</p>
 <p>Si <code>CHANGELOG-next.md</code> ya existe de un ciclo de lanzamiento anterior que se abortó, revísalo para comprobar su exactitud antes de reutilizarlo.</p>
 <hr>
-<h2 id="paso-2-incrementa-la-versión-y-fusiona-el-pr-de-versión"><a class="header" href="#paso-2-incrementa-la-versión-y-fusiona-el-pr-de-versión">Paso 2: Incrementa la versión y fusiona el PR de versión</a></h2>
-<p>Edita el archivo <code>Cargo.toml</code> del workspace:</p>
-<pre><code class="language-toml">[workspace.package]
-version = "X.Y.Z"
+<h2 id="paso-2-incrementar-la-versión-y-fusionar-el-pr-de-versión"><a class="header" href="#paso-2-incrementar-la-versión-y-fusionar-el-pr-de-versión">Paso 2: Incrementar la versión y fusionar el PR de versión</a></h2>
+<p>Incrementa <code>workspace.package.version</code> en el <code>Cargo.toml</code> del workspace, luego sincroniza todas las demás referencias de versión:</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">bash scripts/release/bump-version.sh X.Y.Z
 </code></pre>
-<p>Sincroniza todas las demás referencias de versión:</p>
-<pre><code class="language-bash">bash scripts/release/bump-version.sh X.Y.Z
-</code></pre>
+</div>
+
 <p>Esto actualiza las insignias del README, la configuración de Tauri y los ejemplos de descripción del flujo de trabajo. Confirma todo junto:</p>
 <pre><code class="language-text">chore: bump version to vX.Y.Z
 </code></pre>
 <p>Abre un PR. Etiquétalo como <code>chore</code>, <code>size: XS</code>. Obtén la revisión de un maintainer. Haz merge cuando el CI esté en verde.</p>
 <p><strong>Confirma que el merge se aplicó correctamente:</strong></p>
-<pre><code class="language-bash">git fetch origin
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">git fetch origin
 git show origin/master:Cargo.toml | grep '^version'
 # Debe mostrar: version = "X.Y.Z"
 </code></pre>
+</div>
+
 <hr>
-<h2 id="paso-3--ejecuta-los-flujos-de-trabajo-de-release-en-local-con-act"><a class="header" href="#paso-3--ejecuta-los-flujos-de-trabajo-de-release-en-local-con-act">Paso 3 — Ejecuta los flujos de trabajo de release en local con <code>act</code></a></h2>
-<p>El flujo de trabajo <code>Release Stable</code> es un grafo de tareas de GitHub Actions que consume tu ventana de aprobación de la barrera de entorno en el momento en que haces clic en <strong>Run workflow</strong>. Si un paso del flujo de trabajo está roto —un artefacto de compilación faltante, una ruta obsoleta, un paso de codegen que alguien eliminó sin actualizar CI— el fallo aparece <em>después</em> de que te has comprometido con una ventana de lanzamiento, con el PR de versión ya fusionado y master en la nueva versión. La recuperación implica integrar una rama de corrección de emergencia, volver a ejecutar CI y publicar bajo presión de tiempo sobre un árbol que ya se anuncia a sí mismo como una versión completamente lanzada.</p>
-<p>El seguro barato contra esto es ejecutar primero el mismo grafo de trabajos localmente, sobre el commit exacto de master fusionado, antes de abrir el formulario de GitHub Actions. <a href="https://nektosact.com/"><code>act</code></a> ejecuta los workflows de GitHub Actions dentro de contenedores Docker usando el mismo ecosistema <code>actions/*</code> que usa GitHub. No refleja a la perfección el runner en la nube —no puede acceder al runtime de subida de artefactos, a los tokens OIDC emitidos por GitHub, a los secretos de entorno ni a los jobs que dependen de un tag de release real—, pero sí ejecuta los pasos de build y test que representan casi todos los fallos de CI en tiempo de release que hemos tenido.</p>
+<h2 id="paso-3-ejecute-en-modo-de-prueba-dry-run-los-flujos-de-trabajo-de-lanzamiento-localmente-con-act"><a class="header" href="#paso-3-ejecute-en-modo-de-prueba-dry-run-los-flujos-de-trabajo-de-lanzamiento-localmente-con-act">Paso 3: Ejecute en modo de prueba (dry-run) los flujos de trabajo de lanzamiento localmente con <code>act</code></a></h2>
+<p>El workflow <code>Release Stable</code> es un grafo de trabajos de GitHub Actions que consume tu ventana de aprobación de la puerta de entorno en el momento en que haces clic en <strong>Run workflow</strong>. Si un paso del workflow está roto: un artefacto de compilación faltante, una ruta obsoleta, un paso de codegen que alguien eliminó sin actualizar la CI, el fallo aparece <em>después</em> de que te has comprometido a una ventana de lanzamiento, con el PR de versión ya fusionado y master en la nueva versión. La recuperación implica integrar una rama de corrección de emergencia, volver a ejecutar la CI y publicar bajo presión de tiempo en un árbol que ya se anuncia como una versión completamente lanzada.</p>
+<p>El seguro económico contra esto es ejecutar el mismo grafo de trabajos localmente primero, sobre el commit exacto fusionado en master, antes de abrir el formulario de GitHub Actions. <a href="https://nektosact.com/"><code>act</code></a> ejecuta los flujos de trabajo de GitHub Actions dentro de contenedores Docker usando el mismo ecosistema <code>actions/*</code> que usa GitHub. No replica perfectamente el runner en la nube; no puede acceder al runtime de carga de artefactos, a los tokens OIDC emitidos por GitHub, a los secretos de entorno ni a los trabajos que dependen de una etiqueta de versión real, pero sí ejecuta los pasos de compilación y pruebas que representan casi todos los fallos de CI en tiempo de lanzamiento que hemos encontrado.</p>
 <p>Este paso requiere una inversión de 15 a 20 minutos por versión. Ha detectado defectos reales que el CI habitual por PR no reveló (porque el flujo de trabajo que falla solo se ejecuta con <code>workflow_dispatch</code>, no con <code>push</code>).</p>
 <h3 id="configuración-inicial"><a class="header" href="#configuración-inicial">Configuración inicial</a></h3>
 <p><code>act</code> ejecuta los workflows. La ruta de instalación más limpia es la extensión de GitHub CLI, ya que hereda tu autenticación de <code>gh</code> y expone un <code>GITHUB_TOKEN</code> real a cada ejecución de workflow:</p>
@@ -271,66 +351,82 @@ git show origin/master:Cargo.toml | grep '^version'
 </li>
 <li>
 <p>Instala la extensión <code>act</code>:</p>
-<pre><code class="language-bash">gh extension install nektos/gh-act
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">gh extension install nektos/gh-act
 </code></pre>
+</div>
+
 </li>
 <li>
-<p>Instala Docker Engine o Docker Desktop desde <a href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a>. En Linux, agrégate al grupo <code>docker</code> para no necesitar <code>sudo</code>. <code>act</code> también funciona con Podman y Colima — consulta la <a href="https://nektosact.com/usage/runners.html">documentación de runners de act</a>.</p>
+<p>Instala Docker Engine o Docker Desktop desde <a href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a>. En Linux, agrégate al grupo <code>docker</code> para no necesitar <code>sudo</code>. <code>act</code> también funciona con Podman y Colima; consulta la <a href="https://nektosact.com/usage/runners.html">documentación de runners de act</a>.</p>
 </li>
 </ol>
 <p>Eso es toda la configuración. El <code>.actrc</code> del repositorio y <code>scripts/dev/act-local.sh</code> se encargan de todo lo demás (imagen del runner, archivo de secrets, servidor de artefactos, precarga de SHA de actions).</p>
 <h3 id="simulación-por-versión"><a class="header" href="#simulación-por-versión">Simulación por versión</a></h3>
 <p>Asegúrate de que tu árbol de trabajo coincida con el extremo del master fusionado del paso 2:</p>
-<pre><code class="language-bash">git fetch upstream
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">git fetch upstream
 git checkout upstream/master
 </code></pre>
+</div>
+
 <p>Lista lo que se puede ejecutar en cada archivo de flujo de trabajo:</p>
-<pre><code class="language-bash">./scripts/dev/act-local.sh --list
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">./scripts/dev/act-local.sh --list
 </code></pre>
+</div>
+
 <p>Ejecuta un trabajo específico, selecciónalo de forma interactiva o ejecuta todos los trabajos seguros para dry-run:</p>
-<pre><code class="language-bash">./scripts/dev/act-local.sh release-stable-manual:web   # un trabajo
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">./scripts/dev/act-local.sh release-stable-manual:web   # un trabajo
 ./scripts/dev/act-local.sh                              # selector interactivo
 ./scripts/dev/act-local.sh --all                        # todo trabajo seguro para dry-run
 </code></pre>
-<p>La primera ejecución descarga la imagen del runner (~1.5 GB) e inicializa la caché de compilación de Rust mediante <code>Swatinem/rust-cache</code>; las ejecuciones posteriores son mucho más rápidas. El script crea automáticamente el archivo <code>.secrets</code> ignorado por git, precarga el SHA de cada acción fijada en <code>~/.cache/act/</code> (de lo contrario, el clon superficial de act no puede resolver commits arbitrarios), pasa <code>GITHUB_TOKEN</code> desde tu autenticación de <code>gh</code> a la ejecución a través del entorno del proceso padre (el valor del token nunca aparece en argv) y establece <code>--artifact-server-path</code> para que <code>actions/upload-artifact</code> y <code>actions/download-artifact</code> funcionen entre jobs. Todo eso es simplemente <code>act</code> por debajo: el script solo elimina la sopa de flags.</p>
+</div>
+
+<p>La primera ejecución descarga la imagen del runner (~1.5 GB) y prepara la caché de compilación de Rust mediante <code>Swatinem/rust-cache</code>; las ejecuciones posteriores son mucho más rápidas. El script crea automáticamente el archivo <code>.secrets</code> (ignorado por git), descarga previamente cada SHA de acción fijado en <code>~/.cache/act/</code> (de lo contrario, el clon superficial de act no puede resolver commits arbitrarios), pasa <code>GITHUB_TOKEN</code> desde tu autenticación de <code>gh</code> a la ejecución a través del entorno del proceso padre (el valor del token nunca llega a argv), y configura <code>--artifact-server-path</code> para que <code>actions/upload-artifact</code> y <code>actions/download-artifact</code> funcionen entre jobs. Todo eso es simplemente <code>act</code> por debajo; el script solo elimina la maraña de flags.</p>
 <h3 id="--all-solo-ejecuta-trabajos-en-una-lista-de-permitidos-segura-para-dry-run"><a class="header" href="#--all-solo-ejecuta-trabajos-en-una-lista-de-permitidos-segura-para-dry-run"><code>--all</code> solo ejecuta trabajos en una lista de permitidos segura para dry-run</a></h3>
 <p><code>act</code> <strong>no</strong> respeta las barreras de protección de entornos de GitHub. Con el <code>GITHUB_TOKEN</code> real del mantenedor introducido en la ejecución, una invocación local exitosa de un trabajo que escribe en GitHub (un <code>publish</code> que llama a <code>gh release create</code>, un trabajo <code>docker</code> que envía a GHCR, un <code>docs-deploy</code> que fuerza el push de <code>gh-pages</code>, un <code>daily-audit</code> que abre un issue, un <code>tweet-release</code> o <code>discord-release</code> que publica en un webhook) podría realizar el efecto secundario en el mundo real al primer intento.</p>
-<p><code>--all</code> por lo tanto aplica una lista de permitidos codificada de trabajos comprobados como seguros para ejecutar localmente — actualmente los pasos de compilación de solo artefactos en <code>release-stable-manual.yml</code> y <code>cross-platform-build-manual.yml</code> (<code>validate</code>, <code>web</code>, <code>release-notes</code>, <code>build</code>, <code>build-desktop</code>). Todo lo demás se omite con un motivo registrado:</p>
+<p><code>--all</code> por lo tanto aplica una lista de permitidos codificada de forma fija con trabajos que se ha comprobado que son seguros para ejecutar localmente; actualmente los pasos de compilación de solo artefactos en <code>release-stable-manual.yml</code> y <code>cross-platform-build-manual.yml</code> (<code>validate</code>, <code>web</code>, <code>release-notes</code>, <code>build</code>, <code>build-desktop</code>). Todo lo demás se omite con un motivo registrado:</p>
 <pre><code>==&gt; skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==&gt; skip release-stable-manual:docker (not on dry-run-safe allowlist)
 ==&gt; skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==&gt; skip docs-deploy:deploy (not on dry-run-safe allowlist)
-==&gt; skip daily-audit:audit (not on dry-run-safe allowlist)
+==&gt; skip daily-audit:advisories (not on dry-run-safe allowlist)
 ==&gt; skip tweet-release:tweet (not on dry-run-safe allowlist)
 </code></pre>
-<p>La lista de permitidos es <strong>fail-closed</strong>: un nuevo workflow agregado al repositorio se trata como potencialmente mutante hasta que un mantenedor lo revise y agregue los IDs de jobs seguros a <code>DRY_RUN_SAFE_JOBS</code> en <code>scripts/dev/act-local.sh</code>. Esto es importante porque <code>discover_jobs</code> recorre cada <code>.github/workflows/*.yml</code>, no solo los workflows de release: una lista de denegados dejaría pasar silenciosamente un futuro workflow con superficie de escritura.</p>
+<p>La lista de permitidos es <strong>fail-closed</strong> (falla en modo cerrado): un nuevo workflow añadido al repositorio se trata como potencialmente mutante hasta que un mantenedor lo revisa y añade los IDs de los jobs seguros a <code>DRY_RUN_SAFE_JOBS</code> en <code>scripts/dev/act-local.sh</code>. Esto es importante porque <code>discover_jobs</code> recorre todos los <code>.github/workflows/*.yml</code>, no solo los workflows de release; una lista de denegados dejaría pasar silenciosamente un futuro workflow con superficie de escritura.</p>
 <p>Existen dos vías de escape para el caso poco frecuente en el que tengas un motivo para intentar ejecutar localmente un trabajo no incluido en la lista de permitidos:</p>
 <ul>
-<li><code>./scripts/dev/act-local.sh release-stable-manual:publish</code> — la forma explícita <code>&lt;wf&gt;:&lt;job&gt;</code> ejecuta lo que solicitas y muestra una advertencia destacada antes de invocar <code>act</code> si el destino no está en la lista de permitidos.</li>
-<li><code>./scripts/dev/act-local.sh --all --no-allowlist</code> — desactiva el filtro de la allowlist para toda una ejecución <code>--all</code> (se usa solo cuando ya has verificado que los pasos del workflow no alcanzarán una superficie de mutación, p. ej. en un fork sin credenciales reales de registro y con un archivo <code>.secrets</code> vacío).</li>
+<li><code>./scripts/dev/act-local.sh release-stable-manual:publish</code>: la forma explícita <code>&lt;wf&gt;:&lt;job&gt;</code> ejecuta lo que solicitas e imprime una advertencia llamativa antes de invocar <code>act</code> si el destino no está en la lista de permitidos.</li>
+<li><code>./scripts/dev/act-local.sh --all --no-allowlist</code>: desactiva el filtro de lista de permitidos para una ejecución completa con <code>--all</code> (se usa solo cuando ya has verificado que los pasos del workflow no alcanzarán una superficie de mutación, p. ej. en un fork sin credenciales reales de registro y con un archivo <code>.secrets</code> vacío).</li>
 </ul>
 <h3 id="qué-se-espera-que-falle-bajo-act-y-está-bien"><a class="header" href="#qué-se-espera-que-falle-bajo-act-y-está-bien">Qué se espera que falle bajo <code>act</code> (y está bien)</a></h3>
 <p><code>act</code> no puede simular algunas superficies exclusivas de GitHub. Estos fallos no son defectos reales:</p>
 <ul>
 <li>Trabajos que dependen de una etiqueta de versión real (<code>publish</code> creando una GitHub Release).</li>
-<li>Trabajos restringidos por entorno (<code>crates-io</code>, <code>docker</code>, <code>publish</code>): la interfaz de aprobación no existe localmente.</li>
+<li>Trabajos restringidos por entorno (<code>publish</code>, <code>docker</code>): la interfaz de aprobación no existe localmente.</li>
 <li>Tokens de identidad federada basados en OIDC.</li>
 </ul>
-<p>Todo lo demás — un error de <code>tsc</code>, un archivo faltante, una falla de compilación de Rust, una discrepancia del lockfile de <code>cargo</code> — es un defecto real. No hagas clic en <strong>Run workflow</strong> en el formulario de GitHub Actions hasta que se corrijan mediante un PR estándar desde master.</p>
+<p>Todo lo demás, un error de <code>tsc</code>, un archivo faltante, un fallo de compilación de Rust, una discrepancia en el lockfile de <code>cargo</code>, es un defecto real. No haga clic en <strong>Run workflow</strong> en el formulario de GitHub Actions hasta que se corrijan mediante un PR estándar desde master.</p>
 <hr>
-<h2 id="paso-4-activar-la-versión"><a class="header" href="#paso-4-activar-la-versión">Paso 4: Activar la versión</a></h2>
+<h2 id="paso-4-activar-el-lanzamiento"><a class="header" href="#paso-4-activar-el-lanzamiento">Paso 4: Activar el lanzamiento</a></h2>
 <p>Ir a:</p>
 <p>https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/release-stable-manual.ymlHaz clic en <strong>Run workflow</strong>. Completa:</p>
 <ul>
 <li><strong>Branch:</strong> <code>master</code></li>
-<li><strong>Versión estable para publicar:</strong> <code>X.Y.Z</code> — sin prefijo <code>v</code></li>
+<li><strong>Versión estable a publicar:</strong> <code>X.Y.Z</code>, sin el prefijo <code>v</code></li>
 </ul>
 <p>Haz clic en <strong>Run workflow</strong>.</p>
 <p>El primer trabajo (<code>validate</code>) verifica que la versión coincida con <code>Cargo.toml</code> y que no exista ya una etiqueta <code>vX.Y.Z</code>. Si falla, corrige la discrepancia y vuelve a activarlo. No intentes evadirlo.</p>
 <hr>
-<h2 id="paso-5-aprobar-las-puertas-de-entorno"><a class="header" href="#paso-5-aprobar-las-puertas-de-entorno">Paso 5: Aprobar las puertas de entorno</a></h2>
-<p>Tres trabajos están restringidos por las reglas de protección de entornos de GitHub. Cuando cada uno quede pendiente, verás un banner de <strong>“Waiting for review”</strong> en la ejecución del flujo de trabajo.</p>
-<p>Apruébalos los tres cuando aparezcan:</p>
+<h2 id="paso-5-apruebe-las-puertas-de-aprobación-del-entorno"><a class="header" href="#paso-5-apruebe-las-puertas-de-aprobación-del-entorno">Paso 5: Apruebe las puertas de aprobación del entorno</a></h2>
+<p>Dos trabajos están restringidos por reglas de protección de entornos de GitHub. Cuando cada uno quede pendiente, verás un banner de <strong>“Waiting for review”</strong> en la ejecución del flujo de trabajo.</p>
+<p>Apruebe ambos cuando aparezcan:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -338,91 +434,84 @@ git checkout upstream/master
 </thead>
 <tbody>
 <tr><td><code>github-releases</code></td><td><code>publish</code></td><td>Crea la Release de GitHub y sube los recursos</td></tr>
-<tr><td><code>crates-io</code></td><td><code>crates-io</code></td><td>Publica crates en crates.io</td></tr>
 <tr><td><code>docker</code></td><td><code>docker</code></td><td>Sube imágenes a GHCR</td></tr>
 </tbody>
 </table>
 </div>
-<p>Si pierdes la ventana de aprobación y un job agota su tiempo de espera, vuelve a ejecutar únicamente el job fallido desde la página de ejecución del workflow: no necesitas empezar desde cero.</p>
+<p>Si se te pasa la ventana de aprobación y un trabajo agota el tiempo de espera, vuelve a ejecutar solo el trabajo fallido desde la página de ejecución del flujo de trabajo; no es necesario reiniciar desde cero.</p>
 <hr>
-<h2 id="paso-6--verificar-la-versión"><a class="header" href="#paso-6--verificar-la-versión">Paso 6 — Verificar la versión</a></h2>
+<h2 id="paso-6-verifica-el-lanzamiento"><a class="header" href="#paso-6-verifica-el-lanzamiento">Paso 6: Verifica el lanzamiento</a></h2>
 <p>Una vez que <code>publish</code> se complete, confirma:</p>
 <pre><code class="language-text">[ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
-[ ] CHANGELOG-next.md is gone from master (the publish job removes it automatically)
 </code></pre>
-<p>No es necesario verificar manualmente Docker, crates.io ni los canales de distribución a menos que algún trabajo en la ejecución del flujo de trabajo aparezca en rojo. Revisa el resumen de la ejecución del flujo de trabajo: si todos los trabajos están en verde, has terminado.</p>
+<p><code>CHANGELOG-next.md</code> se deja intencionalmente en <code>master</code> después del lanzamiento: el trabajo de publicación solo lo lee como el cuerpo del lanzamiento, no lo elimina. El siguiente ciclo de lanzamiento lo sobrescribe, por lo que no se requiere limpieza manual.</p>
+<p>No es necesario que verifiques manualmente Docker ni los canales de distribución a menos que un trabajo en la ejecución del workflow aparezca en rojo. Revisa el resumen de la ejecución del workflow; si todos los trabajos están en verde, has terminado.</p>
 <hr>
-<h2 id="step-7--versioned-documentation-deployment"><a class="header" href="#step-7--versioned-documentation-deployment">Step 7 — Versioned documentation deployment</a></h2>
-<p>ZeroClaw docs use a versioned structure on the <code>gh-pages</code> branch. When a tag is pushed, the <code>Deploy mdBook docs to Pages</code> workflow automatically builds and deploys the documentation for that version.</p>
-<h3 id="what-happens-automatically"><a class="header" href="#what-happens-automatically">What happens automatically</a></h3>
+<h2 id="paso-7-despliegue-de-documentación-versionada"><a class="header" href="#paso-7-despliegue-de-documentación-versionada">Paso 7: Despliegue de documentación versionada</a></h2>
+<p>La documentación de ZeroClaw usa una estructura versionada en la rama <code>gh-pages</code>. Cuando se hace push de una etiqueta, el flujo de trabajo <code>Deploy mdBook docs to Pages</code> compila y despliega automáticamente la documentación de esa versión. Esto se ejecuta automáticamente después de que llega la etiqueta del paso 4; los detalles de inicialización y de versión mínima que aparecen a continuación son material de referencia para cuando necesites recrear <code>gh-pages</code> o cambiar el rango de versiones compatibles.</p>
+<h3 id="qué-sucede-automáticamente"><a class="header" href="#qué-sucede-automáticamente">Qué sucede automáticamente</a></h3>
 <ul>
-<li>Pushing a tag (e.g., <code>v0.8.0</code>) triggers a build that lands in <code>/v0.8.0/</code>.</li>
-<li>If the tag is a GA release (no pre-release suffix), it is also copied to <code>/stable/</code>.</li>
-<li>The <code>_shared/</code> directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.</li>
+<li>Hacer push de una etiqueta (p. ej., <code>v0.8.0</code>) activa una compilación que se publica en <code>/v0.8.0/</code>.</li>
+<li>Si la etiqueta es una versión GA (sin sufijo de prelanzamiento), también se copia a <code>/stable/</code>.</li>
+<li>El directorio <code>_shared/</code> (que contiene CSS de UI, JS y favicons) se actualiza desde la compilación para que el tema se aplique en cascada a todas las versiones desplegadas.</li>
 </ul>
-<h3 id="bootstrapping-gh-pages"><a class="header" href="#bootstrapping-gh-pages">Bootstrapping <code>gh-pages</code></a></h3>
-<p>If <code>gh-pages</code> is ever deleted or needs to be fully recreated, seed the versions in this specific order:</p>
+<h3 id="inicializando-gh-pages"><a class="header" href="#inicializando-gh-pages">Inicializando <code>gh-pages</code></a></h3>
+<p>Si la rama <code>gh-pages</code> alguna vez se elimina o necesita recrearse por completo, inicializa las versiones en este orden específico:</p>
 <ol>
-<li><strong>Oldest supported release:</strong> <code>workflow_dispatch</code> with tag <code>v0.7.5</code></li>
-<li><strong>Next releases:</strong> <code>workflow_dispatch</code> with tag <code>v0.8.0-beta-1</code> etc.</li>
-<li><strong>Current master:</strong> <code>workflow_dispatch</code> with tag <code>master</code></li>
+<li><strong>Versión compatible más antigua:</strong> <code>workflow_dispatch</code> con la etiqueta <code>v0.7.5</code></li>
+<li><strong>Próximas versiones:</strong> <code>workflow_dispatch</code> con la etiqueta <code>v0.8.0-beta-1</code>, etc.</li>
+<li><strong>Master actual:</strong> <code>workflow_dispatch</code> con la etiqueta <code>master</code></li>
 </ol>
 <blockquote>
-<p>[!IMPORTANT] <code>master</code> must be deployed <strong>last</strong> during bootstrapping. It writes the definitive <code>_shared/</code> chrome layer that all other versions use.</p>
+<p>[!IMPORTANTE] <code>master</code> debe desplegarse en <strong>último</strong> lugar durante el bootstrapping. Escribe la capa de chrome <code>_shared/</code> definitiva que utilizan todas las demás versiones.</p>
 </blockquote>
-<h3 id="manual-redeploys-and-the-version-floor"><a class="header" href="#manual-redeploys-and-the-version-floor">Manual redeploys and the Version Floor</a></h3>
-<p>To manually re-deploy a specific version:</p>
+<h3 id="redespliegues-manuales-y-el-version-floor"><a class="header" href="#redespliegues-manuales-y-el-version-floor">Redespliegues manuales y el Version Floor</a></h3>
+<p>Para volver a desplegar manualmente una versión específica:</p>
 <ol>
-<li>Go to <strong>Actions</strong> → <strong>Deploy mdBook docs to Pages</strong></li>
-<li>Click <strong>Run workflow</strong></li>
-<li>Enter the tag (e.g., <code>v0.7.5</code> or <code>master</code>)</li>
+<li>Ve a <strong>Actions</strong> → <strong>Deploy mdBook docs to Pages</strong></li>
+<li>Haz clic en <strong>Run workflow</strong></li>
+<li>Ingrese la etiqueta (p. ej., <code>v0.7.5</code> o <code>master</code>)</li>
 </ol>
-<p><strong>The <code>DOCS_MIN_VERSION</code> floor:</strong> To prevent accidentally deploying very old or unsupported versions, the workflow enforces a minimum version floor (currently <code>v0.7.5</code>).</p>
+<p><strong>El piso <code>DOCS_MIN_VERSION</code>:</strong> Para evitar el despliegue accidental de versiones muy antiguas o sin soporte, el flujo de trabajo aplica un piso de versión mínima (actualmente <code>v0.7.5</code>).</p>
 <ul>
-<li>Tags older than <code>DOCS_MIN_VERSION</code> (like <code>v0.7.4</code>) are rejected by the workflow.</li>
-<li><code>cargo mdbook gen-versions</code> (the xtask helper) ignores any directories on <code>gh-pages</code> below this floor, keeping them out of the version dropdown.</li>
+<li>Las etiquetas más antiguas que <code>DOCS_MIN_VERSION</code> (como <code>v0.7.4</code>) son rechazadas por el flujo de trabajo.</li>
+<li><code>cargo mdbook gen-versions</code> (el asistente de xtask) ignora cualquier directorio en <code>gh-pages</code> por debajo de este mínimo, manteniéndolos fuera del menú desplegable de versiones.</li>
 </ul>
-<p>If you need to raise the floor to drop support for an older version:</p>
+<p>Si necesitas elevar el mínimo de versión para dejar de dar soporte a una versión anterior:</p>
 <ol>
-<li>Update the <code>DOCS_MIN_VERSION</code> environment variable in <code>.github/workflows/docs-deploy.yml</code>.</li>
-<li>(Optional) Delete the old version’s directory from the <code>gh-pages</code> branch to save space.</li>
+<li>Actualiza la variable de entorno <code>DOCS_MIN_VERSION</code> en <code>.github/workflows/docs-deploy.yml</code>.</li>
+<li>(Opcional) Elimine el directorio de la versión antigua de la rama <code>gh-pages</code> para ahorrar espacio.</li>
 </ol>
 <hr>
 <h2 id="si-algo-sale-mal"><a class="header" href="#si-algo-sale-mal">Si algo sale mal</a></h2>
-<p><strong>validate falló — discrepancia de versión:</strong> El PR de incremento de versión no se fusionó, o escribiste la versión incorrecta. Corrige la discrepancia y vuelve a activar.</p>
+<p><strong>validate falló: discrepancia de versión:</strong> El PR de incremento de versión no fue fusionado, o escribiste la versión incorrecta. Corrige la discrepancia y vuelve a ejecutar el disparador.</p>
 <p><strong>Una puerta de entorno agotó el tiempo de espera:</strong> Vuelve a ejecutar solo el trabajo que agotó el tiempo de espera. No es necesario reiniciar el flujo de trabajo.</p>
-<p><strong>publish tuvo éxito, pero CHANGELOG-next.md sigue en master:</strong> Elimínalo manualmente:</p>
-<pre><code class="language-bash">git checkout master &amp;&amp; git pull --ff-only origin master
-git rm CHANGELOG-next.md
-git commit -m chore: remove CHANGELOG-next.md after vX.Y.Z release
-git push origin master
-</code></pre>
-<p><strong>Un trabajo de canal de distribución falló (Scoop, AUR, Homebrew):</strong> Cada uno tiene un subflujo de trabajo que se puede activar manualmente. Vuelve a ejecutar el específico con <code>dry_run: true</code> primero para confirmar la corrección, luego <code>dry_run: false</code>. Estos son complementarios: un trabajo de Scoop fallido no invalida la versión en sí.</p>
+<p><strong>Falló un trabajo de canal de distribución (Scoop, AUR, Homebrew):</strong> Cada uno tiene un sub-workflow correspondiente que se puede activar manualmente. Vuelva a ejecutar el específico con <code>dry_run: true</code> primero para confirmar la corrección, luego con <code>dry_run: false</code>. Estos son opcionales: un trabajo fallido de Scoop no invalida la versión en sí.</p>
 <hr>
-<h2 id="flujos-de-trabajo-que-no-debes-tocar"><a class="header" href="#flujos-de-trabajo-que-no-debes-tocar">Flujos de trabajo que no debes tocar</a></h2>
-<p>Los siguientes flujos de trabajo existen en <code>.github/workflows/</code>, pero son peligrosos y están programados para su eliminación en v0.7.4 (#5915). No los actives. No los extiendas.</p>
+<h2 id="se-eliminaron-los-flujos-de-trabajo-heredados"><a class="header" href="#se-eliminaron-los-flujos-de-trabajo-heredados">Se eliminaron los flujos de trabajo heredados</a></h2>
+<p>Varios flujos de trabajo de publicación automática que anteriormente residían en <code>.github/workflows/</code> han sido eliminados porque omitían la revisión o publicaban de forma irreversible. Ya no están presentes; si alguno reaparece en un PR, trátelo como una regresión y bloquéelo:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Flujo de trabajo</th><th>Por qué es peligroso</th></tr>
+<tr><th>Flujo de trabajo</th><th>Por qué se eliminó</th></tr>
 </thead>
 <tbody>
-<tr><td><code>release-beta-on-push.yml</code></td><td>Publica automáticamente en cada push a master</td></tr>
-<tr><td><code>publish-crates-auto.yml</code></td><td>Se publica automáticamente en crates.io ante cualquier cambio de versión — irreversible</td></tr>
-<tr><td><code>version-sync.yml</code></td><td>Hace commits directamente a master como bot, omitiendo la revisión</td></tr>
-<tr><td><code>checks-on-pr.yml</code></td><td>CI duplicado — produce un estado conflictivo y confuso</td></tr>
-<tr><td><code>pre-release-validate.yml</code></td><td>Lista de verificación generada sin usar — este runbook la reemplaza</td></tr>
+<tr><td><code>release-beta-on-push.yml</code></td><td>Se publica automáticamente en cada push a master</td></tr>
+<tr><td><code>publish-crates-auto.yml</code></td><td>Publicación automática en crates.io con cada cambio de versión, irreversible</td></tr>
+<tr><td><code>version-sync.yml</code></td><td>Se hizo commit directamente en master como bot, omitiendo la revisión</td></tr>
+<tr><td><code>checks-on-pr.yml</code></td><td>CI duplicada: produjo estados conflictivos confusos</td></tr>
+<tr><td><code>pre-release-validate.yml</code></td><td>Lista de verificación generada sin usar; este runbook la reemplaza</td></tr>
 </tbody>
 </table>
 </div>
-<p>Todos los demás flujos de trabajo no listados anteriormente están congelados hasta la v0.7.5 o se mantienen activamente. Consulta <code>docs/contributing/ci-map.md</code> para ver el inventario completo una vez que se reescriba en #5917.</p>
+<p>El inventario completo de los flujos de trabajo que permanecen (automáticos y manuales) se encuentra en <a href="./ci-and-actions.html">CI &amp; Actions</a>.</p>
 <hr>
 <h2 id="hacia-dónde-se-dirige-esto"><a class="header" href="#hacia-dónde-se-dirige-esto">Hacia dónde se dirige esto</a></h2>
 <p>Este runbook y <code>release-stable-manual.yml</code> son un puente, no un destino.</p>
-<p>En v0.7.5, el objetivo es:</p>
+<p>El estado final objetivo:</p>
 <ul>
 <li>release-plz gestiona automáticamente los incrementos de versión y los registros de cambios</li>
 <li>Un único <code>release.yml</code> reemplaza el actual mosaico de subflujos de trabajo</li>
@@ -439,9 +528,6 @@ git push origin master
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../maintainers/changelog-generation.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
-                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -453,9 +539,6 @@ git push origin master
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../maintainers/changelog-generation.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
-                    </a>
             </nav>
 
         </div>
@@ -475,6 +558,114 @@ git push origin master
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

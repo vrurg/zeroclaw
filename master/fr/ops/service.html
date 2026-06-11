@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,7 +294,7 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="service--démon"><a class="header" href="#service--démon">Service &amp; Démon</a></h1>
-<p>Cette page est le complément côté opérations de <a href="../setup/service.html">Configuration → Gestion des services</a> — cette page couvre l’installation et la désinstallation du service. Celle-ci traite de son exécution : réglages, limites de ressources, redémarrages gracieux et configurations multi-espaces de travail.</p>
+<p>Cette page est le pendant côté exploitation de <a href="../setup/service.html">Configuration → Gestion du service</a> ; cette dernière couvre l’installation et la désinstallation du service. Cette page couvre son exécution : réglage, limites de ressources, redémarrages progressifs et configurations multi-espaces de travail.</p>
 <h2 id="choisir-entre-la-portée-utilisateur-et-la-portée-système"><a class="header" href="#choisir-entre-la-portée-utilisateur-et-la-portée-système">Choisir entre la portée utilisateur et la portée système</a></h2>
 <div class="table-wrapper">
 <table>
@@ -231,55 +308,64 @@
 </table>
 </div>
 <p>Sur Linux de bureau, activez la persistance des services utilisateur afin que le service utilisateur persiste après les déconnexions :</p>
-<pre><code class="language-bash">loginctl enable-linger $USER
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">loginctl enable-linger $USER
 </code></pre>
+</div>
+
 <p>Sans délai, un service systemd à portée d’utilisateur s’arrête lorsque la dernière session se ferme.</p>
 <h2 id="comportement-de-redémarrage"><a class="header" href="#comportement-de-redémarrage">Comportement de redémarrage</a></h2>
-<p>L’unité par défaut (<code>~/.config/systemd/user/zeroclaw.service</code>) utilise :</p>
-<pre><code class="language-ini">Restart=on-failure
-RestartSec=10s
+<p>L’unité utilisateur systemd installée (<code>~/.config/systemd/user/zeroclaw.service</code>) utilise :</p>
+<pre><code class="language-ini">Restart=always
+RestartSec=3
 </code></pre>
-<p>L’agent se termine proprement en cas d’erreurs de configuration (<code>exit 2</code>) et n’est pas redémarré — cela empêche un service instable de consommer du CPU pendant que vous corrigez la configuration. Pour les autres codes de sortie, systemd redémarre avec un délai croissant de 10 secondes.</p>
-<p>Sur macOS, le plist du LaunchAgent possède <code>KeepAlive = true</code> avec <code>SuccessfulExit = false</code>. Même sémantique que <code>on-failure</code>.</p>
-<p>Sous Windows, la tâche du Planificateur de tâches est configurée avec « Redémarrer si la tâche échoue » — réessayer toutes les 10 s, jusqu’à 10 fois.</p>
+<p>systemd redémarre le démon à chaque arrêt avec un délai de 3 secondes. Il n’existe pas de liste d’autorisation des codes de sortie, donc un démon qui échoue rapidement à cause d’une configuration invalide redémarrera en boucle ; corrigez la configuration et exécutez <code>systemctl --user restart zeroclaw</code> plutôt que de compter sur l’abandon du service.</p>
+<p>Sur macOS, le LaunchAgent (<code>~/Library/LaunchAgents/com.zeroclaw.daemon.plist</code>) définit <code>RunAtLoad</code> et <code>KeepAlive</code> à <code>true</code>, de sorte que launchd maintient le démon en cours d’exécution et le relance chaque fois qu’il se termine.</p>
+<p>Sous Windows, <code>zeroclaw service install</code> enregistre une tâche du Planificateur de tâches déclenchée <code>ONLOGON</code> au niveau d’exécution <code>LIMITED</code>. Elle démarre le démon à l’ouverture de session ; elle n’ajoute pas de stratégie de redémarrage automatique en cas d’échec.</p>
 <h2 id="arrêt-gracieux"><a class="header" href="#arrêt-gracieux">Arrêt gracieux</a></h2>
-<p>Le daemon intercepte <code>SIGTERM</code> (Unix) ou <code>CTRL_CLOSE_EVENT</code> (Windows) :</p>
-<ol>
-<li>Arrêter d’accepter de nouveaux événements de canal</li>
-<li>Vider les boucles d’agents en cours d’exécution (jusqu’à <code>[daemon] shutdown_grace_secs</code>, par défaut 30)</li>
-<li>Vider les reçus de l’outil et la mémoire de la conversation vers SQLite</li>
-<li>Déconnecter les canaux et fermer l’écouteur de la passerelle</li>
-<li>Sortie 0</li>
-</ol>
-<p>Si l’agent est en cours d’appel d’outil au moment où l’arrêt est initié, l’outil bénéficie d’un délai de grâce pour se terminer. Passé ce délai, <code>SIGKILL</code> le termine ; la réception est marquée comme interrompue.</p>
-<p>Forcez une sortie immédiate avec <code>SIGKILL</code> si nécessaire, mais attendez-vous à ce que la mémoire de conversation pour les sessions en cours soit incomplète.</p>
+<p>Sur Unix, le daemon intercepte <code>SIGINT</code> et <code>SIGTERM</code> ; sur Windows, il intercepte Ctrl+C (<code>ctrl_c</code>). Chacun de ces signaux déclenche un arrêt propre : le daemon arrête son serveur de canaux et l’écouteur de la passerelle, puis se termine.</p>
+<p><code>SIGHUP</code> est ignoré (le démon continue de s’exécuter). Un rechargement demandé via le point de terminaison <code>/admin/reload</code> redémarre la boucle du démon sur place plutôt que de quitter.</p>
+<p>La mémoire de conversation et l’état de session sont écrits dans SQLite de manière incrémentale pendant le fonctionnement, et non mis en tampon jusqu’à l’arrêt, donc un arrêt propre ne dépend pas d’une étape de vidage (flush). Les reçus d’outils sont des jetons HMAC intégrés dans la conversation, et non un journal séparé sur disque. Un <code>SIGKILL</code> brutal ignore la fermeture propre du canal mais ne corrompt pas la mémoire déjà validée ; seul un tour d’agent en cours d’écriture est perdu.</p>
 <h2 id="démarrage-manuel-pour-le-débogage"><a class="header" href="#démarrage-manuel-pour-le-débogage">Démarrage manuel pour le débogage</a></h2>
 <p>Ignorer le service et exécuter le démon directement :</p>
-<pre><code class="language-bash">zeroclaw service stop     # libérer le port de la passerelle si le service est en cours d'exécution
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service stop     # libérer le port de la passerelle si le service est en cours d'exécution
 zeroclaw daemon
 </code></pre>
-<p><code>zeroclaw daemon</code> s’exécute en premier plan, effectue la journalisation vers stderr, et est le même processus que celui utilisé par le service — simplement sans le harnais de service. Utile lorsque :</p>
+</div>
+
+<p><code>zeroclaw daemon</code> s’exécute au premier plan, journalise sur stderr, et est le même processus que celui exécuté par le service, simplement sans l’enveloppe du service. Utile lorsque :</p>
 <ul>
 <li>Diagnostic des échecs de démarrage que le service avale</li>
 <li>Exécution sous <code>gdb</code> / <code>lldb</code></li>
 <li>Tester une modification de configuration avant de la valider</li>
 </ul>
-<p>Terminer avec Ctrl-C — mêmes sémantiques d’arrêt gracieux que SIGTERM.</p>
+<p>Terminer avec Ctrl-C, mêmes sémantiques d’arrêt progressif que SIGTERM.</p>
 <h2 id="limites-de-ressources"><a class="header" href="#limites-de-ressources">Limites de ressources</a></h2>
-<h3 id="linux--systemd"><a class="header" href="#linux--systemd">Linux — systemd</a></h3>
+<h3 id="linux--systemd"><a class="header" href="#linux--systemd">Linux : systemd</a></h3>
 <p>Ajouter à un drop-in :</p>
-<pre><code class="language-bash">systemctl --user edit zeroclaw.service
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">systemctl --user edit zeroclaw.service
 </code></pre>
+</div>
+
 <pre><code class="language-ini">[Service]
 MemoryMax=2G
 CPUQuota=200%            # two cores
 LimitNOFILE=16384        # if opening many channel sockets
 </code></pre>
 <p>Recharger et redémarrer :</p>
-<pre><code class="language-bash">systemctl --user daemon-reload
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">systemctl --user daemon-reload
 systemctl --user restart zeroclaw
 </code></pre>
-<h3 id="macos--launchd"><a class="header" href="#macos--launchd">macOS — launchd</a></h3>
+</div>
+
+<h3 id="macos--launchd"><a class="header" href="#macos--launchd">macOS : launchd</a></h3>
 <p>Modifiez <code>~/Library/LaunchAgents/com.zeroclaw.daemon.plist</code> :</p>
 <pre><code class="language-xml">&lt;key&gt;SoftResourceLimits&lt;/key&gt;
 &lt;dict&gt;
@@ -288,9 +374,13 @@ systemctl --user restart zeroclaw
 &lt;/dict&gt;
 </code></pre>
 <p>Décharger + charger le plist pour appliquer :</p>
-<pre><code class="language-bash">launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 </code></pre>
+</div>
+
 <h3 id="docker"><a class="header" href="#docker">Docker</a></h3>
 <p>Composer :</p>
 <pre><code class="language-yaml">services:
@@ -302,24 +392,28 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
       pas de fichier: 16384
 </code></pre>
 <h2 id="exécution-de-plusieurs-espaces-de-travail"><a class="header" href="#exécution-de-plusieurs-espaces-de-travail">Exécution de plusieurs espaces de travail</a></h2>
-<p>Chaque instance de ZeroClaw possède un espace de travail. Pour en exécuter deux :</p>
-<ol>
-<li>Installez le binaire une fois</li>
-<li>Créez <code>~/.zeroclaw-home/</code> et <code>~/.zeroclaw-work/</code> (ou à un autre emplacement)</li>
-<li>Exécutez deux services pointant vers différents espaces de travail :</li>
-</ol>
-<pre><code class="language-bash">ZEROCLAW_WORKSPACE=~/.zeroclaw-home zeroclaw service install --name zeroclaw-home
-ZEROCLAW_WORKSPACE=~/.zeroclaw-work zeroclaw service install --name zeroclaw-work
+<p>Chaque démon ZeroClaw possède un répertoire de configuration (qui contient son répertoire <code>data/</code>). Pour en exécuter deux côte à côte, attribuez à chacun son propre répertoire de configuration via <code>--config-dir</code> (ou la variable d’environnement <code>ZEROCLAW_CONFIG_DIR</code>) :</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">zeroclaw --config-dir ~/.zeroclaw-home daemon
+zeroclaw --config-dir ~/.zeroclaw-work daemon
 </code></pre>
-<p>Chacun dispose de son propre fichier d’unité / plist, de son propre port de passerelle (configurable dans chaque configuration) et de ses propres liaisons de canal. La mémoire reste isolée ; un bot Telegram dans un espace de travail ne connaît pas l’autre.</p>
-<p>Ne pointez pas deux daemons vers le même espace de travail. SQLite est un système à écriture unique ; le second échouera au démarrage.</p>
+</div>
+
+<p>Chaque instance lit sa propre configuration, son propre répertoire <code>data/</code> (mémoire, sessions), son propre port de passerelle (défini par configuration) et ses propres liaisons de canaux. La mémoire reste séparée ; un bot Telegram dans un répertoire de configuration ne connaît pas l’autre.</p>
+<p><code>zeroclaw service install</code> installe toujours une seule unité pointant vers le répertoire de configuration par défaut ; il n’a aucun indicateur permettant de nommer ou de paramétrer les instances. Pour en exécuter plusieurs en tant que service persistant, rédigez manuellement un second fichier d’unité (copiez <code>~/.config/systemd/user/zeroclaw.service</code> sous un nouveau nom) dont le <code>ExecStart</code> passe <code>--config-dir &lt;dir&gt;</code>, puis activez-le séparément.</p>
+<p>Ne pointez pas deux démons vers le même répertoire de configuration. SQLite n’accepte qu’un seul écrivain ; le second échouera au démarrage.</p>
 <h2 id="observer-les-redémarrages-et-les-plantages"><a class="header" href="#observer-les-redémarrages-et-les-plantages">Observer les redémarrages et les plantages</a></h2>
-<pre><code class="language-bash"># Linux
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh"># Linux
 journalctl --user -u zeroclaw --since Il y a 1 jour | grep -E 'Démarré|Arrêté|Échoué'
 
 # macOS
 log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'démarrer|arrêter|erreur'
 </code></pre>
+</div>
+
 <p>Si vous constatez des redémarrages répétés, activez la journalisation de débogage (<code>RUST_LOG=debug</code> via le paramètre <code>Environment=</code> du fichier unit) et laissez un nouveau crash se produire pour capturer la trace complète.</p>
 <h2 id="voir-aussi"><a class="header" href="#voir-aussi">Voir aussi</a></h2>
 <ul>
@@ -372,6 +466,114 @@ log show --predicate 'process == "zeroclaw"' --last 1d | grep -E 'démarrer|arr�
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -221,85 +298,41 @@
 <h2 id="chemins-rapides"><a class="header" href="#chemins-rapides">Chemins rapides</a></h2>
 <ul>
 <li><a href="#2-mqtt-integration">Intégration MQTT</a></li>
-<li><a href="#3-intégration-webhook">Intégration Webhook</a></li>
-<li><a href="#4-cron-integration">Intégration Cron</a></li>
-<li><a href="#5-paramètres-de-sécurité-par-défaut">Paramètres de sécurité par défaut</a></li>
-<li><a href="#6-troubleshooting">Dépannage</a></li>
+<li><a href="#3-other-trigger-types">Autres types de déclencheurs</a></li>
+<li><a href="#4-security-defaults">Paramètres de sécurité par défaut</a></li>
+<li><a href="#5-troubleshooting">Dépannage</a></li>
 </ul>
 <h2 id="1-aperçu"><a class="header" href="#1-aperçu">1. Aperçu</a></h2>
-<p>ZeroClaw achemine les événements MQTT/webhook/cron/périphériques via un répartiteur SOP unifié (<code>dispatch_sop_event</code>).</p>
+<p>Les exécutions de SOP sont pilotées par des événements transmis au moteur SOP via <code>dispatch_sop_event</code>. Le moteur compare chaque événement aux déclencheurs de chaque SOP chargée et démarre des exécutions pour celles qui correspondent.</p>
 <p>Comportements clés :</p>
 <ul>
-<li><strong>Correspondance cohérente des déclencheurs :</strong> un seul chemin de correspondance pour toutes les sources d’événements.</li>
+<li><strong>Correspondance cohérente des déclencheurs :</strong> un seul chemin de correspondance évalue tous les types de déclencheurs.</li>
 <li><strong>Audit de début d’exécution :</strong> les exécutions démarrées sont persistées via <code>SopAuditLogger</code>.</li>
-<li><strong>Sécurité sans tête :</strong> dans les contextes hors boucle d’agent, les actions <code>ExecuteStep</code> sont consignées comme en attente (et non exécutées silencieusement).</li>
+<li><strong>Sécurité en mode headless :</strong> dans les contextes hors boucle d’agent, <code>process_headless_results</code> journalise les actions <code>ExecuteStep</code> comme en attente au lieu de les exécuter silencieusement.</li>
 </ul>
+<p>Parmi les types de déclencheurs définis, <strong>MQTT</strong> est la seule source d’événements reliée à un écouteur actif dans le démon. Les exécutions peuvent également être démarrées directement depuis un tour d’agent avec l’outil <code>sop_execute</code>. Les types de déclencheurs webhook, cron et périphérique sont définis et mis en correspondance par le moteur, mais aucun runtime n’alimente actuellement ces sources d’événements dans <code>dispatch_sop_event</code>. Voir <a href="#3-other-trigger-types">Autres types de déclencheurs</a>.</p>
 <h2 id="2-intégration-mqtt"><a class="header" href="#2-intégration-mqtt">2. Intégration MQTT</a></h2>
+<p>MQTT est pris en charge par <code>run_mqtt_sop_listener</code>, qui s’abonne au broker, construit un <code>SopEvent</code> MQTT par message et appelle <code>dispatch_sop_event</code>. Ce chemin est conditionné par la fonctionnalité de compilation <code>channel-mqtt</code>.</p>
 <h3 id="21-configuration"><a class="header" href="#21-configuration">2.1 Configuration</a></h3>
-<p>Configurez l’accès au courtier avec <code>zeroclaw config set channels.mqtt.&lt;field&gt; &lt;value&gt;</code> — les clés sont placées sous <code>[channels.mqtt]</code> dans la configuration stockée. Consultez la <a href="../reference/config.html">Référence de configuration</a> pour l’ensemble des champs. Le drapeau <code>use_tls</code> doit correspondre au schéma de <code>broker_url</code> (<code>mqtts://</code> ⇒ <code>true</code>, <code>mqtt://</code> ⇒ <code>false</code>).</p>
+<p>Configurez l’accès au broker avec <code>zeroclaw config set channels.mqtt.&lt;field&gt; &lt;value&gt;</code> : les clés sont placées sous <code>[channels.mqtt]</code> dans la configuration enregistrée. Consultez la <a href="../reference/config.html">référence de configuration</a> pour tous les champs. L’indicateur <code>use_tls</code> doit correspondre au schéma de <code>broker_url</code> (<code>mqtts://</code> ⇒ <code>true</code>, <code>mqtt://</code> ⇒ <code>false</code>).</p>
 <h3 id="22-définition-du-déclencheur"><a class="header" href="#22-définition-du-déclencheur">2.2 Définition du déclencheur</a></h3>
-<p>Dans <code>SOP.toml</code> :</p>
-<pre><code class="language-toml">[[triggers]]
-type = "mqtt"
-topic = "sensors/alert"
-condition = "$.severity &gt;= 2"
-</code></pre>
-<p>Le payload MQTT est transféré dans le payload de l’événement SOP (<code>event.payload</code>), puis affiché dans le contexte de l’étape.</p>
-<h2 id="3-intégration-de-webhook"><a class="header" href="#3-intégration-de-webhook">3. Intégration de Webhook</a></h2>
-<h3 id="31-points-de-terminaison"><a class="header" href="#31-points-de-terminaison">3.1 Points de terminaison</a></h3>
-<ul>
-<li><strong><code>POST /sop/{*rest}</code></strong> : point de terminaison réservé aux SOP. Renvoie <code>404</code> si aucun SOP ne correspond.</li>
-<li><strong><code>POST /webhook</code></strong> : point de terminaison de chat. La répartition SOP s’exécute en premier ; en l’absence de correspondance, la requête entre dans le flux LLM normal.</li>
-</ul>
-<p>La correspondance des chemins est exacte par rapport au chemin de déclenchement du webhook configuré.</p>
-<p>La traduction de la réponse est l’objet de la requête.</p>
-<ul>
-<li>Chemin de déclenchement dans SOP : <code>path = "/sop/deploy"</code></li>
-<li>Requête de correspondance : <code>POST /sop/deploy</code></li>
-</ul>
-<h3 id="32-autorisation"><a class="header" href="#32-autorisation">3.2 Autorisation</a></h3>
-<p>Lorsque l’appairage est activé (par défaut), fournir :</p>
-<ol>
-<li><code>Authorization: Bearer &lt;token&gt;</code> (de <code>POST /pair</code>)</li>
-<li>Couche optionnelle : <code>X-Webhook-Secret: &lt;secret&gt;</code> lorsque le secret du webhook est configuré</li>
-</ol>
-<h3 id="33-idempotence"><a class="header" href="#33-idempotence">3.3 Idempotence</a></h3>
-<p>Utiliser :</p>
-<p><code>X-Idempotency-Key: &lt;unique-key&gt;</code></p>
-<p>Valeurs par défaut :</p>
-<ul>
-<li>TTL : 300s</li>
-<li>Réponse en double : <code>200 OK</code> avec <code>"status": "duplicate"</code></li>
-</ul>
-<p>Les clés d’idempotence sont nommées par espace de noms par point de terminaison (<code>/webhook</code> vs <code>/sop/*</code>).</p>
-<h3 id="34-exemple-de-requête"><a class="header" href="#34-exemple-de-requête">3.4 Exemple de requête</a></h3>
-<pre><code class="language-bash">curl -X POST http://127.0.0.1:42617/sop/deploy \
-  -H "Authorization: Bearer &lt;token&gt;" \
-  -H "X-Idempotency-Key: $(uuidgen)" \
-  -H "Content-Type: application/json" \
-  -d '{"message":"deploy-service-a"}'
-</code></pre>
-<p>Réponse typique :</p>
-<pre><code class="language-json">{
-  "statut": "accepté",
-  "sops correspondants": ["déployer-pipeline"],
-  "source": "sop_webhook",
-  "chemin": "/sop/deploy"
-}
-</code></pre>
-<h2 id="4-intégration-cron"><a class="header" href="#4-intégration-cron">4. Intégration Cron</a></h2>
-<p>Le planificateur évalue les déclencheurs cron mis en cache à l’aide d’une vérification basée sur une fenêtre.</p>
-<ul>
-<li><strong>Basé sur une fenêtre :</strong> les événements survenant dans <code>(last_check, now]</code> ne sont pas manqués.</li>
-<li><strong>Au plus une fois par expression par tick :</strong> si plusieurs points de déclenchement se trouvent dans une même fenêtre de sondage, le dispatching est effectué une seule fois.</li>
-</ul>
-<p>Exemple de déclencheur :</p>
-<pre><code class="language-toml">[[triggers]]
-type = "cron"
-expression = "0 0 8 * * *"
-</code></pre>
-<p>Les expressions Cron prennent en charge 5, 6 ou 7 champs.</p>
-<h2 id="5-paramètres-de-sécurité-par-défaut"><a class="header" href="#5-paramètres-de-sécurité-par-défaut">5. Paramètres de sécurité par défaut</a></h2>
+<p>Le déclencheur de la SOP est défini dans son fichier <code>SOP.toml</code> (voir <a href="./syntax.html">Syntaxe</a>). Les motifs de topics prennent en charge les caractères génériques <code>+</code> (un seul niveau) et <code>#</code> (plusieurs niveaux). La charge utile MQTT est transmise dans la charge utile de l’événement SOP (<code>event.payload</code>) et est disponible pour une <code>condition</code> de déclenchement facultative, puis affichée dans le contexte de l’étape.</p>
+<h2 id="3-autres-types-de-déclencheurs"><a class="header" href="#3-autres-types-de-déclencheurs">3. Autres types de déclencheurs</a></h2>
+<p>Le moteur définit et fait correspondre trois types de déclencheurs supplémentaires, mais aucune source d’événements en direct n’achemine actuellement les événements vers le répartiteur pour ceux-ci. La syntaxe des déclencheurs est acceptée dans <code>SOP.toml</code> et validée (voir <a href="./syntax.html">Syntaxe</a>) ; la logique de correspondance est exercée par des tests, mais le fan-in à l’exécution n’est pas encore câblé.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type de déclencheur</th><th>Matcher</th><th>État du câblage</th></tr>
+</thead>
+<tbody>
+<tr><td><code>webhook</code></td><td>Correspondance exacte avec le <code>path</code> du déclencheur</td><td>Aucune route HTTP ne distribue les webhooks <code>SopEvent</code> ; la passerelle ne possède aucun point de terminaison SOP.</td></tr>
+<tr><td><code>cron</code></td><td><code>check_sop_cron_triggers</code> effectue une vérification basée sur une fenêtre temporelle sur les déclencheurs cron mis en cache</td><td>Définie, mais aucun appelant du planificateur ne l’invoque en dehors des tests.</td></tr>
+<tr><td><code>peripheral</code></td><td>Correspondance exacte avec <code>"{board}/{signal}"</code></td><td><code>dispatch_peripheral_signal</code> existe, mais aucun écouteur de périphérique ne l’appelle en dehors des tests.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Définir l’un de ces déclencheurs dans un <code>SOP.toml</code> est valide et ne provoquera pas d’erreur, mais la SOP ne démarrera que via MQTT ou <code>sop_execute</code> tant que la source d’événements correspondante n’est pas connectée.</p>
+<h2 id="4-paramètres-de-sécurité-par-défaut"><a class="header" href="#4-paramètres-de-sécurité-par-défaut">4. Paramètres de sécurité par défaut</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -307,14 +340,12 @@ expression = "0 0 8 * * *"
 </thead>
 <tbody>
 <tr><td><strong>Transport MQTT</strong></td><td><code>mqtts://</code> + <code>use_tls = true</code> pour le transport TLS</td></tr>
-<tr><td><strong>Authentification du webhook</strong></td><td>Jeton porteur de couplage (par défaut requis), en-tête de secret partagé optionnel</td></tr>
-<tr><td><strong>Limitation de débit</strong></td><td>Limites par client pour les routes de webhook (<code>webhook_rate_limit_per_minute</code>, par défaut <code>60</code>)</td></tr>
-<tr><td><strong>Idempotence</strong></td><td>Déduplication basée sur les en-têtes (<code>X-Idempotency-Key</code>, TTL par défaut <code>300s</code>)</td></tr>
 <tr><td><strong>Validation de Cron</strong></td><td>Les expressions cron invalides échouent de manière sécurisée lors de l’analyse/génération du cache.</td></tr>
+<tr><td><strong>Répartition headless</strong></td><td>Les appelants headless journalisent la progression de l’exécution au lieu d’exécuter automatiquement <code>ExecuteStep</code></td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="6-dépannage"><a class="header" href="#6-dépannage">6. Dépannage</a></h2>
+<h2 id="5-dépannage"><a class="header" href="#5-dépannage">5. Dépannage</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -322,10 +353,9 @@ expression = "0 0 8 * * *"
 </thead>
 <tbody>
 <tr><td><strong>MQTT</strong> erreurs de connexion</td><td>Incompatibilité entre l’URL du courtier et TLS</td><td>Vérifiez l’appariement du schéma et de l’indicateur TLS (<code>mqtt://</code>/<code>false</code>, <code>mqtts://</code>/<code>true</code>)</td></tr>
-<tr><td><strong>Webhook</strong> <code>401 Non autorisé</code></td><td>jeton Bearer manquant ou secret invalide</td><td>ré-appairer le jeton (<code>POST /pair</code>) et vérifier <code>X-Webhook-Secret</code> si configuré</td></tr>
-<tr><td><strong><code>/sop/*</code> renvoie 404</strong></td><td>incompatibilité du chemin de déclenchement</td><td>Assurez-vous que <code>SOP.toml</code> utilise le chemin exact (par exemple <code>/sop/deploy</code>).</td></tr>
-<tr><td><strong>SOP démarré mais étape non exécutée</strong></td><td>déclencheur sans boucle d’agent actif</td><td>exécuter une boucle d’agent pour <code>ExecuteStep</code>, ou concevoir l’exécution pour qu’elle s’arrête en attendant des approbations</td></tr>
-<tr><td><strong>Cron ne se déclenche pas</strong></td><td>daemon non démarré ou expression invalide</td><td>exécutez <code>zeroclaw daemon</code> ; vérifiez les journaux pour les avertissements de parsing cron</td></tr>
+<tr><td>La SOP <strong>MQTT</strong> ne démarre pas</td><td>non-correspondance du motif de topic ou échec de la <code>condition</code></td><td>Vérifiez que le sujet/les jokers du déclencheur correspondent au sujet publié ; vérifiez la <code>condition</code> par rapport à la charge utile</td></tr>
+<tr><td><strong>SOP démarré mais étape non exécutée</strong></td><td>déclencheur sans boucle d’agent actif</td><td>exécuter une boucle d’agent pour <code>ExecuteStep</code>, ou concevoir l’exécution pour qu’elle se mette en pause lors des approbations</td></tr>
+<tr><td><strong>Le déclencheur webhook/cron/périphérique ne se déclenche jamais</strong></td><td>source d’événements non raccordée au répartiteur</td><td>utilisez un déclencheur MQTT ou démarrez l’exécution avec <code>sop_execute</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -374,6 +404,114 @@ expression = "0 0 8 * * *"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

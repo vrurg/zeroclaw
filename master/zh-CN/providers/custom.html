@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -223,83 +300,400 @@
 <li><strong>使用一流的本地服务器插槽</strong>（<code>lmstudio</code>、<code>llamacpp</code>、<code>sglang</code>、<code>vllm</code>、<code>osaurus</code>、<code>litellm</code>）。带有合理默认值的轻量封装。</li>
 <li><strong>实现 <code>ModelProvider</code> trait</strong>（Rust）。适用于任何与 OpenAI 不兼容的场景。</li>
 </ol>
-<h2 id="openai-兼容端点--使用-custom-插槽"><a class="header" href="#openai-兼容端点--使用-custom-插槽">OpenAI 兼容端点 — 使用 <code>custom</code> 插槽</a></h2>
-<p>如果该服务支持 OpenAI 的 chat-completions，则只需进行配置更改：</p>
-<pre><code class="language-toml">[providers.models.custom.gateway]
-uri     = "https://my-gateway.example.com/v1"
-model   = "my-model-id"
-api_key = "..."                          # 如果端点无需身份验证则可省略
-</code></pre>
-<p><code>custom</code> 插槽需要 <code>uri</code>（该系列的端点枚举没有默认值）。请从代理中引用它：</p>
-<pre><code class="language-toml">[agents.assistant]
-model_provider = "custom.gateway"
-risk_profile   = "hardened"
-</code></pre>
-<p>这与 <code>groq</code>、<code>mistral</code>、<code>xai</code> 以及其他在<a href="./catalog.html">目录</a>中拥有专属规范槽位的供应商所使用的 <code>OpenAiCompatibleModelProvider</code> 运行时实现完全相同。区别在于你所使用的系列槽位——<code>custom</code> 是用于未被任何供应商槽位涵盖的端点的通用兜底选项。</p>
+<h2 id="openai-兼容端点使用-custom-槽位"><a class="header" href="#openai-兼容端点使用-custom-槽位">OpenAI 兼容端点：使用 <code>custom</code> 槽位</a></h2>
+<p>如果该服务支持 OpenAI chat-completions，则这只需更改配置即可。<code>custom</code> 槽位需要 <code>uri</code>（该系列的端点枚举没有默认值）；请从某个 agent 的 <code>model_provider</code> 中引用它。</p>
+<p>这与 <code>groq</code>、<code>mistral</code>、<code>xai</code> 以及在<a href="./catalog.html">目录</a>中拥有各自规范槽位的其他所有供应商所使用的 <code>OpenAiCompatibleModelProvider</code> 运行时实现相同。区别在于你使用哪个系列槽位：<code>custom</code> 是用于那些没有专属供应商槽位的端点的通用兜底选项。</p>
 <h2 id="一等公民的本地推理服务器"><a class="header" href="#一等公民的本地推理服务器">一等公民的本地推理服务器</a></h2>
 <p>ZeroClaw 为流行的本地推理栈提供了规范化的插槽配置。它们底层都兼容 OpenAI，但已预先应用了默认的 <code>uri</code> 值，因此你通常可以完全省略 <code>uri</code>。</p>
-<h3 id="llamacpp--槽位-llamacpp"><a class="header" href="#llamacpp--槽位-llamacpp">llama.cpp — 槽位 <code>llamacpp</code></a></h3>
-<pre><code class="language-bash">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+<h3 id="llamacpp插槽-llamacpp"><a class="header" href="#llamacpp插槽-llamacpp">llama.cpp：插槽 <code>llamacpp</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 </code></pre>
-<pre><code class="language-toml">[providers.models.llamacpp.local]
-uri   = "http://127.0.0.1:8033/v1"       # 省略则使用系列默认值 http://localhost:8080/v1
-model = "ggml-org/gpt-oss-20b-GGUF"
-# 仅当 llama-server 以 --api-key 启动时才需要 api_key
-</code></pre>
-<p><strong>可选字段</strong>（适用于任何 compat-slot 系列，包括 <code>llamacpp</code>）：</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>字段</th><th>类型</th><th>默认</th><th>描述</th></tr>
-</thead>
-<tbody>
-<tr><td><code>think</code></td><td><code>bool</code></td><td>—</td><td>在请求体顶层设置 <code>enable_thinking</code>。<code>false</code> 会指示支持思维链的模型跳过思维链推理。</td></tr>
-<tr><td><code>chat_template_kwargs</code></td><td>table</td><td>—</td><td>作为 <code>chat_template_kwargs</code> 逐字传递给 Jinja 聊天模板。用于特定模型系列的模板变量。</td></tr>
-<tr><td><code>max_tokens</code></td><td><code>u32</code></td><td>—</td><td>每个响应的最大输出 token 数。</td></tr>
-<tr><td><code>timeout_secs</code></td><td><code>u64</code></td><td>120</td><td>非流式调用的请求超时。</td></tr>
-</tbody>
-</table>
 </div>
+
+<p><strong>可选字段</strong>适用于任何 compat-slot 系列（包括 <code>llamacpp</code>）。完整集合源自 schema：</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>api_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>此 model_provider 的密钥 API 令牌。请从 model_provider 的控制台获取（OpenAI platform、Anthropic console、OpenRouter keys 页面等）。尽可能通过操作系统密钥环存储；切勿直接将其提交到 config.toml 中。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.api_key</code> 字段。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.api_key</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.api_key    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__api_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>chat_template_kwargs</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>作为请求体中的 <code>chat_template_kwargs</code> 原样转发的任意键/值对（llama.cpp 专用）。使用此项可传递模型系列的模板变量，以控制其他字段未公开的行为。示例（Qwen3 思考抑制）：<code>chat_template_kwargs = { enable_thinking = false }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.chat_template_kwargs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__chat_template_kwargs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>extra_headers</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>每个请求都会附带发送的额外 HTTP 头。小众功能：用于身份验证桥接、企业代理或需要追踪头的自定义网关。大多数用户无需使用此功能；如有需要，请直接编辑 <code>config.toml</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.extra_headers</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在<strong>Config</strong>窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.extra_headers</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.extra_headers    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__extra_headers=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback</code> <span class="cfg-field-meta"><code>ModelProviderRef[]</code> · default <code>—</code></span></summary>
+<p>当此别名上的每个模型都失败后，按顺序尝试的其他提供方别名列表。每个条目都是指向 <code>providers.models</code> 的点分 <code>&lt;type&gt;.&lt;alias&gt;</code> 引用，并使用其自身的凭据、端点和模型进行解析。回退别名绝不会继承此别名的密钥。遍历采用深度优先方式：先用尽此别名的模型，然后依次深入每个回退别名（应用其自身的 <code>fallback_models</code> 和 <code>fallback</code>）。为空表示没有提供方级别的回退。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.fallback</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.fallback</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback_models</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>—</code></span></summary>
+<p>在转向 <code>fallback</code> 别名之前，按顺序尝试当前提供方上的备用模型。使用与主 <code>model</code> 相同的端点、密钥和请求头，仅更改模型标识符。当某个提供方提供了备用模型（例如更小或更旧的变体），且应在彻底切换提供方之前先行尝试时，请使用此选项。留空则仅尝试 <code>model</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.fallback_models</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.fallback_models</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback_models &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback_models=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>kind</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>为此配置文件实例化的 Provider 实现。当某个规范化的类型化槽位应通过兼容实现运行时使用，例如 <code>[providers.models.openai.proxy] kind = "openai-compatible"</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.kind</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.kind</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.kind &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__kind=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_tokens</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>响应长度的硬性上限（以 token 计）。大多数模型已内置了合理的限制；除非你出于成本或延迟方面的考虑需要裁剪过长的输出，否则请保持不设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.max_tokens</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.max_tokens</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.max_tokens &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__max_tokens=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>merge_system_into_user</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>ModelProvider 特定的兼容性处理：将系统提示合并到第一条用户消息中，而不是单独发送一个 system 角色。仅在模型拒绝（或错误处理）独立的 system 角色时才需要，例如某些较旧的 Mistral 变体。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a>，并设置 <code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.merge_system_into_user &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__merge_system_into_user=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>model</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>随每个请求发送的模型标识符：来自 model_provider 目录的 ID 字符串（例如 <code>gpt-4o</code>、<code>claude-sonnet-4-5</code>、<code>llama-3.3-70b</code>）。必须与 model_provider 在此账户上实际提供的模型相匹配。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.model</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.model</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.model &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__model=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>native_tools</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>覆盖提供方的原生工具调用默认设置。<code>None</code>（默认）遵循提供方的内置选择。<code>Some(true)</code> 强制开启原生工具调用，<code>Some(false)</code> 强制使用文本回退。目前仅 Groq 工厂会参考此设置，它默认使用文本回退，因为 llama 系列的 Groq 模型会以 HTTP 400 拒绝原生工具调用。设置 <code>native_tools = true</code> 可为支持原生工具调用的 Groq 模型重新启用该功能。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.native_tools</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.native_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.native_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__native_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pricing</code> <span class="cfg-field-meta"><code>map</code> · default <code>—</code></span></summary>
+<p>用于成本追踪的按模型定价，单位为每 100 万 token 的美元数。自由格式的键/值映射。键为用户自定义的模型标识符；当运维人员希望区分费率时，可使用可选的 <code>.input</code> / <code>.output</code> 后缀来表示定价维度。不带后缀的裸键在未指定任一维度时用作统一的按 token 费率。默认值为空：此时成本追踪会回退到“未知”费率，仅记录 token 用量。示例：<code>pricing = { opus = 15.0, sonnet = 3.0 }</code> 或拆分：<code>pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.pricing</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.pricing</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.pricing &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__pricing=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>provider_extra</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>在 API 请求中包含的额外 JSON 参数。在请求体的顶层进行合并，从而无需修改代码即可使用特定提供商的功能（路由、转换等）。示例：<code>provider_extra = { model_provider = { only = ["Anthropic"] } }</code></p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.provider_extra</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.provider_extra</code> 字段。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.provider_extra &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-11"><a class="header" href="#环境变量-11">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__provider_extra=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>requires_openai_auth</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>为 true 时，客户端将从 <code>OPENAI_API_KEY</code> 或 <code>~/.codex/auth.json</code> 中获取凭据，而不是使用上面的 <code>api_key</code> 字段。仅对 OpenAI Codex model_provider 启用；对于标准 API 密钥的 model_provider 请保持关闭。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code> 字段。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code> 字段。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.requires_openai_auth &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-12"><a class="header" href="#环境变量-12">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__requires_openai_auth=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>temperature</code> <span class="cfg-field-meta"><code>number?</code> · default <code>—</code></span></summary>
+<p>传递给模型的采样温度。较低的值（0.0–0.3）会产生确定性、近乎逐字的输出，适用于代码、路由、摘要等场景。较高的值（0.7–1.2）会产生更多样化的输出，适用于开放式对话。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-13"><a class="header" href="#网关仪表板-13">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.temperature</code> 字段。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.temperature</code> 字段。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.temperature &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-13"><a class="header" href="#环境变量-13">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__temperature=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>think</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>为支持思维链推理的模型（例如 Qwen3、GLM-4）启用或禁用该功能。<code>true</code> 开启思维链，<code>false</code> 关闭。<code>None</code>（默认）则由模型自行决定。在请求体中以 <code>enable_thinking</code> 转发；对应 Ollama 提供方的 <code>think</code> 字段。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-14"><a class="header" href="#网关仪表板-14">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.think</code> 字段。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.think</code> 字段。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.think &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-14"><a class="header" href="#环境变量-14">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__think=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>timeout_secs</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>HTTP 请求超时时间（秒）。如果本地 model_providers 较慢（CPU 上运行的 Ollama、大型本地模型）或网络延迟较高，请调大此值；否则请保持未设置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-15"><a class="header" href="#网关仪表板-15">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.timeout_secs</code> 字段。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.timeout_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-15"><a class="header" href="#环境变量-15">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uri</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>客户端访问的端点 URI。当指向自托管网关（LiteLLM、vLLM、Ollama）、自定义代理或任何非标准 URL 时，可覆盖该系列的默认端点。保持未设置则使用该系列 <code>ModelEndpoint</code> 实现中的默认 URI。请将此项设置为完整的端点 URL；不存在单独的路径后缀字段。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-16"><a class="header" href="#网关仪表板-16">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.uri</code> 字段。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.uri</code> 字段。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.uri &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-16"><a class="header" href="#环境变量-16">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__uri=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>wire_api</code> <span class="cfg-field-meta"><code>WireApi</code> · default <code>—</code></span></summary>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-17"><a class="header" href="#网关仪表板-17">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> 并设置 <code>providers.models.custom.&lt;alias&gt;.wire_api</code> 字段。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>providers.models.custom.&lt;alias&gt;.wire_api</code> 字段。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.wire_api &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-17"><a class="header" href="#环境变量-17">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__wire_api=
+</code></pre>
+</div>
+
+</details>
+</div>
+
 <p><strong>控制思考模式</strong>因模型系列而异。<code>think = false</code> 会设置请求中顶层的 <code>enable_thinking</code> 字段。某些模型（例如 Qwen3）会改为通过 <code>chat_template_kwargs</code> 从 Jinja 模板中读取此标志：</p>
-<pre><code class="language-toml">[providers.models.llamacpp.qwen3]
-uri = "http://127.0.0.1:8033/v1"
-model = "Qwen/Qwen3-30B-A3B-GGUF"
-think = false
-# Qwen3 从 Jinja 模板读取 enable_thinking，而不是从顶层字段读取：
-chat_template_kwargs = { enable_thinking = false }
+<p>其他模型系列使用不同的模板变量名称，请检查您的模型的聊天模板，并在 <code>chat_template_kwargs</code> 下设置相应的键。</p>
+<h3 id="sglang插槽-sglang"><a class="header" href="#sglang插槽-sglang">SGLang：插槽 <code>sglang</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
 </code></pre>
-<p>其他模型系列使用不同的模板变量名 — 请检查你的模型的聊天模板，并在 <code>chat_template_kwargs</code> 下设置相应的键。</p>
-<h3 id="sglang--槽位-sglang"><a class="header" href="#sglang--槽位-sglang">SGLang — 槽位 <code>sglang</code></a></h3>
-<pre><code class="language-bash">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+</div>
+
+<h3 id="vllm插槽-vllm"><a class="header" href="#vllm插槽-vllm">vLLM：插槽 <code>vllm</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">vllm serve meta-llama/Llama-3.1-8B-Instruct
 </code></pre>
-<pre><code class="language-toml">[providers.models.sglang.local]
-uri   = "http://localhost:30000/v1"      # 系列默认值
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
-<h3 id="vllm--槽位-vllm"><a class="header" href="#vllm--槽位-vllm">vLLM — 槽位 <code>vllm</code></a></h3>
-<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct
-</code></pre>
-<pre><code class="language-toml">[providers.models.vllm.local]
-uri   = "http://localhost:8000/v1"       # 系列默认值
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
+</div>
+
 <h3 id="lm-studioosauruslitellm"><a class="header" href="#lm-studioosauruslitellm">LM Studio、Osaurus、LiteLLM</a></h3>
-<p>Slot <code>lmstudio</code>、<code>osaurus</code>、<code>litellm</code> 遵循相同的模式——参见<a href="./catalog.html">目录</a>。</p>
-<h2 id="wire-protocol--wire_api--responses"><a class="header" href="#wire-protocol--wire_api--responses">Wire protocol — <code>wire_api = "responses"</code></a></h2>
-<p>Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI <strong>responses</strong> wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:</p>
-<pre><code class="language-toml">[providers.models.custom.vllm]
-uri      = "http://10.0.0.15:8000/v1"
-model    = "Qwen/Qwen3-30B-A3B"
-wire_api = "responses"                  # default is "chat_completions"
+<p>插槽 <code>lmstudio</code>、<code>osaurus</code>、<code>litellm</code> 遵循相同的模式，参见<a href="./catalog.html">目录</a>。</p>
+<h2 id="线路协议wire_api--responses"><a class="header" href="#线路协议wire_api--responses">线路协议：<code>wire_api = "responses"</code></a></h2>
+<p>自带端点（bring-your-own-endpoint）槽位默认使用 OpenAI chat-completions wire。如果某个端点仅支持 OpenAI <strong>responses</strong> wire（某些自托管的 vLLM / TGI 部署），则需要在别名条目中显式设置 <code>wire_api = "responses"</code> 来启用。</p>
+<p>当设置为 <code>"responses"</code> 时，提供方将构建为 <code>OpenAiResponsesModelProvider</code>（基于 responses 协议的完整流式工具调用），而非 chat-completions 提供方。省略该字段或设置为 <code>"chat_completions"</code> 可使用默认的传输方式。</p>
+<p><code>wire_api</code> is honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field, with one exception: <code>opencode</code> honors <code>wire_api = "responses"</code> because OpenCode Zen serves both wires. With no <code>uri</code> override, the OpenCode responses route targets <code>https://opencode.ai/zen/v1/responses</code>:</p>
+<pre><code class="language-toml">[providers.models.opencode.default]
+model    = "big-pickle"
+wire_api = "responses"
 </code></pre>
-<p>When set to <code>"responses"</code>, the provider is built as an <code>OpenAiResponsesModelProvider</code> (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set <code>"chat_completions"</code>, for the default wire.</p>
-<p><code>wire_api</code> is only honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field. The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
+<p>The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
 <h2 id="验证"><a class="header" href="#验证">验证</a></h2>
 <p>无论采用哪种方法：</p>
-<pre><code class="language-bash">zeroclaw config list                          # 加载配置；任何验证失败都会输出到 stderr
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">zeroclaw config list                          # 加载配置；任何验证失败都会输出到 stderr
 zeroclaw models refresh --provider &lt;type&gt;.&lt;alias&gt;   # list models the endpoint advertises
 zeroclaw agent -a &lt;alias&gt; -m "hello"          # 针对 `[agents.&lt;alias&gt;]` 处的 agent 进行冒烟测试
 </code></pre>
+</div>
+
 <h2 id="实现新的-modelprovider-trait"><a class="header" href="#实现新的-modelprovider-trait">实现新的 <code>ModelProvider</code> trait</a></h2>
 <p>如果该端点不兼容 OpenAI，且不属于任何本地服务器槽位，则需要编写代码。</p>
 <p>该 trait 位于 <code>crates/zeroclaw-api/src/model_provider.rs</code>：</p>
@@ -357,45 +751,43 @@ impl ModelEndpoint for MyProviderEndpoint {
 <h2 id="故障排除"><a class="header" href="#故障排除">故障排除</a></h2>
 <h3 id="身份验证错误"><a class="header" href="#身份验证错误">身份验证错误</a></h3>
 <ul>
-<li>验证 API 密钥与端点是否匹配（许多供应商使用密钥前缀——<code>sk-</code>、<code>gsk_</code>、<code>sk-ant-</code>）。</li>
+<li>验证 API 密钥与端点是否匹配（许多厂商使用密钥前缀：<code>sk-</code>、<code>gsk_</code>、<code>sk-ant-</code>）。</li>
 <li>检查 <code>uri</code> 是否包含协议方案（<code>http://</code> / <code>https://</code>），如果端点需要，还应包含 <code>/v1</code> 路径。</li>
 <li>终端节点位于 VPN 或代理之后？请从 ZeroClaw 主机确认路由配置。</li>
 </ul>
 <h3 id="未找到模型"><a class="header" href="#未找到模型">未找到模型</a></h3>
 <ul>
-<li>
-<p>列出该端点所支持的功能：</p>
-<pre><code class="language-bash">curl -sS "$URI/models" -H `Authorization: Bearer $API_KEY` | jq
-</code></pre>
-</li>
-<li>
-<p>如果该端点未实现 <code>/models</code>，请直接发送一个聊天请求并查看错误信息——大多数端点会在错误正文中返回所需的模型系列。</p>
-</li>
-<li>
-<p>网关服务通常只暴露上游模型的一个子集。</p>
-</li>
+<li>列出该端点所支持的功能：</li>
 </ul>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">  curl -sS "$URI/models" -H `Authorization: Bearer $API_KEY` | jq
+</code></pre>
+</div>
+
+- If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
+- Gateway services often expose only a subset of upstream models.
 <h3 id="连接问题"><a class="header" href="#连接问题">连接问题</a></h3>
 <ul>
-<li><code>curl -I $URI</code> —— 它有响应吗？</li>
+<li><code>curl -I $URI</code>，它有响应吗？</li>
 <li>防火墙、代理、出站规则？VPS 提供商有时会屏蔽出站高位端口。</li>
 <li>如果是托管服务，则为供应商状态页面。</li>
 </ul>
-<h3 id="gateway-rejects-temperature"><a class="header" href="#gateway-rejects-temperature">Gateway rejects <code>temperature</code></a></h3>
-<p>Some gateways (e.g. a LiteLLM proxy fronting <code>claude-opus-4-7</code>) return an error when a <code>temperature</code> field is present at all. ZeroClaw honors the <code>Option</code> contract: if you leave <code>temperature</code> unset in config, the field is <strong>omitted</strong> from the request body entirely and the backend picks its own default. Only set <code>temperature</code> explicitly when the endpoint accepts it.</p>
+<h3 id="网关拒绝-temperature"><a class="header" href="#网关拒绝-temperature">网关拒绝 <code>temperature</code></a></h3>
+<p>某些网关（例如代理 <code>claude-opus-4-7</code> 的 LiteLLM proxy）在请求中只要存在 <code>temperature</code> 字段就会返回错误。ZeroClaw 遵循 <code>Option</code> 约定：如果你在配置中未设置 <code>temperature</code>，该字段将被完全<strong>省略</strong>于请求体之外，由后端自行选择默认值。仅在端点接受该字段时才显式设置 <code>temperature</code>。</p>
 <h2 id="另见"><a class="header" href="#另见">另见</a></h2>
 <ul>
-<li><a href="./overview.html">概述</a> — 提供程序模型及每个 agent 的调度工作原理</li>
-<li><a href="./configuration.html">配置</a> — 完整的 <code>[providers.*]</code> 架构、Azure 类型化配置、区域和 OAuth 变体</li>
-<li><a href="./catalog.html">目录</a> — 每个规范槽位及一个完整的 TOML 示例</li>
-<li><a href="../developing/plugin-protocol.html">开发 → 插件协议</a> — 如果插件比原生 crate 更合适</li>
+<li><a href="./overview.html">概览</a>：提供程序模型以及每个代理的分发工作原理</li>
+<li><a href="./configuration.html">配置</a>：完整的 <code>[providers.*]</code> 架构、Azure 类型化配置、区域和 OAuth 变体</li>
+<li><a href="./catalog.html">目录</a>：每个规范化插槽都附带一个完整的 TOML 示例</li>
+<li><a href="../developing/plugin-protocol.html">开发 → 插件协议</a>：如果插件比一等 crate 工作得更好</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../providers/catalog.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../providers/routing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -409,7 +801,7 @@ impl ModelEndpoint for MyProviderEndpoint {
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../providers/catalog.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../providers/routing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -435,6 +827,114 @@ impl ModelEndpoint for MyProviderEndpoint {
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

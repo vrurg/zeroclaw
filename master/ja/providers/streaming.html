@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,22 +296,7 @@
                         <h1 id="ストリーミング"><a class="header" href="#ストリーミング">ストリーミング</a></h1>
 <p>ZeroClaw のストリーミング API をサポートするすべてのプロバイダーは、トークン単位でストリーミングを行います。ランタイムはこれらのストリームを部分的な更新をサポートするチャネルアダプター（Discord、Slack、Telegram、ゲートウェイの WebSocket）に転送するため、ユーザーはモデルがテキストを生成する過程でテキストが逐次表示されるのを見ることができます。</p>
 <h2 id="ストリーミングされる内容"><a class="header" href="#ストリーミングされる内容">ストリーミングされる内容</a></h2>
-<p>プロバイダトレイトは <code>StreamEvent</code> 値を出力します：</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>イベント</th><th>いつ</th></tr>
-</thead>
-<tbody>
-<tr><td><code>TextDelta(String)</code></td><td>アシスタントのテキストの新しいトークン</td></tr>
-<tr><td><code>ReasoningDelta(String)</code></td><td>推論 / コーソト思考トークン (oシリーズ、DeepSeek-R1、Qwen-thinking)</td></tr>
-<tr><td><code>ToolCall { name, args }</code></td><td>モデルがツールを呼び出すことを決定しました</td></tr>
-<tr><td><code>PreExecutedToolCall</code></td><td>プロバイダー側で事前に実行されたツール呼び出し（例：Geminiのグラウンド検索）</td></tr>
-<tr><td><code>PreExecutedToolResult</code></td><td>その結果</td></tr>
-<tr><td><code>最終 { usage }</code></td><td>ストリーム完了；トークン使用量の合計</td></tr>
-</tbody>
-</table>
-</div>
+<p>プロバイダトレイトは、モデルが出力を生成する際に <code>StreamEvent</code> 値を発行します。具体的には、テキストデルタ、構造化されたツール呼び出し、プロバイダ側で事前実行されたツール呼び出しとその結果、トークン使用量レポート、最終的な完了マーカーです。各バリアントの正式な定義は、<code>crates/zeroclaw-api/src/model_provider.rs</code>（<code>enum StreamEvent</code>）の型とともに記述されています。推論トークンは独立したバリアントではなく、テキストデルタとして到着します。</p>
 <p>チャンネルは、<code>Channel</code> トレイトのアウトバウンドストリームフックを通じてこれらのイベントを消費します。</p>
 <h2 id="機能フラグ"><a class="header" href="#機能フラグ">機能フラグ</a></h2>
 <p>プロバイダーは2つのフラグを公開し、ランタイムが何を期待すべきかを知るようにします：</p>
@@ -244,68 +306,58 @@
 fn supports_streaming_tool_events(&amp;self) -&gt; bool { true }
 <span class="boring">}</span></code></pre>
 <ul>
-<li><strong><code>supports_streaming</code></strong> — 現在アクティブにメンテナンスされているすべてのプロバイダーで true</li>
-<li><strong><code>supports_streaming_tool_events</code></strong> — プロバイダーがストリーミング中に <code>ToolCall</code> イベントを出力する場合に <code>true</code> となる</li>
+<li><strong><code>supports_streaming</code></strong>: アクティブにメンテナンスされているすべてのプロバイダーで true</li>
+<li><strong><code>supports_streaming_tool_events</code></strong>: プロバイダーがストリームの最後ではなくストリーム中に<code>ToolCall</code>イベントを発行する場合は true</li>
 </ul>
 <p>OpenAI互換のプロバイダーは異なります。一部はツール呼び出しの引数デルタをチャンクごとにストリーミングしますが、他のプロバイダーは呼び出しが完了してからのみイベントを出力します。<code>compatible.rs</code> の SSE パーサーは両方に対応しています。</p>
 <h2 id="チャネル側のストリーミング"><a class="header" href="#チャネル側のストリーミング">チャネル側のストリーミング</a></h2>
-<p>チャンネルは、自身のストリーミング機能を宣伝します：</p>
+<p>チャネルは <code>Channel</code> トレイトを通じて、自身のストリーミング機能を通知します。</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>fn supports_draft_updates(&amp;self) -&gt; bool;           // メッセージをその場で編集する
 fn supports_multi_message_streaming(&amp;self) -&gt; bool; // 1つの返信を複数のメッセージに分割する
 <span class="boring">}</span></code></pre>
+<p>チャネルの機能はその構成に従います。<code>stream_mode</code> 列挙型 (off / partial / multi_message) を持つチャネルは、ドラフト更新とマルチメッセージの両方をサポートします。<code>stream_drafts</code> ブール値を持つチャネルは、ドラフト更新のみをサポートします。このテーブルはチャネル構成スキーマから生成されるため、チャネルがストリーミングサポートを獲得または喪失しても正確性が保たれます。</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>チャンネル</th><th style="text-align: center">更新ドラフト</th><th style="text-align: center">複数メッセージ</th></tr>
 </thead>
 <tbody>
-<tr><td>CLI</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Discord</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Slack</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
-<tr><td>Telegram</td><td style="text-align: center">✓</td><td style="text-align: center">部分的</td></tr>
-<tr><td>Matrix</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>Mattermost</td><td style="text-align: center">✓</td><td style="text-align: center">—</td></tr>
-<tr><td>メール</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>SMS / 音声</td><td style="text-align: center">—</td><td style="text-align: center">—</td></tr>
-<tr><td>ゲートウェイ (WebSocket)</td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>discord</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>lark</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>matrix</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>nextcloud_talk</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>slack</code></td><td style="text-align: center">✓</td><td style="text-align: center"></td></tr>
+<tr><td><code>telegram</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
+<tr><td><code>wecom_ws</code></td><td style="text-align: center">✓</td><td style="text-align: center">✓</td></tr>
 </tbody>
 </table>
 </div>
 <p>プロバイダーとチャネルの両方がストリーミングをサポートしている場合、フローは次のようになります：プロバイダーが <code>TextDelta</code> を送信 → ランタイムがチャネルに渡す → チャネルが送信済みメッセージを編集します。この編集の頻度は、レート制限を回避するためにチャネル設定の <code>draft_update_interval_ms</code>（デフォルト：500 ms）によって制限されます。</p>
 <h2 id="推論ブロック"><a class="header" href="#推論ブロック">推論ブロック</a></h2>
-<p>推論モデル（OpenAI oシリーズ、DeepSeek-R1、Qwenの推論バリアント）は、通常のテキストとは別に <code>ReasoningDelta</code> イベントを出力します。デフォルトでは、ランタイムはこれらのイベントを出力ストリームから除外します。詳細は <code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> の <code>&lt;think&gt;…&lt;/think&gt;</code> の処理を参照してください。ユーザーは連鎖的思考（chain-of-thought）ではなく、最終的な回答のみを確認できます。</p>
-<p>ユーザーに推論を表示する:</p>
-<pre><code class="language-toml">[channels.&lt;name&gt;]
-show_reasoning = true
-</code></pre>
-<p>これはデフォルトで無効になっています。理由は、推論コンテンツが (a) 冗長になりがちで、(b) 内部の検討過程を明らかにすることがあり、エンドユーザーには混乱を招く可能性があるからです。</p>
-<p>推論機能を持つモデルで推論を完全に無効にする:</p>
-<pre><code class="language-toml">[providers.models.&lt;name&gt;]
-think = false
-reasoning_effort = "none"
-</code></pre>
-<p>両方のフィールドはトップレベルです。どちらの名前を使用するかはプロバイダーやエンドポイントによって異なります。両方を設定することで、Ollama ネイティブ、Ollama OpenAI 互換、および <code>reasoning_effort</code> をサポートするアップストリーム API をカバーできます。</p>
+<p>推論モデル（OpenAI o-series、DeepSeek-R1、Qwen-thinkingの各バリアント）は、通常のテキストとは別に<code>ReasoningDelta</code>イベントを出力します。デフォルトでは、ランタイムがこれらを送信ストリームから除去します。<code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>内の<code>&lt;think&gt;…&lt;/think&gt;</code>の処理を参照してください。ユーザーには、思考の連鎖（chain-of-thought）ではなく、最終的な回答が表示されます。</p>
+<p>推論をユーザーに表示するには、エイリアスエントリーで有効にしてください。これはデフォルトでは無効になっています。理由は、推論の内容が(a) 冗長になりがちで、(b) 内部的な検討過程が明らかになり、エンドユーザーにとって混乱を招くことがあるためです。</p>
+<p>推論対応モデルで推論を完全に無効化するには、該当する推論フィールドを off に設定します。どちらのフィールドもトップレベルにあり、適切な名前はプロバイダー/エンドポイントによって異なります。両方を設定することで、Ollama ネイティブ、Ollama OpenAI 互換、および <code>reasoning_effort</code> を尊重する上流 API に対応できます。</p>
 <h2 id="ストリーム中のツール呼び出し"><a class="header" href="#ストリーム中のツール呼び出し">ストリーム中のツール呼び出し</a></h2>
 <p>モデルがツールを呼び出すことを決定すると、プロバイダは <code>ToolCall</code> を発行します。ランタイムは：</p>
 <ol>
 <li>プロバイダーのストリームからの読み込みを一時停止します</li>
 <li>バッファリングされたテキストをチャネルにフラッシュします</li>
-<li>ツールを実行します（セキュリティ検証の対象となります。詳細は<a href="../security/overview.html">セキュリティ → 概要</a>をご覧ください）。</li>
+<li>ツールを実行します（セキュリティ検証の対象となります。<a href="../security/overview.html">セキュリティ → 概要</a>を参照してください）</li>
 <li>ツール結果を付加して会話を再開する</li>
 <li>次のアシスタントのターンに対して、プロバイダーへの新しいストリーミング呼び出しを開きます。</li>
 </ol>
 <p>ユーザーの視点では、テキスト、エージェントがツールを実行したことを示す可視インジケーター（チャネル固有のヒント経由）、そしてさらにテキストが続きます。タイピングインジケーターがないチャネルでは、ツール呼び出しと次のテキストチャンクの間のギャップが唯一のシグナルとなります。</p>
 <h2 id="ストリーミング以外のプロバイダー"><a class="header" href="#ストリーミング以外のプロバイダー">ストリーミング以外のプロバイダー</a></h2>
-<p>プロバイダーが一度にすべてのレスポンスを返す場合（古い OpenAI 互換エンドポイントやレガシー Gemini）、ランタイムは完全な返信を含む単一の <code>TextDelta</code> とそれに続く <code>Final</code> を合成します。チャネルアダプターも動作しますが、部分的なデータは見えません。</p>
+<p>プロバイダーがレスポンス全体を一度に返す場合（古い OpenAI 互換エンドポイントやレガシーな Gemini）、ランタイムは応答全文を含む単一の <code>TextDelta</code> を生成し、その後に <code>Final</code> を続けます。チャネルアダプターは引き続き動作しますが、部分的なデータを受け取らないだけです。</p>
 <h2 id="コード参照"><a class="header" href="#コード参照">コード参照</a></h2>
 <ul>
-<li><code>crates/zeroclaw-api/src/model_provider.rs</code> — <code>ModelProvider</code> trait, <code>StreamEvent</code> enum</li>
-<li><code>crates/zeroclaw-providers/src/compatible.rs</code> — OpenAI互換SSEパーサー</li>
-<li><code>crates/zeroclaw-providers/src/anthropic.rs</code> — Anthropic ストリーミング</li>
-<li><code>crates/zeroclaw-providers/src/ollama.rs</code> — Ollama ストリーミング</li>
-<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code> — チャンネル側のストリーム消費</li>
+<li><code>crates/zeroclaw-api/src/model_provider.rs</code>: <code>ModelProvider</code> トレイト、<code>StreamEvent</code> 列挙型</li>
+<li><code>crates/zeroclaw-providers/src/compatible.rs</code>: OpenAI互換SSEパーサー</li>
+<li><code>crates/zeroclaw-providers/src/anthropic.rs</code>: Anthropic ストリーミング</li>
+<li><code>crates/zeroclaw-providers/src/ollama.rs</code>: Ollama ストリーミング</li>
+<li><code>crates/zeroclaw-channels/src/orchestrator/mod.rs</code>: チャネル側のストリーム消費</li>
 </ul>
 
                     </main>
@@ -352,6 +404,114 @@ reasoning_effort = "none"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

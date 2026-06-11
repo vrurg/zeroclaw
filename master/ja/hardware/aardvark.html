@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -223,24 +300,24 @@
 <pre><code>┌──────────────────────────────────────────────────────────────┐
 │                        STARTUP (boot)                        │
 │                                                              │
-│  1. aardvark-sysに確認: "アダプターがプラグインされているか？"            │
-│  2. 見つかったものごとに → デバイスとトランスポートを登録               │
-│  3. ハードウェアが見つかった場合のみツールをロード                    │
-└──────────────────────────────────────┬───────────────────┘
+│  1. aardvark-sys に問い合わせ:「接続済みのアダプターはあるか?」    │
+│  2. 見つかった各アダプターについて → デバイスとトランスポートを登録 │
+│  3. ハードウェアが見つかった場合のみツールを読み込む              │
+└──────────────────────────────────────────┬───────────────────┘
                                            │
-                    ┌──────────────────────▼──────────────────────┐
+                    ┌──────────────────────▼───────────────────────┐
                     │              RUNTIME (agent loop)            │
                     │                                              │
-                    │  ユーザー: "i2cバスをスキャン"                        │
-                    │     → エージェントはi2c_scanツールを呼び出す              │
-                    │     → ツールはZcCommandを構築する                │
-                    │     → AardvarkTransportはハードウェアに送信     │
-                    │     → レスポンスはテキストとして戻る            │
+                    │  ユーザー:「scan i2c bus」                    │
+                    │     → エージェントが i2c_scan ツールを呼び出す │
+                    │     → ツールが ZcCommand を構築する            │
+                    │     → AardvarkTransport がハードウェアへ送信する│
+                    │     → レスポンスがテキストとして返ってくる      │
                     └──────────────────────────────────────────────┘
 </code></pre>
 <hr>
 <h2 id="レイヤーごとに"><a class="header" href="#レイヤーごとに">レイヤーごとに</a></h2>
-<h3 id="レイヤー-1--aardvark-sys-usbの通信者"><a class="header" href="#レイヤー-1--aardvark-sys-usbの通信者">レイヤー 1 — <code>aardvark-sys</code> (USBの通信者)</a></h3>
+<h3 id="レイヤー1-aardvark-sysusb通信担当"><a class="header" href="#レイヤー1-aardvark-sysusb通信担当">レイヤー1: <code>aardvark-sys</code>（USB通信担当）</a></h3>
 <p><strong>ファイル:</strong> <code>crates/aardvark-sys/src/lib.rs</code></p>
 <p>これは生のCライブラリに触れる唯一のレイヤーです。C関数呼び出しを安全なRustに変換するシンラッパーと考えてください。</p>
 <p><strong>アルゴリズム:</strong></p>
@@ -282,7 +359,7 @@ Drop(handle)
 </code></pre>
 <p><strong>スタブモード内</strong> (SDKなし): すべてのメソッドは直ちに <code>Err(NotFound)</code> を返します。<code>find_devices()</code> は <code>[]</code> を返します。何もクラッシュしません。</p>
 <hr>
-<h3 id="レイヤー-2--aardvarktransportブリッジ"><a class="header" href="#レイヤー-2--aardvarktransportブリッジ">レイヤー 2 — <code>AardvarkTransport</code>（ブリッジ）</a></h3>
+<h3 id="レイヤー2-aardvarktransportブリッジ"><a class="header" href="#レイヤー2-aardvarktransportブリッジ">レイヤー2: <code>AardvarkTransport</code>（ブリッジ）</a></h3>
 <p><strong>ファイル:</strong> <code>crates/zeroclaw-hardware/src/aardvark.rs</code></p>
 <p>ZeroClaw の残りの部分は単一の言語を話します: <code>ZcCommand</code> → <code>ZcResponse</code>。<code>AardvarkTransport</code> はそのプロトコルと上記の aardvark-sys 呼び出しの間を翻訳します。</p>
 <p><strong>アルゴリズム:</strong></p>
@@ -321,9 +398,9 @@ Drop(handle)
 
   on any AardvarkError → return ZcResponse{ error: "..." }
 </code></pre>
-<p><strong>設計上の重要な選択 — 遅延オープン:</strong> ハンドルはコマンドごとに新しく開かれ、終了時にドロップされます。これはホールドされた接続がなく、クリーンアップする状態がなく、「まだ開いているか?」というロジックがどこにもないことを意味します。</p>
+<p><strong>重要な設計上の選択: 遅延オープン:</strong> ハンドルはコマンドごとに新しく開かれ、最後に破棄されます。これは、接続を保持せず、クリーンアップすべき状態もなく、「まだ開いているか？」というロジックがどこにも存在しないことを意味します。</p>
 <hr>
-<h3 id="レイヤー-3--ツールエージェントが呼び出すもの"><a class="header" href="#レイヤー-3--ツールエージェントが呼び出すもの">レイヤー 3 — ツール（エージェントが呼び出すもの）</a></h3>
+<h3 id="レイヤー3-ツールエージェントが呼び出すもの"><a class="header" href="#レイヤー3-ツールエージェントが呼び出すもの">レイヤー3: ツール（エージェントが呼び出すもの）</a></h3>
 <p><strong>ファイル:</strong> <code>crates/zeroclaw-hardware/src/aardvark_tools.rs</code></p>
 <p>各ツールは薄いラッパーです。それは:</p>
 <ol>
@@ -369,7 +446,7 @@ DatasheetTool.call(args)
   → "read":     open a saved PDF and return its text
 </code></pre>
 <hr>
-<h3 id="レイヤー-4--デバイスレジストリアドレス帳"><a class="header" href="#レイヤー-4--デバイスレジストリアドレス帳">レイヤー 4 — デバイスレジストリ（アドレス帳）</a></h3>
+<h3 id="レイヤー4-デバイスレジストリアドレス帳"><a class="header" href="#レイヤー4-デバイスレジストリアドレス帳">レイヤー4: デバイスレジストリ（アドレス帳）</a></h3>
 <p><strong>ファイル:</strong> <code>crates/zeroclaw-hardware/src/device.rs</code></p>
 <p>レジストリは、接続されたすべてのデバイスのランタイムマップです。各エントリは以下を保存します: エイリアス、種類、機能、トランスポートハンドル。</p>
 <pre><code>register("aardvark", vid=0x2b76, ...)
@@ -390,7 +467,7 @@ resolve_aardvark_device(args)
   → return (alias, DeviceContext{ transport, capabilities })
 </code></pre>
 <hr>
-<h3 id="レイヤー-5--bootスタートアップ配線"><a class="header" href="#レイヤー-5--bootスタートアップ配線">レイヤー 5 — <code>boot()</code>（スタートアップ配線）</a></h3>
+<h3 id="レイヤー5-boot-起動時の配線"><a class="header" href="#レイヤー5-boot-起動時の配線">レイヤー5: <code>boot()</code> (起動時の配線)</a></h3>
 <p><strong>ファイル:</strong> <code>crates/zeroclaw-hardware/src/lib.rs</code></p>
 <p><code>boot()</code> はスタートアップ時に一度実行されます。Aardvark の場合:</p>
 <pre><code>boot()
@@ -409,19 +486,20 @@ resolve_aardvark_device(args)
   ...
 </code></pre>
 <hr>
-<h3 id="レイヤー-6--ツールレジストリローダー"><a class="header" href="#レイヤー-6--ツールレジストリローダー">レイヤー 6 — ツールレジストリ（ローダー）</a></h3>
+<h3 id="レイヤー-6-ツールレジストリローダー"><a class="header" href="#レイヤー-6-ツールレジストリローダー">レイヤー 6: ツールレジストリ（ローダー）</a></h3>
 <p><strong>ファイル:</strong> <code>crates/zeroclaw-hardware/src/tool_registry.rs</code></p>
 <p><code>boot()</code> の後、ツールレジストリは存在するハードウェアをチェックし、関連するツールのみをロードします:</p>
 <pre><code>ToolRegistry::load(devices)
 
-  # always loaded (Pico / GPIO)
-  register: gpio_write, gpio_read, gpio_toggle, pico_flash, device_list, device_status
+  # always loaded (base hardware tools — see catalog::BASE_TOOLS)
+  register: gpio_read, gpio_write, pico_flash,
+            device_read_code, device_write_code, device_exec
 
-  # only loaded if an Aardvark was found at boot
+  # only loaded if an Aardvark was found at boot (catalog::AARDVARK_TOOLS)
   if devices.has_aardvark():
     register: i2c_scan, i2c_read, i2c_write, spi_transfer, gpio_aardvark, datasheet
 </code></pre>
-<p>これが <code>hardware_feature_registers_all_six_tools</code> テストがスタブモードでも合格する理由です — <code>has_aardvark()</code> は false を返し、追加ツールは 0 個ロードされ、カウントは 6 のままです。</p>
+<p><code>hardware_feature_registers_catalog_base_tools</code> テストがスタブモードでも引き続きパスするのは、このためです。<code>has_aardvark()</code> が false を返し、追加ツールが 0 個ロードされ、カウントがベースセットのままになります。</p>
 <hr>
 <h2 id="完全なフロー図"><a class="header" href="#完全なフロー図">完全なフロー図</a></h2>
 <pre><code> SDK FILES          aardvark-sys            ZeroClaw core
@@ -431,7 +509,7 @@ resolve_aardvark_device(args)
  aardvark.h  ──►  build.rs         boot()
  aardvark.so       (bindgen)    ──►  find_devices()
                        │                │
-                  bindings.rs           │  vec![0]  (one adapter)
+                  bindings.rs           │  vec![0]  (アダプター1台)
                        │                ▼
                   lib.rs           register("aardvark0")
                   AardvarkHandle   attach_transport(AardvarkTransport)
@@ -439,37 +517,37 @@ resolve_aardvark_device(args)
                        │                ▼
                        │         ToolRegistry::load()
                        │           has_aardvark() == true
-                       │           → load 6 aardvark tools
+                       │           → load aardvark tools
                        │
 ─────────────────────────────────────────────────────────────────
 
- USER MESSAGE: "scan the i2c bus"
+ ユーザーメッセージ: "scan the i2c bus"
 
-  agent loop
+  エージェントループ
       │
       ▼
   I2cScanTool.call()
       │
       ▼
   resolve_aardvark_device("aardvark0")
-      │  returns transport Arc
+      │  transport Arc を返す
       ▼
   AardvarkTransport.send(ZcCommand{ name: "i2c_scan" })
       │
       ▼
-  AardvarkHandle::open_port(0)    ← opens USB connection
+  AardvarkHandle::open_port(0)    ← USB 接続を開く
       │
       ▼
-  aa_i2c_read(0x08..0x77)         ← probes each address
+  aa_i2c_read(0x08..0x77)         ← 各アドレスをプローブ
       │
       ▼
-  AardvarkHandle dropped           ← USB connection closed
+  AardvarkHandle dropped           ← USB 接続を閉じる
       │
       ▼
   ZcResponse{ output: "Found: 0x48, 0x68" }
       │
       ▼
-  agent sends reply to user: "I found two I2C devices: 0x48 and 0x68"
+  エージェントがユーザーに返信を送信: "I found two I2C devices: 0x48 and 0x68"
 </code></pre>
 <hr>
 <h2 id="スタブと実機を並べて比較"><a class="header" href="#スタブと実機を並べて比較">スタブと実機を並べて比較</a></h2>
@@ -482,13 +560,13 @@ resolve_aardvark_device(args)
 <tr><td><code>find_devices()</code></td><td><code>[]</code> を返す</td><td><code>[0]</code> を返す</td></tr>
 <tr><td><code>open_port(0)</code></td><td><code>Err(NotFound)</code></td><td>USB を開き、ハンドルを返す</td></tr>
 <tr><td><code>i2c_scan()</code></td><td><code>[]</code></td><td>バスをプローブし、アドレスを返す</td></tr>
-<tr><td>ロード済みツール</td><td>Pico ツール 6 個のみ</td><td>Pico ツール 6 個 + Aardvark ツール 6 個</td></tr>
+<tr><td>ロード済みツール</td><td>基本的なハードウェアツールのみ</td><td>基本ツール + Aardvarkツール</td></tr>
 <tr><td><code>has_aardvark()</code></td><td><code>false</code></td><td><code>true</code></td></tr>
 <tr><td>必要な SDK</td><td>いいえ</td><td>はい（<code>vendor/aardvark.h</code> + <code>.so</code>）</td></tr>
 </tbody>
 </table>
 </div>
-<p>実ハードウェアを接続したときに変わる唯一のコードは <code>crates/aardvark-sys/src/lib.rs</code> 内です — 他のすべてのレイヤーは既に配線されており、待機中です。</p>
+<p>実際のハードウェアを接続したときに変更されるコードは <code>crates/aardvark-sys/src/lib.rs</code> 内のみです。他のすべてのレイヤーはすでに配線済みで、待機しています。</p>
 
                     </main>
 
@@ -534,6 +612,114 @@ resolve_aardvark_device(args)
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

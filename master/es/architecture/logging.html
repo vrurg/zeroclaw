@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,61 +294,40 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="arquitectura-de-registro"><a class="header" href="#arquitectura-de-registro">Arquitectura de registro</a></h1>
-<p>ZeroClaw tiene exactamente una superficie de logging: la macro <code>zeroclaw_log::record!</code>. Cada emisión en el workspace —actividad del bucle del agente, E/S de canales, ejecuciones de cron, llamadas a herramientas, operaciones de memoria, ciclo de vida de sesiones, errores— fluye a través de ella. La macro alimenta una única <code>LogCaptureLayer</code> que materializa registros estructurados <code>LogEvent</code> y los enruta a tres sinks a la vez:</p>
+<p>ZeroClaw tiene exactamente una superficie de logging: la macro <code>zeroclaw_log::record!</code>. Cada emisión en el workspace, actividad del bucle del agente, E/S de canales, ejecuciones de cron, llamadas a herramientas, operaciones de memoria, ciclo de vida de sesiones, errores, fluye a través de ella. La macro dispara un evento de <code>tracing</code> que el subscriber instalado alimenta a dos capas hermanas: la capa fmt de stderr (salida de terminal) y la <code>LogCaptureLayer</code>. La capa fmt imprime líneas coloreadas con prefijo de alias en stderr (silenciadas a menos que se use <code>--verbose</code>). La <code>LogCaptureLayer</code> materializa un <code>LogEvent</code> estructurado y lo distribuye, a través de <code>writer::record_event</code>, a:</p>
 <ol>
-<li>La terminal (mediante la capa fmt de <code>tracing-subscriber</code> que <code>zeroclaw-log</code> instala internamente) para que los operadores vean líneas coloreadas y con prefijo de alias en stderr.</li>
-<li>El registro JSONL persistido en <code>&lt;workspace&gt;/state/runtime-trace.jsonl</code> (cuando <code>[observability] log_persistence</code> es <code>"rolling"</code> o <code>"full"</code>).</li>
+<li>El puente Observer (<code>observer_bridge::forward</code>) para métricas tipadas de Prometheus / OTel.</li>
 <li>El canal de difusión de todo el proceso para que el flujo SSE del panel vea cada evento en vivo.</li>
+<li>El registro JSONL persistido en <code>&lt;workspace&gt;/state/runtime-trace.jsonl</code> (cuando <code>[observability] log_persistence</code> es <code>"rolling"</code> o <code>"full"</code>).</li>
 </ol>
-<p>El crate <code>tracing</code> es un detalle de implementación de <code>zeroclaw-log</code>. Ningún otro crate del workspace hace referencia a <code>tracing</code>, <code>tracing-subscriber</code> ni <code>tracing-attributes</code>. Sus archivos Cargo.toml no dependen de esos crates, y ningún archivo <code>.rs</code> fuera de <code>crates/zeroclaw-log/</code> nombra un tipo de tracing.</p>
-<h2 id="la-macro-record"><a class="header" href="#la-macro-record">La macro <code>record!</code></a></h2>
-<p>La macro es de forma fija: toma un nivel, una única expresión <code>Event</code> y un literal de mensaje.</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
-
-record!(INFO, Event::new(module_path!(), Action::Start), paso inicial);
-record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), error en la herramienta);
-<span class="boring">}</span></code></pre>
-<p><code>module_path!()</code> es la fuente canónica del nombre del evento: es la ruta del módulo de Rust del sitio de llamada (p. ej., <code>zeroclaw_channels::telegram</code>), por lo que los eventos se pueden buscar, permiten saltar al código fuente y son imposibles de escribir con errores tipográficos. La misma convención se usa en cada sitio de <code>record!</code> del workspace.</p>
-<p>La macro inyecta <code>file!()</code> y <code>line!()</code> automáticamente. El <code>LogCaptureLayer</code> los adjunta al mapa <code>attributes</code> del evento como <code>_file</code> y <code>_line</code> para que los operadores salten al código fuente desde un visor de registros.</p>
-<h3 id="contrato-del-punto-de-llamada"><a class="header" href="#contrato-del-punto-de-llamada">Contrato del punto de llamada</a></h3>
-<p>Cada llamada a <code>record!</code> es una sola línea de código que indica <strong>qué sucedió</strong>, no <strong>quién lo hizo ni en qué contexto</strong>.</p>
-<ul>
-<li>El único argumento posicional después del nivel es una expresión <code>Event</code>.</li>
-<li>El siguiente argumento es un literal de cadena para el mensaje legible por humanos.</li>
-<li>Eso es todo. Channel, agent_alias, provider, tool, session_key, cron_job_id, model — ninguno de esos son argumentos del sitio de llamada. Fluyen desde spans (consulta <a href="#attribution">Attribution</a>).</li>
-</ul>
-<p>La forma se impone mediante la estructura <code>Event</code>: los campos desconocidos son un error de compilación.</p>
-<h3 id="cuando-los-atributos-están-justificados"><a class="header" href="#cuando-los-atributos-están-justificados">Cuando los atributos están justificados</a></h3>
-<p><code>Event::with_attrs(serde_json::json!({...}))</code> es para mediciones por evento y datos ad-hoc que no existen en ningún lugar del ámbito circundante. Concretamente:</p>
-<ul>
-<li>Mediciones por evento: <code>bytes_received</code>, <code>tokens_used</code>, <code>retry_count</code>, <code>status_code</code>, <code>queue_depth</code>.</li>
-<li>Cargas de error cuando el error es el evento en sí: texto de cadena de <code>anyhow</code>, cuerpo de error HTTP, detalles de error de análisis.</li>
-<li>Identificadores de sistemas externos: el <code>request_id</code> de una API remota, una cabecera de rastreo upstream.</li>
-<li>Estado derivado capturado en este instante: número de solicitudes en curso, segundos de retry-after.</li>
-</ul>
-<p><strong>Los Attrs NO son para</strong> nada que provenga del ámbito circundante — channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Eso pertenece a un <code>attribution_span!</code> o <code>scope!</code> envolvente.</p>
-<p>La regla de serde: pasa el <strong>valor en bruto</strong>, nunca <code>format!("{}", v)</code> o <code>format!("{:?}", v)</code>. <code>serde_json::json!</code> serializa cadenas como cadenas, números como números, <code>Vec&lt;T&gt;</code> como arreglos, <code>Option&lt;T&gt;</code> como null o valor. Envuelve con <code>.to_string()</code> solo cuando el tipo no implementa <code>impl Serialize</code> (p. ej. <code>anyhow::Error</code>, <code>reqwest::Error</code>, <code>std::io::Error</code>, <code>Path::Display</code>, <code>StatusCode</code>).</p>
-<h3 id="regla-de-marcador-de-posición"><a class="header" href="#regla-de-marcador-de-posición">Regla de marcador de posición</a></h3>
-<p>Los marcadores de posición de literales de cadena de Rust como <code>"raw error body: {body}"</code> están prohibidos dentro de los mensajes <code>record!</code>. La captura implícita de cadenas de formato de Rust 2021 no se propaga a través de <code>record!</code>: cada <code>{var}</code> se convierte en una subcadena literal sin sustitución. La regla de conversión:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// BAD — {body} es un literal, nunca se interpola
-record!(WARN, Event::new(module_path!(), Action::Fail), raw error body: {body});
-
-// GOOD — cuerpo en attrs, el mensaje es texto plano
-record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), cuerpo de error sin procesar);
-<span class="boring">}</span></code></pre>
-<h2 id="event-action-eventoutcome-eventcategory"><a class="header" href="#event-action-eventoutcome-eventcategory"><code>Event</code>, <code>Action</code>, <code>EventOutcome</code>, <code>EventCategory</code></a></h2>
-<p>Los cuatro son enums cerrados definidos en <code>crates/zeroclaw-log/src/event.rs</code>. Agregar un valor es el único punto de cambio: los sitios de llamada no inventan cadenas.</p>
-<ul>
-<li><code>Action</code> — conjunto cerrado de verbos, convertidos a snake-case en disco mediante <code>strum::IntoStaticStr</code>: <code>Start</code>, <code>Complete</code>, <code>Fail</code>, <code>Cancel</code>, <code>Skip</code>, <code>Timeout</code>, <code>Retry</code>, <code>Inbound</code>, <code>Outbound</code>, <code>Send</code>, <code>Receive</code>, <code>Connect</code>, <code>Disconnect</code>, <code>Reconnect</code>, <code>Spawn</code>, <code>Kill</code>, <code>Tick</code>, <code>Trigger</code>, <code>Schedule</code>, <code>Approve</code>, <code>Reject</code>, <code>Defer</code>, <code>Read</code>, <code>Write</code>, <code>Delete</code>, <code>List</code>, <code>Query</code>, <code>Invoke</code>, <code>Dispatch</code>, <code>Resolve</code>, <code>Register</code>, <code>Unregister</code>, <code>Load</code>, <code>Save</code>, <code>Migrate</code>, <code>Validate</code>, <code>Note</code>.</li>
-<li><code>EventOutcome</code> — <code>Success</code>, <code>Failure</code>, <code>Unknown</code> (el valor predeterminado — resultado terminal correlacionado con el Start correspondiente mediante <code>trace_id</code>).</li>
-<li><code>EventCategory</code> — <code>Agent</code>, <code>Channel</code>, <code>Cron</code>, <code>Memory</code>, <code>Tool</code>, <code>Provider</code>, <code>Session</code>, <code>System</code>, <code>Internal</code>. Derivada del intervalo de rol más interno, a menos que se anule mediante <code>Event::with_category(...)</code>.</li>
-</ul>
-<h2 id="atribución"><a class="header" href="#atribución">Atribución</a></h2>
-<p>La atribución vinculada a alias (channel composite, agent_alias, model_provider, tool, cron_job_id, …) nunca es un argumento del sitio de llamada. Fluye a través de los tracing spans abiertos en los puntos de entrada y recorridos por la capa.</p>
+<p>La escritura al final del archivo JSONL en disco ocurre en último lugar y solo cuando la persistencia está habilitada; el puente Observer y el hook de difusión se ejecutan incondicionalmente.</p>
+<h2 id="lea-esto-primero-atribución-no-es-attrs"><a class="header" href="#lea-esto-primero-atribución-no-es-attrs">Lea esto primero: atribución no es attrs</a></h2>
+<p>Cada evento de log lleva dos canales completamente separados de datos estructurados. Confundirlos es el error más común en un punto de llamada, así que interioriza la separación antes que cualquier otra cosa:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>Atribución</strong> (<code>zeroclaw.*</code>)</th><th><strong>Attrs</strong> (<code>attributes.*</code>)</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Respuestas</strong></td><td><em>Quién</em> lo hizo y <em>en qué contexto</em></td><td><em>¿Qué</em> pasó específicamente</td></tr>
+<tr><td><strong>Ejemplos</strong></td><td><code>channel</code>, <code>agent_alias</code>, <code>model_provider</code>, <code>tool</code>, <code>session_key</code>, <code>cron_job_id</code></td><td><code>bytes_received</code>, <code>tokens_used</code>, <code>status_code</code>, cargas útiles de error</td></tr>
+<tr><td><strong>Fuente</strong></td><td><strong>Spans.</strong> Se abren en los puntos de entrada y son recorridos por la capa.</td><td><strong>El sitio de llamada.</strong> <code>Event::with_attrs(json!({...}))</code>.</td></tr>
+<tr><td><strong>¿Aparece en el sitio de llamada?</strong></td><td><strong>Nunca.</strong> No es un argumento de <code>record!</code>.</td><td>Sí, ese es el único lugar del que puede venir.</td></tr>
+</tbody>
+</table>
+</div>
+<p>La regla que se deriva de esto: <strong>si un valor identifica a quién o a qué ámbito pertenece un evento, proviene de un span y nunca debe aparecer en el punto de llamada.</strong> La atribución fluye automáticamente desde los wrappers <code>attribution_span!</code> / <code>scope!</code> abiertos más arriba en la pila; la capa recorre el ámbito del span de hoja→raíz cuando se dispara un evento y combina cada contribución en el bloque <code>zeroclaw.*</code> del evento. El punto de llamada que dispara <code>record!</code> no nombra nada de esto.</p>
+<p>Dado que la atribución es la mitad estructural de esta división y la mitad que confunde a la gente, va primero.</p>
+<h2 id="atribución-todo-proviene-de-los-spans"><a class="header" href="#atribución-todo-proviene-de-los-spans">Atribución: todo proviene de los spans</a></h2>
+<p><strong>La atribución nunca es un argumento en el punto de llamada.</strong> Léelo de nuevo. Channel composite, agent_alias, model_provider, tool, session_key, cron_job_id: ninguno de estos se escribe jamás en una llamada a <code>record!</code>. Fluyen a través de spans de tracing abiertos en los puntos de entrada y recorridos por la capa cuando se dispara un evento. Si te encuentras queriendo pasar <code>agent_alias</code> o <code>tool</code> a <code>record!</code>, detente: el valor ya está en el alcance a través de un span, o debería estarlo, y la solución es abrir o corregir el span, no propagar el valor hasta el punto de llamada.</p>
+<p>El mecanismo, de principio a fin:</p>
+<ol>
+<li>Una “cosa” (canal, proveedor, agente, herramienta, tarea cron, backend de memoria, …) implementa <code>Attributable</code> una vez, junto a su struct.</li>
+<li>Su punto de entrada envuelve el trabajo en <code>attribution_span!(self)</code>, que abre un span de tracing que lleva el rol y el alias de ese elemento.</li>
+<li>Cada <code>record!</code> disparado en cualquier lugar dentro de ese span, directamente o anidado a cualquier profundidad, hereda la atribución automáticamente.</li>
+<li>Cuando se dispara el evento, la capa recorre el ámbito del span <strong>de hoja a raíz</strong>, fusiona la contribución de cada <code>Attributable</code> y escribe el bloque <code>zeroclaw.*</code> fusionado. El sitio de llamada no nombró nada de esto.</li>
+</ol>
+<p>Este es el objetivo principal del diseño: el código de logging por elemento es cero. Implementas el trait una vez y envuelves el punto de entrada una vez; cada emisión por debajo queda atribuida gratis.</p>
 <h3 id="el-trait-attributable"><a class="header" href="#el-trait-attributable">El trait <code>Attributable</code></a></h3>
 <p>Reside en <code>crates/zeroclaw-api/src/attribution.rs</code> para que cada crate pueda implementarlo sin depender de <code>zeroclaw-log</code>:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
@@ -293,17 +349,18 @@ record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::js
     Tool(ToolKind),             // Shell, HttpRequest, FetchUrl, ...
     Cron(CronKind),             // Interval, At, Cron, Once
     Provider(ProviderKind),     // Model, Tts, Transcription, Tunnel
-    Memory(MemoryKind),         // Sqlite, Json, InMemory
+    Memory(MemoryKind),         // Sqlite, Json, InMemory, Markdown, Qdrant, ...
     PeerGroup,
     Skill,
     Mcp,
+    Sop,
     Session,
     System,
 }
 <span class="boring">}</span></code></pre>
 <p><code>ChannelKind</code>, <code>ToolKind</code>, <code>CronKind</code>, <code>MemoryKind</code> y los cuatro subenumerados de <code>ProviderKind</code> (<code>ModelProviderKind</code>, <code>TtsProviderKind</code>, <code>TranscriptionProviderKind</code>, <code>TunnelProviderKind</code>) son todos cerrados. La forma snake_case de la variante mediante <code>strum::IntoStaticStr</code> es la porción canónica <code>&lt;type&gt;</code> del compuesto <code>&lt;type&gt;.&lt;alias&gt;</code>. Para agregar una nueva implementación: extiende el enumerado <code>Kind</code> correspondiente, eso es todo.</p>
-<h3 id="apertura-de-un-span"><a class="header" href="#apertura-de-un-span">Apertura de un span</a></h3>
-<p>Envuelve el trabajo de un punto de entrada con <code>attribution_span!(thing)</code>. La macro devuelve un <code>Span</code> que lleva el rol y el alias de la cosa como campos estructurados. Usa <code>.instrument(span)</code> en el future (o <code>let _g = span.entered()</code> en código síncrono).</p>
+<h3 id="abriendo-un-span-haz-esto-en-cada-punto-de-entrada"><a class="header" href="#abriendo-un-span-haz-esto-en-cada-punto-de-entrada">Abriendo un span, haz esto en cada punto de entrada</a></h3>
+<p>Envuelve el trabajo de un punto de entrada con <code>attribution_span!(thing)</code>. La macro devuelve un <code>Span</code> que lleva el rol y el alias del elemento como campos estructurados. Aplica <code>.instrument(span)</code> al future (o <code>let _g = span.entered()</code> en código síncrono). <strong>Una tarea generada que no restablece el span pierde la atribución</strong>: cada cuerpo de <code>tokio::spawn</code> que emita debe llevar el mismo <code>attribution_span!</code> / <code>scope!</code> que usó el padre, o sus emisiones quedarán sin atribuir.</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>use zeroclaw_log::Instrument;
@@ -316,8 +373,8 @@ async move {
 }.instrument(span).await
 <span class="boring">}</span></code></pre>
 <p>La capa recorre el ámbito del span de hoja→raíz cuando se dispara un evento, fusiona la contribución de cada <code>Attributable</code> en el bloque de atribución <code>zeroclaw.*</code> del evento, y emite el compuesto (<code>channel = "telegram.clamps"</code>, <code>channel_type = "telegram"</code>, <code>channel_alias = "clamps"</code>) sin que el sitio de llamada nombre ninguna de esas claves.</p>
-<h3 id="la-macro-scope"><a class="header" href="#la-macro-scope">La macro <code>scope!</code></a></h3>
-<p>Para identificadores por ámbito que no están vinculados a un elemento <code>Attributable</code> con rol —sender id, message id, turn id, request id— usa <code>scope!</code>:</p>
+<h3 id="la-macro-scope-contexto-sin-rol"><a class="header" href="#la-macro-scope-contexto-sin-rol">La macro <code>scope!</code>, contexto sin rol</a></h3>
+<p><code>attribution_span!</code> es para elementos <code>Attributable</code> con roles. Para identificadores por ámbito que no están vinculados a uno (sender id, message id, turn id, request id), use <code>scope!</code>:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>zeroclaw_log::scope!(
@@ -326,27 +383,75 @@ async move {
     =&gt; async move { process_message(msg).await }
 ).await
 <span class="boring">}</span></code></pre>
-<p>Las claves de campo que coinciden con <code>ATTRIBUTION_FIELDS</code> / <code>COMPOSITE_PREFIXES</code> vinculados por alias (en <code>crates/zeroclaw-log/src/event.rs</code>) se ubican en el slot de atribución tipado; todo lo demás se ubica en el mapa <code>attributes</code> del evento para cada emisión descendiente.</p>
+<p><code>scope!</code> se sitúa deliberadamente a ambos lados de la línea entre atribución y attrs: las claves de campo que coinciden con <code>ATTRIBUTION_FIELDS</code> / <code>COMPOSITE_PREFIXES</code> vinculados por alias (en <code>crates/zeroclaw-log/src/event.rs</code>) terminan en el slot de atribución tipado <code>zeroclaw.*</code>; todo lo demás termina en el mapa <code>attributes</code> del evento para cada emisión descendiente. En cualquier caso, el valor viaja en cada <code>record!</code> anidado sin ser un argumento del punto de llamada.</p>
+<h2 id="la-macro-record-y-su-contrato-en-el-punto-de-llamada"><a class="header" href="#la-macro-record-y-su-contrato-en-el-punto-de-llamada">La macro <code>record!</code> y su contrato en el punto de llamada</a></h2>
+<p>El crate <code>tracing</code> es un detalle de implementación de <code>zeroclaw-log</code>: las macros <code>record!</code> / <code>scope!</code> / <code>attribution_span!</code> se expanden a <code>zeroclaw_log::__private::tracing</code>, de modo que un sitio de llamada nunca nombra un tipo de tracing. Las propias macros de eventos de log (<code>tracing::{trace,debug,info,warn,error}</code>, <code>log::*</code>, <code>std::dbg</code>, además de <code>anyhow::anyhow!</code> directo) están <strong>estrictamente prohibidas en todo el workspace</strong> como <code>disallowed-macros</code> en <code>clippy.toml</code>. Con <code>-D warnings</code> en CI, cualquier uso directo de <code>tracing::info!</code>, etc., <strong>hace fallar la compilación</strong>, con un mensaje de clippy que indica <code>::zeroclaw_log::record!</code> como reemplazo. Esto no es una convención; se aplica de forma obligatoria.</p>
+<p>Las únicas exenciones son los pocos archivos dentro de <code>crates/zeroclaw-log/</code> que inicializan el pipeline y llevan un <code>#![allow(clippy::disallowed_macros)]</code> local. Un puñado de crates (<code>zeroclaw-api</code>, <code>zeroclaw-spawn</code>, <code>zeroclaw-providers</code>, <code>zeroclaw-hardware</code>, <code>zeroclaw-log</code>) todavía lista <code>tracing</code> / <code>tracing-subscriber</code> en <code>Cargo.toml</code>, pero solo para la infraestructura de spans y subscribers, no para emitir macros de logging. Que la dependencia esté presente no autoriza llamar a las macros prohibidas. (<code>tokio::spawn</code> está prohibido de la misma manera mediante <code>disallowed-methods</code>; usa <code>::zeroclaw_spawn::spawn!</code> para que las tareas generadas hereden el span de atribución del llamador.)</p>
+<p>La macro es de forma fija: toma un nivel, una única expresión <code>Event</code> y un literal de mensaje.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use zeroclaw_log::{record, Event, Action, EventCategory, EventOutcome};
+
+record!(INFO, Event::new(module_path!(), Action::Start), paso inicial);
+record!(WARN, Event::new(module_path!(), Action::Fail).with_outcome(EventOutcome::Failure).with_attrs(serde_json::json!({"exit_code": 137})), error en la herramienta);
+<span class="boring">}</span></code></pre>
+<p><code>module_path!()</code> es la fuente canónica del nombre del evento: es la ruta de módulo de Rust del punto de llamada (p. ej., <code>zeroclaw_channels::telegram</code>), por lo que los eventos son buscables, permiten saltar al código fuente y es imposible escribirlos mal. La misma convención se usa en cada punto de <code>record!</code> del workspace.</p>
+<p>La macro inyecta <code>file!()</code> y <code>line!()</code> automáticamente. El <code>LogCaptureLayer</code> los adjunta al mapa <code>attributes</code> del evento como <code>_file</code> y <code>_line</code> para que los operadores salten al código fuente desde un visor de registros.</p>
+<h3 id="contrato-del-punto-de-llamada"><a class="header" href="#contrato-del-punto-de-llamada">Contrato del punto de llamada</a></h3>
+<p>Cada llamada a <code>record!</code> es una sola línea de código que indica <strong>qué sucedió</strong>, no <strong>quién lo hizo ni en qué contexto</strong>.</p>
+<ul>
+<li>El único argumento posicional después del nivel es una expresión <code>Event</code>.</li>
+<li>El siguiente argumento es un literal de cadena para el mensaje legible por humanos.</li>
+<li>Eso es todo. Channel, agent_alias, provider, tool, session_key, cron_job_id, model: ninguno de esos son argumentos del punto de llamada. Fluyen desde los spans (consulte <a href="#attribution-it-all-comes-from-spans">Atribución: todo proviene de los spans</a>).</li>
+</ul>
+<p>La forma se impone mediante la estructura <code>Event</code>: los campos desconocidos son un error de compilación.</p>
+<h3 id="cuando-los-atributos-están-justificados"><a class="header" href="#cuando-los-atributos-están-justificados">Cuando los atributos están justificados</a></h3>
+<p><code>Event::with_attrs(serde_json::json!({...}))</code> es para mediciones por evento y datos ad-hoc que no existen en ningún lugar del ámbito circundante. Concretamente:</p>
+<ul>
+<li>Mediciones por evento: <code>bytes_received</code>, <code>tokens_used</code>, <code>retry_count</code>, <code>status_code</code>, <code>queue_depth</code>.</li>
+<li>Cargas de error cuando el error es el evento en sí: texto de cadena de <code>anyhow</code>, cuerpo de error HTTP, detalles de error de análisis.</li>
+<li>Identificadores de sistemas externos: el <code>request_id</code> de una API remota, una cabecera de rastreo upstream.</li>
+<li>Estado derivado capturado en este instante: número de solicitudes en curso, segundos de retry-after.</li>
+</ul>
+<p><strong>Los attrs NO son para</strong> nada que provenga del ámbito circundante: channel composite, agent_alias, model_provider, tool, session_key, cron_job_id, sender, message_id, etc. Esos pertenecen a un <code>attribution_span!</code> o <code>scope!</code> envolvente.</p>
+<p>La regla de serde: pasa el <strong>valor en bruto</strong>, nunca <code>format!("{}", v)</code> o <code>format!("{:?}", v)</code>. <code>serde_json::json!</code> serializa cadenas como cadenas, números como números, <code>Vec&lt;T&gt;</code> como arreglos, <code>Option&lt;T&gt;</code> como null o valor. Envuelve con <code>.to_string()</code> solo cuando el tipo no implementa <code>impl Serialize</code> (p. ej. <code>anyhow::Error</code>, <code>reqwest::Error</code>, <code>std::io::Error</code>, <code>Path::Display</code>, <code>StatusCode</code>).</p>
+<h3 id="regla-de-marcador-de-posición"><a class="header" href="#regla-de-marcador-de-posición">Regla de marcador de posición</a></h3>
+<p>Los marcadores de posición en literales de cadena de Rust como <code>"raw error body: {body}"</code> están prohibidos dentro de los mensajes de <code>record!</code>. La captura implícita de cadenas de formato de Rust 2021 no se propaga a través de <code>record!</code>: cada <code>{var}</code> se convierte en una subcadena literal sin sustitución. La regla de conversión:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// BAD — {body} es un literal, nunca se interpola
+record!(WARN, Event::new(module_path!(), Action::Fail), raw error body: {body});
+
+// GOOD — cuerpo en attrs, el mensaje es texto plano
+record!(WARN, Event::new(module_path!(), Action::Fail).with_attrs(serde_json::json!({"body": body})), cuerpo de error sin procesar);
+<span class="boring">}</span></code></pre>
+<h2 id="event-action-eventoutcome-eventcategory"><a class="header" href="#event-action-eventoutcome-eventcategory"><code>Event</code>, <code>Action</code>, <code>EventOutcome</code>, <code>EventCategory</code></a></h2>
+<p>Las cuatro son enumeraciones cerradas definidas en <code>crates/zeroclaw-log/src/event.rs</code>. Agregar un valor es el único punto de cambio: los puntos de llamada no inventan cadenas.</p>
+<ul>
+<li><code>Action</code>: conjunto cerrado de verbos, en snake_case en disco mediante <code>strum::IntoStaticStr</code>: <code>Start</code>, <code>Complete</code>, <code>Fail</code>, <code>Cancel</code>, <code>Skip</code>, <code>Timeout</code>, <code>Retry</code>, <code>Inbound</code>, <code>Outbound</code>, <code>Send</code>, <code>Receive</code>, <code>Connect</code>, <code>Disconnect</code>, <code>Reconnect</code>, <code>Spawn</code>, <code>Kill</code>, <code>Tick</code>, <code>Trigger</code>, <code>Schedule</code>, <code>Approve</code>, <code>Reject</code>, <code>Defer</code>, <code>Read</code>, <code>Write</code>, <code>Delete</code>, <code>List</code>, <code>Query</code>, <code>Invoke</code>, <code>Dispatch</code>, <code>Resolve</code>, <code>Register</code>, <code>Unregister</code>, <code>Load</code>, <code>Save</code>, <code>Migrate</code>, <code>Validate</code>, <code>Note</code>.</li>
+<li><code>EventOutcome</code>: <code>Success</code>, <code>Failure</code>, <code>Unknown</code>. <code>Unknown</code> es el valor predeterminado y se omite en la serialización (se excluye del <code>event.outcome</code> en disco), por lo que una fila sin clave <code>outcome</code> es implícitamente <code>Unknown</code>.</li>
+<li><code>EventCategory</code>: <code>Agent</code>, <code>Channel</code>, <code>Cron</code>, <code>Memory</code>, <code>Tool</code>, <code>Provider</code>, <code>Session</code>, <code>System</code>, <code>Internal</code>. Derivado del span de rol más interno, a menos que se anule mediante <code>Event::with_category(...)</code>.</li>
+</ul>
 <h2 id="propagación-de-entradasalida-de-herramientas"><a class="header" href="#propagación-de-entradasalida-de-herramientas">Propagación de entrada/salida de herramientas</a></h2>
-<p>El ejecutor central de herramientas (<code>crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool</code>) envuelve cada llamada a <code>Tool::execute(args)</code> con eventos de inicio/finalización/fallo:</p>
+<p>El ejecutor central de herramientas (<code>crates/zeroclaw-runtime/src/agent/tool_execution.rs::execute_one_tool</code>) envuelve cada llamada a <code>Tool::execute(args)</code> con eventos de invocación/finalización/fallo. El nombre de cada evento es <code>module_path!()</code> (el propio módulo del ejecutor), no una cadena codificada de forma fija; el <code>Action</code> y la severidad los distinguen:</p>
 <ol>
-<li>Emite <code>Event::new("tool.invoke.start", Action::Invoke)</code> con <code>args</code> en attrs.</li>
+<li>Antes de ejecutar: <code>record!(DEBUG, Event::new(module_path!(), Action::Invoke).with_category(EventCategory::Tool).with_attrs(...))</code> con <code>tool</code>, <code>tool_call_id</code> y el <code>input</code> completo en attrs.</li>
 <li>Ejecuta <code>execute(args).await</code>.</li>
-<li>En caso de éxito: <code>Event::new("tool.invoke.complete", Action::Complete)</code> con <code>Outcome::Success</code>, la duración y la salida en attrs.</li>
-<li>En caso de fallo: <code>Event::new("tool.invoke.fail", Action::Fail)</code> con <code>Outcome::Failure</code>, la duración y el error/salida en attrs.</li>
-<li>En panic / <code>Err</code>: misma emisión de fallos, cadena de errores en attrs.</li>
+<li>En caso de éxito (<code>r.success</code>): <code>record!(DEBUG, ... Action::Complete)</code> con <code>Outcome::Success</code>, la duración, y <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>output</code> en los attrs.</li>
+<li>En caso de fallo reportado por la herramienta (<code>!r.success</code>): <code>record!(WARN, ... Action::Fail)</code> con <code>Outcome::Failure</code>, la duración, y <code>tool</code> / <code>tool_call_id</code> / <code>input</code> / <code>error</code> / <code>output</code> en los attrs.</li>
+<li>En caso de <code>Err</code> de <code>execute</code>: <code>record!(ERROR, ... Action::Fail)</code> con <code>Outcome::Failure</code>, la duración y el error formateado con debug en los atributos.</li>
 </ol>
-<p>Las implementaciones por herramienta de <code>Tool::execute</code> no añaden código de registro alguno. El par correspondiente (start ↔ complete/fail) comparte un <code>trace_id</code> a través del ámbito del span circundante, de modo que una consulta de panel puede correlacionarlos.</p>
+<p>Estos eventos se emiten dentro de un span estilo <code>scope!</code> (<code>target = "zeroclaw_log_internal_scope"</code>, campo <code>tool = &lt;name&gt;</code>) que se abre alrededor de la llamada, por lo que el campo <code>tool</code> también acompaña a cada emisión descendiente. Las implementaciones de <code>Tool::execute</code> de cada herramienta no añaden ningún código de logging.</p>
 <h2 id="logcapturelayer-y-el-esquema-en-disco"><a class="header" href="#logcapturelayer-y-el-esquema-en-disco"><code>LogCaptureLayer</code> y el esquema en disco</a></h2>
 <p>La capa en <code>crates/zeroclaw-log/src/layer.rs</code> es una Layer de <code>tracing-subscriber</code> que:</p>
 <ol>
 <li>En la creación/registro de un span con el target <code>"zeroclaw_log_internal_attribution"</code> (el target con el que abre la macro <code>attribution_span!</code>): analiza los campos role + alias en una instantánea de <code>ZeroclawAttribution</code> almacenada en las extensiones del span.</li>
 <li>Al crear/registrar un span con el destino <code>"zeroclaw_log_internal_scope"</code> (abierto con <code>scope!</code>): analiza los kvps ad-hoc y los almacena de forma similar.</li>
-<li>Al emitir un evento con el target <code>"zeroclaw_log_event"</code> (el target a través del cual se dispara la macro <code>record!</code>): construye un <code>LogEvent</code> a partir del conjunto de campos <code>zc_*</code>, recorre el ámbito del span de hoja a raíz fusionando cada instantánea de atribución que encuentra, analiza el blob JSON <code>zc_attrs</code> en los <code>attributes</code> del evento, adjunta <code>_file</code>/<code>_line</code> desde la ubicación de origen capturada automáticamente, y escribe el evento final en:
+<li>Al emitir un evento con target <code>"zeroclaw_log_event"</code> (el target a través del cual se dispara el macro <code>record!</code>): construye un <code>LogEvent</code> a partir del conjunto de campos <code>zc_*</code>, recorre el ámbito de spans de hoja→raíz fusionando cada snapshot de atribución que encuentra, parsea el blob JSON de <code>zc_attrs</code> en los <code>attributes</code> del evento, adjunta <code>_file</code>/<code>_line</code> desde la ubicación de origen capturada automáticamente, y entrega el evento final a <code>writer::record_event</code>, que lo distribuye en este orden:
 <ul>
-<li>Persistencia JSONL (<code>writer.rs</code>).</li>
-<li>Hook de broadcast (<code>broadcast.rs</code>) para suscriptores de SSE/dashboard.</li>
-<li>Puente del observador (<code>observer_bridge.rs</code>) para métricas tipadas de Prometheus / OTel.</li>
+<li>Puente de observador (<code>observer_bridge.rs</code>) para métricas tipadas de Prometheus / OTel (incondicional).</li>
+<li>Hook de difusión (<code>broadcast.rs</code>) para suscriptores de SSE/dashboard (incondicional).</li>
+<li>Persistencia JSONL (<code>writer.rs</code>), añadida al final y solo cuando <code>log_persistence</code> está habilitado.</li>
 </ul>
 </li>
 </ol>
@@ -377,14 +482,18 @@ async move {
 </code></pre>
 <p><code>@timestamp</code> es <code>chrono::DateTime&lt;Utc&gt;</code> serializado como RFC 3339 con <code>Z</code>. La versión del esquema es <code>2</code>; las filas más antiguas con <code>version: 1</code> se migran in situ al iniciar el daemon mediante <code>migrate::migrate_legacy_jsonl_in_place</code>.</p>
 <h2 id="logconfig-vs-observabilityconfig"><a class="header" href="#logconfig-vs-observabilityconfig"><code>LogConfig</code> vs <code>ObservabilityConfig</code></a></h2>
-<p><code>zeroclaw-log</code> define su propio <code>LogConfig</code> mínimo (en <code>crates/zeroclaw-log/src/config.rs</code>) — <code>log_persistence</code>, <code>log_persistence_path</code>, <code>log_persistence_max_entries</code>, <code>log_tool_io</code>, <code>log_tool_io_truncate_bytes</code>, <code>log_tool_io_denylist</code>. Esto rompe lo que de otro modo sería un ciclo de dependencias: <code>zeroclaw-config::ObservabilityConfig</code> lleva el esquema completo (con deserialización y validación de TOML), y el runtime lo convierte a <code>LogConfig</code> al iniciar mediante <code>crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config</code>. El resultado: <code>zeroclaw-config</code> puede usar <code>record!</code> sin invertir el árbol de dependencias.</p>
+<p><code>zeroclaw-log</code> define su propio <code>LogConfig</code> mínimo (en <code>crates/zeroclaw-log/src/config.rs</code>): <code>log_persistence</code>, <code>log_persistence_path</code>, <code>log_persistence_max_entries</code>, <code>log_tool_io</code>, <code>log_tool_io_truncate_bytes</code>, <code>log_tool_io_denylist</code>. Esto rompe lo que de otro modo sería un ciclo de dependencias: <code>zeroclaw-config::ObservabilityConfig</code> contiene el esquema completo (con deserialización TOML y validación), y el runtime lo convierte a <code>LogConfig</code> al inicio mediante <code>crates/zeroclaw-runtime/src/observability/runtime_trace.rs::to_log_config</code>. El resultado: <code>zeroclaw-config</code> puede usar <code>record!</code> sin invertir el árbol de dependencias.</p>
 <h2 id="instalación-del-suscriptor"><a class="header" href="#instalación-del-suscriptor">Instalación del suscriptor</a></h2>
 <p>El daemon instala el suscriptor global mediante:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>zeroclaw_log::install_global_subscriber("info,matrix_sdk=warn,matrix_sdk_base=warn");
+</span>zeroclaw_log::install_global_subscriber(
+    recording_filter.as_deref(),   // Option&lt;&amp;str&gt; — el flag --log-level, si está establecido
+    &amp;default_filter,               // &amp;str — filtro de respaldo cuando no hay flag ni RUST_LOG
+    cli.verbose,                   // bool — controla la capa fmt (terminal) de stderr
+);
 <span class="boring">}</span></code></pre>
-<p>Esa única llamada configura el formateador de terminal con prefijo de alias de agente + la <code>LogCaptureLayer</code> sobre un <code>tracing-subscriber::Registry</code>. <code>src/main.rs</code> es el único lugar que la invoca. Las pruebas usan <code>zeroclaw_log::try_install_capture_subscriber()</code> + <code>zeroclaw_log::subscribe_or_install()</code> para drenar los eventos emitidos a través del hook de difusión sin nombrar ningún tipo de tracing en el crate de pruebas.</p>
+<p>Dos ejes independientes: el <strong>piso de registro</strong> (lo que llega a <code>LogCaptureLayer</code>, resuelto como flag → <code>RUST_LOG</code> → valor predeterminado) y la <strong>visualización en terminal</strong> (la capa fmt de stderr, completamente silenciada a menos que <code>verbose</code> sea true). Esa única llamada configura el formateador de terminal con prefijo de alias de agente + el <code>LogCaptureLayer</code> sobre un <code>tracing-subscriber::Registry</code>. <code>src/main.rs</code> es el único lugar que la llama. Las pruebas usan <code>zeroclaw_log::try_install_capture_subscriber()</code> + <code>zeroclaw_log::subscribe_or_install()</code> para drenar los eventos emitidos a través del hook de broadcast sin que se nombre ningún tipo de tracing en el crate de pruebas.</p>
 <h2 id="cuándo-extender-las-enumeraciones-cerradas"><a class="header" href="#cuándo-extender-las-enumeraciones-cerradas">Cuándo extender las enumeraciones cerradas</a></h2>
 <ul>
 <li><strong>Nueva implementación de canal</strong>: agrega una variante a <code>ChannelKind</code>. La forma snake_case es la cadena <code>channel_type</code> almacenada en disco. Agrega <code>#[strum(serialize = "...")]</code> solo cuando el nombre de la variante no se convierte en snake-case al valor deseado (p. ej., <code>OpenAi</code> → <code>"openai"</code>).</li>
@@ -392,7 +501,7 @@ async move {
 <li><strong>Nueva forma de programación de cron</strong>: añadir a <code>CronKind</code>.</li>
 <li><strong>Nuevo proveedor de modelo / TTS / transcripción / túnel</strong>: agregar al subenum <code>*ProviderKind</code> correspondiente bajo <code>ProviderKind</code>.</li>
 <li><strong>Nuevo backend de memoria</strong>: añadir a <code>MemoryKind</code>.</li>
-<li><strong>Una nueva familia de <code>Role</code> completa</strong> (PeerGroup / Skill / Mcp obtienen subtipos): se anida con su propio <code>Kind</code> sobre la marcha; el patrón es uniforme.</li>
+<li><strong>Familia <code>Role</code> completamente nueva</strong> (PeerGroup / Skill / Mcp obtienen subtipos): se anida con su propio <code>Kind</code> sobre la marcha: el patrón es uniforme.</li>
 </ul>
 <p>Luego añade <code>impl Attributable for X</code> junto a la nueva estructura (<code>fn role() -&gt; Role::Family(Kind::Variant)</code>, <code>fn alias() -&gt; &amp;str { &amp;self.alias }</code>) y envuelve su punto de entrada con <code>attribution_span!(self)</code>. La capa recoge todo lo demás automáticamente.</p>
 <h2 id="preocupaciones-del-operador"><a class="header" href="#preocupaciones-del-operador">Preocupaciones del operador</a></h2>
@@ -406,7 +515,7 @@ async move {
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../architecture/multi-agent.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../architecture/rpc-socket.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -420,7 +529,7 @@ async move {
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../architecture/multi-agent.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../architecture/rpc-socket.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -442,6 +551,114 @@ async move {
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

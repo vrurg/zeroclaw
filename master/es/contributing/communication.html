@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -223,20 +300,20 @@
 <p>Chat en tiempo real. Aquí es donde los mantenedores están presentes día a día; la vía más rápida para obtener una respuesta humana.</p>
 <p>Canales:</p>
 <ul>
-<li><code>#general</code> — la sala predeterminada</li>
-<li><code>#help</code> — Hilos de “No puedo hacer que X funcione”; la forma más rápida de desbloquearse</li>
-<li><code>#dev</code> — discusión de desarrollo en curso</li>
-<li><code>#releases</code> — anuncios, notas de la versión, advertencias previas de cambios incompatibles</li>
+<li><code>#general</code>: la sala predeterminada</li>
+<li><code>#help</code>: hilos de “No logro que X funcione”; la forma más rápida de desbloquearte</li>
+<li><code>#dev</code>: discusión de desarrollo en curso</li>
+<li><code>#releases</code>: anuncios, notas de la versión, avisos previos de cambios incompatibles</li>
 </ul>
 <p><a href="https://github.com/zeroclaw-labs/zeroclaw">Enlace de invitación en el README del repositorio.</a></p>
-<p><strong>Discord es efímero</strong>: si la conversación deriva en un error o en una idea de funcionalidad, créala como un issue en GitHub para que el registro perdure. Discord es para la conversación; GitHub es para la memoria.</p>
+<p><strong>Discord es efímero</strong>: si la conversación deriva en un error o una idea de funcionalidad, captúralo después como una issue de GitHub para que el registro persista. Discord es para conversar; GitHub es para la memoria.</p>
 <p>Usa un handoff de GitHub cuando Discord produzca algo que el proyecto deba recordar. Crea o actualiza un issue, una discussion, un comentario de PR o un documento de mantenimiento cuando el hilo produzca un bug reproducible, un alcance de funcionalidad concreto, una decisión de arquitectura o gobernanza, un compromiso de mantenimiento, una asignación de owner, una decisión de milestone, un blocker, una solución alternativa, evidencia de validación, una nota de impacto en el release o un motivo de exención por inactividad. El handoff solo necesita la decisión, la evidencia, el owner cuando exista y el contexto suficiente para que otro mantenedor pueda continuar sin tener que releer el chat.</p>
 <h2 id="problemas-de-github"><a class="header" href="#problemas-de-github">Problemas de GitHub</a></h2>
 <p>Para errores, solicitudes de nuevas funcionalidades y cualquier cosa que deba ser rastreada.</p>
 <ul>
-<li><strong>Informes de errores</strong> — utiliza la plantilla de informe de errores (<code>.github/ISSUE_TEMPLATE/bug_report.yml</code>). Incluye <code>zeroclaw --version</code>, el sistema operativo y la salida de <code>zeroclaw doctor</code>.</li>
-<li><strong>Solicitudes de características</strong> — utiliza la plantilla de características (<code>.github/ISSUE_TEMPLATE/feature_request.yml</code>). Concéntrate en el valor para el usuario y las restricciones; los detalles de implementación son para RFCs o discusión en PRs.</li>
-<li><strong>RFCs</strong> — consulta el <a href="./rfcs.html">proceso de RFC</a>.</li>
+<li><strong>Informes de errores</strong>: use la plantilla de errores (<code>.github/ISSUE_TEMPLATE/bug_report.yml</code>). Incluya <code>zeroclaw --version</code>, el sistema operativo y la salida de <code>zeroclaw doctor</code>.</li>
+<li><strong>Solicitudes de funcionalidades</strong>: use la plantilla de funcionalidades (<code>.github/ISSUE_TEMPLATE/feature_request.yml</code>). Céntrese en el valor para el usuario y las restricciones; los detalles de implementación son para los RFC o la discusión en el PR.</li>
+<li><strong>RFCs</strong>: consulta el <a href="./rfcs.html">proceso de RFC</a>.</li>
 </ul>
 <p>Busca antes de crear un nuevo informe. Los duplicados se consolidan; la caja de búsqueda es tu mejor aliada.</p>
 <h2 id="discusiones-de-github"><a class="header" href="#discusiones-de-github">Discusiones de GitHub</a></h2>
@@ -259,17 +336,17 @@
 </tbody>
 </table>
 </div>
-<p>Utiliza las menciónes <code>@</code>-mention de manera moderada — solo CC a los mantenedores cuando el problema realmente necesite su atención. Por defecto, deja que el equipo haga la triaje.</p>
+<p>Usa menciones con <code>@</code>- con moderación, solo a los mantenedores de CC cuando el problema realmente necesite su atención. Por defecto, deja que el equipo haga el triaje.</p>
 <h2 id="problemas-de-seguridad"><a class="header" href="#problemas-de-seguridad">Problemas de seguridad</a></h2>
 <p>No presente informes públicos sobre vulnerabilidades de seguridad.</p>
-<p>Correo electrónico: <code>security@zeroclaw.dev</code></p>
+<p>Reporta de forma privada a través del <a href="https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new">reporte privado de vulnerabilidades</a> de GitHub (Security Advisories).</p>
 <p>Incluir:</p>
 <ul>
 <li>Versiones afectadas</li>
 <li>Reproducción (mínima, por favor)</li>
 <li>Evaluación de impacto</li>
 </ul>
-<p>Nos comprometemos a reconocer en un plazo de 48 horas y publicar un parche + aviso en un plazo de 14 días para problemas críticos. Se agradece la divulgación coordinada.</p>
+<p>Nuestro objetivo es acusar recibo en un plazo de 48 horas, evaluar en 1 semana y publicar una corrección en 2 semanas para los problemas críticos. Se agradece la divulgación coordinada.</p>
 <p>Consulta <code>SECURITY.md</code> en la raíz del repositorio para obtener la política completa.</p>
 <h2 id="feed-de-lanzamientos"><a class="header" href="#feed-de-lanzamientos">Feed de lanzamientos</a></h2>
 <p>Suscríbete al feed de lanzamientos de GitHub para recibir notificaciones cuando se publiquen nuevas versiones:</p>
@@ -280,14 +357,14 @@
 <h2 id="soporte-comercial"><a class="header" href="#soporte-comercial">Soporte comercial</a></h2>
 <p>Ninguno ofrecido. ZeroClaw es mantenido por la comunidad. Si estás desplegando a gran escala y deseas SLAs, patrocina a un mantenedor directamente o financia un acuerdo de soporte dedicado a través del equipo principal. Contacta a través de <code>hello@zeroclaw.dev</code>.</p>
 <h2 id="comentarios"><a class="header" href="#comentarios">Comentarios</a></h2>
-<p>Los comentarios abiertos — como “Intenté hacer X y me pareció incorrecto”, observaciones de UX o reflexiones sobre la dirección del proyecto — se reciben mejor en un hilo en Discord <code>#general</code> o <code>#dev</code>. Es más probable que el equipo los vea y los discuta allí. Si el hilo se convierte en algo concreto, muévelo a una Discusión o un issue en GitHub.</p>
+<p>Los comentarios abiertos, del tipo “intenté hacer X y algo no me cuadró”, las observaciones de UX y las reflexiones sobre la dirección del proyecto funcionan mejor como un hilo en Discord <code>#general</code> o <code>#dev</code>. Es más probable que el equipo los vea y los discuta allí. Si el hilo se convierte en algo concreto, muévelo a una GitHub Discussion o a un issue.</p>
 <h2 id="reconocimiento-de-colaboradores"><a class="header" href="#reconocimiento-de-colaboradores">Reconocimiento de colaboradores</a></h2>
-<p>Todos los que hayan tenido un PR fusionado aparecen en la lista de colaboradores del repositorio. Para contribuciones sustanciales — características, RFC, correcciones de errores significativas — tu nombre de usuario aparece en las notas de la versión.</p>
+<p>Todos los que han tenido un PR fusionado aparecen en la lista de colaboradores del repositorio. Para contribuciones sustanciales, funcionalidades, RFCs, correcciones de errores significativas, tu nombre de usuario aparece en las notas de la versión.</p>
 <h2 id="ver-también"><a class="header" href="#ver-también">Ver también</a></h2>
 <ul>
 <li><a href="./how-to.html">Cómo contribuir</a></li>
 <li><a href="./rfcs.html">Proceso de RFC</a></li>
-<li><a href="../philosophy.html">Philosophy</a> — lo que el proyecto intenta ser, para que sepas qué está dentro del alcance</li>
+<li><a href="../philosophy/index.html">Filosofía</a>: lo que el proyecto intenta ser, para que sepas qué está dentro del alcance</li>
 </ul>
 
                     </main>
@@ -334,6 +411,114 @@
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

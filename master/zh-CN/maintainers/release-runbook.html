@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -218,50 +295,53 @@
                     <main>
                         <h1 id="发布运行手册"><a class="header" href="#发布运行手册">发布运行手册</a></h1>
 <blockquote>
-<p><strong>临时手动流程。</strong> 本运行手册介绍如何使用 <code>release-stable-manual.yml</code> 在今天发布稳定版本。它仅在 release-plz 进入 v0.7.5 之前存在，届时将完全取代本流程。</p>
-<p>如果这里的任何内容让你觉得繁琐，那是有意为之的阻力——我们尚不具备能够安全移除它的自动化规范。</p>
+<p><strong>临时手动流程。</strong> 本操作手册介绍如何使用 <code>release-stable-manual.yml</code> 在今日发布稳定版本。在 release-plz 落地并取代它之前，这仍是当前生效的流程；该迁移尚未发生（参见<a href="#where-this-is-going">未来规划</a>）。</p>
+<p>如果这里有任何内容让人觉得繁琐，那是有意为之的阻力，我们尚未具备能够安全移除它的自动化规范能力。</p>
 </blockquote>
-<p>上次验证：<strong>2026 年 5 月</strong>（v0.7.4 周期）。</p>
+<p>上次针对 <code>0.8.0-beta</code> 周期进行了验证。</p>
 <hr>
-<h2 id="六个步骤的流程"><a class="header" href="#六个步骤的流程">六个步骤的流程</a></h2>
+<h2 id="七步流程"><a class="header" href="#七步流程">七步流程</a></h2>
 <ol>
 <li>使用 changelog 技能生成 <code>CHANGELOG-next.md</code></li>
 <li>打开并合并版本号更新 PR</li>
 <li>使用 <code>act</code> 在本地试运行发布工作流</li>
 <li>通过手动触发运行 <code>Release Stable</code> 工作流</li>
-<li>在出现提示时批准这三个环境门控</li>
+<li>出现提示时批准这两个环境门控</li>
 <li>验证发布版本存在且资源可下载</li>
+<li>版本化文档部署</li>
 </ol>
-<p>这就是整个流程。其他所有环节（Docker、crates.io、Scoop、AUR、Homebrew、Discord、推文）都会作为下游任务自动运行。除非某个任务明确失败，否则你无需为这些环节做任何操作。</p>
+<p>整个流程到此为止。其他所有操作（Docker、网站重新部署、Scoop、AUR、Homebrew、Discord、推文）都会作为下游任务自动运行。除非某个任务明确失败，否则你无需为这些操作执行任何额外步骤。</p>
 <hr>
-<h2 id="步骤-1--生成-changelog-nextmd"><a class="header" href="#步骤-1--生成-changelog-nextmd">步骤 1 — 生成 CHANGELOG-next.md</a></h2>
-<p>使用 changelog-generation 技能生成 <code>CHANGELOG-next.md</code>：</p>
-<pre><code class="language-text">.claude/skills/changelog-generation/SKILL.md
-</code></pre>
+<h2 id="步骤-1生成-changelog-nextmd"><a class="header" href="#步骤-1生成-changelog-nextmd">步骤 1：生成 CHANGELOG-next.md</a></h2>
+<p>运行 <code>changelog-generation</code> 技能以生成 <code>CHANGELOG-next.md</code>。其完整流程位于 <code>.claude/skills/changelog-generation/SKILL.md</code>。</p>
 <p>该技能会根据上一个稳定标签与 HEAD 之间的 git log 生成更新日志，通过 GitHub GraphQL 解析贡献者信息，并写入文件。可将结果直接提交到一个短期分支，并将其纳入版本号升级 PR（步骤 2）中；如果差异较大，则将其作为单独的前置 PR 提交。</p>
 <p>如果 <code>CHANGELOG-next.md</code> 因之前中止的发布周期而已存在，请在重新使用前检查其准确性。</p>
 <hr>
-<h2 id="第-2-步--提升版本号并合并版本-pr"><a class="header" href="#第-2-步--提升版本号并合并版本-pr">第 2 步 — 提升版本号并合并版本 PR</a></h2>
-<p>编辑工作区的 <code>Cargo.toml</code>：</p>
-<pre><code class="language-toml">[workspace.package]
-version = "X.Y.Z"
+<h2 id="步骤-2升级版本并合并版本-pr"><a class="header" href="#步骤-2升级版本并合并版本-pr">步骤 2：升级版本并合并版本 PR</a></h2>
+<p>更新工作区 <code>Cargo.toml</code> 中的 <code>workspace.package.version</code>，然后同步所有其他版本引用：</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">bash scripts/release/bump-version.sh X.Y.Z
 </code></pre>
-<p>同步所有其他版本引用：</p>
-<pre><code class="language-bash">bash scripts/release/bump-version.sh X.Y.Z
-</code></pre>
+</div>
+
 <p>此更新涉及 README 徽章、Tauri 配置以及工作流描述示例。请将所有内容一并提交：</p>
 <pre><code class="language-text">chore: bump version to vX.Y.Z
 </code></pre>
 <p>打开一个 PR。为其添加 <code>chore</code>、<code>size: XS</code> 标签。获得一位维护者的审查。CI 通过后合并。</p>
 <p><strong>确认合并已正确落地：</strong></p>
-<pre><code class="language-bash">git fetch origin
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">git fetch origin
 git show origin/master:Cargo.toml | grep '^version'
 # 必须显示：version = "X.Y.Z"
 </code></pre>
+</div>
+
 <hr>
-<h2 id="步骤-3--使用-act-在本地试运行发布工作流"><a class="header" href="#步骤-3--使用-act-在本地试运行发布工作流">步骤 3 — 使用 <code>act</code> 在本地试运行发布工作流</a></h2>
-<p><code>Release Stable</code> 工作流是一个 GitHub Actions 任务图，当你点击 <strong>Run workflow</strong> 的那一刻，它就会占用你的环境门控审批窗口期。如果某个工作流步骤出现问题——构建产物缺失、路径过期、有人移除了代码生成步骤却未同步更新 CI——故障会在你已经投入某个发布窗口期_之后_才暴露出来，此时版本 PR 已经合并，master 也已处于新版本。要恢复，意味着要合入一个紧急修复分支、重新运行 CI，并在一个已经对外宣称自己是完整发布版本的代码树上、在时间压力下完成发布。</p>
-<p>防范这种情况的廉价保险是先在本地、针对精确合并后的 master 提交运行相同的作业图，然后再打开 GitHub Actions 表单。<a href="https://nektosact.com/"><code>act</code></a> 使用与 GitHub 相同的 <code>actions/*</code> 生态系统，在 Docker 容器中执行 GitHub Actions 工作流。它并不能完美还原云端 runner——无法访问 artifact 上传运行时、GitHub 颁发的 OIDC 令牌、environment secrets，或依赖真实发布标签的作业——但它确实能运行构建和测试步骤，而这些步骤几乎涵盖了我们曾遇到的所有发布时 CI 失败。</p>
+<h2 id="步骤-3使用-act-在本地试运行发布工作流"><a class="header" href="#步骤-3使用-act-在本地试运行发布工作流">步骤 3：使用 <code>act</code> 在本地试运行发布工作流</a></h2>
+<p><code>Release Stable</code> 工作流是一个 GitHub Actions 作业图，它会在你点击 <strong>Run workflow</strong> 的那一刻消耗掉你的环境门控审批窗口。如果某个工作流步骤出现问题：缺失构建产物、过时的路径、某人在未更新 CI 的情况下移除了代码生成步骤，那么这些故障会在你已经投入到一个发布窗口_之后_才暴露出来，此时版本 PR 已经合并，master 已经处于新版本。恢复意味着要落地一个紧急修复分支、重新运行 CI，并在一棵已经把自己标榜为完全发布版本的代码树上、在时间压力下完成发布。</p>
+<p>针对这种情况，廉价的保险措施是：在打开 GitHub Actions 表单之前，先在本地、针对完全相同的合并后 master 提交，运行同一份作业图。<a href="https://nektosact.com/"><code>act</code></a> 使用与 GitHub 相同的 <code>actions/*</code> 生态系统，在 Docker 容器内执行 GitHub Actions 工作流。它并不能完美地镜像云端 runner；它无法访问构件上传运行时、GitHub 签发的 OIDC 令牌、环境密钥，也无法运行那些依赖真实发布标签的作业，但它确实能运行构建和测试步骤，而我们曾遇到的几乎所有发布时 CI 失败都源于这些步骤。</p>
 <p>这一步骤每次发布需投入 15–20 分钟。它发现了常规的逐 PR CI 未能暴露的真实缺陷（因为失败的工作流仅在 <code>workflow_dispatch</code> 时运行，而非在 <code>push</code> 时运行）。</p>
 <h3 id="一次性设置"><a class="header" href="#一次性设置">一次性设置</a></h3>
 <p><code>act</code> 运行工作流。最简洁的安装方式是使用 GitHub CLI 扩展，因为它会继承你的 <code>gh</code> 身份验证，并向每次工作流运行暴露一个真实的 <code>GITHUB_TOKEN</code>：</p>
@@ -271,66 +351,82 @@ git show origin/master:Cargo.toml | grep '^version'
 </li>
 <li>
 <p>安装 <code>act</code> 扩展：</p>
-<pre><code class="language-bash">gh extension install nektos/gh-act
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">gh extension install nektos/gh-act
 </code></pre>
+</div>
+
 </li>
 <li>
-<p>从 <a href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a> 安装 Docker Engine 或 Docker Desktop。在 Linux 上，将你自己添加到 <code>docker</code> 组，这样就不需要使用 <code>sudo</code>。<code>act</code> 也可以配合 Podman 和 Colima 使用——参阅 <a href="https://nektosact.com/usage/runners.html">act runners 文档</a>。</p>
+<p>从 <a href="https://docs.docker.com/engine/install/">https://docs.docker.com/engine/install/</a> 安装 Docker Engine 或 Docker Desktop。在 Linux 上，将你自己添加到 <code>docker</code> 组，这样就不需要使用 <code>sudo</code>。<code>act</code> 也可以与 Podman 和 Colima 配合使用；请参阅 <a href="https://nektosact.com/usage/runners.html">act runners 文档</a>。</p>
 </li>
 </ol>
 <p>这就是全部设置。仓库中的 <code>.actrc</code> 和 <code>scripts/dev/act-local.sh</code> 会处理其他所有事项（runner 镜像、密钥文件、产物服务器、action SHA 预获取）。</p>
 <h3 id="发布前演练"><a class="header" href="#发布前演练">发布前演练</a></h3>
 <p>确保你的工作树与步骤 2 中合并后的 master 顶端一致：</p>
-<pre><code class="language-bash">git fetch upstream
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">git fetch upstream
 git checkout upstream/master
 </code></pre>
+</div>
+
 <p>列出每个工作流文件中所有可运行的项：</p>
-<pre><code class="language-bash">./scripts/dev/act-local.sh --list
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">./scripts/dev/act-local.sh --list
 </code></pre>
+</div>
+
 <p>运行特定作业、交互式选择，或运行所有可安全空运行的作业：</p>
-<pre><code class="language-bash">./scripts/dev/act-local.sh release-stable-manual:web   # 一项工作
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">./scripts/dev/act-local.sh release-stable-manual:web   # 一项工作
 ./scripts/dev/act-local.sh                              # 交互式选择器
 ./scripts/dev/act-local.sh --all                        # 所有安全的 dry-run 任务
 </code></pre>
-<p>首次运行会拉取 runner 镜像（约 1.5 GB），并通过 <code>Swatinem/rust-cache</code> 预热 Rust 构建缓存；后续运行会快得多。该脚本会自动创建被 gitignore 忽略的 <code>.secrets</code> 文件，将每个固定的 action SHA 预获取到 <code>~/.cache/act/</code>（否则 act 的浅克隆无法解析任意提交），通过父进程环境将你的 <code>gh</code> 认证中的 <code>GITHUB_TOKEN</code> 传入运行（令牌值绝不会出现在 argv 中），并设置 <code>--artifact-server-path</code>，使 <code>actions/upload-artifact</code> 和 <code>actions/download-artifact</code> 能够在不同 job 之间正常工作。所有这些底层都是普通的 <code>act</code> —— 该脚本只是去掉了一大堆繁琐的标志。</p>
+</div>
+
+<p>首次运行会拉取 runner 镜像（约 1.5 GB），并通过 <code>Swatinem/rust-cache</code> 预热 Rust 构建缓存；后续运行会快得多。该脚本会自动创建被 gitignore 忽略的 <code>.secrets</code> 文件，将每个固定的 action SHA 预取到 <code>~/.cache/act/</code>（否则 act 的浅克隆无法解析任意提交），通过父进程环境将来自 <code>gh</code> 认证的 <code>GITHUB_TOKEN</code> 传入运行过程（令牌值绝不会出现在 argv 中），并设置 <code>--artifact-server-path</code>，使 <code>actions/upload-artifact</code> 和 <code>actions/download-artifact</code> 能够在多个作业之间正常工作。这一切底层都只是普通的 <code>act</code>；该脚本只是省去了繁杂的标志参数。</p>
 <h3 id="--all-仅在演练安全允许列表中运行作业"><a class="header" href="#--all-仅在演练安全允许列表中运行作业"><code>--all</code> 仅在“演练安全”允许列表中运行作业</a></h3>
 <p><code>act</code> <strong>不会</strong>遵循 GitHub 的环境保护门控。当维护者真实的 <code>GITHUB_TOKEN</code> 被注入到运行中时，对写入 GitHub 的作业（调用 <code>gh release create</code> 的 <code>publish</code>、推送到 GHCR 的 <code>docker</code> 作业、强制推送 <code>gh-pages</code> 的 <code>docs-deploy</code>、打开 issue 的 <code>daily-audit</code>、向 webhook 发布消息的 <code>tweet-release</code> 或 <code>discord-release</code>）进行一次成功的本地调用，就可能在首次尝试时执行真实的副作用。</p>
-<p>因此，<code>--all</code> 会强制使用一份硬编码的允许列表，仅包含已被证实可安全在本地运行的作业——目前为 <code>release-stable-manual.yml</code> 和 <code>cross-platform-build-manual.yml</code> 中仅生成构件的构建步骤（<code>validate</code>、<code>web</code>、<code>release-notes</code>、<code>build</code>、<code>build-desktop</code>）。其余所有作业都会被跳过，并记录跳过原因：</p>
+<p>因此，<code>--all</code> 会强制使用一份硬编码的允许列表，仅包含已证实可安全在本地运行的作业；目前包括 <code>release-stable-manual.yml</code> 和 <code>cross-platform-build-manual.yml</code> 中仅生成构件的构建步骤（<code>validate</code>、<code>web</code>、<code>release-notes</code>、<code>build</code>、<code>build-desktop</code>）。其他所有作业都会被跳过，并记录跳过原因：</p>
 <pre><code>==&gt; skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==&gt; skip release-stable-manual:docker (not on dry-run-safe allowlist)
 ==&gt; skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==&gt; skip docs-deploy:deploy (not on dry-run-safe allowlist)
-==&gt; skip daily-audit:audit (not on dry-run-safe allowlist)
+==&gt; skip daily-audit:advisories (not on dry-run-safe allowlist)
 ==&gt; skip tweet-release:tweet (not on dry-run-safe allowlist)
 </code></pre>
-<p>允许列表采用<strong>故障关闭</strong>策略：仓库中新增的工作流会被视为可能产生变更，直到维护者对其进行审查并将安全的任务 ID 添加到 <code>scripts/dev/act-local.sh</code> 中的 <code>DRY_RUN_SAFE_JOBS</code>。这一点很重要，因为 <code>discover_jobs</code> 会遍历每一个 <code>.github/workflows/*.yml</code>，而不仅仅是发布工作流——若采用拒绝列表策略，则会在不知不觉中放行未来某个具有写入操作的工作流。</p>
+<p>允许列表采用**默认关闭（fail-closed）**策略：仓库中新添加的工作流会被视为可能产生变更，直到维护者审查它并将安全的作业 ID 添加到 <code>scripts/dev/act-local.sh</code> 中的 <code>DRY_RUN_SAFE_JOBS</code>。这一点很重要，因为 <code>discover_jobs</code> 会遍历每一个 <code>.github/workflows/*.yml</code>，而不仅仅是发布工作流，使用拒绝列表会悄无声息地放行未来可能存在写入操作的工作流。</p>
 <p>在极少数情况下，如果你有理由尝试在本地运行未列入允许列表的作业，可以使用两种应急方案：</p>
 <ul>
-<li><code>./scripts/dev/act-local.sh release-stable-manual:publish</code> —— 显式的 <code>&lt;wf&gt;:&lt;job&gt;</code> 形式会运行你所请求的内容，并在目标不在允许列表中时，于调用 <code>act</code> 前打印醒目的警告。</li>
-<li><code>./scripts/dev/act-local.sh --all --no-allowlist</code> — 在整个 <code>--all</code> 运行期间禁用允许列表过滤器（仅当你已确认工作流步骤不会触及变更操作时使用，例如在没有真实注册表凭据且 <code>.secrets</code> 文件为空的 fork 上）。</li>
+<li><code>./scripts/dev/act-local.sh release-stable-manual:publish</code>：显式的 <code>&lt;wf&gt;:&lt;job&gt;</code> 形式会运行你所要求的内容，并在目标不在允许列表中时，于调用 <code>act</code> 之前打印醒目的警告。</li>
+<li><code>./scripts/dev/act-local.sh --all --no-allowlist</code>：在整个 <code>--all</code> 运行期间禁用允许列表过滤器（仅在你已确认工作流步骤不会触及变更面时使用，例如在没有真实注册表凭据且 <code>.secrets</code> 文件为空的 fork 上）。</li>
 </ul>
 <h3 id="在-act-下预期会失败的情况属于正常现象"><a class="header" href="#在-act-下预期会失败的情况属于正常现象">在 <code>act</code> 下预期会失败的情况（属于正常现象）</a></h3>
 <p><code>act</code> 无法模拟少数仅限 GitHub 的功能。这些失败并非真正的缺陷：</p>
 <ul>
 <li>依赖真实发布标签的作业（<code>publish</code> 用于创建 GitHub Release）。</li>
-<li>环境门控作业（<code>crates-io</code>、<code>docker</code>、<code>publish</code>）——审批 UI 在本地不存在。</li>
+<li>环境门控作业（<code>publish</code>、<code>docker</code>）：审批 UI 在本地不存在。</li>
 <li>基于 OIDC 的联合身份令牌。</li>
 </ul>
-<p>其他所有问题——<code>tsc</code> 错误、缺失的文件、Rust 编译失败、<code>cargo</code> 锁文件不匹配——都是真正的缺陷。在通过基于 master 的标准 PR 修复这些问题之前，请勿点击 GitHub Actions 表单上的 <strong>Run workflow</strong>。</p>
+<p>其他所有问题，包括 <code>tsc</code> 错误、缺失文件、Rust 编译失败、<code>cargo</code> 锁文件不匹配，都是真正的缺陷。在通过基于 master 的标准 PR 修复这些问题之前，请勿点击 GitHub Actions 表单上的 <strong>Run workflow</strong>。</p>
 <hr>
-<h2 id="第-4-步--触发发布"><a class="header" href="#第-4-步--触发发布">第 4 步 — 触发发布</a></h2>
+<h2 id="步骤-4触发发布"><a class="header" href="#步骤-4触发发布">步骤 4：触发发布</a></h2>
 <p>转到：</p>
 <p>https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/release-stable-manual.yml点击 <strong>Run workflow</strong>。填写：</p>
 <ul>
 <li><strong>分支：</strong> <code>master</code></li>
-<li><strong>要发布的稳定版本：</strong> <code>X.Y.Z</code> — 不带 <code>v</code> 前缀</li>
+<li><strong>要发布的稳定版本：</strong> <code>X.Y.Z</code>，不带 <code>v</code> 前缀</li>
 </ul>
 <p>点击 <strong>Run workflow</strong>。</p>
 <p>第一个作业（<code>validate</code>）会检查版本是否与 <code>Cargo.toml</code> 匹配，以及标签 <code>vX.Y.Z</code> 是否尚未存在。如果检查失败，请修正不匹配项并重新触发，不要尝试绕过它。</p>
 <hr>
-<h2 id="步骤-5--批准环境关卡"><a class="header" href="#步骤-5--批准环境关卡">步骤 5 — 批准环境关卡</a></h2>
-<p>三个作业受 GitHub 环境保护规则的限制。当每个作业进入待处理状态时，你会在工作流运行中看到 <strong>“Waiting for review”</strong> 横幅。</p>
-<p>批准全部三项（出现时）：</p>
+<h2 id="步骤-5批准环境关卡"><a class="header" href="#步骤-5批准环境关卡">步骤 5：批准环境关卡</a></h2>
+<p>两个作业受 GitHub 环境保护规则的限制。当每个作业进入待处理状态时，您会在工作流运行中看到 <strong>“Waiting for review”</strong> 横幅。</p>
+<p>两者出现时都予以批准：</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -338,91 +434,84 @@ git checkout upstream/master
 </thead>
 <tbody>
 <tr><td><code>github-releases</code></td><td><code>publish</code></td><td>创建 GitHub Release 并上传资源</td></tr>
-<tr><td><code>crates-io</code></td><td><code>crates-io</code></td><td>将 crate 发布到 crates.io</td></tr>
 <tr><td><code>docker</code></td><td><code>docker</code></td><td>将镜像推送到 GHCR</td></tr>
 </tbody>
 </table>
 </div>
-<p>如果你错过了审批时间窗口导致作业超时，只需从工作流运行页面重新运行失败的作业即可——无需从头开始重新运行。</p>
+<p>如果你错过了审批窗口导致作业超时，只需从工作流运行页面重新运行失败的作业即可；无需从头重新开始。</p>
 <hr>
-<h2 id="第-6-步--验证发布"><a class="header" href="#第-6-步--验证发布">第 6 步 — 验证发布</a></h2>
+<h2 id="第-6-步验证发布"><a class="header" href="#第-6-步验证发布">第 6 步：验证发布</a></h2>
 <p><code>publish</code> 完成后，请确认：</p>
 <pre><code class="language-text">[ ] GitHub Release exists at /releases/tag/vX.Y.Z and is marked Latest
 [ ] Release notes are non-empty
 [ ] SHA256SUMS asset is present and non-empty
 [ ] At least one binary archive is downloadable (spot-check linux x86_64)
-[ ] CHANGELOG-next.md is gone from master (the publish job removes it automatically)
 </code></pre>
-<p>除非工作流运行中有任务显示为红色，否则你无需手动验证 Docker、crates.io 或分发渠道。查看工作流运行摘要——如果所有任务都是绿色，就完成了。</p>
+<p>发布后，<code>CHANGELOG-next.md</code> 会被有意保留在 <code>master</code> 上：发布作业仅将其读取为发布说明正文，并不会删除它。下一个发布周期会覆盖该文件，因此无需手动清理。</p>
+<p>除非工作流运行中有作业显示为红色，否则你无需手动验证 Docker 或分发渠道。查看工作流运行摘要；如果所有作业均为绿色，则表示完成。</p>
 <hr>
-<h2 id="step-7--versioned-documentation-deployment"><a class="header" href="#step-7--versioned-documentation-deployment">Step 7 — Versioned documentation deployment</a></h2>
-<p>ZeroClaw docs use a versioned structure on the <code>gh-pages</code> branch. When a tag is pushed, the <code>Deploy mdBook docs to Pages</code> workflow automatically builds and deploys the documentation for that version.</p>
-<h3 id="what-happens-automatically"><a class="header" href="#what-happens-automatically">What happens automatically</a></h3>
+<h2 id="第-7-步版本化文档部署"><a class="header" href="#第-7-步版本化文档部署">第 7 步：版本化文档部署</a></h2>
+<p>ZeroClaw 文档在 <code>gh-pages</code> 分支上采用版本化的结构。当推送标签时，<code>Deploy mdBook docs to Pages</code> 工作流会自动为该版本构建并部署文档。该流程会在步骤 4 的标签落地后自动运行；下方的引导初始化和版本下限详情属于参考资料，供你需要重建 <code>gh-pages</code> 或更改支持版本范围时使用。</p>
+<h3 id="自动执行的操作"><a class="header" href="#自动执行的操作">自动执行的操作</a></h3>
 <ul>
-<li>Pushing a tag (e.g., <code>v0.8.0</code>) triggers a build that lands in <code>/v0.8.0/</code>.</li>
-<li>If the tag is a GA release (no pre-release suffix), it is also copied to <code>/stable/</code>.</li>
-<li>The <code>_shared/</code> directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.</li>
+<li>推送标签（例如 <code>v0.8.0</code>）会触发一次构建，并将产物发布到 <code>/v0.8.0/</code>。</li>
+<li>如果该标签是 GA 正式发布版本（没有预发布后缀），它还会被复制到 <code>/stable/</code>。</li>
+<li><code>_shared/</code> 目录（包含 UI 的 CSS、JS 和图标）会在构建时更新，从而使主题级联应用到所有已部署的版本。</li>
 </ul>
-<h3 id="bootstrapping-gh-pages"><a class="header" href="#bootstrapping-gh-pages">Bootstrapping <code>gh-pages</code></a></h3>
-<p>If <code>gh-pages</code> is ever deleted or needs to be fully recreated, seed the versions in this specific order:</p>
+<h3 id="正在初始化-gh-pages"><a class="header" href="#正在初始化-gh-pages">正在初始化 <code>gh-pages</code></a></h3>
+<p>如果 <code>gh-pages</code> 曾被删除或需要完全重新创建，请按以下特定顺序初始化各版本：</p>
 <ol>
-<li><strong>Oldest supported release:</strong> <code>workflow_dispatch</code> with tag <code>v0.7.5</code></li>
-<li><strong>Next releases:</strong> <code>workflow_dispatch</code> with tag <code>v0.8.0-beta-1</code> etc.</li>
-<li><strong>Current master:</strong> <code>workflow_dispatch</code> with tag <code>master</code></li>
+<li><strong>支持的最早版本：</strong> 标签为 <code>v0.7.5</code> 的 <code>workflow_dispatch</code></li>
+<li><strong>后续发布：</strong> 使用 <code>workflow_dispatch</code> 并指定标签 <code>v0.8.0-beta-1</code> 等。</li>
+<li><strong>当前 master：</strong><code>workflow_dispatch</code> 使用标签 <code>master</code></li>
 </ol>
 <blockquote>
-<p>[!IMPORTANT] <code>master</code> must be deployed <strong>last</strong> during bootstrapping. It writes the definitive <code>_shared/</code> chrome layer that all other versions use.</p>
+<p>[!IMPORTANT] 在引导期间，<code>master</code> 必须<strong>最后</strong>部署。它会写入所有其他版本使用的最终 <code>_shared/</code> chrome 层。</p>
 </blockquote>
-<h3 id="manual-redeploys-and-the-version-floor"><a class="header" href="#manual-redeploys-and-the-version-floor">Manual redeploys and the Version Floor</a></h3>
-<p>To manually re-deploy a specific version:</p>
+<h3 id="手动重新部署与版本下限"><a class="header" href="#手动重新部署与版本下限">手动重新部署与版本下限</a></h3>
+<p>手动重新部署特定版本：</p>
 <ol>
-<li>Go to <strong>Actions</strong> → <strong>Deploy mdBook docs to Pages</strong></li>
-<li>Click <strong>Run workflow</strong></li>
-<li>Enter the tag (e.g., <code>v0.7.5</code> or <code>master</code>)</li>
+<li>前往 <strong>Actions</strong> → <strong>Deploy mdBook docs to Pages</strong></li>
+<li>单击 <strong>Run workflow</strong></li>
+<li>输入标签（例如 <code>v0.7.5</code> 或 <code>master</code>）</li>
 </ol>
-<p><strong>The <code>DOCS_MIN_VERSION</code> floor:</strong> To prevent accidentally deploying very old or unsupported versions, the workflow enforces a minimum version floor (currently <code>v0.7.5</code>).</p>
+<p><strong><code>DOCS_MIN_VERSION</code> 下限：</strong> 为防止意外部署非常旧或不受支持的版本，该工作流强制实施最低版本下限（当前为 <code>v0.7.5</code>）。</p>
 <ul>
-<li>Tags older than <code>DOCS_MIN_VERSION</code> (like <code>v0.7.4</code>) are rejected by the workflow.</li>
-<li><code>cargo mdbook gen-versions</code> (the xtask helper) ignores any directories on <code>gh-pages</code> below this floor, keeping them out of the version dropdown.</li>
+<li>工作流会拒绝早于 <code>DOCS_MIN_VERSION</code>（例如 <code>v0.7.4</code>）的标签。</li>
+<li><code>cargo mdbook gen-versions</code>（xtask 辅助工具）会忽略 <code>gh-pages</code> 上低于此下限的任何目录，将它们排除在版本下拉菜单之外。</li>
 </ul>
-<p>If you need to raise the floor to drop support for an older version:</p>
+<p>如果你需要提高最低版本要求以放弃对旧版本的支持：</p>
 <ol>
-<li>Update the <code>DOCS_MIN_VERSION</code> environment variable in <code>.github/workflows/docs-deploy.yml</code>.</li>
-<li>(Optional) Delete the old version’s directory from the <code>gh-pages</code> branch to save space.</li>
+<li>更新 <code>.github/workflows/docs-deploy.yml</code> 中的 <code>DOCS_MIN_VERSION</code> 环境变量。</li>
+<li>（可选）从 <code>gh-pages</code> 分支删除旧版本的目录以节省空间。</li>
 </ol>
 <hr>
 <h2 id="如果出现问题"><a class="header" href="#如果出现问题">如果出现问题</a></h2>
-<p><strong>validate 失败 — 版本不匹配：</strong> 版本升级 PR 未合并，或者你输入了错误的版本。请修复不匹配问题并重新触发。</p>
+<p><strong>validate failed: version mismatch:</strong> 版本升级 PR 未被合并，或者您输入了错误的版本。修复此不一致后重新触发。</p>
 <p><strong>环境门控超时：</strong> 仅重新运行超时的作业。无需重启整个工作流。</p>
-<p><strong>发布成功，但 CHANGELOG-next.md 仍保留在 master 上：</strong> 请手动删除它：</p>
-<pre><code class="language-bash">git checkout master &amp;&amp; git pull --ff-only origin master
-git rm CHANGELOG-next.md
-git commit -m chore: 在 vX.Y.Z 发布后移除 CHANGELOG-next.md
-git push origin master
-</code></pre>
-<p><strong>分发渠道作业失败（Scoop、AUR、Homebrew）：</strong> 每个渠道都有对应的可手动触发的子工作流。先以 <code>dry_run: true</code> 重新运行特定作业以确认修复，然后再设置为 <code>dry_run: false</code>。这些都属于可选项——Scoop 作业失败并不会使发布本身失效。</p>
+<p><strong>某个分发渠道任务失败（Scoop、AUR、Homebrew）：</strong> 每个渠道都有对应的可手动触发的子工作流。请先以 <code>dry_run: true</code> 重新运行对应的那个工作流以确认修复有效，然后再使用 <code>dry_run: false</code>。这些属于锦上添花的功能：Scoop 任务失败并不会使发布本身失效。</p>
 <hr>
-<h2 id="不得触及的工作流"><a class="header" href="#不得触及的工作流">不得触及的工作流</a></h2>
-<p>以下工作流位于 <code>.github/workflows/</code> 中，但存在危险，已计划在 v0.7.4 (#5915) 中删除。请勿触发它们。请勿扩展它们。</p>
+<h2 id="移除旧版工作流"><a class="header" href="#移除旧版工作流">移除旧版工作流</a></h2>
+<p>以前位于 <code>.github/workflows/</code> 中的几个自动发布工作流已被删除，因为它们绕过了审查或会进行不可逆的发布。它们已不再存在；如果其中任何一个在 PR 中重新出现，请将其视为回退并予以拦截：</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>工作流</th><th>为何它是危险的</th></tr>
+<tr><th>工作流</th><th>移除原因</th></tr>
 </thead>
 <tbody>
 <tr><td><code>release-beta-on-push.yml</code></td><td>每次推送到 master 时自动发布</td></tr>
-<tr><td><code>publish-crates-auto.yml</code></td><td>版本变更时自动发布到 crates.io——不可撤销</td></tr>
-<tr><td><code>version-sync.yml</code></td><td>以机器人身份直接提交到 master，跳过审查</td></tr>
-<tr><td><code>checks-on-pr.yml</code></td><td>重复的 CI — 会产生令人困惑的状态冲突</td></tr>
-<tr><td><code>pre-release-validate.yml</code></td><td>未使用的生成清单——本运行手册将取代它</td></tr>
+<tr><td><code>publish-crates-auto.yml</code></td><td>在任何版本变更时自动发布到 crates.io，不可逆</td></tr>
+<tr><td><code>version-sync.yml</code></td><td>以机器人身份直接提交到 master，绕过审查</td></tr>
+<tr><td><code>checks-on-pr.yml</code></td><td>重复的 CI：产生了令人困惑的冲突状态</td></tr>
+<tr><td><code>pre-release-validate.yml</code></td><td>未使用的自动生成检查清单；此运维手册将取而代之</td></tr>
 </tbody>
 </table>
 </div>
-<p>上面未列出的所有其他工作流，要么冻结至 v0.7.5，要么处于积极维护状态。完整清单请参阅 <code>docs/contributing/ci-map.md</code>，待 #5917 重写完成后即可查阅。</p>
+<p>保留下来的工作流（自动和手动）的完整清单见 <a href="./ci-and-actions.html">CI &amp; Actions</a>。</p>
 <hr>
 <h2 id="未来展望"><a class="header" href="#未来展望">未来展望</a></h2>
 <p>本运行手册和 <code>release-stable-manual.yml</code> 只是一个过渡方案，而非最终目标。</p>
-<p>在 v0.7.5 中，目标是：</p>
+<p>目标最终状态：</p>
 <ul>
 <li>release-plz 自动管理版本升级和变更日志</li>
 <li>单个 <code>release.yml</code> 取代了当前由多个子工作流拼凑的方案</li>
@@ -439,9 +528,6 @@ git push origin master
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../maintainers/changelog-generation.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
-                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -453,9 +539,6 @@ git push origin master
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../maintainers/changelog-generation.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
-                    </a>
             </nav>
 
         </div>
@@ -475,6 +558,114 @@ git push origin master
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

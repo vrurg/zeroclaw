@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -230,36 +307,24 @@
 </table>
 </div>
 <p>No configure ambos selectores en el mismo canal a menos que quiera intencionadamente que el modo Cloud API prevalezca por compatibilidad con versiones anteriores.</p>
+<h2 id="quién-puede-hablar-con-el-agente"><a class="header" href="#quién-puede-hablar-con-el-agente">Quién puede hablar con el agente</a></h2>
+<p>Los remitentes entrantes se filtran contra el <strong>conjunto de pares</strong> resuelto para el agente vinculado, obtenido de la configuración <code>peer_groups</code> a la que pertenece el agente. La coincidencia elimina el <code>@</code> inicial y no distingue mayúsculas de minúsculas frente al identificador nativo de remitente del canal. Un conjunto <strong>vacío</strong> deniega a todos; un conjunto que contiene <code>"*"</code> acepta a cualquiera; en caso contrario, solo se aceptan los pares externos listados (y los agentes pares). Esto es independiente del emparejamiento de la puerta de enlace (<code>gateway.require_pairing</code>), que autentica clientes HTTP/WebSocket, no remitentes de canales de chat.</p>
+<p>Un grupo de pares para whatsapp establece <code>channel</code> en <code>whatsapp</code>, enumera los remitentes permitidos en <code>external_peers</code> (para whatsapp, un identificador de teléfono (Cloud API) o la parte de usuario del JID (modo Web); <code>["*"]</code> acepta a cualquiera), opcionalmente nombra <code>agents</code> pares para el despacho entre agentes, una lista de bloqueo <code>ignore</code> y un <code>output_modality</code> (<code>mirror</code>, <code>voice</code> o <code>text</code>). Consulta <a href="peer-groups.html">Peer Groups</a> para la referencia de campos.</p>
+<p>Dónde configurar esto:</p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway"><a class="header" href="#panel-de-control-del-gateway">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a> en el panel de control web.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, en <strong>Peer groups</strong>.</p>
+</div>
+
 <h2 id="modo-cloud-api"><a class="header" href="#modo-cloud-api">Modo Cloud API</a></h2>
 <p>El modo Cloud API es la integración con Meta Business Platform. Requiere una cuenta de Meta Business, una app de WhatsApp Business, un ID de número de teléfono, un token de verificación y un token de acceso. Es el modo adecuado para implementaciones empresariales que reciben mensajes a través de webhooks de Meta.</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-enabled = true
-phone_number_id = "&lt;meta-phone-number-id&gt;"
-verify_token = "&lt;webhook-verify-token&gt;"
-access_token = "&lt;meta-access-token&gt;"
-# app_secret = "&lt;meta-app-secret&gt;" # recomendado para la verificación de la firma del webhook
-</code></pre>
-<p>The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel via <code>zeroclaw config set gateway.tunnel.provider=&lt;ngrok|cloudflare&gt;</code> and the related <code>gateway.tunnel.*</code> fields (see the <a href="../reference/config.html">Config reference</a>), or front the gateway with your own reverse proxy when developing locally.</p>
+<p>El gateway debe ser accesible por Meta para los webhooks entrantes. Configura un túnel en la sección de nivel superior <code>[tunnel]</code> (<code>tunnel_provider</code> y los bloques de proveedor relacionados, consulta la <a href="../reference/config.html#tunnel">referencia de configuración</a>), o coloca tu propio proxy inverso delante del gateway cuando desarrolles localmente.</p>
 <h2 id="modo-web"><a class="header" href="#modo-web">Modo web</a></h2>
 <p>El modo WhatsApp Web vincula una cuenta normal de WhatsApp a través del backend opcional Web. No necesita una cuenta de Meta Business. Sí necesita una compilación de ZeroClaw con la característica <code>whatsapp-web</code> habilitada y una ruta de base de datos de sesión persistente.</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-enabled = true
-session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
-mode = "personal"
-dm_policy = "allowlist"
-group_policy = "allowlist"
-mention_only = true
-
-[agents.assistant]
-enabled = true
-channels = ["whatsapp.default"]
-</code></pre>
-<p>En el primer inicio, el backend de Web vincula la cuenta mediante enlace por código QR o por código de emparejamiento. <code>pair_phone</code> puede inicializar el enlace por código de emparejamiento, pero déjalo sin definir si quieres el emparejamiento por QR:</p>
-<pre><code class="language-toml">[channels.whatsapp.default]
-pair_phone = "&lt;country-code-and-number-without-plus&gt;"
-</code></pre>
-<p>Mantén <code>session_path</code> en almacenamiento persistente. Eliminarlo fuerza una nueva vinculación del dispositivo.</p>
-<p>La entrada <code>channels</code> vincula el alias del canal con el agente que debe responderlo. Usa el alias real de tu agente en lugar de <code>assistant</code>.</p>
+<p>Al iniciarse por primera vez, el backend Web empareja la cuenta mediante vinculación por QR o por código de emparejamiento (<code>pair_phone</code> inicia la vinculación por código de emparejamiento; déjelo sin definir para usar QR). Mantenga <code>session_path</code> en almacenamiento persistente; eliminarlo fuerza una nueva vinculación del dispositivo. Vincule el canal a un agente a través de la lista <code>channels</code> de ese agente.</p>
+<p>The shared <code>interrupt_on_new_message</code> option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.</p>
 <h2 id="comportamiento-personal-y-empresarial"><a class="header" href="#comportamiento-personal-y-empresarial">Comportamiento personal y empresarial</a></h2>
 <p>Para el modo Web, <code>mode = "personal"</code> aplica políticas separadas de DM, grupo y autochat:</p>
 <div class="table-wrapper">
@@ -276,24 +341,438 @@ pair_phone = "&lt;country-code-and-number-without-plus&gt;"
 </table>
 </div>
 <p>El modo predeterminado <code>mode = "business"</code> no aplica la división de políticas de DM/grupo personales. Para implementaciones de cuentas normales con restricción de pares, usa <code>mode = "personal"</code> con <code>dm_policy = "allowlist"</code> y <code>group_policy = "allowlist"</code>.</p>
-<h2 id="restringir-quién-puede-hablar-con-el-agente"><a class="header" href="#restringir-quién-puede-hablar-con-el-agente">Restringir quién puede hablar con el agente</a></h2>
-<p>La autorización de pares entrantes se encuentra en <code>peer_groups</code>. Un grupo puede dirigirse a todos los alias de WhatsApp con <code>channel = "whatsapp"</code> o a un solo alias con <code>channel = "whatsapp.default"</code>.</p>
-<pre><code class="language-toml">[peer_groups.whatsapp_ops]
-channel = "whatsapp.default"
-agents = []
-external_peers = ["&lt;allowed-whatsapp-peer&gt;"]
-ignore = []
+<h2 id="superficies-de-configuración"><a class="header" href="#superficies-de-configuración">Superficies de configuración</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>access_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Token de acceso de Meta Business Suite (modo Cloud API)</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-1"><a class="header" href="#panel-de-control-del-gateway-1">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.access_token    # entrada enmascarada, almacenada cifrada
 </code></pre>
-<p>Usa el formato de identificador de par que reporta el backend activo. Cloud API normalmente reporta identificadores de teléfono del remitente desde el payload del webhook. El modo web puede reportar identificadores con forma de chat o JID. Mantén los ejemplos y fixtures neutrales; no incluyas números de teléfono reales, IDs de cuenta ni IDs de chat.</p>
-<h2 id="configuración-desde-la-cli"><a class="header" href="#configuración-desde-la-cli">Configuración desde la CLI</a></h2>
-<p>Prefer <code>zeroclaw config set</code> for WhatsApp fields:</p>
-<pre><code class="language-bash">zeroclaw config set channels.whatsapp.default.session-path ~/.zeroclaw/state/whatsapp-web/session.db
+<h4 id="variable-de-entorno"><a class="header" href="#variable-de-entorno">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__access_token=
 </code></pre>
-<p><code>zeroclaw channel add &lt;type&gt; &lt;CONFIG&gt;</code> is not the recommended setup path for WhatsApp. It takes a JSON object at the CLI layer, but current channel setup is routed through <code>zeroclaw config set</code> so secret handling, pairing, and peer authorization stay explicit.</p>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>app_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Secreto de la aplicación de Meta Business Suite (para la verificación de firmas de webhooks) También puede configurarse mediante la variable de entorno <code>ZEROCLAW_WHATSAPP_APP_SECRET</code> Solo se utiliza en el modo Cloud API</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-2"><a class="header" href="#panel-de-control-del-gateway-2">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y establece el campo <code>channels.whatsapp.&lt;alias&gt;.app_secret</code>.</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.app_secret</code>.</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.app_secret    # entrada enmascarada, almacenada cifrada
+</code></pre>
+<h4 id="variable-de-entorno-1"><a class="header" href="#variable-de-entorno-1">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__app_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>approval_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>300</code></span></summary>
+<p>Segundos de espera para la aprobación del operador en las herramientas <code>always_ask</code> antes de denegar automáticamente.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-3"><a class="header" href="#panel-de-control-del-gateway-3">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.approval_timeout_secs</code>.</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.approval_timeout_secs</code>.</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.approval_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-2"><a class="header" href="#variable-de-entorno-2">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__approval_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>dm_mention_patterns</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Patrones regex para el filtrado de menciones en DM (sin distinción entre mayúsculas y minúsculas). Cuando no está vacío, solo se procesan los mensajes directos que coinciden con al menos un patrón; los fragmentos coincidentes se eliminan del contenido reenviado. Ejemplo: <code>["@?ZeroClaw", "\\+?15555550123"]</code></p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-4"><a class="header" href="#panel-de-control-del-gateway-4">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.dm_mention_patterns</code>.</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.dm_mention_patterns</code>.</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.dm_mention_patterns &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-3"><a class="header" href="#variable-de-entorno-3">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__dm_mention_patterns=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>dm_policy</code> <span class="cfg-field-meta"><code>WhatsAppChatPolicy</code> · default <code>"allowlist"</code></span></summary>
+<p>Política para mensajes directos cuando mode = “personal”. “allowlist” (predeterminado) | “ignore” | “all”.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-5"><a class="header" href="#panel-de-control-del-gateway-5">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.dm_policy</code>.</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.dm_policy</code>.</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.dm_policy &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-4"><a class="header" href="#variable-de-entorno-4">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__dm_policy=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Herramientas excluidas de la especificación de herramientas de este canal. Cuando se establece, estas herramientas no se exponen al modelo al responder a través de este canal.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-6"><a class="header" href="#panel-de-control-del-gateway-6">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.excluded_tools</code>.</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.excluded_tools</code>.</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-5"><a class="header" href="#variable-de-entorno-5">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>group_mention_patterns</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Patrones de expresiones regulares para el filtrado de menciones en chats grupales (sin distinción entre mayúsculas y minúsculas). Cuando no está vacío, solo se procesan los mensajes grupales que coincidan con al menos un patrón; los fragmentos coincidentes se eliminan del contenido reenviado. Ejemplo: <code>["@?ZeroClaw", "\\+?15555550123"]</code></p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-7"><a class="header" href="#panel-de-control-del-gateway-7">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.group_mention_patterns</code>.</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.group_mention_patterns</code>.</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.group_mention_patterns &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-6"><a class="header" href="#variable-de-entorno-6">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__group_mention_patterns=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>group_policy</code> <span class="cfg-field-meta"><code>WhatsAppChatPolicy</code> · default <code>"allowlist"</code></span></summary>
+<p>Política para chats grupales cuando mode = “personal”. “allowlist” (predeterminado) | “ignore” | “all”.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-8"><a class="header" href="#panel-de-control-del-gateway-8">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.group_policy</code>.</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.group_policy</code>.</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.group_policy &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-7"><a class="header" href="#variable-de-entorno-7">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__group_policy=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Cancel an in-flight response from this channel sender when a newer WhatsApp message arrives. Default: <code>false</code>.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-9"><a class="header" href="#panel-de-control-del-gateway-9">Panel de control del gateway</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> and set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message</code> field.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-8"><a class="header" href="#variable-de-entorno-8">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Cuando es true, solo responde a mensajes que mencionen al bot con @ en grupos (solo modo Web). Los mensajes directos siempre se procesan. La identidad del bot se resuelve desde el dispositivo wa-rs en tiempo de ejecución; <code>pair_phone</code> la inicializa en la primera conexión.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-10"><a class="header" href="#panel-de-control-del-gateway-10">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.mention_only</code>.</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configura el campo <code>channels.whatsapp.&lt;alias&gt;.mention_only</code>.</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mention_only &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-9"><a class="header" href="#variable-de-entorno-9">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mention_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mode</code> <span class="cfg-field-meta"><code>WhatsAppWebMode</code> · default <code>"business"</code></span></summary>
+<p>Modo de uso para WhatsApp Web: “business” (predeterminado) o “personal”. En el modo personal, el bot aplica dm_policy, group_policy y self_chat_mode para decidir en qué chats responder.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-11"><a class="header" href="#panel-de-control-del-gateway-11">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.mode</code>.</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.mode</code>.</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.mode &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-10"><a class="header" href="#variable-de-entorno-10">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pair_code</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Código de emparejamiento personalizado para la vinculación (modo Web, opcional). Déjelo vacío para que WhatsApp genere uno</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-12"><a class="header" href="#panel-de-control-del-gateway-12">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.pair_code</code>.</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.pair_code</code>.</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_code &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-11"><a class="header" href="#variable-de-entorno-11">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_code=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pair_phone</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Número de teléfono para vinculación por código de emparejamiento (modo Web, opcional) Formato: código de país + número (p. ej., “15551234567”) Si no se establece, se usará el emparejamiento por código QR</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-13"><a class="header" href="#panel-de-control-del-gateway-13">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.pair_phone</code>.</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.pair_phone</code>.</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.pair_phone &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-12"><a class="header" href="#variable-de-entorno-12">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__pair_phone=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>phone_number_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>ID del número de teléfono de Meta Business API (modo Cloud API)</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-14"><a class="header" href="#panel-de-control-del-gateway-14">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code>.</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.phone_number_id</code>.</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.phone_number_id &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-13"><a class="header" href="#variable-de-entorno-13">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__phone_number_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>proxy_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>URL de proxy por canal (http, https, socks5, socks5h). Anula la configuración global <code>[proxy]</code> solo para este canal.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-15"><a class="header" href="#panel-de-control-del-gateway-15">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.proxy_url</code>.</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.proxy_url</code>.</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.proxy_url &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-14"><a class="header" href="#variable-de-entorno-14">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__proxy_url=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>Límite mínimo de ritmo de salida por (canal, destinatario) en segundos. Rango: <code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code> (0 lo desactiva).</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-16"><a class="header" href="#panel-de-control-del-gateway-16">Panel de control del gateway</a></h4>
+<p>Abra <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configure el campo <code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code>.</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs</code>.</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-15"><a class="header" href="#variable-de-entorno-15">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>Profundidad de la cola de regulación de salida por (canal, destinatario). Rango: <code>0..=REPLY_QUEUE_DEPTH_CEILING</code>. Cuando <code>reply_min_interval_secs &gt; 0</code> y este valor es <code>0</code>, el envoltorio de regulación sustituye <code>DEFAULT_REPLY_QUEUE_DEPTH</code> (16). Cuando la cola está llena, se descarta el envío más reciente y se registra un <code>WARN</code>.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-17"><a class="header" href="#panel-de-control-del-gateway-17">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code>.</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max</code>.</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-16"><a class="header" href="#variable-de-entorno-16">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>self_chat_mode</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Cuando es true y mode = “personal”, siempre responde a los mensajes en el chat personal del propio usuario (Notes to Self). El valor predeterminado es false.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-18"><a class="header" href="#panel-de-control-del-gateway-18">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code>.</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configura el campo <code>channels.whatsapp.&lt;alias&gt;.self_chat_mode</code>.</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.self_chat_mode &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-17"><a class="header" href="#variable-de-entorno-17">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__self_chat_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>session_path</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Ruta de la base de datos de sesión para el cliente de WhatsApp Web (modo Web). Cuando se establece, habilita el modo nativo de WhatsApp Web con wa-rs</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-19"><a class="header" href="#panel-de-control-del-gateway-19">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.session_path</code>.</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.session_path</code>.</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.session_path &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-18"><a class="header" href="#variable-de-entorno-18">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__session_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>verify_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Token de verificación del webhook (tú lo defines, Meta lo devuelve para la verificación) Solo se usa en modo Cloud API</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-20"><a class="header" href="#panel-de-control-del-gateway-20">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.verify_token</code>.</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, establece el campo <code>channels.whatsapp.&lt;alias&gt;.verify_token</code>.</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.verify_token    # entrada enmascarada, almacenada cifrada
+</code></pre>
+<h4 id="variable-de-entorno-19"><a class="header" href="#variable-de-entorno-19">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__verify_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ws_url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Anula la URL del WebSocket de WhatsApp Web (modo Web, opcional). Se utiliza en pruebas de integración y configuraciones de proxy; déjala sin definir para usar el endpoint predeterminado incluido con <code>wa-rs</code>.</p>
+<p><strong>Colócalo sobre cualquier superficie:</strong></p>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-21"><a class="header" href="#panel-de-control-del-gateway-21">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura el campo <code>channels.whatsapp.&lt;alias&gt;.ws_url</code>.</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.ws_url</code>.</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.ws_url &lt;value&gt;
+</code></pre>
+<h4 id="variable-de-entorno-20"><a class="header" href="#variable-de-entorno-20">Variable de entorno</a></h4>
+<p>Exporte la anulación (shells POSIX; colóquelo en <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> o un Dockerfile). Reemplace <code>&lt;alias&gt;</code> con el alias literal:</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__whatsapp__&lt;alias&gt;__ws_url=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-22"><a class="header" href="#panel-de-control-del-gateway-22">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> en el panel de control web.</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, en <strong>Channels</strong>.</p>
+</div>
+
+<blockquote>
+<p><strong><code>channels.whatsapp.&lt;alias&gt;.access_token</code> es un secreto.</strong> Se almacena cifrado, nunca en texto plano en <code>config.toml</code>. Configúralo mediante una de estas opciones, que cifran al escribir:</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="panel-de-control-del-gateway-23"><a class="header" href="#panel-de-control-del-gateway-23">Panel de control del gateway</a></h4>
+<p>Abre <a href="http://127.0.0.1:42617/config/channels/whatsapp"><code>/config/channels/whatsapp</code></a> y configura allí el campo <code>channels.whatsapp.&lt;alias&gt;.access_token</code>.</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>En el panel <strong>Config</strong>, configure el campo <code>channels.whatsapp.&lt;alias&gt;.access_token</code> (la entrada está enmascarada).</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.whatsapp.&lt;alias&gt;.access_token    # solicita entrada enmascarada, almacena cifrado
+</code></pre>
+</div>
+
+<p>Lo mismo aplica para <code>verify_token</code> y <code>app_secret</code> (Cloud API).</p>
 <h2 id="iniciar-y-comprobar"><a class="header" href="#iniciar-y-comprobar">Iniciar y comprobar</a></h2>
 <p>Tras configurar un modo, inicia el ejecutor de canales:</p>
-<pre><code class="language-bash">zeroclaw channel start
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw channel start
 </code></pre>
+</div>
+
 <p>Use <code>zeroclaw channel doctor</code> para una primera comprobación. Para el modo Web, confirma también que el binario se compiló con <code>whatsapp-web</code>; para el modo Cloud API, confirma que el túnel del webhook y el token de verificación de Meta coinciden.</p>
 
                     </main>
@@ -340,6 +819,114 @@ ignore = []
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

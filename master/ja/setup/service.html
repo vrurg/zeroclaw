@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -218,95 +295,134 @@
                     <main>
                         <h1 id="サービス管理"><a class="header" href="#サービス管理">サービス管理</a></h1>
 <p>ZeroClaw は、systemd（Linux）、launchctl（macOS）、タスク スケジューラ / Windows サービス（Windows）に対して、ファーストクラスのサービス統合を提供します。これら3つはすべて、1つのCLIインターフェースによって制御されます：</p>
-<pre><code class="language-bash">zeroclaw service install     # サービスを登録する
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service install     # サービスを登録する
 zeroclaw service start       # 起動する
 zeroclaw service stop        停止
 zeroclaw service restart     # 停止 + 開始
 zeroclaw service status      # 実行中 / 停止中、最後の終了コード
 zeroclaw service uninstall   # 削除してください
 </code></pre>
-<p>プラットフォーム固有のバックエンドは <code>crates/zeroclaw-runtime/src/service/</code> に実装されています。これらについて深く考える必要はありませんが、デバッグ時にそれらが生成する内容を知っていると役立ちます。</p>
-<h2 id="linux--systemd"><a class="header" href="#linux--systemd">Linux — systemd</a></h2>
+</div>
+
+<p>プラットフォーム固有のバックエンドは <code>crates/zeroclaw-runtime/src/service/</code> に実装されています。それらについて意識する必要はありませんが、何を生成するかを把握しておくとデバッグ時に役立ちます。</p>
+<h2 id="linux-systemd"><a class="header" href="#linux-systemd">Linux: systemd</a></h2>
 <p><code>zeroclaw service install</code> は、<code>~/.config/systemd/user/zeroclaw.service</code> にユーザースコープのユニットファイルを書き込みます。</p>
 <p>単位：</p>
 <ul>
 <li><code>Type=simple</code> とエージェントプロセスがフォアグラウンドで実行される</li>
-<li><code>User=</code> は呼び出し元のユーザーに設定されます</li>
-<li><code>SupplementaryGroups=gpio spi i2c</code> (ハードウェア機能がコンパイルされている場合に有効)</li>
-<li><code>Restart=on-failure</code> を10秒のバックオフで</li>
-<li><code>ExecStart=/home/$USER/.cargo/bin/zeroclaw daemon</code></li>
+<li><code>ExecStart={cargo-bin}/zeroclaw daemon</code></li>
+<li><code>Restart=always</code> （<code>RestartSec=3</code> 付き）</li>
+<li><code>Environment=HOME=%h</code> と <code>PassEnvironment=DISPLAY XDG_RUNTIME_DIR</code> を設定することで、ヘッドレスブラウザツールがプロファイル/キャッシュディレクトリを作成し、ユーザーセッションにアクセスできるようになります</li>
+<li><code>WantedBy=default.target</code></li>
 </ul>
-<h3 id="手動制御"><a class="header" href="#手動制御">手動制御</a></h3>
-<pre><code class="language-bash">systemctl --user start zeroclaw
+<h3 id="手動制御-systemd"><a class="header" href="#手動制御-systemd">手動制御 (systemd)</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">systemctl --user start zeroclaw
 systemctl --user stop zeroclaw
 systemctl --user status zeroclaw
 systemctl --user enable zeroclaw     # ログイン時に開始
 </code></pre>
+</div>
+
 <h3 id="ログ"><a class="header" href="#ログ">ログ</a></h3>
-<pre><code class="language-bash">journalctl --user -u zeroclaw -f        # フォロー
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">journalctl --user -u zeroclaw -f        # フォロー
 journalctl --user -u zeroclaw --since 1時間前
 </code></pre>
-<h3 id="システムスコープルートサービス"><a class="header" href="#システムスコープルートサービス">システムスコープ（ルート）サービス</a></h3>
-<p>ZeroClaw をユーザーログイン前に起動する必要がある場合（ヘッドレス SBC、VPS など）、root としてインストールコマンドを実行してください：</p>
-<pre><code class="language-bash">sudo zeroclaw service install
-sudo systemctl enable --now zeroclaw
+</div>
+
+<h3 id="ユーザーログイン前の起動"><a class="header" href="#ユーザーログイン前の起動">ユーザーログイン前の起動</a></h3>
+<p>CLIは常にユーザースコープのユニット（<code>systemctl --user</code>）のみを書き込みます。これはデフォルトでログイン時に開始し、ログアウト時に停止します。アクティブなセッションのないヘッドレスマシンでZeroClawを実行し続けるには、サービスユーザーに対してlingeringを有効にしてください。</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">sudo loginctl enable-linger $USER
+systemctl --user enable --now zeroclaw
 </code></pre>
-<p><code>sudo</code>/root で実行すると、<code>zeroclaw service install</code> は <code>/etc/systemd/system/zeroclaw.service</code> にシステムスコープのユニットを作成し、専用の <code>zeroclaw</code> サービスユーザーをプロビジョニングします。</p>
-<h2 id="linux--openrc"><a class="header" href="#linux--openrc">Linux — OpenRC</a></h2>
+</div>
+
+<p>真にシステムスコープのユニット（root所有、<code>/etc/systemd/system/</code>、専用のサービスアカウント、または<code>SupplementaryGroups</code>によるハードウェアグループ）が必要な場合、CLIはそれを生成しません。<a href="https://github.com/zeroclaw-labs/zeroclaw/blob/master/scripts/zeroclaw.service"><code>scripts/zeroclaw.service</code></a>にあるシステムレベルのテンプレートを適応させて、ご自身でインストールしてください。OpenRCホストでは、<code>sudo zeroclaw service install</code>が専用の<code>zeroclaw</code>ユーザーとシステムパスをプロビジョニングします（下記参照）。</p>
+<h2 id="linux-openrc"><a class="header" href="#linux-openrc">Linux: OpenRC</a></h2>
 <p><code>/run/openrc</code> が存在するときに自動的に検出されます（Alpine、一部のGentoo設定など）。</p>
-<pre><code class="language-bash">zeroclaw service install   # /etc/init.d/zeroclaw に書き込み
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service install   # /etc/init.d/zeroclaw に書き込み
 rc-service zeroclaw start
 rc-update add zeroclaw default    # ブート時に開始
 </code></pre>
-<h2 id="macos--launchagent"><a class="header" href="#macos--launchagent">macOS — LaunchAgent</a></h2>
+</div>
+
+<h2 id="macos-launchagent"><a class="header" href="#macos-launchagent">macOS: LaunchAgent</a></h2>
 <p><code>zeroclaw service install</code> は <code>~/Library/LaunchAgents/com.zeroclaw.daemon.plist</code> を書き出し、それをロードします。</p>
-<pre><code class="language-bash">launchctl list | grep zeroclaw
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">launchctl list | grep zeroclaw
 launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 </code></pre>
-<p>ログは <code>~/Library/Logs/ZeroClaw/zeroclaw.log</code> (stdout) と <code>zeroclaw.err</code> (stderr) に出力されます。</p>
+</div>
+
+<p>ログは <code>&lt;config-dir&gt;/logs/</code> に <code>daemon.stdout.log</code> および <code>daemon.stderr.log</code> として出力されます（デフォルトインストールの場合は <code>~/.zeroclaw/logs/</code>）。Homebrew でインストールした場合は、代わりに <code>$HOMEBREW_PREFIX/var/zeroclaw/logs/</code> に書き込まれます。</p>
 <h3 id="homebrew管理"><a class="header" href="#homebrew管理">Homebrew管理</a></h3>
 <p>Homebrew経由でインストールした場合、<code>brew services</code> が推奨されるインターフェースです：</p>
-<pre><code class="language-bash">brew services start zeroclaw
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">brew services start zeroclaw
 brew services restart zeroclaw
 brew services info zeroclaw
 </code></pre>
-<p><code>zeroclaw service</code> の CLI コマンドと <code>brew services</code> を混在させないでください。どちらか一方を選んでください。どちらも plist ファイルに書き込むため、両方存在すると <code>launchctl</code> が混乱します。</p>
-<h2 id="windows--タスク-スケジューラ"><a class="header" href="#windows--タスク-スケジューラ">Windows — タスク スケジューラ</a></h2>
-<p><code>zeroclaw service install</code> は、現在のユーザーのセッションにスケジュールされたタスクを作成します：</p>
+</div>
+
+<p><code>zeroclaw service</code> CLIコマンドと<code>brew services</code>を混在させず、どちらか一方を選んでください。どちらも最終的にはplistを書き込むため、両方が存在すると<code>launchctl</code>が混乱します。</p>
+<h2 id="windows-タスク-スケジューラ"><a class="header" href="#windows-タスク-スケジューラ">Windows: タスク スケジューラ</a></h2>
+<p><code>zeroclaw service install</code> は、<strong>ZeroClaw Daemon</strong> という名前のユーザーごとのスケジュールタスクを作成します:</p>
 <ul>
-<li>トリガー: ログオン時</li>
-<li>条件: バッテリー、アイドル、および省電力の条件が<strong>すべて無効</strong>になっている（そうしないとタスクが予期せず停止する）</li>
-<li>アクション: <code>zeroclaw daemon</code> をバックグラウンドで実行</li>
+<li>トリガー: ログオン時 (<code>/SC ONLOGON</code>)</li>
+<li>実行レベル: <code>LIMITED</code> (昇格せず、現在のユーザーとして実行)</li>
+<li>操作: インストールラッパー <code>zeroclaw-daemon.cmd</code> を実行し、<code>zeroclaw daemon</code> を起動します</li>
 </ul>
-<p>タスク スケジューラの GUI (<code>taskschd.msc</code>) で、タスク スケジューラ ライブラリ → ZeroClaw を確認してください。</p>
-<p>ログは <code>%LOCALAPPDATA%\ZeroClaw\logs\</code> に出力されます：</p>
-<pre><code class="language-cmd">type %LOCALAPPDATA%\ZeroClaw\logs\zeroclaw.log
+<p>タスク スケジューラ GUI (<code>taskschd.msc</code>) で、タスク スケジューラ ライブラリ → ZeroClaw Daemon の順に確認してください。</p>
+<p>ログは <code>&lt;config-dir&gt;\logs\</code> に <code>daemon.stdout.log</code> および <code>daemon.stderr.log</code> として出力されます（デフォルトのインストールでは <code>%USERPROFILE%\.zeroclaw\logs\</code>）:</p>
+<div class="os-tabs-src">
+<h4 id="cmd"><a class="header" href="#cmd">cmd</a></h4>
+<pre><code class="language-cmd">type %USERPROFILE%\.zeroclaw\logs\daemon.stdout.log
 </code></pre>
-<h3 id="windows-サービスシステムスコープ"><a class="header" href="#windows-サービスシステムスコープ">Windows サービス（システムスコープ）</a></h3>
-<p>サーバーまたはマルチユーザーの Windows インストールの場合、管理者プロンプトから <code>zeroclaw service install</code> を実行してください：</p>
-<pre><code class="language-cmd">:: 管理者として cmd.exe
-zeroclaw service install
+</div>
+
+<h3 id="手動制御タスクスケジューラ"><a class="header" href="#手動制御タスクスケジューラ">手動制御（タスクスケジューラ）</a></h3>
+<p>このタスクは <code>zeroclaw service start|stop|status</code> で操作します。これらは <strong>ZeroClaw Daemon</strong> タスクに対して <code>schtasks /Run</code>、<code>/End</code>、<code>/Query</code> をラップしたものです。直接管理することもできます。</p>
+<div class="os-tabs-src">
+<h4 id="cmd-1"><a class="header" href="#cmd-1">cmd</a></h4>
+<pre><code class="language-cmd">schtasks /Run /TN "ZeroClaw Daemon"
+schtasks /End /TN "ZeroClaw Daemon"
+schtasks /Query /TN "ZeroClaw Daemon" /FO LIST
 </code></pre>
-<p>管理者権限で実行すると、インストーラはユーザースコープのタスク スケジューラではなく、<code>LocalSystem</code> 下の実際の Windows サービスを登録します。<code>services.msc</code> または:</p>
-<pre><code class="language-cmd">sc query ZeroClaw
-sc start ZeroClaw
-sc stop ZeroClaw
-</code></pre>
+</div>
+
+<p>CLI はユーザーごとの ONLOGON タスクのみをインストールします。<code>LocalSystem</code> の Windows サービスは登録しません。本格的なシステムサービスにするには、サードパーティ製のスーパーバイザー（例: NSSM）を使ってバイナリを自分でラップしてください。</p>
 <h2 id="設定ファイルパスの解決"><a class="header" href="#設定ファイルパスの解決">設定ファイルパスの解決</a></h2>
-<p>サービスは、インストールされたワークスペースから設定を読み取ります。順序:</p>
+<p>サービスは、インストール時に解決されたディレクトリから設定を読み込みます。優先順位（最初に一致したものが優先されます）：</p>
 <ol>
-<li><code>$ZEROCLAW_CONFIG_DIR/config.toml</code> が設定されている場合</li>
-<li><code>$ZEROCLAW_WORKSPACE/.zeroclaw/config.toml</code> が設定されている場合</li>
-<li>Homebrew経由でインストールした場合、<code>$HOMEBREW_PREFIX/var/zeroclaw/.zeroclaw/config.toml</code></li>
-<li><code>~/.zeroclaw/config.toml</code> (Linux/macOS) または <code>%USERPROFILE%\.zeroclaw\config.toml</code> (Windows)</li>
+<li><code>$ZEROCLAW_CONFIG_DIR</code>（設定は <code>$ZEROCLAW_CONFIG_DIR</code> の直下に配置されます）</li>
+<li><code>$ZEROCLAW_DATA_DIR</code></li>
+<li><code>$ZEROCLAW_WORKSPACE</code>（<strong>非推奨</strong>。<code>ZEROCLAW_DATA_DIR</code> の使用を推奨します。<code>$ZEROCLAW_WORKSPACE</code> またはレガシーの同階層 <code>.zeroclaw/</code> のいずれかを解決します）</li>
+<li>macOS のみ、Homebrew 経由でインストールした場合の Homebrew 設定ディレクトリ (<code>$HOMEBREW_PREFIX/var/zeroclaw/</code>)</li>
+<li>デフォルトは <code>~/.zeroclaw/</code>（Linux/macOS）または <code>%USERPROFILE%\.zeroclaw\</code>（Windows）</li>
 </ol>
-<p>サービスが設定変更を無視しているように見える場合は、デーモンがどのパスを読み込んでいるかを確認してください：</p>
-<pre><code class="language-bash">zeroclaw config list
+<p><code>ZEROCLAW_CONFIG_DIR</code> はすべてに優先されます。<code>ZEROCLAW_DATA_DIR</code> や <code>ZEROCLAW_WORKSPACE</code> と併せて設定すると、警告がログに記録され、他の設定は無視されます。</p>
+<p>サービスが構成変更を無視しているように見える場合は、デーモンがどのパスを解決したかを確認してください。<code>zeroclaw status</code> はアクティブな構成ファイルを報告し、ランタイムは起動時に解決元の行をログに記録します:</p>
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">zeroclaw status
 </code></pre>
-<p>出力の最初の数行には、解決された設定ファイルのパスが表示されます。</p>
+</div>
+
+<p>解決に使用した設定ファイルのパスが出力に含まれます。</p>
 <h2 id="自動更新"><a class="header" href="#自動更新">自動更新</a></h2>
-<p>このサービスは<strong>自動更新されません</strong>。これは意図的な設計で、新しいコードを適用するタイミングをあなたが選択できるようになっています。GitHub のリリースフィードまたは Discord の <code>#releases</code> チャンネルを購読してください（<a href="../contributing/communication.html">コントリビューション → コミュニケーション</a> を参照）。</p>
+<p>このサービスは自動更新を<strong>行いません</strong>。これは意図的なもので、新しいコードを取り込むタイミングを自分で選べます。GitHubのリリースフィードまたはDiscordの<code>#releases</code>チャンネルを購読してください（<a href="../contributing/communication.html">コントリビュート → コミュニケーション</a>を参照）。</p>
 <h2 id="関連項目も参照してください"><a class="header" href="#関連項目も参照してください">関連項目も参照してください</a></h2>
 <ul>
 <li><a href="./linux.html">Linux のセットアップ</a>、<a href="./macos.html">macOS のセットアップ</a>、<a href="./windows.html">Windows のセットアップ</a></li>
@@ -358,6 +474,114 @@ sc stop ZeroClaw
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

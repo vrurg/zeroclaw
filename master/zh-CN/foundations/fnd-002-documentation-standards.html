@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -216,15 +293,15 @@
                 <div id="mdbook-content" class="content">
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
-                        <h1 id="fnd-002有意文档化--标准结构和国际化策略"><a class="header" href="#fnd-002有意文档化--标准结构和国际化策略">FND-002：有意文档化 — 标准、结构和国际化策略</a></h1>
-<h3 id="自-v070-起--类型文档--修订版-1"><a class="header" href="#自-v070-起--类型文档--修订版-1">自 v0.7.0 起 · 类型：文档 · 修订版 1</a></h3>
+                        <h1 id="fnd-002有意识的文档编写标准结构与国际化策略"><a class="header" href="#fnd-002有意识的文档编写标准结构与国际化策略">FND-002：有意识的文档编写：标准、结构与国际化策略</a></h1>
 <blockquote>
+<p>自 v0.7.0 起 · 类型：文档 · 修订版 1</p>
 <p><strong>规范参考</strong> · 团队已批准 · 修订版 1 讨论线程及完整修订历史：<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5576">#5576</a></p>
 </blockquote>
 <hr>
 <blockquote>
 <p><strong>在你们阅读此内容之前，给团队的一条提示。</strong></p>
-<p>文档并非在代码完成后才去编写的内容。它本身就是一个产品界面——是项目与所有未来贡献者、使用者或基于其构建的人之间的接口。没有文档的代码库会迫使每个新人从零开始重新发现一切；而文档糟糕的代码库往往更糟，因为它会给人虚假的信心。本 RFC 提议以我们应用于架构的同样意图来对待文档：先确立愿景，再构建结构，最后填充内容。</p>
+<p>文档不是你在代码完成之后才写的东西。它本身就是一个产品界面,是项目与每一位将来会为其贡献、使用或基于它进行开发的人之间的接口。一个没有文档的代码库,会迫使每一个新人从零开始重新摸索一切。而一个文档糟糕的代码库往往更糟,因为它会给人带来虚假的信心。本 RFC 提议以我们应用于架构的同样的用心来对待文档:先有愿景,再有结构,最后才是内容。</p>
 </blockquote>
 <hr>
 <h2 id="目录"><a class="header" href="#目录">目录</a></h2>
@@ -246,7 +323,7 @@
 <p>文档问题几乎总是源于在撰写第一句话之前跳过了一个本应提出的问题：<strong>这份文档是什么类型，它的目标读者是谁？</strong></p>
 <p>如果没有对这一问题的解答，文档就会堆积成一大堆页面，它们都属于同一个模糊类别的不同变体：“关于项目的资料”。设置指南与架构决策并列，面向用户的使用指南与内部编码规范并存。README 的三十种语言翻译与安全策略文档争夺空间。没有人能找到任何东西，所有内容以不同的速度过时，每一个涉及文档的 PR 都变成了一场关于哪些页面需要更新的谈判。</p>
 <p>修复方法不是编写更多文档。修复方法是，在编写任何内容之前，先确定你要创建的工件类型。类型决定了格式、受众、位置、生命周期以及谁负责保持其最新状态。一旦确定了类型，其余部分自然会随之而来。</p>
-<p>本 RFC 采用 Svyatoslav Kotusev 的 <strong>EA Artifacts on a Page</strong> 框架（https://eaonapage.com）作为所有 ZeroClaw 文档的分类视角。该框架基于证据，刻意不具规定性，并且直接映射到开源基础设施项目实际需要的文档类型。</p>
+<p>本 RFC 采用 Svyatoslav Kotusev 提出的 <strong>EA Artifacts on a Page</strong> 框架（<a href="https://eaonapage.com">https://eaonapage.com</a>）作为所有 ZeroClaw 文档的分类视角。该框架基于实证、刻意保持非规定性，并能直接映射到一个开源基础设施项目实际所需的各类文档。</p>
 <p>该团队正在采用的更广泛开发哲学中借用的核心原则：</p>
 <blockquote>
 <p><strong>文档和代码一样，应该沿着“愿景 → 架构 → 设计 → 实现”这条路径向上追溯。如果在动笔之前无法明确文档的类型及其目标读者，说明你尚未准备好开始撰写。</strong></p>
@@ -283,7 +360,7 @@
 </ul>
 <p>这三个文件都位于 <code>docs/</code> 目录下，它们之间没有结构上的区分。结果是一个扁平的堆，其中包含一个手动维护的 <code>SUMMARY.md</code>，每次发生任何更改时都需要有人去更新它。</p>
 <h3 id="23-adr-差距"><a class="header" href="#23-adr-差距">2.3 ADR 差距</a></h3>
-<p>该项目仅包含一份架构决策记录（ADR）：<code>ADR-004-tool-shared-state-ownership.md</code>。这份记录非常出色——结构清晰、引用了代码、内容具体。然而，该项目至少还做出了五项或六项同等重要甚至更重要的架构决策，却从未被记录下来：</p>
+<p>该项目恰好有一个架构决策记录：<code>ADR-004-tool-shared-state-ownership.md</code>。它非常出色：结构清晰、有代码引用、内容具体。但该项目至少做出了五到六个同等重要或更为重要的架构决策，却从未被记录下来：</p>
 <ul>
 <li>选择 Rust 而非 TypeScript</li>
 <li>基于特性的可扩展性模型</li>
@@ -293,7 +370,7 @@
 </ul>
 <p>如果没有这些记录，每位新贡献者都必须通过代码考古来重新发现背后的原因。每个读取代码库的 AI 编程助手都只能知道“是什么”，而无法了解“为什么”。这是未记录的技术债务中最昂贵的一种形式。</p>
 <h3 id="24-已经做得好的部分"><a class="header" href="#24-已经做得好的部分">2.4 已经做得好的部分</a></h3>
-<p><code>docs-contract.md</code> 的理念——将文档视为受治理的产品表面——是正确的直觉。它只需要合适的规则。根目录下的 <code>AGENTS.md</code> 非常出色，为 AI 辅助开发树立了良好的先例。ADR-004 证明了团队能够编写高质量的架构记录。</p>
+<p><code>docs-contract.md</code> 这一概念将文档视为受治理的产品界面，方向上是对的，只是还需要配以恰当的规则。根目录下的 <code>AGENTS.md</code> 非常出色，为 AI 辅助开发树立了良好的范例。ADR-004 则证明了团队有能力撰写高质量的架构记录。</p>
 <hr>
 <h2 id="3-分类框架ea-工件在一页上"><a class="header" href="#3-分类框架ea-工件在一页上">3. 分类框架：EA 工件在一页上</a></h2>
 <p><strong>EA 页面工件</strong>框架定义了五类架构工件。ZeroClaw 仓库中的每份文档都应归属于其中一类，而该类别决定了其存放位置、格式以及何时失效。</p>
@@ -323,7 +400,7 @@
 <h2 id="4-i18n-问题"><a class="header" href="#4-i18n-问题">4. i18n 问题</a></h2>
 <h3 id="41-移除参数的理由"><a class="header" href="#41-移除参数的理由">4.1 移除参数的理由</a></h3>
 <p>从仓库中移除所有非英文内容的理由基于以下四个支柱：</p>
-<p><strong>1. 受众具备按需翻译能力。</strong> ZeroClaw 的主要用户是运行 AI 助手的人。每个这样的人都可以访问即时、高质量机器翻译——无论是通过他们正在运行的代理、浏览器，还是通过数十种免费翻译服务之一。在仓库中提供翻译的实际收益微乎其微。</p>
+<p><strong>1. 受众可以随时获得翻译。</strong> ZeroClaw 的主要用户是运行 AI 助手的人。每一个这样的用户都能即时获得高质量的机器翻译，无论是通过他们运行的代理、通过浏览器，还是通过数十种免费翻译服务中的任意一种。在代码仓库中提供翻译所带来的实际收益微乎其微。</p>
 <p><strong>2. 翻译内容几乎肯定已过时。</strong> 机器翻译的内容可能只生成过一次，且未与英文源文件保持同步。对于 AI 辅助开发而言，过时的文档比没有文档更糟糕，因为语言模型会基于过时信息自信地得出错误结论。</p>
 <p><strong>3. 贡献者税是真实且可衡量的。</strong> <code>docs-contract.md</code> 的对等性要求意味着每个文档 PR 都必须涉及多达六种语言版本。这使得文档贡献变得昂贵，并阻碍了那些保持文档健康的小幅、增量改进（例如修复拼写错误、澄清步骤、更新过时的引用）。</p>
 <p><strong>4. 本地化是社区工作，而非核心项目工作。</strong> 最有能力维护日语文档的是日语贡献者。将本地化内容放在主仓库中并要求保持同步，会将负担转嫁给核心维护者，而不是受益的社区。GitHub Wiki 正确地反转了这一点：社区成员可以编辑和维护他们语言的页面，而无需提交 PR。</p>
@@ -350,7 +427,7 @@
 <p>在 GitHub Wiki 上<strong>创建</strong>一个 <code>Translations</code> 页面，其中包含可用语言列表、它们的完成度以及负责维护的贡献者</p>
 </li>
 <li>
-<p><strong>可选：</strong> 添加一个 <code>zeroclaw docs --translate</code> CLI 功能，该功能使用配置的 LLM 提供商按需翻译任何文档页面——这对于一个以 AI 辅助为核心目的的产品来说，是一个自然的选择。</p>
+<p><strong>可选：</strong> 添加 <code>zeroclaw docs --translate</code> CLI 功能，使用已配置的 LLM 提供方按需翻译任意文档页面，这对于一款核心用途即为 AI 辅助的产品而言是再合适不过的功能</p>
 </li>
 </ol>
 <h3 id="44-agentsmd-的影响"><a class="header" href="#44-agentsmd-的影响">4.4 AGENTS.md 的影响</a></h3>
@@ -363,7 +440,7 @@
 </blockquote>
 <p>这不是一个模糊规则。请逐字应用它。</p>
 <p><strong>仓库。</strong> ADR 记录了在特定时间点做出某项具体架构决策的原因。即使代码发生变化，ADR 仍能准确描述当时所做出的决策及其时间。代码可能已偏离该决策，但记录本身依然准确。</p>
-<p>配置 Telegram 频道的设置指南描述了用户针对当前软件版本所执行的步骤。如果配置格式发生变化，该指南就会失效。→ <strong>这听起来应该放在仓库中——但实际上不应该。</strong> 设置指南应遵循其自身的时间线进行更新，而不应与代码提交耦合。正确的模型是：API 参考文档（直接映射到配置结构体）位于仓库中，而引导用户使用该 API 的设置指南则放在 Wiki 上，由任何人在步骤发生变化时进行更新。</p>
+<p><strong>这听起来应该放在仓库里，但其实不该。</strong> 配置 Telegram 频道的设置指南描述了用户针对当前版本软件所执行的步骤。如果配置格式发生变化，该指南就会过时。设置指南应当按照自己的节奏更新，而不应与代码提交绑定。正确的模式是：API 参考文档（直接映射到配置结构体）放在仓库里，而引导用户使用该 API 的设置指南则放在 Wiki 上，当步骤发生变化时任何人都可以更新。</p>
 <h3 id="52-实践中的拆分"><a class="header" href="#52-实践中的拆分">5.2 实践中的拆分</a></h3>
 <p><strong>保留在仓库中（<code>docs/book/src/</code>）：</strong></p>
 <div class="table-wrapper">
@@ -455,7 +532,7 @@
 <hr>
 <h2 id="6-adr-标准"><a class="header" href="#6-adr-标准">6. ADR 标准</a></h2>
 <h3 id="61-格式"><a class="header" href="#61-格式">6.1 格式</a></h3>
-<p>所有架构决策记录均采用 <strong>Nygard 格式</strong>，并扩展了 YAML frontmatter 以支持机器可读性。ADR-004 是现有的模型——本节对其进行了形式化定义。</p>
+<p>所有架构决策记录均采用 <strong>Nygard 格式</strong>，并扩展了 YAML frontmatter 以便于机器读取。ADR-004 为现有模型。本节将其正式确定下来。</p>
 <p>每个 ADR 包含三个部分和五个前置元数据字段：</p>
 <pre><code>---
 id: ADR-NNN
@@ -524,7 +601,7 @@ relates-to:
 <h2 id="7-agentsmd-作为-ai-开发层"><a class="header" href="#7-agentsmd-作为-ai-开发层">7. AGENTS.md 作为 AI 开发层</a></h2>
 <h3 id="71-模式"><a class="header" href="#71-模式">7.1 模式</a></h3>
 <p>根目录下的 <code>AGENTS.md</code> 是该项目对 AI 辅助开发最有力的现有贡献。它向 AI 编码助手说明了需要执行的命令、需要遵循的架构、需要应用的风险层级以及需要避免的反模式。它之所以有效，是因为它具体、有主见且简洁。</p>
-<p>随着工作区按照微内核架构 RFC 分解为多个 crate，每个 crate 都应拥有自己的 <code>AGENTS.md</code>。这是使架构边界在 AI 辅助层得以强制执行的一种机制——不仅通过 crate 依赖在编译时实现，更在编写任何代码之前的推理层实现。</p>
+<p>随着工作区分解为多个 crate（依据微内核架构 RFC），每个 crate 都应拥有自己的 <code>AGENTS.md</code>。借此机制，架构边界不仅能在编译期通过 crate 依赖关系得以强制实施，更能在 AI 辅助层、即编写任何代码之前的推理层就成为可执行的约束。</p>
 <h3 id="72-每个-crate-的-agentsmd-包含的内容"><a class="header" href="#72-每个-crate-的-agentsmd-包含的内容">7.2 每个 crate 的 AGENTS.md 包含的内容</a></h3>
 <p>保持简短。超过 60 行的 <code>AGENTS.md</code> 将不会被阅读。每个文件回答五个问题：</p>
 <pre><code class="language-markdown"># &lt;crate-name&gt;
@@ -709,7 +786,7 @@ Cargo.lock
 <hr>
 <h2 id="9-替换文档合同"><a class="header" href="#9-替换文档合同">9. 替换文档合同</a></h2>
 <p>旧的 <code>docs/contributing/docs-contract.md</code> 编码了 i18n 对等性要求和目录结构，本 RFC 已取代这些内容。该文件已被移除；本节是其替代内容。</p>
-<p>该替代方案涉及三项内容：工件分类、仓库/维基拆分以及 ADR 治理。它未提及 i18n——区域设置一致性现在由 <a href="../maintainers/docs-and-translations.html">维护者 → 文档与翻译</a> 页面处理。</p>
+<p>该替换方案管理三件事：制品分类、repo/wiki 拆分，以及 ADR 治理。它对 i18n 不作任何规定：语言区域的对等性现由 <a href="../maintainers/docs-and-translations.html">Maintainers → Docs &amp; Translations</a> 页面负责。</p>
 <p><strong>替换文档契约：</strong></p>
 <pre><code class="language-markdown"># Documentation Contract
 
@@ -762,7 +839,7 @@ precede implementation by multiple releases.
 <h2 id="10-我们应该采用的标准"><a class="header" href="#10-我们应该采用的标准">10. 我们应该采用的标准</a></h2>
 <p>这些文档特定的标准补充了架构 RFC 中提出的更广泛的标准。</p>
 <h3 id="diátaxis-框架文档结构"><a class="header" href="#diátaxis-框架文档结构">Diátaxis 框架（文档结构）</a></h3>
-<p><strong>它是什么：</strong> Diátaxis（https://diataxis.fr）是一种系统化的技术文档框架，将内容分为四种类型：教程、操作指南、参考文档和解释性文档。它是 Python 文档、Django 文档等所使用的文档框架。它与 EA Artifacts 方法高度兼容——两者回答的问题不同（Diátaxis：如何组织文档的内容；EA Artifacts：这是什么类型的文档，它位于何处）。</p>
+<p><strong>它是什么：</strong> Diátaxis（<a href="https://diataxis.fr">https://diataxis.fr</a>）是一套系统化的技术文档框架，将内容分为四种类型：教程、操作指南、参考和说明。它是 Python 文档、Django 文档以及许多其他文档背后所采用的文档框架。它与 EA Artifacts 方法高度兼容：二者回答的是不同的问题（Diátaxis：如何组织文档的内容；EA Artifacts：这是什么类型的文档以及它应放在何处）。</p>
 <p><strong>如何应用：</strong> 面向用户维基上的文档应遵循 Diátaxis 结构。代码相关的仓库文档遵循 EA Artifacts。这两个框架在不同的层面上运作，并不冲突。</p>
 <div class="table-wrapper">
 <table>
@@ -788,17 +865,17 @@ relates-to:
   - crates/zeroclaw-api
 ---
 </code></pre>
-<p>CI 检查应验证 <code>docs/</code> 中的所有文档是否具有有效的前置元数据（frontmatter）。这可以防止文档在未声明其类型和状态的情况下被编写，从而在工具层面强制执行分类规范。</p>
+<p>CI 检查应验证 <code>docs/</code> 中的所有文档都具有有效的 frontmatter。这可以防止在未先声明文档类型和状态的情况下编写文档，从而在工具层面强制执行分类规范。</p>
 <h3 id="commonmark--github-风格-markdown"><a class="header" href="#commonmark--github-风格-markdown">CommonMark + GitHub 风格 Markdown</a></h3>
 <p>所有文档均使用 CommonMark（标准化的 Markdown 规范）以及 GitHub Flavored Markdown 扩展（包括表格、任务列表、围栏代码块和 Mermaid 图表）。不使用任何自定义扩展、MDX 或 ReStructuredText。对于架构图，推荐使用 Mermaid 图表而非图像文件，因为它们能够与代码一起进行版本控制。</p>
 <h3 id="用于-prose-linting-的-vale"><a class="header" href="#用于-prose-linting-的-vale">用于 Prose Linting 的 Vale</a></h3>
-<p><strong>它是什么：</strong> Vale（https://vale.sh）是一个文本风格检查工具——它通过可配置的规则来检查写作风格、一致性和可读性。它可以强制执行诸如：始终使用“你”而不是“用户”，在命令式部分避免使用被动语态，使用一致的术语（如“插件”而不是“扩展”或“模块”）等要求。</p>
+<p><strong>它是什么：</strong> Vale（<a href="https://vale.sh">https://vale.sh</a>）是一款散文检查工具：它使用可配置的规则来检查写作风格、一致性和可读性。它可以强制执行诸如此类的规则：始终使用 “you” 而非 “the user”、在祈使语句部分避免使用被动语态、使用一致的术语（“plugin” 而非 “extension” 或 “module”）。</p>
 <p><strong>为什么重要：</strong> 当前文档在语气、术语和风格上不一致。有些页面使用“插件”，有些使用“模块”，还有些使用“扩展”。Vale 使这些规则自动化，并在 CI 阶段强制执行，就像 Clippy 强制执行代码质量一样。</p>
 <hr>
 <h2 id="11-分阶段路线图"><a class="header" href="#11-分阶段路线图">11. 分阶段路线图</a></h2>
 <p>文档迁移遵循与架构迁移相同的绞杀榕模式：增量式、始终处于可用状态，避免一次性重写。</p>
 <hr>
-<h3 id="第一阶段--v070--清理根目录"><a class="header" href="#第一阶段--v070--清理根目录">第一阶段 · v0.7.0 — “清理根目录”</a></h3>
+<h3 id="阶段-1--v070清理根目录"><a class="header" href="#阶段-1--v070清理根目录">阶段 1 · v0.7.0：“清理根目录”</a></h3>
 <p><strong>交付物：</strong></p>
 <ul>
 <li><input disabled="" type="checkbox"> 从仓库根目录移除所有 <code>README.*.md</code> 文件（仅保留 <code>README.md</code>）</li>
@@ -818,7 +895,7 @@ relates-to:
 <li>GitHub Wiki 已上线，并从 README 中公开链接</li>
 </ul>
 <hr>
-<h3 id="第二阶段--v070v080--编写缺失的-adr"><a class="header" href="#第二阶段--v070v080--编写缺失的-adr">第二阶段 · v0.7.0–v0.8.0 — “编写缺失的 ADR”</a></h3>
+<h3 id="阶段-2--v070v080补写缺失的-adr"><a class="header" href="#阶段-2--v070v080补写缺失的-adr">阶段 2 · v0.7.0–v0.8.0：“补写缺失的 ADR”</a></h3>
 <p><strong>交付物：</strong></p>
 <ul>
 <li><input disabled="" type="checkbox"> 编写 ADR-001 至 ADR-003 以及 ADR-005 至 ADR-007（追溯性，参见第 6.3 节）</li>
@@ -837,7 +914,7 @@ relates-to:
 <li><code>docs/</code> 中无死链</li>
 </ul>
 <hr>
-<h3 id="阶段-3--v080v090--ai-层"><a class="header" href="#阶段-3--v080v090--ai-层">阶段 3 · v0.8.0–v0.9.0 — “AI 层”</a></h3>
+<h3 id="阶段-3--v080v090ai-层"><a class="header" href="#阶段-3--v080v090ai-层">阶段 3 · v0.8.0–v0.9.0：“AI 层”</a></h3>
 <p><strong>交付物：</strong></p>
 <ul>
 <li><input disabled="" type="checkbox"> 为工作区中的每个新 crate 编写 <code>AGENTS.md</code> 文件（按照架构 RFC 的各个阶段逐步分解）。</li>
@@ -854,7 +931,7 @@ relates-to:
 <li>插件 SDK 文档对于外部贡献者编写一个可用的工具插件来说已经足够。</li>
 </ul>
 <hr>
-<h3 id="第-4-阶段--v100--稳定平台"><a class="header" href="#第-4-阶段--v100--稳定平台">第 4 阶段 · v1.0.0 — “稳定平台”</a></h3>
+<h3 id="阶段-4--v100稳定平台"><a class="header" href="#阶段-4--v100稳定平台">阶段 4 · v1.0.0：“稳定平台”</a></h3>
 <p><strong>交付物：</strong></p>
 <ul>
 <li><input disabled="" type="checkbox"> 在相应的代码发布后，将 ADR-001 至 ADR-007 标记为 <code>accepted</code>（而非 <code>proposed</code>）。</li>
@@ -872,22 +949,22 @@ relates-to:
 </ul>
 <hr>
 <h2 id="附录-a术语表"><a class="header" href="#附录-a术语表">附录 A：术语表</a></h2>
-<p><strong>架构决策记录（ADR）</strong>——对重要架构决策的不可变记录，包括促使该决策的背景、所做的决策以及其后果。ADR 一经采纳便不再更改；被取代的决策将通过新的 ADR 进行记录。</p>
-<p><strong>Diátaxis</strong> — 一种系统化的技术文档结构框架，将内容分为教程（学习）、操作指南（目标导向）、参考（信息）和解释（理解）。详见 https://diataxis.fr。</p>
-<p><strong>EA 页面工件</strong> — 由 Svyatoslav Kotusev 开发的用于企业架构文档的分类框架。将工件分为五类：考虑因素、景观、大纲、设计和标准。详见 https://eaonapage.com。</p>
-<p><strong>Frontmatter</strong> — Markdown 文件顶部的 YAML 元数据，由 <code>---</code> 分隔。使文档对工具、CI 检查和 AI 助手可读且可查询。</p>
-<p><strong>Nygard 格式</strong> — 由 Michael Nygard 引入的 ADR 格式：包含三个部分（背景、决策、后果），用于捕捉核心推理过程，避免不必要的繁文缛节。</p>
-<p><strong>绞杀榕模式</strong> — 一种迁移策略，通过在旧结构周围逐步构建新结构，逐块替换旧结构，而不是一次性全部替换。在整个迁移过程中，系统始终保持功能正常。</p>
-<p><strong>Vale</strong> — 面向技术文档的散文风格检查工具。在 CI 阶段强制执行风格、一致性和可读性规则，类似于 Clippy 对 Rust 代码质量的保障。详见 https://vale.sh。</p>
+<p><strong>ADR（架构决策记录）</strong>：对重大架构决策的不可变记录，包括促成该决策的背景、所做的决定以及由此带来的影响。ADR 一经接受便不再更改；被取代的决策会以新的 ADR 形式记录下来。</p>
+<p><strong>Diátaxis</strong>：一种用于组织技术文档结构的系统化框架，它将内容划分为教程（学习导向）、操作指南（目标导向）、参考（信息导向）和解释（理解导向）。参见 <a href="https://diataxis.fr">https://diataxis.fr</a>。</p>
+<p><strong>EA Artifacts on a Page</strong>：由 Svyatoslav Kotusev 开发的企业架构文档分类框架。将工件分为五大类：Considerations、Landscapes、Outlines、Designs 和 Standards。参见 <a href="https://eaonapage.com">https://eaonapage.com</a>。</p>
+<p><strong>Frontmatter</strong>：位于 Markdown 文件顶部的 YAML 元数据，以 <code>---</code> 分隔。使文档可被工具、CI 检查和 AI 助手读取和查询。</p>
+<p><strong>Nygard 格式</strong>：由 Michael Nygard 引入的 ADR 格式：包含三个部分（Context、Decision、Consequences），在不增加冗余形式的情况下记录核心推理过程。</p>
+<p><strong>绞杀者无花果模式（Strangler Fig Pattern）</strong>：一种迁移策略，围绕旧结构逐步构建新结构，逐块替换而非一次性全部替换。整个迁移过程中系统始终保持可用。</p>
+<p><strong>Vale</strong>：一款用于技术文档的文本检查工具。它在 CI 阶段强制执行样式、一致性和可读性规则，就像 Clippy 强制执行 Rust 代码质量一样。参见 <a href="https://vale.sh">https://vale.sh</a>。</p>
 <hr>
 <h2 id="附录-b延伸阅读"><a class="header" href="#附录-b延伸阅读">附录 B：延伸阅读</a></h2>
 <ul>
-<li><strong>Diátaxis 文档框架</strong> — https://diataxis.fr — 按类型构建技术文档的权威参考。</li>
-<li><strong>页面中的 EA 工件 (v2.2)</strong> — https://eaonapage.com — 第 3 节中使用的分类框架。</li>
-<li><strong>“面向开发者的文档”</strong> —— Jared Bhatti 等 —— 一本由维护过大型文档系统的工程师撰写的技术文档实用指南。</li>
-<li><strong>Vale 文档</strong> — https://vale.sh/docs — 第 10 节中提出的文本检查器的安装指南和配置参考。</li>
-<li><strong>Michael Nygard 关于 ADR 的文章</strong> — https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions — 这篇原始文章介绍了在第 6 节中使用的 ADR 格式。</li>
-<li><strong>GitHub Wikis 文档</strong> — https://docs.github.com/en/communities/documenting-your-project-with-wikis — 关于设置和管理 GitHub Wiki 的参考文档，详见第 5 节。</li>
+<li><a href="https://diataxis.fr">Diátaxis 文档框架</a>：按类型组织技术文档的权威参考。</li>
+<li><a href="https://eaonapage.com">EA Artifacts on a Page (v2.2)</a>：第 3 节中使用的分类框架。</li>
+<li><strong>《Docs for Developers》</strong>：Jared Bhatti 等著：一本实用的技术文档指南，由维护过大型文档系统的工程师们撰写。</li>
+<li><a href="https://vale.sh/docs">Vale 文档</a>：第 10 节中提出的文章检查工具的安装指南和配置参考。</li>
+<li><a href="https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions">Michael Nygard 关于 ADR 的文章</a>：介绍第 6 节所用 ADR 格式的原始文章。</li>
+<li><a href="https://docs.github.com/en/communities/documenting-your-project-with-wikis">GitHub Wikis 文档</a>：用于设置和管理第 5 节中提议的 GitHub Wiki 的参考资料。</li>
 </ul>
 <hr>
 <p><em>本提案基于对 ZeroClaw 文档系统在 v0.6.8 版本的直接分析。所引用的指标（169 个 i18n 文件、2.2 MB、31 种语言版本的 README）均基于直接测量。建议内容反映了开源基础设施项目技术文档中的成熟实践，并针对 ZeroClaw 的具体约束和目标进行了适配。</em></p>
@@ -937,6 +1014,114 @@ relates-to:
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

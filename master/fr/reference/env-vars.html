@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -218,9 +295,15 @@
                     <main>
                         <h1 id="variables-denvironnement"><a class="header" href="#variables-denvironnement">Variables d’environnement</a></h1>
 <p>Chaque substitution de variable d’environnement d’opérateur utilise une grammaire unique en miroir du schéma. La fin d’une variable d’environnement <code>ZEROCLAW_*</code> est le chemin de propriété en notation pointée que <code>zeroclaw config set</code> accepte, où chaque <code>__</code> (double trait de soulignement) sépare les segments du chemin et chaque <code>_</code> simple est soit un connecteur snake-case à l’intérieur d’un nom de champ (<code>api_key</code> → <code>api-key</code> dans <code>set_prop</code>), soit un caractère littéral dans une clé d’alias.</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
 <pre><code class="language-sh">ZEROCLAW_&lt;dotted_path_with_double_underscores&gt;=&lt;value&gt;
 </code></pre>
+</div>
+
 <h2 id="exemples"><a class="header" href="#exemples">Exemples</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
 <pre><code class="language-sh"># Injecter un identifiant d'alias de famille typée
 ZEROCLAW_providers__models__anthropic__home__api_key=sk-ant-...
 
@@ -229,8 +312,8 @@ ZEROCLAW_providers__models__openrouter__prod_v2__model=anthropic/claude-sonnet-4
 ZEROCLAW_providers__models__openrouter__prod_v2__api_key=sk-or-...
 
 # Activer/désactiver et configurer un canal
-ZEROCLAW_channels__matrix__enabled=true
-ZEROCLAW_channels__matrix__homeserver=https://matrix.example.org
+ZEROCLAW_channels__matrix__home__enabled=true
+ZEROCLAW_channels__matrix__home__homeserver=https://matrix.example.org
 
 # Remplacer les paramètres d'exécution de la passerelle
 ZEROCLAW_gateway__request_timeout_secs=120
@@ -249,6 +332,8 @@ ZEROCLAW_storage__qdrant__home__url=https://qdrant.example.com
 ZEROCLAW_storage__qdrant__home__collection=zeroclaw
 ZEROCLAW_storage__qdrant__home__api_key=...
 </code></pre>
+</div>
+
 <p>Le mappage entre le nom de la variable d’environnement et le chemin TOML est mécanique :</p>
 <div class="table-wrapper">
 <table>
@@ -257,24 +342,28 @@ ZEROCLAW_storage__qdrant__home__api_key=...
 </thead>
 <tbody>
 <tr><td><code>[providers.models.anthropic.home] api_key = "..."</code></td><td><code>ZEROCLAW_providers__models__anthropic__home__api_key=...</code></td></tr>
-<tr><td><code>[channels.matrix] homeserver = "..."</code></td><td><code>ZEROCLAW_channels__matrix__homeserver=...</code></td></tr>
-<tr><td><code>[gateway] request_timeout_secs = 120</code></td><td><code>ZEROCLAW_gateway__request_timeout_secs=120</code></td></tr>
-<tr><td><code>[gateway] web_dist_dir = "/srv/zeroclaw/web/dist"</code></td><td><code>ZEROCLAW_gateway__web_dist_dir=/srv/zeroclaw/web/dist</code></td></tr>
+<tr><td><code>[channels.matrix.home] homeserver = "..."</code></td><td><code>ZEROCLAW_channels__matrix__home__homeserver=...</code></td></tr>
+<tr><td><code>[gateway] request_timeout_secs = "..."</code></td><td><code>ZEROCLAW_gateway__request_timeout_secs=...</code></td></tr>
+<tr><td><code>[gateway] web_dist_dir = "..."</code></td><td><code>ZEROCLAW_gateway__web_dist_dir=...</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Les segments <code>&lt;alias&gt;</code> ci-dessus (<code>home</code>, <code>prod_v2</code>) sont choisis par l’opérateur — remplacez-les par les noms réellement utilisés dans votre <code>config.toml</code>.</p>
+<p>Les segments <code>&lt;alias&gt;</code> ci-dessus (<code>home</code>, <code>prod_v2</code>) sont choisis par l’opérateur, remplacez-les par les noms réellement utilisés dans votre configuration.</p>
 <h2 id="bootstrap-suite-en-majuscules"><a class="header" href="#bootstrap-suite-en-majuscules">Bootstrap (suite en majuscules)</a></h2>
-<p>These env vars decide <em>where</em> the config file and instance data live, before any <code>Config</code> exists. They keep their UPPERCASE form so the case rule disambiguates them from the schema-mirror surface. They resolve in the order <code>ZEROCLAW_CONFIG_DIR</code> &gt; <code>ZEROCLAW_DATA_DIR</code> &gt; <code>ZEROCLAW_WORKSPACE</code> (deprecated):</p>
-<pre><code class="language-sh">ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # config-file location (takes precedence)
-ZEROCLAW_DATA_DIR=/srv/zeroclaw           # instance data directory (canonical)
-ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DATA_DIR
+<p>Ces variables d’environnement déterminent <em>où</em> se trouvent le fichier de configuration et les données d’instance, avant qu’une quelconque <code>Config</code> n’existe. Elles conservent leur forme en MAJUSCULES afin que la règle de casse les distingue de la surface miroir du schéma. Elles sont résolues dans l’ordre <code>ZEROCLAW_CONFIG_DIR</code> &gt; <code>ZEROCLAW_DATA_DIR</code> &gt; <code>ZEROCLAW_WORKSPACE</code> (obsolète) :</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">ZEROCLAW_CONFIG_DIR=/etc/zeroclaw         # emplacement du fichier de configuration (prioritaire)
+ZEROCLAW_DATA_DIR=/srv/zeroclaw           # répertoire de données de l'instance (canonique)
+ZEROCLAW_WORKSPACE=/srv/zeroclaw          # OBSOLÈTE — alias pour ZEROCLAW_DATA_DIR
 </code></pre>
-<p>L’emplacement du tableau de bord web de la passerelle est configuré via le formulaire standard schema-mirror <code>ZEROCLAW_gateway__web_dist_dir</code> — consultez <a href="../gateway/web-dashboard.html">Tableau de bord web (web_dist_dir)</a> pour la référence complète du paramètre.</p>
+</div>
+
+<p>L’emplacement du tableau de bord web de la passerelle est configuré via la forme standard de schéma miroir <code>ZEROCLAW_gateway__web_dist_dir</code>, consultez <a href="../gateway/web-dashboard.html">Web dashboard (web_dist_dir)</a> pour la référence complète du paramètre.</p>
 <h2 id="limite-de-persistance"><a class="header" href="#limite-de-persistance">Limite de persistance</a></h2>
 <p>Les valeurs appliquées via les variables d’environnement <code>ZEROCLAW_*</code> sont chargées dans la <code>Config</code> <strong>en mémoire</strong> au moment du chargement et ne sont <strong>jamais</strong> persistées sur le disque. <code>zeroclaw config save</code> rétablit les chemins surchargés par l’environnement à leurs valeurs sur disque ou par défaut avant le chiffrement. Une ligne de journal <code>WARN</code> est émise chaque fois qu’un chemin de type secret (par exemple une clé API) est surchargé par l’environnement, afin que les journaux d’audit rendent l’injection visible.</p>
 <h2 id="grammaire-des-alias"><a class="header" href="#grammaire-des-alias">Grammaire des alias</a></h2>
-<p>Les alias (les segments <code>&lt;alias&gt;</code> dans les exemples ci-dessus — <code>home</code>, <code>prod_v2</code>, <code>mymatrixalias</code>, etc.) suivent ces règles :</p>
+<p>Les alias (les segments <code>&lt;alias&gt;</code> dans les exemples ci-dessus, <code>home</code>, <code>prod_v2</code>, <code>mymatrixalias</code>, etc.) suivent les règles suivantes :</p>
 <ol>
 <li>Lettres ASCII minuscules, chiffres et traits de soulignement simples.</li>
 <li>Doit commencer ET se terminer par une lettre ou un chiffre (pas de trait de soulignement en début ou en fin).</li>
@@ -289,21 +378,23 @@ ZEROCLAW_WORKSPACE=/srv/zeroclaw          # DEPRECATED — alias for ZEROCLAW_DA
 <h2 id="visibilité"><a class="header" href="#visibilité">Visibilité</a></h2>
 <p>L’état de remplacement est affiché partout où la configuration est rendue, avec un indicateur 💉 marquant les champs remplacés par l’environnement :</p>
 <ol>
-<li><strong><code>zeroclaw config list</code></strong> — légende <code>💉 env-overridden  🔒 secret</code> affichée une fois en haut ; les lignes des champs remplacés par l’environnement sont préfixées par 💉.</li>
-<li><strong>Éditeur de config Web</strong> — chaque <code>ListEntry</code> porte un booléen <code>is_env_overridden</code>. Les lignes de champs surchargées par l’environnement affichent le badge 💉 et un avertissement persistant <em>“Les modifications ici ne prendront pas effet — surchargées par ZEROCLAW_…”</em> afin que les opérateurs voient la surcharge sans avoir à tenter une modification.</li>
-<li><strong>Intégration CLI/TUI</strong> — <code>prompt_field</code> ignore les champs surchargés par l’environnement et affiche une note 💉 sur trois lignes (le nom de la variable d’environnement, le chemin TOML et un avis d’ignorance) qui disparaît lors de la navigation suivant/précédent. Les opérateurs ne sont pas invités à saisir une valeur qu’ils ont déjà injectée.</li>
-<li><strong>Par programmation</strong> — <code>Config::prop_is_env_overridden(path) -&gt; bool</code> est une recherche HashSet en O(1). Points d’ancrage ici pour toute couche de rendu personnalisée.</li>
+<li><strong><code>zeroclaw config list</code></strong> : la légende <code>💉 env-overridden  🔒 secret</code> est affichée une seule fois en haut ; les lignes des champs remplacés par des variables d’environnement sont préfixées par 💉.</li>
+<li><strong>Éditeur de configuration Web</strong> : chaque <code>ListEntry</code> porte un booléen <code>is_env_overridden</code>. Les lignes de champs surchargés par l’environnement affichent le badge 💉 et un avertissement persistant <em>« Les modifications effectuées ici n’auront aucun effet, surchargées par ZEROCLAW_… »</em> afin que les opérateurs voient la surcharge sans avoir à tenter une modification.</li>
+<li><strong>Intégration CLI/TUI</strong> : <code>prompt_field</code> ignore les champs remplacés par des variables d’environnement et affiche une note 💉 de trois lignes (le nom de la variable d’environnement, le chemin TOML et un avis d’omission) qui s’efface lors de la navigation suivant/précédent. Les opérateurs ne sont pas invités à saisir une valeur qu’ils ont déjà injectée.</li>
+<li><strong>Programmatique</strong> : <code>Config::prop_is_env_overridden(path) -&gt; bool</code> est une recherche O(1) dans un HashSet. Point d’ancrage ici pour toute couche de rendu personnalisée.</li>
 </ol>
 <h2 id="dérivation-des-noms-de-variables-denvironnement-à-partir-de-votre-configuration"><a class="header" href="#dérivation-des-noms-de-variables-denvironnement-à-partir-de-votre-configuration">Dérivation des noms de variables d’environnement à partir de votre configuration</a></h2>
 <p>Trois étapes mécaniques pour dériver un nom de variable d’environnement à partir de n’importe quelle clé TOML :</p>
 <ol>
-<li><strong>Préfixez le chemin avec <code>ZEROCLAW_</code>.</strong> Le chemin TOML en notation pointée est la source de vérité — trouvez le champ dans votre <code>config.toml</code> (ou dans <code>zeroclaw config schema</code>).</li>
-<li><strong>Remplacez <code>.</code> par <code>__</code></strong> (double tiret bas — le séparateur de chemin).</li>
+<li><strong>Préfixez le chemin avec <code>ZEROCLAW_</code>.</strong> Le chemin de configuration en notation pointée est la source de vérité, trouvez le champ via <code>zeroclaw config schema</code>.</li>
+<li><strong>Remplacez <code>.</code> par <code>__</code></strong> (double trait de soulignement, le séparateur de chemin).</li>
 <li><strong>Le nom du champ reste tel quel</strong> (snake_case). Les alias restent tels quels. Rien d’autre n’est transformé.</li>
 </ol>
 <p>Par exemple, <code>[providers.models.anthropic.home] api_key = "sk-..."</code> se trouve au chemin pointé <code>providers.models.anthropic.home.api_key</code>. Appliquez les trois règles et la variable d’environnement devient <code>ZEROCLAW_providers__models__anthropic__home__api_key=sk-...</code>. Le même mappage mécanique s’applique à n’importe quel champ dans n’importe quelle section.</p>
 <h2 id="variables-denvironnement-par-défaut-de-lécosystème-de-pontage"><a class="header" href="#variables-denvironnement-par-défaut-de-lécosystème-de-pontage">Variables d’environnement par défaut de l’écosystème de pontage</a></h2>
 <p>La grammaire schema-mirror est la manière canonique d’injecter des valeurs, mais <code>ANTHROPIC_API_KEY</code> / <code>OPENROUTER_API_KEY</code> / <code>QDRANT_URL</code> / etc. restent des noms courants dans les fichiers <code>.env</code> et les configurations CI. Des expansions shell sur une seule ligne font pointer un nom schema-mirror vers la valeur par défaut de l’écosystème :</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
 <pre><code class="language-sh"># POSIX (bash, zsh, sh) — à insérer dans ~/.bashrc / ~/.zshrc / .env / Dockerfile
 export ZEROCLAW_providers__models__anthropic__home__api_key=$ANTHROPIC_API_KEY
 export ZEROCLAW_providers__models__openai__home__api_key=$OPENAI_API_KEY
@@ -312,21 +403,24 @@ export ZEROCLAW_storage__qdrant__home__url="$QDRANT_URL"
 export ZEROCLAW_storage__qdrant__home__api_key="$QDRANT_API_KEY"
 export ZEROCLAW_gateway__request_timeout_secs="$GATEWAY_TIMEOUT_SECS"
 </code></pre>
+<h4 id="powershell"><a class="header" href="#powershell">PowerShell</a></h4>
 <pre><code class="language-powershell"># PowerShell — drop into $PROFILE
 $env:ZEROCLAW_providers__models__anthropic__home__api_key = $env:ANTHROPIC_API_KEY
-$env:ZEROCLAW_providers__models__openai__home__api_key    = $env:OPENAI_API_KEY
-$env:ZEROCLAW_storage__qdrant__home__url                  = $env:QDRANT_URL
+$env:ZEROCLAW_providers__models__openai__home__api_key = $env:OPENAI_API_KEY
+$env:ZEROCLAW_storage__qdrant__home__url = $env:QDRANT_URL
 </code></pre>
-<p>Substituez le nom de l’alias à la place de <code>home</code> pour correspondre à votre <code>config.toml</code>. Pour plusieurs alias sur la même famille, répétez la ligne avec chaque alias.</p>
+</div>
+
+<p>Remplacez <code>home</code> par le nom de votre alias pour correspondre à votre configuration. Pour plusieurs alias sur la même famille, répétez la ligne avec chaque alias.</p>
 <h2 id="champs-oauth-et-chemin-de-la-cli"><a class="header" href="#champs-oauth-et-chemin-de-la-cli">Champs OAuth et chemin de la CLI</a></h2>
 <p>Quelques champs sont définis comme des champs de schéma, accessibles via le mapping standard :</p>
 <ol>
-<li><strong>Flux de rafraîchissement OAuth MiniMax</strong> — <code>[providers.models.minimax.&lt;alias&gt;] oauth_refresh_token = "..."</code> (avec <code>oauth_client_id</code> facultatif) ; la sélection de région correspond à l’énumération typée <code>endpoint</code> (<code>cn</code> / <code>intl</code>). Le runtime échange le refresh token contre un access token de courte durée lors de la construction du provider.</li>
-<li><strong>Flux de rafraîchissement Qwen OAuth</strong> — <code>[providers.models.qwen.&lt;alias&gt;] oauth_refresh_token = "..."</code> (avec <code>oauth_client_id</code> et <code>oauth_resource_url</code> facultatifs).</li>
-<li><strong>Gemini OAuth</strong> — <code>[providers.models.gemini.&lt;alias&gt;] oauth_client_id</code> et <code>oauth_client_secret</code> ; le paramètre optionnel <code>oauth_project</code> épingle un ID de projet GCP Code Assist.</li>
-<li><strong>Chemins KiloCLI / Gemini CLI</strong> — <code>[providers.models.kilocli.&lt;alias&gt;] binary_path</code> et <code>[providers.models.gemini_cli.&lt;alias&gt;] binary_path</code>.</li>
-<li><strong>Clés de transcription / TTS</strong> — <code>[transcription].api_key</code>, <code>[providers.tts.openai.&lt;alias&gt;].api_key</code>, <code>[providers.tts.elevenlabs.&lt;alias&gt;].api_key</code>, <code>[providers.tts.google.&lt;alias&gt;].api_key</code>.</li>
-<li><strong>Notion / WhatsApp</strong> — <code>[notion].api_key</code>, <code>[channels.whatsapp.&lt;alias&gt;].ws_url</code> (surcharge WebSocket de test/proxy).</li>
+<li><strong>Flux de rafraîchissement OAuth MiniMax</strong> : <code>[providers.models.minimax.&lt;alias&gt;] oauth_refresh_token = "..."</code> (avec <code>oauth_client_id</code> optionnel) ; la sélection de la région se fait via l’énumération typée <code>endpoint</code> (<code>cn</code> / <code>intl</code>). Le runtime échange le jeton de rafraîchissement contre un jeton d’accès de courte durée au moment de la construction du fournisseur.</li>
+<li><strong>Flux de rafraîchissement OAuth Qwen</strong> : <code>[providers.models.qwen.&lt;alias&gt;] oauth_refresh_token = "..."</code> (avec <code>oauth_client_id</code> et <code>oauth_resource_url</code> optionnels).</li>
+<li><strong>Gemini OAuth</strong> : <code>[providers.models.gemini.&lt;alias&gt;] oauth_client_id</code> et <code>oauth_client_secret</code> ; le paramètre optionnel <code>oauth_project</code> fixe un ID de projet GCP Code Assist.</li>
+<li><strong>Chemins KiloCLI / Gemini CLI</strong> : <code>[providers.models.kilocli.&lt;alias&gt;] binary_path</code> et <code>[providers.models.gemini_cli.&lt;alias&gt;] binary_path</code>.</li>
+<li><strong>Clés de transcription / TTS</strong> : <code>[transcription].api_key</code>, <code>[providers.tts.openai.&lt;alias&gt;].api_key</code>, <code>[providers.tts.elevenlabs.&lt;alias&gt;].api_key</code>, <code>[providers.tts.google.&lt;alias&gt;].api_key</code>.</li>
+<li><strong>Notion / WhatsApp</strong> : <code>[notion].api_key</code>, <code>[channels.whatsapp.&lt;alias&gt;].ws_url</code> (remplacement WebSocket pour test/proxy).</li>
 </ol>
 
                     </main>
@@ -373,6 +467,114 @@ $env:ZEROCLAW_storage__qdrant__home__url                  = $env:QDRANT_URL
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

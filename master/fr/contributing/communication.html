@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -219,24 +296,24 @@
                         <h1 id="communication"><a class="header" href="#communication">Communication</a></h1>
 <p>Où poser des questions, signaler des bugs, proposer des fonctionnalités et contacter l’équipe.</p>
 <p><strong>Si vous souhaitez simplement discuter avec nous, Discord est la solution.</strong> Pour tout ce qui nécessite un enregistrement durable (bugs, demandes de fonctionnalités, discussions sur la conception, RFCs), utilisez GitHub.</p>
-<h2 id="discord--le-meilleur-endroit-pour-joindre-léquipe"><a class="header" href="#discord--le-meilleur-endroit-pour-joindre-léquipe">Discord — le meilleur endroit pour joindre l’équipe</a></h2>
+<h2 id="discord--le-meilleur-endroit-pour-contacter-léquipe"><a class="header" href="#discord--le-meilleur-endroit-pour-contacter-léquipe">Discord : le meilleur endroit pour contacter l’équipe</a></h2>
 <p>Chat en temps réel. C’est ici que les mainteneurs vivent au quotidien ; le chemin le plus rapide pour obtenir une réponse humaine.</p>
 <p>Canaux :</p>
 <ul>
-<li><code>#general</code> — la salle par défaut</li>
-<li><code>#help</code> — Threads « Je n’arrive pas à faire fonctionner X » ; le moyen le plus rapide de débloquer la situation</li>
-<li><code>#dev</code> — discussion de développement en cours</li>
-<li><code>#releases</code> — annonces, notes de version, avertissements anticipés sur les modifications incompatibles</li>
+<li><code>#general</code> : le salon par défaut</li>
+<li><code>#help</code> : fils de discussion « Je n’arrive pas à faire fonctionner X » ; le moyen le plus rapide de se débloquer</li>
+<li><code>#dev</code> : discussion sur le développement en cours</li>
+<li><code>#releases</code> : annonces, notes de version, avertissements préalables sur les changements incompatibles</li>
 </ul>
 <p><a href="https://github.com/zeroclaw-labs/zeroclaw">Lien d’invitation dans le README du dépôt.</a></p>
-<p><strong>Discord est éphémère</strong> — si la conversation mène à un bug ou à une idée de fonctionnalité, capturez-la sous forme de ticket GitHub par la suite afin que l’information soit conservée. Discord sert à la conversation ; GitHub sert à la mémoire.</p>
+<p><strong>Discord est éphémère</strong> : si la conversation aboutit à un bug ou à une idée de fonctionnalité, consignez-la ensuite sous forme d’issue GitHub afin que la trace persiste. Discord sert à la conversation ; GitHub sert de mémoire.</p>
 <p>Utilisez un transfert GitHub lorsque Discord produit quelque chose que le projet doit conserver. Créez ou mettez à jour une issue, une discussion, un commentaire de PR ou un document de mainteneur lorsque le fil produit un bug reproductible, une portée de fonctionnalité concrète, une décision d’architecture ou de gouvernance, un engagement de mainteneur, une attribution de responsable, une décision de jalon, un blocage, une solution de contournement, une preuve de validation, une note d’impact sur une version, ou une raison d’exemption pour inactivité. Le transfert n’a besoin que de la décision, des preuves, du responsable lorsqu’il en existe un, et de suffisamment de contexte pour qu’un autre mainteneur puisse continuer sans relire la discussion.</p>
 <h2 id="problèmes-github"><a class="header" href="#problèmes-github">Problèmes GitHub</a></h2>
 <p>Pour les bogues, les demandes de fonctionnalités et tout ce qui doit être suivi.</p>
 <ul>
-<li><strong>Rapports de bogues</strong> — utilisez le modèle de rapport de bogue (<code>.github/ISSUE_TEMPLATE/bug_report.yml</code>). Incluez <code>zeroclaw --version</code>, le système d’exploitation, et la sortie de <code>zeroclaw doctor</code>.</li>
-<li><strong>Demandes de fonctionnalités</strong> — utilisez le modèle de demande de fonctionnalité (<code>.github/ISSUE_TEMPLATE/feature_request.yml</code>). Mettez l’accent sur la valeur utilisateur et les contraintes ; les détails d’implémentation sont réservés aux RFC ou aux discussions de PR.</li>
-<li><strong>RFCs</strong> — voir <a href="./rfcs.html">processus RFC</a>.</li>
+<li><strong>Rapports de bogues</strong> : utilisez le modèle de bogue (<code>.github/ISSUE_TEMPLATE/bug_report.yml</code>). Incluez <code>zeroclaw --version</code>, le système d’exploitation et la sortie de <code>zeroclaw doctor</code>.</li>
+<li><strong>Demandes de fonctionnalités</strong> : utilisez le modèle de fonctionnalité (<code>.github/ISSUE_TEMPLATE/feature_request.yml</code>). Concentrez-vous sur la valeur pour l’utilisateur et les contraintes ; les détails d’implémentation relèvent des RFC ou de la discussion de PR.</li>
+<li><strong>RFC</strong> : voir le <a href="./rfcs.html">processus RFC</a>.</li>
 </ul>
 <p>Recherchez avant de créer un ticket. Les doublons sont fusionnés ; la barre de recherche est votre alliée.</p>
 <h2 id="discussions-github"><a class="header" href="#discussions-github">Discussions GitHub</a></h2>
@@ -259,17 +336,17 @@
 </tbody>
 </table>
 </div>
-<p><code>@</code>-mentionnez avec parcimonie — ne mentionnez les mainteneurs que lorsque le problème nécessite vraiment leur attention. Laissez par défaut l’équipe trier les demandes.</p>
+<p>Utilisez les <code>@</code>-mentions avec parcimonie, ne mentionnez les mainteneurs de CC que lorsque le problème nécessite réellement leur attention. Par défaut, laissez l’équipe effectuer le triage.</p>
 <h2 id="problèmes-de-sécurité"><a class="header" href="#problèmes-de-sécurité">Problèmes de sécurité</a></h2>
 <p>Ne signalez pas de problèmes publics pour les vulnérabilités de sécurité.</p>
-<p>Email : <code>security@zeroclaw.dev</code></p>
+<p>Signalez de manière privée via le <a href="https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new">signalement privé de vulnérabilités</a> de GitHub (Security Advisories).</p>
 <p>Inclure :</p>
 <ul>
 <li>Versions concernées</li>
 <li>Reproduction (minimale, s’il vous plaît)</li>
 <li>Évaluation des impacts</li>
 </ul>
-<p>Nous nous engageons à accuser réception sous 48 heures et à publier un correctif ainsi qu’un avis de sécurité sous 14 jours pour les problèmes critiques. La divulgation coordonnée est appréciée.</p>
+<p>Nous nous efforçons d’accuser réception sous 48 heures, d’évaluer sous 1 semaine et de livrer un correctif sous 2 semaines pour les problèmes critiques. La divulgation coordonnée est appréciée.</p>
 <p>Consultez le fichier <code>SECURITY.md</code> à la racine du dépôt pour connaître la politique complète.</p>
 <h2 id="flux-de-publication"><a class="header" href="#flux-de-publication">Flux de publication</a></h2>
 <p>Abonnez-vous au flux de publication de GitHub pour être notifié des nouvelles versions :</p>
@@ -280,14 +357,14 @@
 <h2 id="support-commercial"><a class="header" href="#support-commercial">Support commercial</a></h2>
 <p>Aucune offre n’est proposée. ZeroClaw est maintenu par la communauté. Si vous déployez à grande échelle et souhaitez des SLA, sponsorisez un mainteneur directement ou financez un arrangement de support dédié via l’équipe principale. Contactez-nous à l’adresse <code>hello@zeroclaw.dev</code>.</p>
 <h2 id="retour-dinformation"><a class="header" href="#retour-dinformation">Retour d’information</a></h2>
-<p>Les retours ouverts — « J’ai essayé de faire X et cela m’a semblé incorrect », observations UX, réflexions sur l’orientation — sont mieux reçus sous forme de fil dans Discord <code>#general</code> ou <code>#dev</code>. L’équipe est plus susceptible de les voir et d’en discuter là-bas. Si le fil devient concret, déplacez-le vers une Discussion ou un ticket GitHub.</p>
+<p>Les retours ouverts, du type « j’ai essayé de faire X et ça ne semblait pas naturel », les observations UX, les réflexions sur la direction du projet, trouvent leur meilleure place dans un fil de discussion sur Discord <code>#general</code> ou <code>#dev</code>. L’équipe est plus susceptible de les voir et d’en discuter là-bas. Si le fil aboutit à quelque chose de concret, transférez-le vers une GitHub Discussion ou une issue.</p>
 <h2 id="reconnaissance-des-contributeurs"><a class="header" href="#reconnaissance-des-contributeurs">Reconnaissance des contributeurs</a></h2>
-<p>Tous ceux qui ont eu une PR fusionnée apparaissent dans la liste des contributeurs du dépôt. Pour les contributions substantielles — fonctionnalités, RFC, corrections de bugs importantes — votre identifiant apparaît dans les notes de version.</p>
+<p>Toute personne ayant eu une PR fusionnée apparaît dans la liste des contributeurs du dépôt. Pour les contributions substantielles, fonctionnalités, RFC, corrections de bugs importantes, votre pseudo apparaît dans les notes de version.</p>
 <h2 id="voir-aussi"><a class="header" href="#voir-aussi">Voir aussi</a></h2>
 <ul>
 <li><a href="./how-to.html">Comment contribuer</a></li>
 <li><a href="./rfcs.html">Processus RFC</a></li>
-<li><a href="../philosophy.html">Philosophie</a> — ce que le projet cherche à être, afin que vous sachiez ce qui est inclus dans le périmètre</li>
+<li><a href="../philosophy/index.html">Philosophie</a> : ce que le projet cherche à être, afin de savoir ce qui entre dans son périmètre</li>
 </ul>
 
                     </main>
@@ -334,6 +411,114 @@
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

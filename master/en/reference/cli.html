@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-b814e2fb.js";
+            window.path_to_searchindex_js = "../searchindex-d9900378.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-acb59c9f.js"></script>
+        <script src="../toc-8b3eb20a.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -231,6 +308,7 @@
 <li><a href="#zeroclaw-onboard-skills"><code>zeroclaw onboard skills</code>↴</a></li>
 <li><a href="#zeroclaw-onboard-skill_bundles"><code>zeroclaw onboard skill_bundles</code>↴</a></li>
 <li><a href="#zeroclaw-onboard-mcp"><code>zeroclaw onboard mcp</code>↴</a></li>
+<li><a href="#zeroclaw-onboard-mcp.servers"><code>zeroclaw onboard mcp.servers</code>↴</a></li>
 <li><a href="#zeroclaw-onboard-mcp_bundles"><code>zeroclaw onboard mcp_bundles</code>↴</a></li>
 <li><a href="#zeroclaw-onboard-knowledge_bundles"><code>zeroclaw onboard knowledge_bundles</code>↴</a></li>
 <li><a href="#zeroclaw-onboard-providers.tts"><code>zeroclaw onboard providers.tts</code>↴</a></li>
@@ -424,6 +502,7 @@
 <li><code>skills</code> — Skills tool settings — where skill markdown lives on disk (defaults to the data dir), and how the skills loader handles community repositories. Add skill BUNDLES under <code>skill-bundles</code> below</li>
 <li><code>skill_bundles</code> — Named bundles of skill files. Agents reference a bundle to load a set of capabilities at startup</li>
 <li><code>mcp</code> — Model Context Protocol settings. Toggle <code>enabled</code> and pick deferred or eager loading. Individual MCP servers live under <code>mcp.servers[]</code></li>
+<li><code>mcp.servers</code> — Individual Model Context Protocol servers. Each entry binds a transport (stdio, http, sse), the command or URL to reach it, optional headers, and a <code>tool_timeout_secs</code> cap (≤ 600). Each server’s <code>name</code> is its addressable key — rename via the section page rather than editing the field directly. Group servers into bundles under <code>mcp_bundles</code> below</li>
 <li><code>mcp_bundles</code> — Named bundles of MCP servers. Agents reference a bundle to pull in a set of MCP tools as one unit</li>
 <li><code>knowledge_bundles</code> — Named bundles of knowledge sources (RAG indexes, doc folders). Agents reference a bundle to surface relevant snippets at inference time</li>
 <li><code>providers.tts</code> — Text-to-speech providers (OpenAI, ElevenLabs, Google, Edge, Piper). Configure one per voice / language; agents reference them by alias</li>
@@ -460,6 +539,9 @@
 <h2 id="zeroclaw-onboard-mcp"><a class="header" href="#zeroclaw-onboard-mcp"><code>zeroclaw onboard mcp</code></a></h2>
 <p>Model Context Protocol settings. Toggle <code>enabled</code> and pick deferred or eager loading. Individual MCP servers live under <code>mcp.servers[]</code></p>
 <p><strong>Usage:</strong> <code>zeroclaw onboard mcp</code></p>
+<h2 id="zeroclaw-onboard-mcpservers"><a class="header" href="#zeroclaw-onboard-mcpservers"><code>zeroclaw onboard mcp.servers</code></a></h2>
+<p>Individual Model Context Protocol servers. Each entry binds a transport (stdio, http, sse), the command or URL to reach it, optional headers, and a <code>tool_timeout_secs</code> cap (≤ 600). Each server’s <code>name</code> is its addressable key — rename via the section page rather than editing the field directly. Group servers into bundles under <code>mcp_bundles</code> below</p>
+<p><strong>Usage:</strong> <code>zeroclaw onboard mcp.servers</code></p>
 <h2 id="zeroclaw-onboard-mcp_bundles"><a class="header" href="#zeroclaw-onboard-mcp_bundles"><code>zeroclaw onboard mcp_bundles</code></a></h2>
 <p>Named bundles of MCP servers. Agents reference a bundle to pull in a set of MCP tools as one unit</p>
 <p><strong>Usage:</strong> <code>zeroclaw onboard mcp_bundles</code></p>
@@ -559,7 +641,7 @@ zeroclaw gateway restart -p 8080    # restart on port 8080</p>
 <p>Displays the pairing code for connecting new clients without restarting the gateway. Requires the gateway to be running.</p>
 <p>With –new, generates a fresh pairing code even if the gateway was previously paired (useful for adding additional clients). This does NOT revoke existing tokens.</p>
 <p>With –rotate, revokes ALL paired bearer tokens, clears the device registry, and issues a fresh code. Use this after a suspected token leak when you do not know which token was compromised; every client must re-pair.</p>
-<p>With –rotate-device <id>, revokes just that device’s bearer token and issues a fresh code for re-pairing that one device.</id></p>
+<p>With –rotate-device ID, revokes just that device’s bearer token and issues a fresh code for re-pairing that one device.</p>
 <p>Examples:
 zeroclaw gateway get-paircode               # show current pairing code
 zeroclaw gateway get-paircode –new         # add another client (no revocation)
@@ -1495,7 +1577,7 @@ zeroclaw config schema &gt; schema.json</p>
 <li><code>get</code> — Get a config property value</li>
 <li><code>set</code> — Set a config property (secret fields auto-prompt for masked input)</li>
 <li><code>init</code> — Initialize unconfigured sections with defaults (enabled=false)</li>
-<li><code>migrate</code> — Migrate config.toml to the current schema version on disk (preserves comments)</li>
+<li><code>migrate</code> — Migrate the on-disk config to the current schema version (preserves comments)</li>
 <li><code>patch</code> — Apply a JSON Patch (RFC 6902) document atomically. Mirrors <code>PATCH /api/config</code></li>
 <li><code>docs</code> — Print the API explorer URL (plus a hint if the daemon isn’t running)</li>
 <li><code>generate</code> — Generate a canonical config at any supported schema version to stdout</li>
@@ -1552,7 +1634,7 @@ zeroclaw config schema &gt; schema.json</p>
 <li><code>--json</code> — Emit a structured JSON envelope ({initialized: […]}) instead of plain text</li>
 </ul>
 <h2 id="zeroclaw-config-migrate"><a class="header" href="#zeroclaw-config-migrate"><code>zeroclaw config migrate</code></a></h2>
-<p>Migrate config.toml to the current schema version on disk (preserves comments)</p>
+<p>Migrate the on-disk config to the current schema version (preserves comments)</p>
 <p><strong>Usage:</strong> <code>zeroclaw config migrate [OPTIONS]</code></p>
 <p><strong>Options:</strong></p>
 <ul>
@@ -1717,6 +1799,114 @@ This document was generated automatically by
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

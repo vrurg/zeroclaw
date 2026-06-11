@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,32 +294,245 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="mcp"><a class="header" href="#mcp">MCP</a></h1>
-<p>ZeroClaw は <strong>Model Context Protocol (MCP)</strong> をサポートしており、外部ツールとコンテキストプロバイダーでエージェントの機能を拡張できます。このガイドでは、MCP サーバーの登録と設定方法について説明します。</p>
-<h2 id="概要"><a class="header" href="#概要">概要</a></h2>
-<p>MCP サーバーは、3 つのトランスポートタイプで接続できます:</p>
-<ul>
-<li><strong>stdio</strong>: 長時間実行されるローカルプロセス (例: Node.js または Python スクリプト)。</li>
-<li><strong>sse</strong>: Server-Sent Events 経由のリモートサーバー。</li>
-<li><strong>http</strong>: シンプルな HTTP POST ベースのサーバー。</li>
-</ul>
-<h2 id="設定"><a class="header" href="#設定">設定</a></h2>
-<p>MCP サーバーは <code>config.toml</code> の <code>[mcp]</code> および <code>[[mcp.servers]]</code> で設定されます。ディスプレイ <code>name</code> (ツールプレフィックス <code>name__tool_name</code> として使用) は必須で、<code>transport</code> (<code>stdio</code> | <code>sse</code> | <code>http</code>) とトランスポート固有のフィールドを指定します。完全なフィールドインデックスとデフォルト値については、<a href="../reference/config.html">設定リファレンス</a> を参照してください。</p>
-<p><code>deferred_loading = true</code> (デフォルト) を使用して、ツールスキーマをオンデマンドで読み込みます。これにより、初期トークンオーバーヘッドが最小限に抑えられます。</p>
-<h2 id="セキュリティと自動承認"><a class="header" href="#セキュリティと自動承認">セキュリティと自動承認</a></h2>
-<p>デフォルトでは、エージェントの risk-profile レベルが <code>full</code> に設定されていない限り、MCP サーバーからのツール実行はすべて手動承認が必要です。</p>
-<p>MCP サーバーから特定のツールを自動承認するには、それらをエージェントのリスクプロファイル（<code>[risk_profiles.&lt;alias&gt;]</code>）の <code>auto_approve</code> に追加します。</p>
-<pre><code class="language-toml">[risk_profiles.assistant]
-auto_approve = [
-  "my_local_tool__read_file",   # `my_local_tool` MCPサーバーのツール
-  "my_remote_tool__get_weather" # `my_remote_tool` MCPサーバーのツール
-]
+<p>ZeroClawはMCPクライアントです。外部の<a href="https://modelcontextprotocol.io">Model Context Protocol</a>サーバーに接続し、それらのツールをエージェントに公開します。各MCPツールは<code>&lt;server&gt;__&lt;tool&gt;</code>という名前空間で管理されるため（例: <code>filesystem__read_file</code>）、異なるサーバーのツールが衝突することはありません。</p>
+<h2 id="configure-mcp"><a class="header" href="#configure-mcp">Configure MCP</a></h2>
+<p>MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under <code>mcp.servers</code>. Configure through the gateway, zerocode, or <code>zeroclaw config set</code>:</p>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.filesystem.command npx
 </code></pre>
-<p>プロファイルごとのフィールドの全体像については、<a href="../security/autonomy.html">自律性レベル</a>を参照してください。</p>
-<h2 id="ヒント"><a class="header" href="#ヒント">ヒント</a></h2>
+<p>Set <code>mcp.enabled = false</code> to disable MCP tool loading without removing server definitions.</p>
+<h2 id="トランスポート"><a class="header" href="#トランスポート">トランスポート</a></h2>
+<p>サーバーは3つのトランスポートのいずれか（<code>transport</code>フィールド）を介して接続されます:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>トランスポート</th><th>使用タイミング</th><th>必須フィールド</th></tr>
+</thead>
+<tbody>
+<tr><td><code>stdio</code>（デフォルト）</td><td>起動するローカルプロセス（Node.jsまたはPython製のMCPサーバー）</td><td><code>command</code>、オプションの <code>args</code>、<code>env</code></td></tr>
+<tr><td><code>http</code></td><td>HTTP POST 経由で MCP を扱うリモートサーバー</td><td><code>url</code>、オプションで<code>headers</code></td></tr>
+<tr><td><code>sse</code></td><td>HTTP + Server-Sent Events で MCP を通信するリモートサーバー</td><td><code>url</code>、オプションで<code>headers</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>env</code>（stdio）と <code>headers</code>（http/sse）はシークレットとして保存されます。<code>headers</code> には通常、上流サーバー向けの <code>Authorization: Bearer …</code> トークンが含まれます。</p>
+<p>ゲートウェイ、zerocode、または <code>zeroclaw config set</code> を使用してサーバーを追加します（例：<code>zeroclaw config set mcp.servers.filesystem.command npx</code>）。stdio サーバーには <code>command</code> とオプションの <code>args</code>/<code>env</code> が必要です。http/sse サーバーには <code>url</code> とオプションの <code>headers</code> が必要です。フィールドごとのコマンドは下記のフィールド表に記載されています。</p>
+<h2 id="editing-servers"><a class="header" href="#editing-servers">Editing servers</a></h2>
+<p>Three surfaces edit the same <code>[[mcp.servers]]</code> table:</p>
 <ul>
-<li><strong>ツールフィルタリング</strong>: プロジェクト設定で <code>tool_filter_groups</code> を使用して、LLM に公開する MCP ツールを制限できます。</li>
-<li><strong>遅延読み込み</strong>: <code>deferred_loading = true</code> を保持すると、初期トークンオーバーヘッドが軽減され、ツール名のみが LLM に送信されます。エージェントは、ツールの使用を決定した場合にのみ完全なスキーマを取得します。</li>
+<li><strong><code>config.toml</code></strong>: hand-edit the keys documented below. The full table is round-tripped on save.</li>
+<li><strong>zerocode TUI</strong> (<code>/config</code> -&gt; <code>mcp.servers</code>): first-class per-field editor. The section shows one row per server, labeled with the server’s <code>name</code>; enter a row to edit <code>transport</code>, <code>command</code> / <code>url</code>, <code>headers</code>, <code>env</code>, and <code>tool_timeout_secs</code> as individual fields. <code>+ Add</code> creates a new entry seeded with the name you supply; deleting from the alias list removes the entry. The <code>name</code> field is not edited inline because renaming the natural key mid-edit would invalidate in-flight references; use the dashboard or hand-edit <code>config.toml</code> to rename for now.</li>
+<li><strong>Web dashboard</strong>: currently renders <code>mcp.servers</code> through a JSON-array editor. A migration to the same per-field surface the TUI uses is planned; until then the dashboard remains a usable but coarser editor.</li>
 </ul>
+<h2 id="サーバーフィールド"><a class="header" href="#サーバーフィールド">サーバーフィールド</a></h2>
+<p>サーバーごとのフィールド（<code>[[mcp.servers]]</code>）、スキーマから生成:</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>args</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>stdio トランスポートのコマンド引数。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード"><a class="header" href="#ゲートウェイダッシュボード">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて、<code>mcp.servers.args</code> フィールドを設定してください。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>mcp.servers.args</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.args &lt;value&gt;
+</code></pre>
+<h4 id="環境変数"><a class="header" href="#環境変数">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__args=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>command</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>stdio トランスポート用に起動する実行可能ファイル。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-1"><a class="header" href="#ゲートウェイダッシュボード-1">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて、<code>mcp.servers.command</code> フィールドを設定してください。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p><strong>Config</strong>ペインで、<code>mcp.servers.command</code>フィールドを設定します。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.command &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-1"><a class="header" href="#環境変数-1">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__command=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>env</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>{}</code></span></summary>
+<p>stdio トランスポート用のオプション環境変数。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-2"><a class="header" href="#ゲートウェイダッシュボード-2">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開き、<code>mcp.servers.env</code> フィールドを設定します。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.env</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.env    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-2"><a class="header" href="#環境変数-2">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__env=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>headers</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>{}</code></span></summary>
+<p>HTTP/SSE トランスポート用のオプションの HTTP ヘッダー。シークレットとして扱われます。値には通常、上流の MCP サーバー向けの Bearer トークンが含まれます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-3"><a class="header" href="#ゲートウェイダッシュボード-3">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて <code>mcp.servers.headers</code> フィールドを設定してください。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.headers</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.headers    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-3"><a class="header" href="#環境変数-3">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__headers=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>name</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>ツールのプレフィックスとして使用される表示名（<code>&lt;server&gt;__&lt;tool&gt;</code>）。<code>create_map_key("mcp.servers", "&lt;name&gt;")</code> を使用してエントリが作成される際、指定された <code>map_key</code> から埋め込まれます。<code>#[serde(default)]</code> を指定すると、名前が挿入される前にマクロが <code>{}</code> からデフォルト構築できるようになります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-4"><a class="header" href="#ゲートウェイダッシュボード-4">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開き、<code>mcp.servers.name</code> フィールドを設定してください。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.name</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.name &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-4"><a class="header" href="#環境変数-4">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__name=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>tool_timeout_secs</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>null</code></span></summary>
+<p>呼び出しごとのオプションのタイムアウト（秒単位、検証で上限が設定されます）。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-5"><a class="header" href="#ゲートウェイダッシュボード-5">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて <code>mcp.servers.tool_timeout_secs</code> フィールドを設定します。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.tool_timeout_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.tool_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-5"><a class="header" href="#環境変数-5">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__tool_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>transport</code> <span class="cfg-field-meta"><code>McpTransport</code> · default <code>"stdio"</code></span></summary>
+<p>トランスポートタイプ（デフォルト: stdio）。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-6"><a class="header" href="#ゲートウェイダッシュボード-6">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて、<code>mcp.servers.transport</code> フィールドを設定してください。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.transport</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.transport &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-6"><a class="header" href="#環境変数-6">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__transport=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>url</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>HTTP/SSE トランスポートの URL。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-7"><a class="header" href="#ゲートウェイダッシュボード-7">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp.servers"><code>/config/mcp.servers</code></a> を開いて <code>mcp.servers.url</code> フィールドを設定してください。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers.url</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers.url &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-7"><a class="header" href="#環境変数-7">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers__url=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p><code>tool_timeout_secs</code> は呼び出しごとに設定できるオプションのタイムアウトです。0 より大きい値である必要があり、最大 600 秒に制限されます。</p>
+<h2 id="トップレベルフィールド"><a class="header" href="#トップレベルフィールド">トップレベルフィールド</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>deferred_loading</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Load MCP tool schemas on-demand via <code>tool_search</code> instead of eagerly including them in the LLM context window. When enabled, only tool names are listed in the system prompt; the LLM must call <code>tool_search</code> to fetch full schemas before invoking a deferred tool.</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-8"><a class="header" href="#ゲートウェイダッシュボード-8">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp"><code>/config/mcp</code></a> を開いて <code>mcp.deferred_loading</code> フィールドを設定します。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.deferred_loading</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.deferred_loading &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-8"><a class="header" href="#環境変数-8">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__deferred_loading=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>servers</code> <span class="cfg-field-meta"><code>McpServerConfig[]</code> · default <code>[]</code></span></summary>
+<p>Configured MCP servers. The <code>#[nested]</code> annotation makes the macro expose this as a List section in <code>map_key_sections()</code>, so the dashboard’s <code>+ Add MCP server</code> affordance and the <code>POST /api/config/map-key?path=mcp.servers&amp;key=&lt;name&gt;</code> endpoint pick it up automatically (no hand-table on the gateway side). <code>#[natural_key = "name"]</code> opts the Vec into per-element property routing (see <code>route_vec_path</code> and the <code>Configurable</code> derive’s <code>#[natural_key]</code> arm). With it, <code>set_prop("mcp.servers.&lt;name&gt;.url", ...)</code> and <code>get_prop("mcp.servers.&lt;name&gt;.transport")</code> resolve to the matching element’s own <code>set_prop</code> / <code>get_prop</code>, and the <code>mcp.servers</code> section behaves like a <code>HashMap&lt;String, McpServerConfig&gt;</code> from the dashboard / TUI’s point of view. <code>name</code> itself becomes read-only via <code>set_prop</code>; rename goes through <code>rename_map_key</code> which mutates the <code>name</code> field in place.</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-9"><a class="header" href="#ゲートウェイダッシュボード-9">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/mcp"><code>/config/mcp</code></a> を開いて <code>mcp.servers</code> フィールドを設定してください。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>mcp.servers</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set mcp.servers &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-9"><a class="header" href="#環境変数-9">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_mcp__servers=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h2 id="遅延読み込み"><a class="header" href="#遅延読み込み">遅延読み込み</a></h2>
+<p><code>mcp.deferred_loading</code> is <code>false</code> by default, so configured MCP tools are included in the model context eagerly. Set it to <code>true</code> to place only MCP tool <strong>names</strong> in the system prompt; the LLM calls the built-in <code>tool_search</code> tool to fetch a tool’s full schema before invoking it. This keeps the initial context window small when a server exposes many tools.</p>
+<h2 id="セキュリティと承認"><a class="header" href="#セキュリティと承認">セキュリティと承認</a></h2>
+<p>MCP tool calls go through the same approval gate as every other tool, governed by the agent’s risk profile (<code>risk_profiles.&lt;alias&gt;</code>). The <code>tool_search</code> discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:</p>
+<ul>
+<li>自律性が <code>level = full</code> の場合、ツール呼び出しのプロンプトは表示されません（MCP ツールを含む）。</li>
+<li>それ以外の場合、MCPツールの呼び出しは、その<strong>プレフィックス付き</strong>の名前（<code>&lt;server&gt;__&lt;tool&gt;</code>）がプロファイルの<code>auto_approve</code>リストに含まれていない限り、承認を求めます。<code>auto_approve = ["*"]</code>はすべてを承認します。<code>auto_approve = ["filesystem__read_file"]</code>のような完全一致のエントリは、そのツールだけを承認します。</li>
+<li><code>always_ask</code> はその逆で、ここに名前（または <code>"*"</code>）を指定すると常に確認を求め、<code>auto_approve</code> より優先されます。</li>
+</ul>
+<p>プロファイルごとのフィールド全体については <a href="../security/autonomy.html">自律性レベル</a> を、すべての MCP フィールドとデフォルト値については <a href="../reference/config.html#mcp">設定リファレンス</a> を参照してください。</p>
 
                     </main>
 
@@ -288,6 +578,114 @@ auto_approve = [
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

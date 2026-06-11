@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -217,7 +294,7 @@
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
                         <h1 id="discipline-relative-à-la-confidentialité-et-aux-données-personnelles"><a class="header" href="#discipline-relative-à-la-confidentialité-et-aux-données-personnelles">Discipline relative à la confidentialité et aux données personnelles</a></h1>
-<p>Les artefacts ZeroClaw sont publics — historique git, versions, jeux de données, instantanés, le livre de documentation, chaque locale rendue. Tout ce que vous validez est livré avec le projet pour toujours. Traitez la confidentialité comme une porte de fusion, pas comme une tentative.</p>
+<p>Les artefacts ZeroClaw sont publics : l’historique git, les versions publiées, les fixtures, les snapshots, le livre de documentation, chaque locale rendue. Tout ce que vous commitez est livré avec le projet pour toujours. Traitez la confidentialité comme une condition de merge, pas comme un effort de bonne volonté.</p>
 <h2 id="ne-jamais-valider-aucun-de-ces-fichiers"><a class="header" href="#ne-jamais-valider-aucun-de-ces-fichiers">Ne jamais valider aucun de ces fichiers.</a></h2>
 <p>Dans le code, la documentation, les tests, les fixtures, les instantanés (snapshots), les journaux (logs), les exemples, les messages d’erreur ou les messages de commit :</p>
 <ul>
@@ -245,20 +322,24 @@
 </tbody>
 </table>
 </div>
-<p>Les noms de tests, les messages d’assertion et le contenu des fixtures restent impersonnels et centrés sur le système — évitez le langage à la première personne et le cadrage spécifique à l’identité.</p>
+<p>Les noms de tests, les messages d’assertion et le contenu des fixtures restent impersonnels et centrés sur le système : évitez le langage à la première personne et les formulations liées à une identité spécifique.</p>
 <h2 id="lorsque-vous-devez-faire-référence-à-une-identité"><a class="header" href="#lorsque-vous-devez-faire-référence-à-une-identité">Lorsque vous devez faire référence à une identité</a></h2>
-<p>Si un test ou une documentation nécessite vraiment une identité de type rôle, utilisez uniquement les rôles définis dans l’espace de noms ZeroClaw : <code>ZeroClawAgent</code>, <code>ZeroClawOperator</code>, <code>ZeroClawMaintainer</code>. N’empruntez pas de vrais noms, même des pseudonymes — les pseudonymes finissent par redevenir réels avec le temps.</p>
-<p>Les mentions <code>@</code> dans les commentaires des PR/issue sur GitHub sont différentes : adresser un contributeur par son identifiant est la manière habituelle de communiquer sur GitHub, et <code>@WareWolf-MoonWall</code> ne constitue pas une violation de la vie privée. La règle concerne <strong>le contenu stocké dans le dépôt</strong> (code, tests, fixtures, documentation), et non les conversations dans les fils de discussion des PR/issue.</p>
+<p>Si un test ou une doc nécessite réellement une identité de type rôle, utilisez uniquement des rôles à portée ZeroClaw : <code>ZeroClawAgent</code>, <code>ZeroClawOperator</code>, <code>ZeroClawMaintainer</code>. N’empruntez pas de vrais noms, même des pseudonymes : les pseudonymes finissent par redevenir réels avec le temps.</p>
+<p>Les <code>@</code>-mentions GitHub dans les commentaires de PR/issue sont différentes : s’adresser à un contributeur par son pseudonyme est la façon de parler aux gens sur GitHub, et <code>@WareWolf-MoonWall</code> n’est pas une violation de la vie privée. La règle concerne le <strong>contenu stocké dans le dépôt</strong> (code, tests, fixtures, docs), pas les conversations dans les fils de discussion de PR/issue.</p>
 <h2 id="reproduire-des-incidents-externes"><a class="header" href="#reproduire-des-incidents-externes">Reproduire des incidents externes</a></h2>
 <p>Si vous capturez une trace d’incident, un payload de journalisation ou une réponse externe dans un jeu de tests : redigez et anonymisez avant de valider. Les vrais identifiants de session, les vrais identifiants utilisateur, les vrais noms d’hôte et les vrais jetons d’authentification doivent tous passer par une étape de nettoyage. La version redigée est celle qui est livrée ; l’original reste hors du dépôt git.</p>
 <h2 id="liste-de-contrôle-avant-le-push"><a class="header" href="#liste-de-contrôle-avant-le-push">Liste de contrôle avant le push</a></h2>
 <p>Avant de pousser, analysez le diff en attente spécifiquement pour détecter toute fuite d’identité :</p>
-<pre><code class="language-bash">git diff --cached
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">git diff --cached
 </code></pre>
+</div>
+
 <p>Les formes à rechercher : tout ce qui ressemble à une adresse e-mail, une URL avec un nom d’hôte non public, une longue chaîne aléatoire qui pourrait être un jeton, ou un nom qui n’est pas le vôtre et qui ne provient pas d’un espace réservé spécifique à un projet.</p>
-<p>Si une exécution CI a capturé une valeur réelle (un identifiant de session réel dans une capture d’écran, une chaîne d’agent utilisateur réelle contenant des informations d’identification, etc.) et qu’elle a été validée, il s’agit d’un incident de confidentialité — ouvrez un ticket, nettoyez les données, forcez le push si la validation est récente, et contactez les mainteneurs si elle a été intégrée sur <code>master</code>.</p>
+<p>Si une exécution CI a capturé une valeur réelle (un véritable ID de session dans un instantané, une vraie chaîne user agent contenant des informations d’identification, etc.) et qu’elle a été commitée, il s’agit d’un incident de confidentialité : ouvrez un ticket, nettoyez les données, effectuez un force-push si le commit vient d’arriver, et contactez les mainteneurs s’il a atterri sur <code>master</code>.</p>
 <h2 id="pourquoi-est-ce-strict-"><a class="header" href="#pourquoi-est-ce-strict-">Pourquoi est-ce strict ?</a></h2>
-<p>La dernière catégorie — la soumission accidentelle d’une identité réelle — est difficile à annuler. Une fois qu’un vrai nom ou une adresse e-mail est intégré à <code>master</code>, il se propage immédiatement aux forks, aux miroirs et aux clones. Le squash ou le force-push corrige la branche publique, mais n’affecte pas les copies. La solution la plus économique est le scan pré-commit ; tout ce qui suit relève de la réduction des dommages.</p>
+<p>La dernière catégorie, le fait de committer accidentellement une identité réelle, est difficile à annuler. Une fois qu’un vrai nom ou une vraie adresse e-mail atterrit sur <code>master</code>, il se propage immédiatement à travers les forks, les miroirs et les clones. Faire un squash ou un force-push corrige la branche publique mais n’atteint pas les copies. Le correctif le moins coûteux est l’analyse pre-commit ; tout ce qui vient après n’est que de la réduction des dégâts.</p>
 
                     </main>
 
@@ -304,6 +385,114 @@
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

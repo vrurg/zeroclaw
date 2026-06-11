@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-24e5bc2d.js";
+            window.path_to_searchindex_js = "../searchindex-c62c6261.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fc3b529.js"></script>
+        <script src="../toc-9364d956.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -221,9 +298,9 @@
 <blockquote>
 <p><strong>参考材料</strong>位于提供程序系统的以下位置：</p>
 <ul>
-<li><a href="../providers/overview.html">模型提供商 → 概述</a> — 提供商的定义、配置结构</li>
-<li><a href="../providers/routing.html">模型提供方 → 路由</a> — 按代理分发与 OpenRouter</li>
-<li><a href="../providers/catalog.html">模型提供商 → 目录</a> — 每个提供商的配置结构</li>
+<li><a href="../providers/overview.html">模型提供方 → 概述</a>：提供方是什么，以及配置形式</li>
+<li><a href="../providers/routing.html">模型提供方 → 路由</a>：按 agent 分发与 OpenRouter</li>
+<li><a href="../providers/catalog.html">模型提供方 → 目录</a>：每个提供方的配置结构</li>
 </ul>
 </blockquote>
 <h2 id="何时使用多模型配置"><a class="header" href="#何时使用多模型配置">何时使用多模型配置</a></h2>
@@ -235,188 +312,53 @@
 <li><strong>团队级隔离</strong>：不同团队使用不同的智能体，配备不同的 model_providers 和凭据</li>
 <li><strong>速率限制处理</strong>：在收到 <code>429</code>（速率限制）响应时轮换 API 密钥</li>
 </ol>
-<h2 id="核心理念--按代理分发"><a class="header" href="#核心理念--按代理分发">核心理念 — 按代理分发</a></h2>
+<h2 id="核心理念按代理分发"><a class="header" href="#核心理念按代理分发">核心理念：按代理分发</a></h2>
 <p>每个 <code>[agents.&lt;alias&gt;]</code> 条目精确指向一个 <code>[providers.models.&lt;type&gt;.&lt;alias&gt;]</code>。如果该模型不可用，对应的智能体也会不可用；操作员会将受影响的通道路由到其他智能体。完整模式请参阅<a href="../providers/routing.html">路由</a>。</p>
-<p>要运行多个模型，请运行多个智能体：</p>
-<pre><code class="language-toml">[providers.models.anthropic.haiku]
-model   = "claude-haiku-4-5-20251001"
-api_key = "sk-ant-..."
-
-[providers.models.anthropic.sonnet]
-model   = "claude-sonnet-4-6"
-api_key = "sk-ant-..."
-
-[providers.models.deepseek.reasoner]
-model   = "deepseek-reasoner"
-api_key = "sk-..."
-
-[channels.telegram.home]
-bot_token = "..."
-
-[channels.slack.engineering]
-bot_token = "..."
-
-[channels.slack.research]
-bot_token = "..."
-
-[agents.fast]
-model_provider  = "anthropic.haiku"
-risk_profile    = "hardened"
-runtime_profile = "tight"            # 减少迭代次数以实现快速的公开回复
-channels        = ["telegram.home"]
-
-[agents.deep]
-model_provider  = "anthropic.sonnet"
-risk_profile    = "hardened"
-runtime_profile = "deep"             # 为工程任务提供更高的迭代上限
-channels        = ["slack.engineering"]
-
-[agents.reasoner]
-model_provider  = "deepseek.reasoner"
-risk_profile    = "hardened"
-runtime_profile = "deep"             # 为研究型提示提供更长的推理链
-channels        = ["slack.research"]
-
-# 三个面向公开的智能体共享 `hardened` 安全态势，
-# 但每个智能体根据其吞吐量需求采用不同的 `tight` / `deep` 运行时配置。
-# `risk_profile` 和 `runtime_profile` 是相互独立的映射。
-
-[risk_profiles.hardened]
-level                            = "supervised"
-workspace_only                   = true
-require_approval_for_medium_risk = true
-block_high_risk_commands         = true
-
-[runtime_profiles.tight]
-max_tool_iterations  = 5
-max_actions_per_hour = 30
-
-[runtime_profiles.deep]
-max_tool_iterations  = 50
-max_actions_per_hour = 200
-</code></pre>
-<p>每个通道一次只能绑定到一个代理。要将通道移动到其他代理，请编辑应接管该通道的代理上的 <code>channels = [...]</code> 列表——<code>Config::validate()</code> 会确保引用在启动时能够正确解析。</p>
-<h2 id="跨厂商可靠性--使用-openrouter"><a class="header" href="#跨厂商可靠性--使用-openrouter">跨厂商可靠性 — 使用 OpenRouter</a></h2>
-<p>OpenRouter 被视为单一的一流提供商。它通过单一端点处理供应商分发和正常运行时间：</p>
-<pre><code class="language-toml">[providers.models.openrouter.home]
-model   = "anthropic/claude-sonnet-4-20250514"
-api_key = "sk-or-..."
-
-[agents.assistant]
-model_provider = "openrouter.home"
-risk_profile   = "hardened"
-# runtime_profile omitted — uses runtime defaults
-
-[risk_profiles.hardened]
-level = "supervised"
-</code></pre>
-<p>如果你的目标是“一个服务商宕机时，自动切换到另一个”，那是 OpenRouter 的职责——而非 ZeroClaw 的。运行时只看到一个服务商；跨厂商的工作由 OpenRouter 在上游完成。</p>
+<p>要运行多个模型，请运行多个代理，每个代理绑定到一个模型提供方。每个通道一次只能绑定到一个代理。要将通道迁移到其他代理，请编辑应接管该通道的代理上的 <code>channels</code> 列表；<code>Config::validate()</code> 会确保在启动时正确解析这些引用。</p>
+<h2 id="跨厂商可靠性使用-openrouter"><a class="header" href="#跨厂商可靠性使用-openrouter">跨厂商可靠性：使用 OpenRouter</a></h2>
+<p>OpenRouter 被视为单一的一等供应商。它在一个端点背后处理供应商分流和可用性。如果你的目标是“一个供应商宕机时，自动使用另一个”，那是 OpenRouter 的职责，而非 ZeroClaw 的。运行时只看到一个供应商；OpenRouter 在上游完成跨供应商的工作。</p>
 <h2 id="同厂商重试"><a class="header" href="#同厂商重试">同厂商重试</a></h2>
-<p>对于针对_同一_提供商的瞬时错误（网络抖动、503、超时），ZeroClaw 会采用指数退避策略进行重试。该行为可全局配置：</p>
-<pre><code class="language-toml">[reliability]
-provider_retries    = 2          # retries per provider attempt before bailing
-provider_backoff_ms = 500        # initial backoff; doubles per retry
-</code></pre>
-<p>默认值为重试 2 次、初始退避 500 ms。这些是同一提供方内部的重试。</p>
+<p>对于针对_同一_提供商的瞬时错误（网络抖动、503、超时），ZeroClaw 会采用指数退避策略进行重试，可在 <code>reliability</code> 下进行全局配置（默认值：重试 2 次，初始退避 500 ms）。这些是同一提供商内部的重试。</p>
 <h2 id="api-密钥轮换"><a class="header" href="#api-密钥轮换">API 密钥轮换</a></h2>
-<p>对于经常遇到速率限制的提供商，可提供额外的 API 密钥，ZeroClaw 将在收到 <code>429</code> 响应时轮换使用这些密钥：</p>
-<pre><code class="language-toml">[reliability]
-api_keys = ["sk-key-2", "sk-key-3", "sk-key-4"]
-</code></pre>
-<p>主 <code>api_key</code>（在提供商条目中配置）始终最先尝试；这些额外密钥会在触发速率限制错误时轮换使用。所有密钥必须属于同一提供商账户类别——这是用于平滑速率限制的机制，而非多租户密钥调度。</p>
+<p>对于经常遇到速率限制的提供商，可以在提供商条目中提供额外的 API 密钥，ZeroClaw 会在收到 <code>429</code> 响应时轮换使用这些密钥。主 <code>api_key</code> 始终最先尝试；额外的密钥会在出现速率限制错误时轮换使用。所有密钥必须属于同一提供商账户类别；这只是为了平滑速率限制，而不是多租户密钥管理。</p>
 <h2 id="本地开发与托管替代方案"><a class="header" href="#本地开发与托管替代方案">本地开发与托管替代方案</a></h2>
 <p>并排运行本地 Ollama 代理和托管服务商代理；将每个通道路由到你希望其使用的代理。</p>
+<p><code>dev</code> 代理从 CLI 运行（无需绑定通道，使用 <code>zeroclaw agent -a dev</code> 即可）。当 Ollama 宕机时，dev 代理会快速失败并显示错误。生产通道不受影响。</p>
+<h2 id="local-small-no-text-fallback-profile"><a class="header" href="#local-small-no-text-fallback-profile">Local-small no-text-fallback profile</a></h2>
+<p>Small local models usually need a runtime profile, not a provider-specific mode. Keep the Ollama provider focused on connection details, then use <code>[runtime_profiles.&lt;alias&gt;]</code> to tighten the prompt/tool loop behavior.</p>
 <pre><code class="language-toml">[providers.models.ollama.local]
 uri   = "http://localhost:11434"
-model = "qwen3.6:35b-a3b"
+model = "qwen2.5-coder:7b"
 
-[providers.models.openrouter.home]
-model   = "anthropic/claude-haiku-4-5-20251001"
-api_key = "sk-or-..."
-
-[channels.telegram.production]
-bot_token = "..."
-
-[channels.slack.production]
-bot_token = "..."
-
-[agents.dev]
+[agents.local]
 model_provider  = "ollama.local"
-risk_profile    = "permissive"      # 本地开发机——宽松的限制
-runtime_profile = "deep"            # 迭代过程中有充足的迭代次数
+risk_profile    = "supervised"
+runtime_profile = "local_small"
 
-[agents.prod]
-model_provider  = "openrouter.home"
-risk_profile    = "hardened"        # 公共渠道——严格的限制
-runtime_profile = "tight"           # 生产环境规范——短循环，低开销
-channels        = ["telegram.production", "slack.production"]
-
-[risk_profiles.permissive]
-level          = "full"
-workspace_only = false
-
-[risk_profiles.hardened]
+[risk_profiles.supervised]
 level                            = "supervised"
 workspace_only                   = true
 require_approval_for_medium_risk = true
 block_high_risk_commands         = true
 
-[runtime_profiles.deep]
-max_tool_iterations  = 50
-max_actions_per_hour = 200
-
-[runtime_profiles.tight]
-max_tool_iterations  = 5
-max_actions_per_hour = 30
+[runtime_profiles.local_small]
+compact_context          = true
+strict_tool_parsing      = true
+max_tool_iterations      = 4
+max_history_messages     = 20
+max_context_tokens       = 8000
+max_tool_result_chars    = 4000
+keep_tool_context_turns  = 1
 </code></pre>
-<p><code>dev</code> 代理从 CLI 运行（无需绑定通道——使用 <code>zeroclaw agent -a dev</code> 即可）。当 Ollama 宕机时，dev 代理会快速失败并显示错误信息。prod 通道不受影响。</p>
-<h2 id="成本分层--需要时使用高性能模型其他情况使用快速模型"><a class="header" href="#成本分层--需要时使用高性能模型其他情况使用快速模型">成本分层 — 需要时使用高性能模型，其他情况使用快速模型</a></h2>
-<p>运行两个 agent 并将通道路由到相应的层级。<code>delegate</code> 工具允许一个 agent 在对话中途将任务移交给另一个 agent。移交是受控的：调用方的风险配置必须设置 <code>delegation_policy mode = "allow"</code>，并且<strong>两个 agent 必须共享相同的风险配置</strong>（移交不会跨越信任层级）。因此下面的前线 agent 和重型 agent 运行在_相同_的 <code>trusted</code> 风险配置上——它们的区别在于模型和运行时配置（迭代预算），而非信任面。</p>
-<pre><code class="language-toml">[providers.models.anthropic.opus]
-model   = "claude-opus-4-7"
-api_key = "sk-ant-..."
-# （无 temperature —— claude-opus-4-7 拒绝任何 temperature 设置）
-
-[providers.models.anthropic.haiku]
-model   = "claude-haiku-4-5-20251001"
-api_key = "sk-ant-..."
-
-[channels.telegram.home]
-bot_token = "..."
-
-[agents.frontline]
-model_provider  = "anthropic.haiku"
-risk_profile    = "trusted"      # 共享信任层级（委派要求匹配）
-runtime_profile = "tight"        # 低迭代上限，快速周转
-channels        = ["telegram.home"]
-
-[agents.heavy]
-model_provider  = "anthropic.opus"
-risk_profile    = "trusted"      # 与 frontline 相同的配置 —— 可委派的必要条件
-runtime_profile = "deep"         # 为思维链工作设置高迭代上限
-# 无 channels —— 通过 frontline 的 delegate 工具调用
-
-# runtime_profile 引用的是独立于 risk_profile 的别名映射表；
-# 这两个 agent 共享一个 risk profile，但 runtime profile 不同。
-
-[risk_profiles.trusted]
-level                            = "supervised"
-workspace_only                   = true
-require_approval_for_medium_risk = true
-block_high_risk_commands         = true
-# 允许此配置下的 agent 相互委派；若无此项，
-# 默认禁止委派。
-delegation_policy                = { mode = "allow" }
-allowed_tools                    = ["shell", "file_read", "memory_recall", "delegate"]
-
-[runtime_profiles.tight]
-max_tool_iterations  = 5
-max_actions_per_hour = 30
-
-[runtime_profiles.deep]
-max_tool_iterations  = 50
-max_actions_per_hour = 200
-</code></pre>
+<p>This profile composes existing primitives:</p>
+<ul>
+<li><code>compact_context</code> keeps startup context small.</li>
+<li><code>strict_tool_parsing</code> treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.</li>
+<li><code>max_tool_iterations</code>, <code>max_context_tokens</code>, and <code>max_tool_result_chars</code> bound runaway loops and oversized tool context.</li>
+</ul>
+<p>With Ollama, this is a no-text-fallback profile: authorized tools remain configured in <code>risk_profile</code>, but text-form tool markup from the model is not executed. Use it for chat-first local agents, or for providers that return native/structured tool calls. If a local model must use ZeroClaw’s text fallback tool syntax, set <code>strict_tool_parsing = false</code> and keep the other small-model limits.</p>
+<h2 id="成本分级需要时使用重型模型其他情况使用快速模型"><a class="header" href="#成本分级需要时使用重型模型其他情况使用快速模型">成本分级：需要时使用重型模型，其他情况使用快速模型</a></h2>
+<p>运行两个 agent，并将通道路由到合适的层级。<code>delegate</code> 工具允许一个 agent 在对话中途移交给另一个 agent。<a href="../agents/delegation.html">委派</a>是受限的：调用方的风险配置必须将 <code>delegation_policy mode = "allow"</code>，并且<strong>两个 agent 必须共享相同的风险配置</strong>（委派不会跨越信任层级）。因此下面的前线 agent 和重型 agent 运行在_相同_的 <code>trusted</code> 风险配置上，它们的区别在于模型和运行时配置（迭代预算），而非信任面。</p>
 <p>前线智能体使用 Haiku 处理每一条入站消息。当需要更深入的推理时，它会调用 <code>delegate</code> 工具并设置 <code>agent = "heavy"</code>；由于两个智能体共享 <code>trusted</code> 风险配置，且该配置允许委派，因此更重量级的智能体将使用 Opus 接管该子任务。</p>
 <h2 id="错误处理"><a class="header" href="#错误处理">错误处理</a></h2>
 <p>单个提供程序内部的重试会在以下情况触发：</p>
@@ -432,23 +374,22 @@ max_actions_per_hour = 200
 <li><strong>永久身份验证失败</strong>：API 密钥格式无效</li>
 <li><strong>模型输出错误</strong>：模型已响应，但返回了错误负载</li>
 </ol>
-<p>当单个提供商的所有重试都已用尽时，故障会反馈到调用方通道。系统不会自动跨提供商重试——这正是使用 OpenRouter 或将流量分散到多个代理的意义所在。</p>
+<p>当单个提供方的所有重试都已用尽时，该故障会反馈到调用通道。系统不会自动跨提供方重试，而这正是使用 OpenRouter 或将流量分散到多个 agent 的意义所在。</p>
 <h2 id="调试"><a class="header" href="#调试">调试</a></h2>
-<p>持久化日志（默认为 <code>"rolling"</code>）会记录重试和密钥轮换行为：</p>
-<pre><code class="language-toml">[observability]
-log_persistence = "rolling"
-log_persistence_path = "state/runtime-trace.jsonl"
-</code></pre>
-<p>然后查询跟踪信息：</p>
-<pre><code class="language-bash">zeroclaw doctor traces --contains 重试
+<p>持久化日志（<code>"rolling"</code> 为默认值）会捕获重试和密钥轮换行为。然后查询追踪信息：</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw doctor traces --contains 重试
 zeroclaw doctor traces --contains "429"
 zeroclaw doctor traces --contains "model_provider"
 </code></pre>
+</div>
+
 <h2 id="最佳实践"><a class="header" href="#最佳实践">最佳实践</a></h2>
 <ol>
 <li><strong>每个路由意图对应一个 agent。</strong> 如果两个渠道需要不同的模型行为，请命名两个 agent。</li>
 <li><strong>使用 OpenRouter 实现跨厂商可靠性。</strong> 跨厂商的“如果 Claude 失败，就尝试 OpenAI“是 OpenRouter 的职责；将其配置为一个提供商，让其端点处理分发即可。</li>
-<li><strong>保持 API 密钥轮换池的同质性。</strong> <code>[reliability] api_keys</code> 中的所有密钥都应来自同一个提供商账户——这是为了平滑速率限制，而非多租户。</li>
+<li><strong>保持 API 密钥轮换池的同质性。</strong> <code>[reliability] api_keys</code> 中的所有密钥都应来自同一个提供商账户，这是为了平滑速率限制，而非实现多租户。</li>
 <li><strong>单独对每个 agent 进行冒烟测试。</strong> <code>zeroclaw agent -a &lt;alias&gt;</code> 可在不受通道连接干扰的情况下运行 agent。</li>
 <li><strong>记录代理意图。</strong> 添加 <code># comment</code> 行，说明每个代理服务于哪些通道以及原因。</li>
 <li><strong>通过 env 注入密钥，而非内联。</strong> <code>ZEROCLAW_providers__models__&lt;type&gt;__&lt;alias&gt;__api_key=...</code> 会在启动时设置 <code>api_key</code>；参见<a href="../reference/env-vars.html">环境变量</a>。</li>
@@ -459,10 +400,10 @@ zeroclaw doctor traces --contains "model_provider"
 <ol>
 <li><strong>内联 <code>api_key</code></strong>（在 provider 条目中）。</li>
 <li><code>~/.zeroclaw/secrets</code> 中的<strong>密钥存储</strong>。</li>
-<li><strong>通用环境变量覆盖</strong> — 在启动时使用 <code>ZEROCLAW_providers__models__&lt;type&gt;__&lt;alias&gt;__api_key=...</code>。完整语法请参阅<a href="../reference/env-vars.html">环境变量</a>。</li>
+<li><strong>通用环境变量覆盖</strong>：在启动时使用 <code>ZEROCLAW_providers__models__&lt;type&gt;__&lt;alias&gt;__api_key=...</code>。完整语法请参阅<a href="../reference/env-vars.html">环境变量</a>。</li>
 <li><strong>各厂商专用环境变量</strong>（当该系列支持时，例如 Anthropic 的 <code>ANTHROPIC_API_KEY</code> / <code>ANTHROPIC_OAUTH_TOKEN</code>；OpenRouter 的 <code>OPENROUTER_API_KEY</code>）。</li>
 </ol>
-<p>凭据不会在提供商之间共享——请为每个提供商条目单独设置。</p>
+<p>凭据不会在提供商之间共享，请为每个提供商条目单独设置。</p>
 <h2 id="相关文档"><a class="header" href="#相关文档">相关文档</a></h2>
 <ul>
 <li><a href="../providers/overview.html">模型提供商 → 概述</a></li>
@@ -514,6 +455,114 @@ zeroclaw doctor traces --contains "model_provider"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

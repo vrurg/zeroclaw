@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -216,17 +293,17 @@
                 <div id="mdbook-content" class="content">
                     <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
                     <main>
-                        <h1 id="fnd-006-cero-compromiso-en-la-práctica--salud-del-código-disciplina-de-errores-y-el-estándar-de-preparación-para-producción"><a class="header" href="#fnd-006-cero-compromiso-en-la-práctica--salud-del-código-disciplina-de-errores-y-el-estándar-de-preparación-para-producción">FND-006: Cero Compromiso en la Práctica — Salud del Código, Disciplina de Errores y el Estándar de Preparación para Producción</a></h1>
-<h3 id="a-partir-de-la-versión-070--tipo-calidad--rev-1"><a class="header" href="#a-partir-de-la-versión-070--tipo-calidad--rev-1">A partir de la versión 0.7.0 · Tipo: Calidad · Rev. 1</a></h3>
+                        <h1 id="fnd-006-cero-compromisos-en-la-práctica-salud-del-código-disciplina-de-errores-y-el-estándar-de-preparación-para-producción"><a class="header" href="#fnd-006-cero-compromisos-en-la-práctica-salud-del-código-disciplina-de-errores-y-el-estándar-de-preparación-para-producción">FND-006: Cero Compromisos en la Práctica: Salud del Código, Disciplina de Errores y el Estándar de Preparación para Producción</a></h1>
 <blockquote>
+<p>A partir de la versión 0.7.0 · Tipo: Calidad · Rev. 1</p>
 <p><strong>Referencia canónica</strong> · Ratificado por el equipo · Rev. 1 Hilo de discusión e historial completo de revisiones: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5653">#5653</a></p>
 </blockquote>
 <hr>
 <blockquote>
 <p>Una nota para el equipo antes de que lean esto.</p>
-<p>Este es el sexto documento del marco de madurez de ZeroClaw. Los cinco anteriores abordaron la arquitectura, la documentación, la gobernanza, la infraestructura de ingeniería y la colaboración: el andamiaje estructural y humano que rodea el trabajo. Cada uno respondió a una pregunta diferente sobre cómo construimos este proyecto juntos. Si los has leído todos, es posible que hayas notado una pregunta que ninguno de ellos respondió: sí, pero ¿cómo lo escribimos bien? El RFC de arquitectura te dijo en qué forma construir. El RFC de documentación te dijo cómo registrarla. El RFC de gobernanza te dijo cómo coordinarla. El RFC de CI/CD te dijo cómo controlarla. El RFC de cultura te dijo cómo trabajar con las personas que te rodean. Ninguno de ellos te dijo qué aspecto tiene la calidad a nivel de oración —dentro de una función, en el momento en que tomas una decisión.</p>
+<p>Este es el sexto documento del marco de madurez de ZeroClaw. Los cinco anteriores abordaron la arquitectura, la documentación, la gobernanza, la infraestructura de ingeniería y la colaboración: el andamiaje estructural y humano que rodea el trabajo. Cada uno respondió una pregunta distinta sobre cómo construimos este proyecto juntos. Si los has leído todos, quizá hayas notado una pregunta que ninguno respondió: sí, pero ¿cómo lo escribimos realmente bien? El RFC de arquitectura te dijo con qué forma construir. El RFC de documentación te dijo cómo registrarlo. El RFC de gobernanza te dijo cómo coordinarte. El RFC de CI/CD te dijo cómo establecer controles. El RFC de cultura te dijo cómo trabajar con las personas que te rodean. Ninguno te dijo cómo se ve la calidad a nivel de la frase, dentro de una función, en el momento en que estás tomando una decisión.</p>
 <p>Eso es para lo que está este documento.</p>
-<p>Los temas específicos aquí — manejo de errores, documentación de API, diseño de pruebas, deuda técnica — son temas de Rust en la superficie. Las habilidades que desarrollan no lo son. La tecnología cambia. Cambia más rápido con cada iteración que en la anterior. Las herramientas que estás utilizando hoy — este lenguaje, este framework, este asistente de IA — serán superadas. Algunas de ellas dentro de la vida útil de este proyecto. El juicio que este documento intenta ayudarte a construir no será superado. Se acumulará silenciosamente en el trasfondo de cada decisión que tomes, en cada lenguaje que escribas, en cada sistema que construyas, y en el trabajo que pueda no tener nada que ver con el software. Esa es la inversión que estamos haciendo en ti. No en tu capacidad para escribir Rust. En tu capacidad para pensar sobre la calidad, el fracaso y la artesanía — y llevar ese pensamiento contigo a cada herramienta que uses, incluyendo las herramientas de IA que estás utilizando hoy y las que aún no existen.</p>
+<p>Los temas específicos aquí, manejo de errores, documentación de API, diseño de pruebas, deuda técnica, son temas de Rust en la superficie. Las habilidades que desarrollan no lo son. La tecnología cambia. Cambia más rápido con cada iteración que la vez anterior. Las herramientas que estás usando hoy, este lenguaje, este framework, este asistente de IA, serán superadas. Algunas de ellas dentro del tiempo de vida de este proyecto. El criterio que este documento intenta ayudarte a construir no será superado. Se acumulará silenciosamente en el trasfondo de cada decisión que tomes, en cada lenguaje en el que alguna vez escribas, en cada sistema que alguna vez construyas, y en trabajos que quizás no tengan nada que ver con el software. Esa es la inversión que estamos haciendo en ti. No en tu capacidad de escribir Rust. En tu capacidad de pensar sobre la calidad, el fallo y el oficio, y de llevar ese pensamiento contigo a cada herramienta que alguna vez tomes en tus manos, incluidas las herramientas de IA que estás usando hoy y las que aún no existen.</p>
 <p>Tómate tu tiempo con ello.</p>
 </blockquote>
 <hr>
@@ -238,16 +315,16 @@
 <tr><th>RFC</th><th>Ámbito</th><th>Problema</th></tr>
 </thead>
 <tbody>
-<tr><td>Arquitectura Intencional — Transición al Microkernel</td><td>Lo que estamos construyendo y cómo está estructurado</td><td>#5574</td></tr>
+<tr><td>Arquitectura Intencional: Transición a Microkernel</td><td>Lo que estamos construyendo y cómo está estructurado</td><td>#5574</td></tr>
 <tr><td>Estándares de Documentación y Arquitectura del Conocimiento</td><td>Cómo documentamos lo que construimos</td><td>#5576</td></tr>
 <tr><td>Organización del equipo y gobernanza del proyecto</td><td>Cómo coordinamos y tomamos decisiones</td><td>#5577</td></tr>
-<tr><td>Infraestructura de Ingeniería — Pipeline de CI/CD</td><td>Cómo construimos, probamos y enviamos de manera confiable</td><td>#5579</td></tr>
-<tr><td>Cultura de Contribución — Colaboración Humana, Alianza con IA y Crecimiento del Equipo</td><td>Cómo trabajamos juntos y crecemos</td><td>#5615</td></tr>
-<tr><td>Cero Compromiso en la Práctica — Salud del Código, Disciplina de Errores y el Estándar de Preparación para Producción</td><td>Cómo escribimos código que perdura</td><td>esta RFC</td></tr>
+<tr><td>Infraestructura de ingeniería: Pipeline de CI/CD</td><td>Cómo construimos, probamos y enviamos de manera confiable</td><td>#5579</td></tr>
+<tr><td>Cultura de Contribución: Colaboración Humana, Asociación con IA y Crecimiento del Equipo</td><td>Cómo trabajamos juntos y crecemos</td><td>#5615</td></tr>
+<tr><td>Compromiso cero en la práctica: salud del código, disciplina de errores y el estándar de preparación para producción</td><td>Cómo escribimos código que perdura</td><td>esta RFC</td></tr>
 </tbody>
 </table>
 </div>
-<p>Los primeros cinco RFCs responden a preguntas estructurales y humanas. Este responde a la pregunta que se encuentra en el centro de todas ellas: dada la estructura, dado el equipo, dados las herramientas — ¿qué significa escribir el código bien?</p>
+<p>Los primeros cinco RFC responden preguntas estructurales y humanas. Este responde la pregunta que subyace en todas ellas: dada la estructura, dado el equipo, dadas las herramientas, ¿qué significa escribir bien el código?</p>
 <hr>
 <h2 id="tabla-de-contenidos"><a class="header" href="#tabla-de-contenidos">Tabla de contenidos</a></h2>
 <ol>
@@ -299,14 +376,14 @@
                                 └── Release
 </code></pre>
 <p>Esa jerarquía responde a la pregunta de <em>qué</em> construir en cada capa. Este RFC se encuentra dentro de las capas de Implementación y Pruebas y plantea una pregunta diferente: <em>¿qué tan bien?</em></p>
-<p>La respuesta a “qué tan bien” no es una lista de verificación. Las listas de verificación pueden cumplirse sin que se comprendan, y en el desarrollo de software, la comprensión es lo que genera resultados duraderos. Un colaborador que ha memorizado las reglas las seguirá hasta que la situación sea ligeramente diferente. Un colaborador que ha internalizado el juicio detrás de las reglas lo aplicará correctamente a situaciones que las reglas no anticiparon, incluidas aquellas que más importan, que siempre son las que nadie planeó.</p>
-<p>Esta distinción es especialmente relevante en el contexto de este proyecto. ZeroClaw se opera en un entorno de herramientas poderosas: generación de código con IA, puertas de integración continua que detectan una amplia gama de errores comunes, linters de IDE y escáneres de seguridad automatizados. Estas herramientas son genuinamente valiosas. Definen un nivel mínimo —un piso— por debajo del cual el código no debería ser fusionado. Pero lo que no pueden hacer es pensar. No pueden decidir si un error es operativo o un error del programador. No pueden evaluar si una prueba está afirmando el comportamiento correcto. No pueden determinar si una API pública está documentada con suficiente claridad para que un contribuidor futuro la implemente correctamente. Solo pueden verificar lo que fueron programados para verificar.</p>
-<p>La brecha entre “lo que las herramientas pueden verificar” y “la calidad que beneficia a los usuarios, contribuyentes y al proyecto a lo largo del tiempo” se llena con el juicio. Ese juicio es lo que este documento intenta ayudarte a construir: no para reemplazar las herramientas, sino para dirigir su uso.</p>
+<p>La respuesta a “qué tan bien” no es una lista de verificación. Las listas de verificación pueden cumplirse sin ser comprendidas, y en el software, la comprensión es lo que crea resultados duraderos. Un colaborador que ha memorizado las reglas las seguirá hasta que la situación sea ligeramente diferente. Un colaborador que ha interiorizado el criterio detrás de las reglas lo aplicará correctamente a situaciones que las reglas no anticiparon, incluidas las situaciones que más importan, que son siempre las que nadie planificó.</p>
+<p>Esta distinción importa especialmente en el contexto de este proyecto. ZeroClaw opera en un entorno de herramientas potentes: generación de código con IA, gates de CI que detectan una amplia gama de errores comunes, linters de IDE, escáneres de seguridad automatizados. Estas herramientas son genuinamente valiosas. Definen un piso, un mínimo por debajo del cual el código no debería fusionarse. Pero lo que no pueden hacer es pensar. No pueden decidir si un error es operacional o un error del programador. No pueden evaluar si una prueba está verificando el comportamiento correcto. No pueden determinar si una API pública está documentada con la claridad suficiente para que un futuro colaborador implemente correctamente a partir de ella. Solo pueden comprobar lo que fueron programadas para comprobar.</p>
+<p>La brecha entre “lo que las herramientas pueden verificar” y “la calidad que sirve a los usuarios, los colaboradores y el proyecto a lo largo del tiempo” se llena con el criterio. Ese criterio es lo que este documento intenta ayudarle a desarrollar, no para reemplazar las herramientas, sino para dirigirlas.</p>
 <hr>
 <h2 id="2-evaluación-honesta-lo-que-el-código-nos-está-diciendo"><a class="header" href="#2-evaluación-honesta-lo-que-el-código-nos-está-diciendo">2. Evaluación honesta: Lo que el código nos está diciendo</a></h2>
 <p>Esta sección no es una crítica. Es un diagnóstico. El mismo enfoque que se aplicó en el RFC de arquitectura se aplica aquí: no puedes mejorar lo que no puedes nombrar, y los detalles son útiles precisamente porque son específicos.</p>
 <h3 id="21-la-evidencia"><a class="header" href="#21-la-evidencia">2.1 La evidencia</a></h3>
-<p>La descomposición del espacio de trabajo descrita en la RFC §5574 se ha completado con éxito. Los crates existen, los límites de los traits son reales y el compilador aplica la dirección de las dependencias. Ese es un trabajo genuinamente bueno. Y dentro de esos nuevos crates, se han mantenido los mismos patrones que caracterizaban al monolito original, porque la base de código se ha movido antes de que el equipo tuviera un modelo compartido de lo que significa “calidad a nivel de implementación”.</p>
+<p>La descomposición del workspace del RFC §5574 tuvo éxito. Los crates existen, los límites de los traits son reales y el compilador hace cumplir la dirección de las dependencias. Eso es un trabajo genuinamente bueno. Y dentro de esos nuevos crates, los mismos patrones que caracterizaban al monolito original se han trasladado, porque el código base avanzó antes de que el equipo tuviera un modelo compartido de cómo se ve la “calidad a nivel de implementación”.</p>
 <p>Estos son hechos medidos, no estimaciones:</p>
 <div class="table-wrapper">
 <table>
@@ -314,17 +391,17 @@
 <tr><th>Métrica</th><th>Valor</th><th>Lo que indica</th></tr>
 </thead>
 <tbody>
-<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16.800 líneas</td><td>Ahora el archivo más grande de la base de código; el original <code>loop_.rs</code> fue mencionado en el RFC de arquitectura con 9.500 líneas; esto lo supera.</td></tr>
+<tr><td><code>zeroclaw-config/src/schema.rs</code></td><td>16.800 líneas</td><td>Ahora el archivo más grande del código base; el <code>loop_.rs</code> original fue señalado con 9,500 líneas en el RFC de arquitectura; este lo supera</td></tr>
 <tr><td><code>zeroclaw-channels/src/orchestrator/mod.rs</code></td><td>11,813 líneas</td><td>Segundo archivo más grande; un único módulo que concentra la responsabilidad</td></tr>
 <tr><td><code>zeroclaw-runtime/src/onboard/wizard.rs</code></td><td>7,988 líneas</td><td>Un único flujo de trabajo en un solo archivo</td></tr>
-<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101 líneas</td><td>Reducción de ~9.500 en el monolito — progreso real y medible; sigue siendo grande</td></tr>
+<tr><td><code>zeroclaw-runtime/src/agent/loop_.rs</code></td><td>6,101 líneas</td><td>Reducido de ~9,500 en el monolito: progreso real y medible; aún es grande</td></tr>
 <tr><td><code>zeroclaw-channels/src/orchestrator/telegram.rs</code></td><td>5.122 líneas</td><td>Una implementación de canal; un archivo</td></tr>
-<tr><td>Llamadas a <code>.unwrap()</code> / <code>.expect()</code> en crates</td><td>5,630</td><td>Cada uno es una llamada de juicio diferida sobre el manejo de errores — véase §4.1</td></tr>
+<tr><td>Llamadas a <code>.unwrap()</code> / <code>.expect()</code> en crates</td><td>5,630</td><td>Cada uno es una decisión postergada sobre el manejo de errores, ver §4.1</td></tr>
 <tr><td>Llamadas a <code>.unwrap()</code> / <code>.expect()</code> en <code>src/</code> heredado</td><td>240</td><td>La migración llevó el patrón hacia adelante a gran escala</td></tr>
-<tr><td>Funciones públicas en <code>zeroclaw-api</code></td><td>371</td><td>Toda la superficie de la API fundamental: cada otro crate depende de esto.</td></tr>
-<tr><td>Líneas de comentarios de documentación en <code>zeroclaw-api</code></td><td>~27</td><td>Proporción aproximada de 14:1 de API pública no documentada — véase §4.2</td></tr>
+<tr><td>Funciones públicas en <code>zeroclaw-api</code></td><td>371</td><td>Toda la superficie fundamental de la API; todos los demás crates dependen de este</td></tr>
+<tr><td>Líneas de comentarios de documentación en <code>zeroclaw-api</code></td><td>~27</td><td>Proporción aproximada de 14:1 de API pública sin documentar, véase §4.2</td></tr>
 <tr><td><code>#[allow(unused_imports)]</code> / <code>#[allow(dead_code)]</code> en los módulos <code>src/</code> heredados</td><td>~30+ instancias</td><td>El compilador ha identificado código que ya no se está utilizando; se le ha pedido que no lo mencione.</td></tr>
-<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> en toda la base de código</td><td>20</td><td>Notablemente bajo: sugiere que la mayor parte de la deuda es silenciosa en lugar de marcada.</td></tr>
+<tr><td><code>TODO</code> / <code>FIXME</code> / <code>todo!()</code> / <code>unimplemented!()</code> en toda la base de código</td><td>20</td><td>Notablemente bajo, sugiere que la mayor parte de la deuda es silenciosa en lugar de estar marcada</td></tr>
 </tbody>
 </table>
 </div>
@@ -341,10 +418,10 @@
 <p>Estas son preguntas de juicio. No tienen un control de integración continua (CI). Tienen los estándares que este documento propone nombrar, y la cultura de revisión y mentoría que estamos construyendo juntos.</p>
 <h3 id="23-qué-es-bueno"><a class="header" href="#23-qué-es-bueno">2.3 Qué es bueno</a></h3>
 <p>El diagnóstico no debe oscurecer lo que está genuinamente bien construido.</p>
-<p>La capa de rasgos en <code>zeroclaw-api</code> es la arquitectura adecuada. <code>Provider</code>, <code>Channel</code>, <code>Tool</code>, <code>Memory</code>, <code>Observer</code>, <code>RuntimeAdapter</code> y <code>Peripheral</code> son abstracciones limpias y bien fundamentadas. Son los puntos de extensión correctos. El problema no radica en el diseño, sino en que este aún no está completamente expresado en la documentación, la cobertura de pruebas y la disciplina en el manejo de errores. Este RFC tiene como objetivo cerrar esa brecha.</p>
-<p>El modelo de seguridad es reflexivo. La combinación de códigos de emparejamiento, niveles de autonomía, capas de aislamiento y aplicación de políticas muestra una intención de diseño clara. Esa intención debe ser comprendida por cada colaborador que escriba código cerca de un límite de confianza, y este RFC existe en parte para proporcionar a los colaboradores el vocabulario necesario para reconocer dónde se encuentran esos límites.</p>
+<p>La capa de traits en <code>zeroclaw-api</code> es la arquitectura correcta. <code>Provider</code>, <code>Channel</code>, <code>Tool</code>, <code>Memory</code>, <code>Observer</code>, <code>RuntimeAdapter</code> y <code>Peripheral</code> son abstracciones limpias y bien razonadas. Son los puntos de separación correctos. El problema no es el diseño. Es que el diseño aún no está completamente expresado en la documentación, la cobertura de pruebas y la disciplina de manejo de errores. Este RFC trata de cerrar esa brecha.</p>
+<p>El modelo de seguridad está bien pensado. Los códigos de emparejamiento, los niveles de autonomía, las capas de sandboxing y la aplicación de políticas demuestran una verdadera intención de diseño. Esa intención debe ser comprendida por cada colaborador que escriba código cerca de un límite de confianza, y este RFC existe en parte para dar a los colaboradores el vocabulario necesario para reconocer dónde están esos límites.</p>
 <p>La infraestructura de observabilidad está madura. OpenTelemetry, Prometheus y las métricas DORA están implementadas en función de un trait <code>Observer</code> limpio. La infraestructura está disponible. La brecha formativa radica en cómo los colaboradores la utilizan para que realmente sea útil cuando algo falla.</p>
-<p>El conjunto de pruebas no está ausente. La inversión actual en pruebas es real. El trabajo descrito en este RFC se centra en la calidad y distribución de dicha inversión: qué se prueba, cómo y si las pruebas demuestran lo que parecen demostrar.</p>
+<p>La suite de pruebas no está ausente. La inversión existente en pruebas es real. El trabajo que describe este RFC trata sobre la calidad y la distribución de esa inversión: qué se prueba, cómo, y si las pruebas demuestran lo que aparentan demostrar.</p>
 <p><code>ADR-004-tool-shared-state-ownership.md</code> es un excelente documento de registro arquitectónico. Demuestra que el equipo puede producir documentación de diseño de alta calidad cuando la expectativa es clara. Esta RFC propone establecer una expectativa equivalente para el código en sí.</p>
 <hr>
 <h2 id="3-puertas-y-estándares-la-distinción-central"><a class="header" href="#3-puertas-y-estándares-la-distinción-central">3. Puertas y Estándares: La Distinción Central</a></h2>
@@ -383,15 +460,15 @@
 <blockquote>
 <p>Un código puede superar todas las pruebas y seguir siendo incomprensible para el siguiente colaborador, silencioso donde debería mostrar errores, imposible de probar de forma aislada e inseguro en el límite donde la entrada del usuario se encuentra con la lógica de negocio. La marca verde responde a la pregunta “¿este código pasó las reglas que escribimos?”. No responde a la pregunta “¿es este código bueno?”. Estas no son la misma pregunta.</p>
 </blockquote>
-<p>Esto no es una crítica a las puertas de revisión. Las puertas de revisión son valiosas precisamente porque definen una línea base compartida y aplicable dentro de la cual trabaja cada colaborador. El objetivo de este documento es construir el vocabulario y el criterio compartido que definen lo que se considera bueno por encima de esa línea base, y explicar claramente por qué ese criterio no puede delegarse a una herramienta.</p>
+<p>Esto no es una crítica a los gates. Los gates son valiosos precisamente porque definen una línea base compartida y aplicable dentro de la cual trabaja cada colaborador. El objetivo de este documento es construir el vocabulario y el criterio compartidos que definen cómo se ve lo bueno por encima de esa línea base, y explicar claramente por qué ese criterio no puede delegarse a una herramienta.</p>
 <hr>
 <h2 id="4-las-siete-disciplinas"><a class="header" href="#4-las-siete-disciplinas">4. Las siete disciplinas</a></h2>
 <h3 id="41-el-manejo-de-errores-como-una-preocupación-de-diseño"><a class="header" href="#41-el-manejo-de-errores-como-una-preocupación-de-diseño">4.1 El manejo de errores como una preocupación de diseño</a></h3>
-<p>Cada llamada a <code>.unwrap()</code> es una decisión. La mayoría de las 5.630 en la base de código no se tomaron de manera consciente; se hicieron por defecto, porque <code>.unwrap()</code> es el camino de menor resistencia cuando necesitas obtener un valor de un <code>Result</code> o <code>Option</code> y quieres seguir adelante. El problema con las decisiones tomadas por defecto es que no son decisiones: son aplazamientos. Y lo que se aplaza es una pregunta real: <em>¿qué debería ocurrir aquí cuando esto falle?</em></p>
+<p>Cada llamada a <code>.unwrap()</code> es una decisión. La mayoría de las 5,630 en el código base no se tomaron de forma consciente. Se tomaron por defecto, porque <code>.unwrap()</code> es el camino de menor resistencia cuando necesitas extraer un valor de un <code>Result</code> o un <code>Option</code> y quieres seguir adelante. El problema con las decisiones tomadas por defecto es que no son decisiones. Son aplazamientos. Y lo que aplazan es una pregunta real: <em>¿qué debería suceder aquí cuando esto falla?</em></p>
 <p>La respuesta depende del tipo de fallo que estés manejando. Hay tres tipos, y cada uno tiene una respuesta correcta diferente.</p>
-<p><strong>Errores del programador</strong> son violaciones de invariantes que deberían ser imposibles en un código correcto. Por ejemplo, una función que requiere un <code>Vec</code> no vacío, pero se llama con uno vacío. O una coincidencia de un enum que alcanza una rama que el sistema de tipos debería haber hecho inalcanzable. Estos representan errores de programación — no fallos operativos, sino lógica incorrecta. <code>panic!</code> es la respuesta adecuada, porque el objetivo es detectar estos errores durante el desarrollo, no ante un usuario en tiempo de ejecución. <code>assert!</code> y <code>debug_assert!</code> son las herramientas correctas. <code>.expect()</code> con un mensaje que explique por qué este estado es imposible también es apropiado aquí — hace explícito y buscable el razonamiento, de modo que la próxima persona que lea el código entienda por qué el <code>panic</code> fue intencional.</p>
-<p><strong>Los errores operativos</strong> son modos de fallo esperables. Timeouts de red. Archivos que no existen. Claves de API que han expirado. Respuestas del proveedor que incluyen un estado de error. Usuarios que proporcionan datos malformados. Estos no son errores de programación; son las condiciones normales de operación de un sistema que interactúa con el mundo. La respuesta correcta es <code>Result&lt;T, E&gt;</code>. El operador <code>?</code> propaga el fallo a un llamador que está en mejor posición para decidir qué hacer al respecto. Un <code>.unwrap()</code> en un error operativo es un pánico diferido: se activará, eventualmente, en condiciones reales, frente a un usuario real, sin contexto útil ni oportunidad de recuperación.</p>
-<p><strong>Errores de configuración</strong> son configuraciones malformadas o faltantes descubiertas durante el inicio. La respuesta correcta es fallar rápidamente, pero de manera específica. No un pánico con una traza de pila, ni un mensaje vago de “configuración inválida”. Un mensaje que señale el campo específico, explique qué se esperaba y le indique al operador qué proporcionar. Un usuario que no pueda iniciar ZeroClaw debido a una mala configuración debe salir del proceso con una comprensión clara de exactamente qué corregir.</p>
+<p><strong>Errores del programador</strong> son violaciones de invariantes que deberían ser imposibles en código correcto. Una función que requiere un <code>Vec</code> no vacío, llamada con uno vacío. Un match de enum que alcanza un brazo que el sistema de tipos debería haber hecho inalcanzable. Estos representan bugs, no fallos operacionales, sino lógica incorrecta. <code>panic!</code> es la respuesta correcta, porque el objetivo es encontrarlos en tiempo de desarrollo, no frente a un usuario en tiempo de ejecución. <code>assert!</code> y <code>debug_assert!</code> son las herramientas adecuadas. <code>.expect()</code> con un mensaje que explique por qué este estado es imposible también es apropiado aquí. Hace que el razonamiento sea explícito y buscable, de modo que la siguiente persona que lea el código entienda por qué el panic fue intencional.</p>
+<p><strong>Los errores operativos</strong> son modos de fallo esperados. Tiempos de espera de red agotados. Archivos que no existen. Claves de API que han expirado. Respuestas del proveedor que llevan un estado de error. Usuarios que proporcionan entradas con formato incorrecto. Estos no son bugs. Son las condiciones normales de operación de un sistema que interactúa con el mundo. La respuesta correcta es <code>Result&lt;T, E&gt;</code>. El operador <code>?</code> propaga el fallo a un llamador que está en mejor posición para decidir qué hacer al respecto. Un <code>.unwrap()</code> sobre un error operativo es un panic diferido: se disparará, tarde o temprano, en condiciones reales, frente a un usuario real, sin contexto útil y sin oportunidad de recuperación.</p>
+<p><strong>Los errores de configuración</strong> son configuraciones malformadas o faltantes descubiertas al iniciar. La respuesta correcta es fallar rápido, pero de forma específica. No un panic con un stack trace, no un mensaje vago de “invalid config”. Un mensaje que señale el campo específico, explique qué se esperaba y le indique al operador qué debe proporcionar. Un usuario que no puede iniciar ZeroClaw debido a una configuración incorrecta debería salir del proceso con una comprensión clara de exactamente qué corregir.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -404,34 +481,34 @@
 </tbody>
 </table>
 </div>
-<p>Antes de cada <code>.unwrap()</code> o <code>.expect()</code>, pregúntate: ¿qué tipo de fallo es este? Si la respuesta es “error del programador: este estado no puede ocurrir en un código correcto”, entonces <code>.expect()</code> con un comentario que explique por qué es la opción adecuada, y comunica tu razonamiento a cada lector futuro. Si la respuesta es cualquier otra cosa, usa <code>?</code> o maneja el fallo explícitamente.</p>
-<p>El operador <code>?</code> vale la pena entenderlo por lo que <em>dice</em>, no solo por lo que hace. Dice: Reconozco que esta operación puede fallar. Estoy propagando explícitamente ese fallo a mi llamador, quien está mejor posicionado para decidir qué hacer al respecto. Ese reconocimiento es arquitectónicamente significativo: hace visible el contrato de manejo de errores en el punto de llamada y traslada las decisiones a la capa que tiene más contexto.</p>
+<p>Antes de cada <code>.unwrap()</code> o <code>.expect()</code>, pregúntate: ¿qué tipo de fallo es este? Si la respuesta es “error del programador: este estado no puede ocurrir en código correcto”, entonces <code>.expect()</code> con un comentario que explique el porqué es la elección correcta, y comunica tu razonamiento a todo futuro lector. Si la respuesta es cualquier otra cosa, usa <code>?</code> o maneja el fallo de forma explícita.</p>
+<p>Vale la pena entender el operador <code>?</code> por lo que <em>dice</em>, no solo por lo que hace. Dice: reconozco que esta operación puede fallar. Estoy propagando explícitamente ese fallo a quien me llama, que está en mejor posición para decidir qué hacer al respecto. Ese reconocimiento es arquitectónicamente significativo: hace visible el contrato de manejo de errores en el punto de llamada y traslada las decisiones a la capa que tiene más contexto.</p>
 <p>El objetivo no es eliminar todas las llamadas a <code>.unwrap()</code>. Algunas son correctas. El objetivo es que cada una represente una decisión consciente, con el razonamiento visible para cualquiera que lea el código. La diferencia entre <code>.unwrap()</code> y <code>.expect("este vector está garantizado como no vacío por el llamador — véase §4.2 de las invariantes del motor de SOP")</code> no es solo de estilo. Es la diferencia entre un juicio diferido y un juicio documentado.</p>
 <h3 id="42-superficie-de-la-api-pública-como-una-promesa"><a class="header" href="#42-superficie-de-la-api-pública-como-una-promesa">4.2 Superficie de la API pública como una Promesa</a></h3>
 <p><code>pub</code> es un contrato.</p>
 <p>Cuando marcas una función, estructura, rasgo o módulo como público, estás haciendo una promesa a cada llamador. Esto incluye al contribuidor que implementa contra ella el próximo mes sin recordar tu intención original. Incluye al asistente de IA que lee tu crate para generar una implementación. Incluye a la persona que depura un incidente en producción y necesita entender lo que esto debía hacer. Incluye a ti mismo, volviendo a este código después de dos meses trabajando en otra cosa.</p>
-<p>Un elemento público sin documentación es una promesa sin condiciones. El llamador no tiene forma de saber qué supuestos hiciste al escribirlo, qué condiciones de error puede devolver y bajo qué circunstancias, qué efectos secundarios tiene, si es seguro llamarlo concurrentemente, o cuál es la diferencia sutil entre dos funciones con nombres similares. Se ven obligados a inferir —a partir del nombre, la firma del tipo y el cuerpo de la implementación— algo que podrías haberles dicho en tres oraciones.</p>
-<p>La situación de <code>zeroclaw-api</code> es lo suficientemente específica como para nombrarla directamente. Este es el único crate del que depende toda la arquitectura. Cada proveedor, canal, herramienta, backend de memoria, observador, adaptador de tiempo de ejecución e implementación periférica en el espacio de trabajo se construye sobre estos rasgos y tipos. Una interfaz no documentada en esta base propaga confusión en cada crate que la implementa, cada prueba que la ejerce y cada código generado por IA que trabaja con ella. La proporción de 14:1 de superficie de API pública no documentada no es una preferencia de estilo de documentación, sino una brecha en el contrato que el RFC de la arquitectura indicó como la capa más importante del sistema.</p>
-<p>La dimensión de la IA aquí es práctica y directa: cuando le pides a un asistente de IA que implemente un rasgo o llame a una función que no tiene documentación, la IA infiere la intención a partir del nombre y la firma del tipo. A veces, esa inferencia es correcta. Más a menudo, produce código que se compila, pasa el verificador de tipos y se comporta incorrectamente bajo condiciones específicas que la IA no sabía anticipar, porque nadie las documentó. La documentación no es solo para humanos. Es la especificación que proporcionas a cada herramienta que trabajará con tu código y a cada persona que dependa de él.</p>
+<p>Un elemento público sin documentación es una promesa sin términos. Quien lo invoca no tiene forma de saber qué suposiciones hiciste al escribirlo, qué condiciones de error puede devolver y bajo qué circunstancias, qué efectos secundarios tiene, si es seguro llamarlo de forma concurrente, o cuál es la diferencia sutil entre dos funciones con nombres similares. Se ven obligados a inferir, a partir del nombre, la firma de tipos y el cuerpo de la implementación, algo que podrías haberles dicho en tres oraciones.</p>
+<p>La situación de <code>zeroclaw-api</code> es lo suficientemente específica como para nombrarla directamente. Este es el único crate del que depende toda la arquitectura. Cada provider, canal, herramienta, backend de memoria, observador, adaptador de runtime e implementación de periférico en el workspace está construido sobre estos traits y tipos. Una interfaz sin documentar en esta base propaga confusión a cada crate que la implementa, a cada test que la ejercita y a cada código generado por IA que trabaja con ella. La proporción de 14:1 de superficie de API pública sin documentar no es una preferencia de estilo de documentación. Es una brecha en el contrato que el RFC de arquitectura dijo que era la capa más importante del sistema.</p>
+<p>La dimensión de IA aquí es práctica y directa: cuando le pides a un asistente de IA que implemente un trait o llame a una función que no tiene documentación, la IA infiere la intención a partir del nombre y la firma de tipos. A veces esa inferencia es correcta. Con mayor frecuencia, produce código que compila, pasa el verificador de tipos y se comporta incorrectamente bajo condiciones específicas que la IA no sabía que debía anticipar, porque nadie las dejó por escrito. La documentación no es solo para humanos. Es la especificación que proporcionas a cada herramienta que alguna vez trabajará con tu código, y a cada persona que alguna vez dependerá de él.</p>
 <p>Como mínimo, cada elemento público en <code>zeroclaw-api</code> debe incluir:</p>
 <ul>
-<li><strong>Una oración que describe lo que hace.</strong> No qué es, sino lo que hace.</li>
+<li><strong>Una frase que describa lo que hace.</strong> No lo que es: lo que hace.</li>
 <li><strong>Una sección <code># Errores</code></strong> (si devuelve <code>Result</code>): bajo qué condiciones falla y qué variantes de error necesita manejar el llamador.</li>
 <li><strong>Una sección <code># Panics</code></strong> (si puede entrar en pánico): bajo qué condiciones y por qué?</li>
 <li><strong>Precondiciones</strong> (si alguna no es obvia): ¿qué debe ser cierto antes de llamar a esto?</li>
 </ul>
-<p>Un comentario de documentación de tres oraciones en un método de rasgo público vale más para el próximo implementador que cien líneas de implementación sin explicación. La implementación les dice qué hace el código. La documentación les dice qué se supone que debe hacer, lo cual es lo importante cuando ambos divergen.</p>
+<p>Un comentario de documentación de tres oraciones en un método público de un trait vale más para el siguiente implementador que cien líneas de implementación sin explicación. La implementación les dice qué hace el código. La documentación les dice qué se supone que debe hacer, que es lo que importa cuando ambas divergen.</p>
 <h3 id="43-pruebas-como-retroalimentación-del-diseño"><a class="header" href="#43-pruebas-como-retroalimentación-del-diseño">4.3 Pruebas como retroalimentación del diseño</a></h3>
-<p>El objetivo de una prueba no es obtener una marca de verificación verde. El objetivo es crear un registro preciso y ejecutable de lo que se <em>supone</em> que debe hacer un fragmento de código — un registro que falle de manera visible si ese comportamiento cambia en algún momento.</p>
+<p>El objetivo de una prueba no es producir una marca de verificación verde. El objetivo es crear un registro preciso y ejecutable de lo que un fragmento de código <em>se supone que debe hacer</em>: un registro que falle estrepitosamente si ese comportamiento alguna vez cambia.</p>
 <p>Esta distinción es importante porque hay dos tipos fundamentalmente diferentes de pruebas, y solo una de ellas logra ese objetivo.</p>
-<p>Una prueba que accede al estado interno de una estructura, establece valores directamente, llama a un método y verifica los valores de retorno está probando la <em>implementación</em>. Si la implementación cambia —si se logra el mismo comportamiento mediante un mecanismo diferente—, la prueba falla, aunque nada de lo que le importa al usuario haya cambiado. Esto genera fricción frente a la refactorización sin aportar seguridad. Además, tiende a pasar cuando el comportamiento es incorrecto de maneras que la prueba no anticipó.</p>
+<p>Una prueba que accede al estado interno de un struct, establece valores directamente, llama a un método y hace aserciones sobre los valores de retorno está probando la <em>implementación</em>. Si la implementación cambia, si el mismo comportamiento se logra mediante un mecanismo diferente, la prueba falla, aunque nada de lo que le importa al usuario haya cambiado. Esto crea fricción contra la refactorización sin crear seguridad. También tiende a pasar cuando el comportamiento es incorrecto de formas que la prueba no anticipó.</p>
 <p>Una prueba que construye valores a través de interfaces públicas, ejecuta el comportamiento mediante métodos públicos y verifica los resultados observables está probando el <em>comportamiento</em>. Si la implementación cambia pero el comportamiento se mantiene, la prueba se supera. Si el comportamiento cambia de una manera que afecta a los usuarios, la prueba falla. Esto es lo que permite realizar refactorizaciones con confianza: las pruebas verifican que se obtenga el resultado correcto, no que se obtenga de una manera específica.</p>
 <p>El principio más importante es el diagnóstico:</p>
 <blockquote>
 <p>Una prueba que es difícil de escribir suele indicarte algo sobre el diseño.</p>
 </blockquote>
-<p>Si escribir una prueba unitaria para una función requiere establecer una conexión a la base de datos, simular seis dependencias, construir un objeto de configuración completo e iniciar explícitamente un entorno asíncrono, es probable que esa función esté haciendo demasiado, dependiendo de demasiado o ubicándose en la capa incorrecta de la arquitectura. La dificultad no es un obstáculo que deba sortearse. Es una señal de retroalimentación. La prueba está siendo honesta sobre algo que el código aún no es.</p>
-<p>Esto se conecta directamente a la estructura de crates establecida por el RFC de arquitectura. Uno de los propósitos de la descomposición de crates era crear componentes que puedan probarse de forma aislada. <code>zeroclaw-tool-call-parser</code> debería poder probarse con una entrada de tipo <code>&amp;str</code> y sin necesidad de tiempo de ejecución. <code>zeroclaw-config</code> debería poder probarse construyendo directamente las estructuras de configuración. Las implementaciones de traits en <code>zeroclaw-api</code> deberían poder probarse frente a implementaciones falsas del trait, no contra la pila completa de producción. Cuando te encuentres incapaz de probar un componente sin todo su entorno, pregúntate si una dependencia ha entrado en la implementación de manera no prevista por la arquitectura. La prueba te está dando la respuesta; la pregunta es si la estás escuchando.</p>
+<p>Si escribir una prueba unitaria para una función requiere levantar una conexión a base de datos, simular seis dependencias, construir un objeto de configuración completo e iniciar explícitamente un runtime asíncrono, esa función probablemente está haciendo demasiado, dependiendo de demasiadas cosas o ubicada en la capa equivocada de la arquitectura. La dificultad no es una molestia que haya que sortear. Es retroalimentación. La prueba está siendo honesta sobre algo que el código todavía no es honesto consigo mismo.</p>
+<p>Esto se conecta directamente con la estructura de crates que estableció el RFC de arquitectura. Uno de los propósitos de la descomposición en crates era crear componentes que puedan probarse de forma aislada. <code>zeroclaw-tool-call-parser</code> debería poder probarse con una entrada <code>&amp;str</code> y sin runtime. <code>zeroclaw-config</code> debería poder probarse construyendo los structs de configuración directamente. Las implementaciones de traits en <code>zeroclaw-api</code> deberían poder probarse contra implementaciones falsas del trait, no contra el stack de producción completo. Cuando te encuentres incapaz de probar un componente sin todo su entorno, pregúntate si ha entrado en la implementación una dependencia que la arquitectura no pretendía. La prueba te está dando la respuesta; la cuestión es si la estás escuchando.</p>
 <p>Un enfoque práctico para mejorar la calidad de las pruebas con el tiempo:</p>
 <ul>
 <li>Cuando corriges un error, escribe una prueba que lo habría detectado. Este hábito, practicado de manera consistente, acerca el conjunto de pruebas a los modos de fallo que realmente importan.</li>
@@ -439,11 +516,11 @@
 <li>Cuando una prueba es difícil de escribir, dedica tiempo a preguntar <em>por qué</em> antes de recurrir a un simulacro. La respuesta a esa pregunta suele ser más valiosa que la prueba que estabas a punto de escribir.</li>
 </ul>
 <h3 id="44-triaje-de-la-deuda-técnica"><a class="header" href="#44-triaje-de-la-deuda-técnica">4.4 Triaje de la deuda técnica</a></h3>
-<p>La palabra “deuda” es útil porque conlleva la implicación correcta: acumula intereses. La deuda no examinada en una zona de alto tráfico de la base de código se complica: el nuevo código se adapta a su presencia, las nuevas suposiciones se construyen sobre las antiguas, y el costo de abordarla crece con cada capa añadida encima.</p>
+<p>La palabra “deuda” es útil porque conlleva la implicación correcta: acumula intereses. La deuda que se deja sin examinar en un área de alto tráfico del código base se acumula de forma compuesta: el código nuevo se adapta a su presencia, las nuevas suposiciones se construyen sobre las antiguas, y el costo de abordarla crece con cada capa que se añade encima.</p>
 <p>El error más común que cometen los equipos con la deuda técnica es tratarla como binaria: o bien todo es deuda y no se puede hacer nada al respecto, o bien nada es deuda y no se debe dedicar tiempo a ello. Ambas posturas son incorrectas. La pregunta útil es: <em>¿qué deuda, en qué ubicación, conlleva el mayor riesgo en este momento?</em></p>
 <p>Dos ejes determinan la prioridad.</p>
 <p><strong>Proximidad a un límite de confianza.</strong> El código que maneja la entrada del usuario, aplica políticas de seguridad, ejecuta herramientas, gestiona la autenticación o procesa datos de fuentes externas está operando cerca de un límite de confianza. Las fallas en este contexto pueden ser explotadas, corromper silenciosamente el estado o generar un comportamiento incorrecto con consecuencias de seguridad. La deuda técnica cerca de los límites de confianza conlleva un riesgo desproporcionado en relación con su tamaño.</p>
-<p><strong>Radio de explosión.</strong> La deuda técnica en <code>zeroclaw-api</code> — la base de la cual dependen todos los demás componentes — tiene un radio de explosión mayor que la deuda técnica en la implementación de un solo canal. Una suposición incorrecta en un tipo fundamental se propaga a cualquier lugar donde se utilice ese tipo. La deuda técnica en un crate hoja afecta únicamente a los consumidores de ese crate.</p>
+<p><strong>Radio de impacto.</strong> La deuda en <code>zeroclaw-api</code>, la base de la que depende todo lo demás, tiene un radio de impacto mayor que la deuda en la implementación de un solo canal. Una suposición errónea en un tipo fundamental se propaga a todos los lugares donde se usa ese tipo. La deuda en un crate hoja afecta solo a los consumidores de ese crate.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -456,18 +533,18 @@
 </table>
 </div>
 <p>Este marco implica que un <code>.unwrap()</code> en la ruta de aplicación de la política de seguridad no es el mismo problema que un <code>.unwrap()</code> en un formateador de visualización de la CLI. Ambos aparecen en el recuento de 5.630. El recuento nos indica el alcance. La triaje nos indica la prioridad.</p>
-<p>Cuando estás trabajando en un archivo y detectas deuda técnica — como un <code>.unwrap()</code> que representa un error operativo no manejado, una función que ha crecido para gestionar cuatro responsabilidades distintas, o un <code>#[allow(dead_code)]</code> que silencia algo que nadie llama — no necesitas arreglarlo todo. Debes preguntarte: ¿se encuentra en una ubicación de alto riesgo? Si es así, abórdalo en este PR o crea un seguimiento con la ubicación específica, el riesgo y un propietario propuesto. Si no es así, puedes marcarla con un comentario <code>// TODO(debt): &lt;descripción&gt;</code> que la haga visible sin convertirla en urgente. Lo que no debes hacer es dejarla completamente sin marcar, porque el silencio es cómo se acumulan 5.630 decisiones diferidas sin que nadie note la tendencia.</p>
-<p>El patrón Strangler Fig también se aplica a este nivel. El RFC de arquitectura lo aplicó a nivel de crate: construir la nueva estructura alrededor de la antigua y migrar hacia el interior con el tiempo. El mismo patrón funciona dentro de un archivo grande. No reescribes <code>schema.rs</code> en un único PR. Identificas las funciones más cercanas a los límites de confianza, las que se modifican con mayor frecuencia o las más difíciles de probar, y las extraes primero, mejorando la estructura de forma incremental y dejando que el resto siga a un ritmo que el equipo pueda sostener.</p>
+<p>Cuando estés trabajando en un archivo y notes deuda técnica, un <code>.unwrap()</code> que representa un error operacional no manejado, una función que ha crecido hasta manejar cuatro responsabilidades separadas, un <code>#[allow(dead_code)]</code> silenciando algo que nadie llama, no necesitas arreglarlo todo. Necesitas preguntarte: ¿está esto en una ubicación de alto riesgo? Si lo está, abórdalo en este PR o crea un issue de seguimiento con la ubicación específica, el riesgo y un responsable propuesto. Si no lo está, puedes marcarlo con un comentario <code>// TODO(debt): &lt;description&gt;</code> que lo haga visible sin hacerlo urgente. Lo que no debes hacer es dejarlo completamente sin marcar, porque el silencio es la forma en que 5,630 decisiones aplazadas se acumulan sin que nadie note la tendencia.</p>
+<p>El patrón Strangler Fig también se aplica a este nivel. El RFC de arquitectura lo aplicó a nivel de crate: construir la nueva estructura alrededor de la antigua y migrar hacia adentro con el tiempo. El mismo patrón funciona dentro de un archivo grande. No se reescribe <code>schema.rs</code> en un solo PR. Se identifican las funciones que están más cerca de los límites de confianza, las que se modifican con más frecuencia o las más difíciles de probar, y se extraen primero, mejorando la estructura de forma incremental, dejando que el resto siga a un ritmo que el equipo pueda sostener.</p>
 <h3 id="45-seguridad-en-la-capa-de-aplicación"><a class="header" href="#45-seguridad-en-la-capa-de-aplicación">4.5 Seguridad en la capa de aplicación</a></h3>
 <p>La RFC de CI/CD estableció la postura de seguridad para la <em>cadena de suministro</em>: <code>cargo deny</code> encuentra vulnerabilidades conocidas en las dependencias, aplica el cumplimiento de licencias y asegura que las dependencias provengan de fuentes aprobadas. Este es el sistema inmunológico para lo que ingresa al proyecto. Esta sección trata sobre la postura de seguridad del código que se ejecuta.</p>
 <p><code>cargo deny</code> no puede encontrar una vulnerabilidad que cree la lógica de tu aplicación. No puede indicarte si se está validando la entrada del usuario antes de que llegue a tu lógica de negocio. No puede determinar si una ejecución de herramienta está respetando el nivel de autonomía que debe imponer. Tampoco puede decirte si una ruta de error está silenciosamente ignorando un fallo en una verificación de seguridad. Todo esto requiere un colaborador que entienda dónde están los límites de confianza y cómo debe ser el código responsable en ambos lados de ellos.</p>
 <p>Tres principios que deben guiar cualquier código escrito cerca de un límite de confianza:</p>
-<p><strong>Los límites de confianza son explícitos, no asumidos.</strong> Un límite de confianza es cualquier punto donde los datos llegan desde fuera de tu control directo: entrada del usuario desde cualquier canal, respuestas de API de proveedores, contenidos de archivos del sistema de archivos, salidas de plugins, resultados de herramientas, lecturas de hardware. En cada límite de confianza, valida antes de procesar. No asumas la forma, tamaño, tipo o contenido de los datos que no has generado. El modelo de seguridad de ZeroClaw define estos límites a nivel de política. La implementación debe reflejarlos a nivel de código — no porque la política vaya a fallar, sino porque la defensa en profundidad significa que cada capa del sistema está haciendo su parte, en lugar de confiar en que todas las demás capas hicieron la suya.</p>
-<p><strong>Huella mínima.</strong> Una función que necesita leer un archivo no debería poder escribir uno. Una implementación de un trait que maneja los mensajes de un canal no debería tener acceso al estado de otro canal. Una herramienta que opera en un nivel de autonomía 1 no debería estar en posición de ejercer capacidades que requieran el nivel 3. El modelo de seguridad ya define estas restricciones. La disciplina consiste en escribir implementaciones que no adquieran más capacidades de las necesarias para la tarea en cuestión, y en detectar cuándo una implementación está intentando acceder a algo fuera de su ámbito previsto.</p>
-<p><strong>Falla de forma explícita cerca de los límites de seguridad.</strong> Un error en una comprobación de seguridad — como una evaluación de política fallida, un fallo en la verificación de firma, un intento de llamada a una herramienta no autorizada o una discrepancia en el código de emparejamiento — nunca debe ser ignorado silenciosamente. Debe registrarse, propagarse y manejarse de manera explícita. Un error en un auxiliar de visualización puede recuperarse de forma elegante con un mensaje de registro. Un error en una ruta de autorización, en cambio, no puede. Conoce el tipo de función que estás escribiendo y deja que esa determinación guíe la agresividad con la que expones las fallas desde ella.</p>
-<p>Estos no son principios de seguridad avanzados. Son una higiene fundamental que se aplica a cualquier código que interactúe con algo que un usuario puede influenciar. El RFC de arquitectura describió el modelo de seguridad como “reflexivo”. El trabajo que este RFC solicita es hacer que esa reflexión sea legible a nivel de implementación — en las funciones que validan entradas, en las rutas de error que manejan fallos de política, en los límites entre lo que el sistema fue solicitado a hacer y lo que realmente hace.</p>
+<p><strong>Los límites de confianza son explícitos, no asumidos.</strong> Un límite de confianza es cualquier punto donde los datos llegan desde fuera de tu control directo: entrada del usuario desde cualquier canal, respuestas de API de proveedores, contenidos de archivos del sistema de archivos, salidas de plugins, resultados de herramientas, lecturas de hardware. En cada límite de confianza, valida antes de procesar. No asumas la forma, el tamaño, el tipo ni el contenido de datos que no produjiste tú mismo. El modelo de seguridad de ZeroClaw define estos límites a nivel de política. La implementación debe reflejarlos a nivel de código, no porque la política vaya a fallar, sino porque la defensa en profundidad significa que cada capa del sistema cumple con su parte, en lugar de confiar en que todas las demás capas cumplieron con la suya.</p>
+<p><strong>Huella mínima.</strong> Una función que necesita leer un archivo no debería poder escribir uno. Una implementación de trait que maneja los mensajes de un canal no debería tener acceso al estado de otro canal. Una herramienta que se ejecuta en el nivel de autonomía 1 no debería estar en posición de ejercer capacidades que requieren el nivel 3. El modelo de seguridad ya define estas restricciones. La disciplina consiste en escribir implementaciones que no adquieran más capacidad de la que requieren para la tarea en cuestión, y en notar cuándo una implementación está intentando alcanzar algo fuera de su alcance previsto.</p>
+<p><strong>Falle de forma estrepitosa cerca de los límites de seguridad.</strong> Un error en una verificación de seguridad, una evaluación de política fallida, un fallo en la verificación de firma, un intento de llamada a herramienta no autorizado, una discordancia en el código de emparejamiento, nunca deben ser silenciados sin más. Deben registrarse, propagarse y manejarse explícitamente. Un error en un asistente de visualización puede recuperarse con elegancia mediante un mensaje de registro. Un error en una ruta de autorización no. Sepa qué tipo de función está escribiendo, y deje que esa determinación dicte con cuánta agresividad expone los fallos que esta produce.</p>
+<p>Estos no son principios de seguridad avanzados. Son higiene fundamental que aplica a cualquier código que toque algo que un usuario pueda influenciar. El RFC de arquitectura describió el modelo de seguridad como “cuidadoso”. El trabajo que este RFC solicita es hacer que ese cuidado sea legible a nivel de implementación: en las funciones que validan entradas, en las rutas de error que manejan fallos de políticas, en los límites entre lo que se le pidió al sistema que hiciera y lo que realmente hace.</p>
 <h3 id="46-observabilidad-como-capacidad-de-depuración"><a class="header" href="#46-observabilidad-como-capacidad-de-depuración">4.6 Observabilidad como capacidad de depuración</a></h3>
-<p>La infraestructura de observabilidad está madura: el rastreo con OpenTelemetry, las métricas de Prometheus, el seguimiento de DORA y un trait <code>Observer</code> limpio están todos en su lugar. Este es un trabajo de calidad de producción. La brecha de enseñanza radica en tener la infraestructura y utilizarla de una manera que realmente ayude cuando algo sale mal, idealmente antes de saber qué salió mal.</p>
+<p>La infraestructura de observabilidad está madura: trazas de OpenTelemetry, métricas de Prometheus, seguimiento de DORA y un trait <code>Observer</code> limpio están todos en su lugar. Este es un trabajo de calidad de producción. La brecha de aprendizaje está entre tener la infraestructura y usarla de una manera que realmente ayude cuando algo sale mal, idealmente antes de que sepas qué salió mal.</p>
 <p>Considera dos mensajes de registro. Ambos se compilan. Ambos pasan la integración continua (CI). Ambos son sintácticamente correctos.</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
@@ -486,7 +563,7 @@
     "la solicitud del proveedor falló — se agotaron los reintentos"
 );
 <span class="boring">}</span></code></pre>
-<p>El primero es un registro. Confirma que algo salió mal. El segundo es un <em>diagnóstico</em>. Responde a las preguntas que importan: ¿qué estábamos intentando hacer, en qué contexto, con qué parámetros y exactamente qué salió mal? La diferencia entre ellos no es la sofisticación técnica, sino si la persona que escribió el mensaje estaba pensando en la persona que algún día necesitará leerlo.</p>
+<p>El primero es un registro. Confirma que algo salió mal. El segundo es un <em>diagnóstico</em>. Responde a las preguntas que importan: qué estábamos intentando hacer, en qué contexto, con qué parámetros y qué fue exactamente lo que salió mal. La diferencia entre ambos no es la sofisticación técnica. Es si la persona que escribió el mensaje estaba pensando en la persona que algún día necesitará leerlo.</p>
 <p>La pregunta que debes hacerte antes de escribir cualquier mensaje de registro en <code>warn</code> o superior:</p>
 <blockquote>
 <p>¿Qué necesita saber la persona que debe diagnosticar este fallo en el peor momento?</p>
@@ -507,13 +584,13 @@ let _span = span!(
     sender = %sender_id,
 );
 <span class="boring">}</span></code></pre>
-<p>El registro estructurado y el diseño significativo de los spans no son preferencias de estilo. Son lo que hace que la infraestructura de observabilidad que tienes sea realmente útil — no solo durante el desarrollo, sino en manos de los usuarios que ejecutan ZeroClaw en hardware que nunca verás, en configuraciones que no anticipaste, encontrando errores que no planeaste. La infraestructura crea la capacidad. La disciplina con la que los contribuyentes la utilizan determina si esa capacidad se traduce en sistemas diagnosticables.</p>
+<p>El registro estructurado y el diseño significativo de spans no son preferencias de estilo. Son lo que hace que la infraestructura de observabilidad que tienes sea realmente útil, no solo durante el desarrollo, sino en manos de usuarios que ejecutan ZeroClaw en hardware que nunca verás, en configuraciones que no anticipaste, encontrando errores que no planificaste. La infraestructura crea la capacidad. La disciplina con la que los colaboradores la utilizan determina si esa capacidad se traduce en sistemas diagnosticables.</p>
 <h3 id="47-trabajo-por-encima-del-suelo"><a class="header" href="#47-trabajo-por-encima-del-suelo">4.7 Trabajo por encima del suelo</a></h3>
-<p>Las seis disciplinas anteriores abordan cada una un dominio específico. Esta sección las sintetiza en una visión unificada de lo que significa “por encima del suelo” en la práctica: qué experimenta realmente un revisor, un futuro colaborador o un usuario cuando se encuentra con código que cumple con los estándares descritos en este RFC.</p>
+<p>Las seis disciplinas anteriores abordan cada una un dominio específico. Esta sección las sintetiza en una imagen única de cómo se ve “por encima del mínimo” en la práctica: lo que un revisor, un futuro colaborador o un usuario realmente experimenta cuando se encuentra con código que cumple los estándares descritos en este RFC.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Dimensión</th><th>En el suelo — las puertas pasan</th><th>Encima del suelo — estándar met</th></tr>
+<tr><th>Dimensión</th><th>En el límite inferior, los gates pasan</th><th>Por encima del mínimo, estándar cumplido</th></tr>
 </thead>
 <tbody>
 <tr><td>Manejo de errores</td><td>El código se compila; no hay advertencias de Clippy</td><td>Los fallos se categorizan; los errores operativos aparecen con contexto; los panics son intencionales y están documentados.</td></tr>
@@ -529,40 +606,40 @@ let _span = span!(
 <p>Ninguno de estos es alcanzable únicamente mediante automatización. Todos ellos son alcanzables por contribuyentes que comprenden por qué son importantes y han desarrollado el criterio necesario para aplicarlos de manera consistente. Ese es el objetivo de este documento.</p>
 <hr>
 <h2 id="5-qué-significa-esto-para-el-desarrollo-asistido-por-ia"><a class="header" href="#5-qué-significa-esto-para-el-desarrollo-asistido-por-ia">5. Qué significa esto para el desarrollo asistido por IA</a></h2>
-<p>La RFC de cultura abordó cómo trabajar con herramientas de IA como parte de un equipo colaborativo. Esta sección aborda algo más específico: qué sucede cuando el código generado por IA se encuentra con los estándares descritos anteriormente, y qué se requiere para reconocer y cerrar la brecha cuando esto no ocurre.</p>
+<p>El RFC de cultura abordó cómo trabajar con herramientas de IA como parte de un equipo colaborativo. Esta sección aborda algo más específico: qué sucede cuando el código generado por IA se enfrenta a los estándares descritos anteriormente, y qué se necesita para reconocer y cerrar la brecha cuando no los cumple.</p>
 <p>Las herramientas de IA son realmente buenas para superar las barreras. Generan código que se compila, satisface el verificador de tipos, pasa Clippy y, a menudo, produce pruebas junto con la implementación. Este es un valor real, y no es el objetivo de esta sección minimizarlo. El problema no es que las herramientas de IA sean poco fiables. El problema es que son fiables en lo incorrecto: producen código que pasa las comprobaciones, en lugar de código que cumple con los estándares.</p>
-<p>La razón es estructural. La IA genera código en función de lo que puede inferir. Si una función no tiene documentación, la IA infiere la intención a partir del nombre y la firma; y a veces esa inferencia es correcta, y a veces produce un comportamiento sutilmente incorrecto que solo se manifiesta en condiciones que nadie probó. Si un tipo de error no tiene documentación sobre cuándo se devuelve, la IA lo maneja basándose en el nombre de la variante. Si un conjunto de pruebas prueba la implementación en lugar del comportamiento, la IA genera implementaciones que coinciden con esas pruebas, lo cual puede o no coincidir con el comportamiento previsto que las pruebas debían capturar. El límite superior de calidad de la salida de la IA está determinado por la calidad del contexto que proporcionas. Un mejor contexto — documentación más clara, tipos de error más específicos, pruebas centradas en el comportamiento — produce una mejor salida. Un contexto poco desarrollado produce una salida que pasa los filtros y pospone el juicio a quien la revise a continuación.</p>
+<p>La razón es estructural. La IA genera código en función de lo que puede inferir. Si una función no tiene documentación, la IA infiere la intención a partir del nombre y la firma, y a veces esa inferencia es correcta, y a veces produce un comportamiento sutilmente erróneo que solo se manifiesta en condiciones que nadie probó. Si un tipo de error no tiene documentación sobre cuándo se devuelve, la IA lo maneja basándose en el nombre de la variante. Si una suite de pruebas prueba la implementación en lugar del comportamiento, la IA genera implementaciones que coinciden con esas pruebas, lo cual puede o no coincidir con el comportamiento previsto que las pruebas debían capturar. El techo de calidad de la salida de la IA está determinado por la calidad del contexto que proporcionas. Un mejor contexto, documentación más clara, tipos de error más específicos, pruebas centradas en el comportamiento, produce una mejor salida. Un contexto poco desarrollado produce una salida que pasa los controles y delega el juicio a quien la revise después.</p>
 <p>Esto crea una responsabilidad específica y no opcional para los colaboradores que trabajan con herramientas de IA.</p>
-<p><strong>La revisión no es opcional porque la IA la escribió.</strong> El RFC de cultura lo dejó claro, y vale la pena repetirlo con detalles: al revisar código generado por IA, las preguntas clave —¿compila? ¿pasan las pruebas?— son el inicio de la revisión, no el final. Las preguntas estándar son: ¿maneja correctamente los errores operativos o los <code>.unwrap()</code>? ¿Está documentada la nueva API pública? ¿La prueba afirma el comportamiento o la implementación? ¿Se encuentra cerca de un límite de confianza y, en ese caso, ¿valida sus entradas? Estas preguntas son tu responsabilidad, independientemente de quién escribió el código o qué herramientas se utilizaron para producirlo.</p>
-<p><strong>La IA amplifica tu juicio, no tu ausencia de él.</strong> Un colaborador que aún no tiene un modelo mental de cómo debe ser un buen manejo de errores aceptará el código generado por la IA sin cuestionarlo — incluyendo <code>.unwrap()</code> y todo lo demás. Un colaborador que ha internalizado la sección §4.1 puede analizar la misma salida y dirigir la herramienta: “esta es una ruta de error operativa; usa <code>?</code> y propaga el fallo al llamador con contexto.” La herramienta producirá una versión corregida. El mismo patrón se aplica a cada disciplina en la sección §4. La herramienta es poderosa en manos de alguien que sabe qué pedir. Sin esa dirección, produce código que satisface al compilador y pospone las decisiones reales para la siguiente persona en la cadena.</p>
-<p><strong>Esta relación se refuerza en ambas direcciones.</strong> Un equipo que comprende los estándares obtiene un valor cada vez mayor de las herramientas de IA a medida que estas mejoran, ya que puede dirigir herramientas más capaces con mayor precisión. La brecha entre “lo que produce la herramienta” y “lo que exige el estándar” se convierte en algo que pueden cerrar mediante indicaciones, en lugar de reescritura manual. Un equipo que no desarrolla ese criterio accede a un camino más rápido hacia el mismo nivel mínimo de calidad, pero sin la capacidad de superarlo. La inversión descrita a lo largo de este documento es también, directamente, una inversión en la efectividad a largo plazo de todas las herramientas de IA que el equipo utilizará, porque el valor de estas herramientas escala con la claridad del criterio que las dirige.</p>
+<p><strong>La revisión no es opcional porque la haya escrito una IA.</strong> El RFC de cultura lo expresó claramente, y vale la pena repetirlo con detalles concretos: al revisar código generado por IA, las preguntas de control —¿compila?, ¿pasan las pruebas?— son el principio de la revisión, no el final. Las preguntas estándar son: ¿este código maneja los errores operativos correctamente, o les hace <code>.unwrap()</code>? ¿Está documentada la nueva API pública? ¿La prueba verifica el comportamiento o la implementación? ¿Está esto cerca de un límite de confianza y, de ser así, valida sus entradas? Estas preguntas son tu responsabilidad independientemente de quién escribió el código o qué herramientas se usaron para producirlo.</p>
+<p><strong>La IA amplifica tu criterio, no tu ausencia de él.</strong> Un colaborador que aún no tiene un modelo mental de cómo se ve un buen manejo de errores aceptará el manejo de errores generado por IA tal cual: <code>.unwrap()</code> incluido. Un colaborador que ha interiorizado §4.1 puede mirar el mismo resultado y dirigir la herramienta: “esta es una ruta de error operacional; usa <code>?</code> y propaga el fallo al llamador con contexto.” La herramienta producirá una versión corregida. El mismo patrón se aplica a cada disciplina en §4. La herramienta es poderosa en manos de alguien que sabe qué pedir. Sin esa dirección, produce código que satisface al compilador y delega las decisiones reales a la siguiente persona en la cadena.</p>
+<p><strong>Esta relación se potencia en ambas direcciones.</strong> Un equipo que comprende los estándares obtiene progresivamente más valor de las herramientas de IA a medida que estas mejoran, porque puede dirigir herramientas más capaces con mayor precisión. La brecha entre “lo que produjo la herramienta” y “lo que exige el estándar” se convierte en algo que pueden cerrar mediante dirección en lugar de reescritura manual. Un equipo que no desarrolla ese criterio obtiene un camino más rápido hacia el mismo nivel mínimo de calidad, sin la capacidad de superarlo. La inversión descrita a lo largo de este documento es también, directamente, una inversión en la efectividad a largo plazo de cada herramienta de IA que el equipo llegue a usar, porque el valor de esas herramientas escala con la claridad del criterio que las dirige.</p>
 <hr>
 <h2 id="6-la-portabilidad-de-craft"><a class="header" href="#6-la-portabilidad-de-craft">6. La portabilidad de Craft</a></h2>
-<p>La tecnología cambia. Lo hace más rápido en cada iteración que en la anterior, y esa velocidad está acelerándose. Las herramientas específicas que se mencionan en este documento — Rust, <code>cargo</code>, <code>clippy</code>, el SDK de OpenTelemetry, los asistentes de IA que el equipo utiliza hoy en día — serán superadas. Algunas de ellas incluso dentro del ciclo de vida de este proyecto. Las plataformas cambiarán. Los lenguajes evolucionarán. El ecosistema de herramientas se verá diferente en cinco años de lo que es hoy, y aún más diferente en diez.</p>
+<p>La tecnología cambia. Cambia más rápido con cada iteración que la vez anterior, y ese ritmo se está acelerando. Las herramientas específicas de este documento: Rust, <code>cargo</code>, <code>clippy</code>, el SDK de OpenTelemetry, los asistentes de IA que el equipo usa hoy, serán reemplazadas. Algunas de ellas dentro del tiempo de vida de este proyecto. Las plataformas cambiarán. Los lenguajes evolucionarán. El ecosistema de herramientas se verá diferente en cinco años de como se ve hoy, y diferente otra vez en diez.</p>
 <p>Los modelos mentales en este documento no cambiarán.</p>
-<p>La pregunta “¿qué debe ocurrir aquí cuando esto falle, y quién necesita saberlo?” no caduca cuando cambia el lenguaje. La formularás en el próximo lenguaje que aprendas. La plantearás al diseñar un sistema distribuido donde el “lenguaje” es un protocolo de red. La formularás al construir cualquier cosa de la que dependan otras personas y que no puedas supervisar personalmente. El mecanismo específico de Rust para responderla — <code>Result&lt;T, E&gt;</code>, el operador <code>?</code>, tipos de error estructurados con contexto — es una respuesta a una pregunta que existe en todas partes.</p>
-<p>La pregunta “¿cuál es la interfaz pública que estoy prometiendo y si mi documentación refleja esa promesa?” — te la harás al diseñar una API, al escribir una especificación técnica, al definir el alcance de las responsabilidades de un equipo, al comunicar requisitos a otro equipo, a una herramienta de IA, a un cliente o a un contratista. El modelo de promesa y términos de las interfaces públicas se extiende mucho más allá de Rust y mucho más allá del software.</p>
-<p>La pregunta “¿qué demuestra realmente mi prueba?” se extiende más allá del software a cualquier dominio donde necesites verificar que un sistema se comporta como se pretende. La instintiva de hacer esta pregunta — para distinguir entre la evidencia de que tu implementación existe y la evidencia de que ocurre lo correcto — es la habilidad. La sintaxis para expresarla en Rust es incidental.</p>
-<p>La pregunta “¿qué necesitaría saber la persona que debe diagnosticar este fallo?” es una pregunta de ingeniería que se aplica a cualquier cosa que construyas y de la que otras personas dependan. También es, en un nivel más profundo, una pregunta sobre empatía: sobre recordar que la persona al otro lado de tu trabajo es una persona real con un problema real, en un momento que no puedes predecir, con un contexto que no estarás ahí para proporcionar.</p>
+<p>La pregunta “¿qué debería ocurrir aquí cuando esto falla, y quién necesita saberlo?” no caduca cuando cambia el lenguaje. La harás en el próximo lenguaje que aprendas. La harás al diseñar un sistema distribuido donde el “lenguaje” es un protocolo de red. La harás al construir cualquier cosa de la que dependan otras personas y que no puedas supervisar personalmente. El mecanismo específico de Rust para responderla: <code>Result&lt;T, E&gt;</code>, el operador <code>?</code>, tipos de error estructurados con contexto, es una respuesta a una pregunta que existe en todas partes.</p>
+<p>La pregunta “¿cuál es la interfaz pública que estoy prometiendo, y mi documentación refleja esa promesa?”: te la harás al diseñar una API, al escribir una especificación técnica, al definir el alcance de las responsabilidades de un equipo, al comunicar requisitos a otro equipo, a una herramienta de IA, a un cliente, a un contratista. El modelo de promesa y términos de las interfaces públicas se extiende mucho más allá de Rust y mucho más allá del software.</p>
+<p>La pregunta “¿qué demuestra realmente mi prueba?” se extiende más allá del software hacia cualquier dominio donde necesites verificar que un sistema se comporta según lo previsto. El instinto de hacerla, de distinguir entre la evidencia de que tu implementación existe y la evidencia de que ocurre lo correcto, es la habilidad. La sintaxis para expresarla en Rust es incidental.</p>
+<p>La pregunta “¿qué necesitaría saber la persona que tiene que diagnosticar este fallo?” es una pregunta de ingeniería que se aplica a cualquier cosa que construyas de la que dependan otras personas. También es, en un nivel más profundo, una pregunta sobre empatía, sobre recordar que la persona al otro lado de tu trabajo es una persona real con un problema real, en un momento que no puedes predecir, con un contexto que no estarás ahí para proporcionar.</p>
 <blockquote>
-<p>No estás aprendiendo Rust. Estás, a través de Rust, aprendiendo a construir cosas en las que se pueda confiar. Eso es portátil. Se acumulará mientras lo practiques — en cada lenguaje, cada sistema, cada equipo y cada dominio en el que trabajes.</p>
+<p>No estás aprendiendo Rust. Estás, a través del vehículo de Rust, aprendiendo a construir cosas en las que se puede confiar. Eso es transferible. Se acumulará mientras lo practiques, en cada lenguaje, cada sistema, cada equipo y cada dominio en el que trabajes.</p>
 </blockquote>
 <p>Esta es la inversión que el proyecto está realizando en ti. No en tus habilidades técnicas específicas, sino en tu capacidad para aportar juicio, oficio y cuidado a lo que construyas a continuación. Y, a su vez, es la inversión que tú haces en cada persona que algún día dependerá de algo que hayas construido.</p>
 <hr>
 <h2 id="7-qué-significa-esto-para-los-colaboradores"><a class="header" href="#7-qué-significa-esto-para-los-colaboradores">7. Qué significa esto para los colaboradores</a></h2>
 <p><strong>Si eres nuevo en Rust o en el desarrollo de software:</strong></p>
-<p>Las siete disciplinas de §4 no son requisitos que debas dominar antes de poder contribuir. Son un mapa del territorio: cosas que encontrarás a medida que trabajes, nombradas de manera clara para que sepas qué estás viendo cuando las encuentres.</p>
+<p>Las siete disciplinas en §4 no son requisitos que deba dominar antes de poder contribuir. Son un mapa del territorio: cosas que encontrará mientras trabaja, nombradas con suficiente claridad para que sepa qué está viendo cuando las encuentre.</p>
 <p>Comienza con §4.1. El modelo mental de manejo de errores es lo más importante que puedes internalizar desde el principio, y no es específico de Rust. Cuando leas código existente y te encuentres con <code>.unwrap()</code>, pregúntate en cuál de las tres categorías cae. Cuando escribas nuevo código, haz la misma pregunta sobre tus propias decisiones. Este hábito, practicado de manera consistente, mejora cada archivo que toca y desarrolla un juicio que te acompañará en todas partes.</p>
 <p>No esperes a sentirte listo para aplicar estos estándares. Aplícalos de manera imperfecta, haz preguntas cuando no estés seguro de a qué categoría pertenece algo y considera los comentarios que recibas en la revisión como la enseñanza que se pretende que sean. Nadie llegó sabiendo estas cosas. Se aprendieron, lentamente, a través de exactamente el tipo de trabajo que estás haciendo aquí.</p>
 <p><strong>Si estás utilizando herramientas de IA para ayudarte a contribuir:</strong></p>
-<p>Los estándares de este documento son los criterios que una revisión cuidadosa utilizará para evaluar el código generado por IA. Además, constituyen el contexto que hace que la salida de la IA sea más precisa antes de llegar a la revisión. Antes de solicitar a una IA que implemente algo, verifica si las interfaces contra las cuales se implementará están documentadas. Si no lo están, documentalas primero o incluye la documentación como parte de lo que le pides a la IA que produzca. La salida será más precisa, habrás cerrado una brecha real en la base del proyecto y el próximo colaborador que llegue se beneficiará de ambos aspectos.</p>
+<p>Los estándares de este documento son aquellos contra los que una revisión cuidadosa evaluará el código generado por IA. También son, en la práctica, el contexto que hace que la salida de la IA sea más correcta antes de llegar a revisión. Antes de pedirle a una IA que implemente algo, verifique si las interfaces contra las que implementará están documentadas. Si no lo están, documéntelas primero, o incluya la documentación como parte de lo que le pide a la IA que produzca. La salida será más correcta, habrá cerrado una brecha real en los cimientos, y el siguiente colaborador que llegue se beneficiará de ambas cosas.</p>
 <p>Cuando recibas comentarios sobre código generado por IA, trátalos como comentarios sobre el código en sí, no como una crítica a tu decisión de usar IA. Los estándares se aplican por igual, independientemente de la autoría. La pregunta siempre es: ¿este código cumple con el estándar? Si no lo cumple, ¿qué debe cambiar y por qué?</p>
 <p><strong>Si estás revisando solicitudes de extracción (pull requests):</strong></p>
-<p>Las preguntas de la puerta — ¿compila?, ¿pasan las pruebas?, ¿lo acepta Clippy? — son el piso, no el techo. Una revisión que solo responde a esas preguntas es una revisión incompleta. Utiliza el marco de trabajo del §3 y las disciplinas del §4 para estructurar tus observaciones. Nombra el estándar que estás aplicando, explica por qué es importante y separa claramente las preocupaciones bloqueantes de las sugerencias no bloqueantes.</p>
-<p>El objetivo de una revisión no es encontrar fallos. Es transferir comprensión. Cada comentario específico que incluye una explicación — “este es un camino de error operativo; aquí está por qué <code>.unwrap()</code> crea un riesgo en producción y qué usar en su lugar” — es una inversión en el colaborador que estás revisando. Esa inversión se acumula. El colaborador que comprende el principio lo aplicará correctamente en las siguientes diez situaciones donde sea relevante, sin necesidad de que se le indique nuevamente.</p>
+<p>Las preguntas de control —¿compila?, ¿pasan las pruebas?, ¿lo acepta Clippy?— son el piso, no el techo. Una revisión que solo responde esas preguntas es una revisión incompleta. Use el marco de trabajo de la §3 y las disciplinas de la §4 para estructurar sus observaciones. Nombre el estándar que está aplicando, explique por qué es importante y separe claramente las objeciones bloqueantes de las sugerencias no bloqueantes.</p>
+<p>El objetivo de una revisión no es encontrar fallos. Es transferir comprensión. Cada comentario específico que incluye una explicación, “esta es una ruta de error operacional; aquí está el porqué <code>.unwrap()</code> crea un riesgo de producción en este punto y qué usar en su lugar”, es una inversión en el contribuidor al que estás revisando. Esa inversión se acumula. El contribuidor que comprende el principio lo aplicará correctamente en las siguientes diez situaciones en las que importe, sin necesidad de que se lo digan de nuevo.</p>
 <p><strong>Si eres un mantenedor o un colaborador más experimentado:</strong></p>
-<p>Tienes la mejor posición para hacer que estos estándares sean reales, no imponiéndolos desde arriba, sino modelándolos en tu propio código y nombrándolos explícitamente durante la revisión. La enseñanza más efectiva en un proyecto de código abierto ocurre en los hilos de las solicitudes de extracción (PR) y en los comentarios del código, no en documentos. Este documento proporciona el vocabulario. Usarlo de manera consistente en la revisión diaria es lo que lo transforma de palabras en un papel a una práctica compartida.</p>
-<p>Cuando veas un <code>.unwrap()</code> en un camino de error operativo, nómbralo como tal. Cuando veas una función pública sin documentación, hazte la pregunta: ¿qué necesita saber un futuro implementador aquí? Cuando veas un test que fallaría en una refactorización válida, explica por qué eso es importante. Estas no son correcciones, sino la mentoría continua que el RFC de cultura identificó como una de las cosas más importantes que un contribuidor más experimentado puede ofrecer.</p>
+<p>Tú estás en la mejor posición para hacer realidad estos estándares, no imponiéndolos desde arriba, sino modelándolos en tu propio código y nombrándolos explícitamente en las revisiones. La enseñanza más efectiva en un proyecto de código abierto ocurre en los hilos de PR y en los comentarios del código, no en los documentos. Este documento proporciona el vocabulario. Usarlo de manera consistente en las revisiones cotidianas es lo que lo convierte de palabras en una página en práctica compartida.</p>
+<p>Cuando veas un <code>.unwrap()</code> en una ruta de error operacional, nómbralo como tal. Cuando veas una función pública sin documentación, hazte la pregunta: ¿qué necesita saber aquí un futuro implementador? Cuando veas una prueba que se rompería con una refactorización válida, explica por qué eso importa. Estas no son correcciones: son la mentoría continua que el RFC de cultura identificó como una de las cosas más importantes que un contribuidor con más experiencia puede ofrecer.</p>
 <hr>
                     </main>
 
@@ -608,6 +685,114 @@ let _span = span!(
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

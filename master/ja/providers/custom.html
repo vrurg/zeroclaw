@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-59fbaa70.js";
+            window.path_to_searchindex_js = "../searchindex-44ad045e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c98164c8.js"></script>
+        <script src="../toc-8e2df50e.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -223,83 +300,400 @@
 <li><strong>ファーストクラスのローカルサーバースロットを使用する</strong>（<code>lmstudio</code>、<code>llamacpp</code>、<code>sglang</code>、<code>vllm</code>、<code>osaurus</code>、<code>litellm</code>）。適切なデフォルト値を備えたシンラッパーです。</li>
 <li>Rustで**<code>ModelProvider</code>トレイトを実装**します。OpenAI互換ではないものすべてに対して使用します。</li>
 </ol>
-<h2 id="openai互換エンドポイント--customスロットを使用"><a class="header" href="#openai互換エンドポイント--customスロットを使用">OpenAI互換エンドポイント — <code>custom</code>スロットを使用</a></h2>
-<p>サービスがOpenAIのチャット完了APIをサポートしている場合、これは設定のみの変更です：</p>
-<pre><code class="language-toml">[providers.models.custom.gateway]
-uri     = "https://my-gateway.example.com/v1"
-model   = "my-model-id"
-api_key = "..."                          # エンドポイントが認証を必要としない場合は省略
-</code></pre>
-<p><code>custom</code> スロットには <code>uri</code> が必要です（ファミリーのエンドポイント enum にはデフォルトがありません）。エージェントから参照してください:</p>
-<pre><code class="language-toml">[agents.assistant]
-model_provider = "custom.gateway"
-risk_profile   = "hardened"
-</code></pre>
-<p>これは <code>groq</code>、<code>mistral</code>、<code>xai</code>、および<a href="./catalog.html">カタログ</a>に独自の正規スロットを持つその他すべてのベンダーで使用されているものと同じ <code>OpenAiCompatibleModelProvider</code> ランタイム実装です。違いはどのファミリースロットを使用するかです — <code>custom</code> は、ベンダースロットで表現されないエンドポイントのための汎用スロットです。</p>
+<h2 id="openai互換エンドポイント-custom-スロットを使用します"><a class="header" href="#openai互換エンドポイント-custom-スロットを使用します">OpenAI互換エンドポイント: <code>custom</code> スロットを使用します</a></h2>
+<p>サービスが OpenAI の chat-completions に対応している場合、これは設定のみの変更です。<code>custom</code> スロットには <code>uri</code> が必要です（このファミリのエンドポイント enum にはデフォルト値がありません）。エージェントの <code>model_provider</code> から参照してください。</p>
+<p>これは <code>groq</code>、<code>mistral</code>、<code>xai</code>、および<a href="./catalog.html">カタログ</a>に独自の正規スロットを持つ他のすべてのベンダーで使用されているものと同じ <code>OpenAiCompatibleModelProvider</code> ランタイム実装です。違いは使用するファミリースロットにあります。<code>custom</code> はベンダースロットで表現されないエンドポイント向けの汎用スロットです。</p>
 <h2 id="ファーストクラスのローカル推論サーバー"><a class="header" href="#ファーストクラスのローカル推論サーバー">ファーストクラスのローカル推論サーバー</a></h2>
 <p>ZeroClawは、人気のあるローカル推論スタック向けの標準スロットを同梱しています。これらはすべて内部的にOpenAI互換ですが、デフォルトの<code>uri</code>値があらかじめ適用されているため、通常は<code>uri</code>を完全に省略できます。</p>
-<h3 id="llamacpp--スロット-llamacpp"><a class="header" href="#llamacpp--スロット-llamacpp">llama.cpp — スロット <code>llamacpp</code></a></h3>
-<pre><code class="language-bash">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
+<h3 id="llamacpp-スロット-llamacpp"><a class="header" href="#llamacpp-スロット-llamacpp">llama.cpp: スロット <code>llamacpp</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 </code></pre>
-<pre><code class="language-toml">[providers.models.llamacpp.local]
-uri   = "http://127.0.0.1:8033/v1"       # ファミリーのデフォルト http://localhost:8080/v1 を使用する場合は省略
-model = "ggml-org/gpt-oss-20b-GGUF"
-# api_key は llama-server が --api-key 付きで起動された場合にのみ必要
-</code></pre>
-<p><strong>オプションフィールド</strong>（<code>llamacpp</code> を含む任意の compat-slot ファミリーに適用）：</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>フィールド</th><th>タイプ</th><th>デフォルト</th><th>説明</th></tr>
-</thead>
-<tbody>
-<tr><td><code>think</code></td><td><code>bool</code></td><td>—</td><td><code>enable_thinking</code> をリクエストボディのトップレベルに設定します。<code>false</code> を指定すると、思考対応モデルに対して chain-of-thought をスキップするよう指示します。</td></tr>
-<tr><td><code>chat_template_kwargs</code></td><td>table</td><td>—</td><td>モデルファミリー固有のテンプレート変数に使用します。Jinja チャットテンプレートに <code>chat_template_kwargs</code> としてそのまま渡されます。</td></tr>
-<tr><td><code>max_tokens</code></td><td><code>u32</code></td><td>—</td><td>レスポンスごとの最大出力トークン数。</td></tr>
-<tr><td><code>timeout_secs</code></td><td><code>u64</code></td><td>120</td><td>非ストリーミング呼び出しのリクエストタイムアウト。</td></tr>
-</tbody>
-</table>
 </div>
+
+<p><strong>オプションフィールド</strong>は、任意の compat-slot ファミリー（<code>llamacpp</code> を含む）に適用されます。スキーマから導出された完全なセットは次のとおりです。</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>api_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>この model_provider のシークレット API トークン。model_provider のダッシュボード（OpenAI platform、Anthropic console、OpenRouter keys ページなど）から取得します。可能な場合は OS キーリング経由で保存され、config.toml に直接コミットしないでください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード"><a class="header" href="#ゲートウェイダッシュボード">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.api_key</code> フィールドを設定します。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.api_key</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.api_key    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数"><a class="header" href="#環境変数">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__api_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>chat_template_kwargs</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>リクエストボディ内で <code>chat_template_kwargs</code> としてそのまま転送される任意のキー/値のペア（llama.cpp 固有）。他のフィールドでは公開されていない動作を制御するモデルファミリーのテンプレート変数を渡すために使用します。例（Qwen3 の thinking 抑制）: <code>chat_template_kwargs = { enable_thinking = false }</code></p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-1"><a class="header" href="#ゲートウェイダッシュボード-1">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code> フィールドを設定してください。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.chat_template_kwargs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.chat_template_kwargs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-1"><a class="header" href="#環境変数-1">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__chat_template_kwargs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>extra_headers</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>—</code></span></summary>
+<p>すべてのリクエストに付与される追加のHTTPヘッダー。ニッチな用途: 認証ブリッジ、企業プロキシ、またはトレーシングヘッダーを要求するカスタムゲートウェイで使用されます。ほとんどのユーザーが触れることはありません。必要な場合は<code>config.toml</code>を直接編集してください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-2"><a class="header" href="#ゲートウェイダッシュボード-2">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.extra_headers</code> フィールドを設定します。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.extra_headers</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.extra_headers    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-2"><a class="header" href="#環境変数-2">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__extra_headers=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback</code> <span class="cfg-field-meta"><code>ModelProviderRef[]</code> · default <code>—</code></span></summary>
+<p>このエイリアスのすべてのモデルが失敗したときに試行する、他のプロバイダーエイリアスの順序付きリストです。各エントリは <code>providers.models</code> 内のドット区切りの <code>&lt;type&gt;.&lt;alias&gt;</code> 参照であり、独自の認証情報、エンドポイント、モデルで解決されます。フォールバックがこのエイリアスのキーを継承することはありません。走査は深さ優先で行われます。まずこのエイリアスのモデルが使い尽くされ、次に各フォールバックエイリアスが順番に降下されます（それぞれ独自の <code>fallback_models</code> と <code>fallback</code> を適用します）。空の場合、プロバイダーレベルのフォールバックはありません。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-3"><a class="header" href="#ゲートウェイダッシュボード-3">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.fallback</code> フィールドを設定してください。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.fallback</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-3"><a class="header" href="#環境変数-3">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>fallback_models</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>—</code></span></summary>
+<p><code>fallback</code> エイリアスにフォールバックする前に、このプロバイダーで試行する代替モデルの順序付きリスト。プライマリの <code>model</code> と同じエンドポイント、キー、ヘッダーを使用します。変更されるのはモデル識別子のみです。プロバイダーが（例えばより小さい、または古いバリアントの）バックアップモデルを提供しており、プロバイダーを完全に離れる前に試行すべき場合に使用します。空の場合は <code>model</code> のみが試行されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-4"><a class="header" href="#ゲートウェイダッシュボード-4">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.fallback_models</code> フィールドを設定します。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.fallback_models</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.fallback_models &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-4"><a class="header" href="#環境変数-4">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__fallback_models=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>kind</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>このプロファイルでインスタンス化するプロバイダー実装です。正規の型付きスロットを互換性のある実装で実行する場合に使用します。例: <code>[providers.models.openai.proxy] kind = "openai-compatible"</code>。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-5"><a class="header" href="#ゲートウェイダッシュボード-5">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.kind</code> フィールドを設定してください。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.kind</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.kind &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-5"><a class="header" href="#環境変数-5">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__kind=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_tokens</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>応答の長さの上限をトークン数で指定するハードキャップです。ほとんどのモデルにはすでに適切な組み込みの上限が設定されているため、コストやレイテンシの理由で長い出力を切り詰める必要が特にない限り、未設定のままにしてください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-6"><a class="header" href="#ゲートウェイダッシュボード-6">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて <code>providers.models.custom.&lt;alias&gt;.max_tokens</code> フィールドを設定してください。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.max_tokens</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.max_tokens &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-6"><a class="header" href="#環境変数-6">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__max_tokens=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>merge_system_into_user</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>ModelProvider 固有の癖: システムプロンプトを別の system ロールとして送信せず、最初のユーザーメッセージに統合します。単独の system ロールを拒否する（または正しく処理できない）モデル、例えば一部の古い Mistral バリアントでのみ必要です。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-7"><a class="header" href="#ゲートウェイダッシュボード-7">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code> フィールドを設定します。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.merge_system_into_user</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.merge_system_into_user &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-7"><a class="header" href="#環境変数-7">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__merge_system_into_user=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>model</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>各リクエストで送信するモデル識別子: model_provider のカタログにある ID 文字列（例: <code>gpt-4o</code>、<code>claude-sonnet-4-5</code>、<code>llama-3.3-70b</code>）。このアカウントで model_provider が実際に提供しているモデルと一致する必要があります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-8"><a class="header" href="#ゲートウェイダッシュボード-8">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.model</code> フィールドを設定します。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.model</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.model &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-8"><a class="header" href="#環境変数-8">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__model=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>native_tools</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>ネイティブツール呼び出しに関するプロバイダーのデフォルト設定をオーバーライドします。<code>None</code>（デフォルト）はプロバイダーの組み込み設定を尊重します。<code>Some(true)</code> はネイティブツール呼び出しを強制的に有効化し、<code>Some(false)</code> はテキストフォールバックを強制します。現在はGroqファクトリーのみが参照しており、llamaファミリーのGroqモデルがネイティブツール呼び出しをHTTP 400で拒否するため、デフォルトでテキストフォールバックになっています。<code>native_tools = true</code> を設定すると、対応するGroqモデルでネイティブツール呼び出しが再度有効になります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-9"><a class="header" href="#ゲートウェイダッシュボード-9">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.native_tools</code> フィールドを設定します。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.native_tools</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.native_tools &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-9"><a class="header" href="#環境変数-9">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__native_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>pricing</code> <span class="cfg-field-meta"><code>map</code> · default <code>—</code></span></summary>
+<p>コスト追跡用のモデルごとの料金設定。100万トークンあたりのUSD。自由形式のキー/値マップ。キーはユーザー定義のモデル識別子で、オプションの <code>.input</code> / <code>.output</code> サフィックスは、オペレーターがレートを分割したい場合に料金の次元を示します。サフィックスのない単純なキーは、いずれの次元も指定されていない場合にトークンごとの一律レートとして使用されます。デフォルトは空です。この場合、コスト追跡は「不明」レートにフォールバックし、トークン使用量のみが記録されます。例: <code>pricing = { opus = 15.0, sonnet = 3.0 }</code> または分割する場合: <code>pricing = { "opus.input" = 15.0, "opus.output" = 75.0 }</code></p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-10"><a class="header" href="#ゲートウェイダッシュボード-10">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.pricing</code> フィールドを設定してください。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.pricing</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.pricing &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-10"><a class="header" href="#環境変数-10">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__pricing=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>provider_extra</code> <span class="cfg-field-meta"><code>table</code> · default <code>—</code></span></summary>
+<p>API リクエストに含める追加の JSON パラメーター。リクエストボディのトップレベルでマージされ、コードを変更することなくプロバイダー固有の機能（ルーティング、変換など）を利用できます。例: <code>provider_extra = { model_provider = { only = ["Anthropic"] } }</code></p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-11"><a class="header" href="#ゲートウェイダッシュボード-11">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.provider_extra</code> フィールドを設定します。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.provider_extra</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.provider_extra &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-11"><a class="header" href="#環境変数-11">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__provider_extra=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>requires_openai_auth</code> <span class="cfg-field-meta"><code>bool</code> · default <code>—</code></span></summary>
+<p>trueの場合、クライアントは上記の<code>api_key</code>フィールドの代わりに<code>OPENAI_API_KEY</code>または<code>~/.codex/auth.json</code>から認証情報を取得します。OpenAI Codexのmodel_providerの場合のみ有効にし、標準のAPIキーを使用するmodel_providerでは無効のままにしてください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-12"><a class="header" href="#ゲートウェイダッシュボード-12">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code> フィールドを設定してください。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.requires_openai_auth</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.requires_openai_auth &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-12"><a class="header" href="#環境変数-12">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__requires_openai_auth=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>temperature</code> <span class="cfg-field-meta"><code>number?</code> · default <code>—</code></span></summary>
+<p>モデルに渡されるサンプリング温度です。低い値（0.0〜0.3）は決定論的でほぼ忠実な出力となり、コード、ルーティング、要約に適しています。高い値（0.7〜1.2）はより多様な出力となり、自由形式のチャットに適しています。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-13"><a class="header" href="#ゲートウェイダッシュボード-13">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.temperature</code> フィールドを設定してください。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p><strong>Config</strong>ペインで、<code>providers.models.custom.&lt;alias&gt;.temperature</code>フィールドを設定します。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.temperature &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-13"><a class="header" href="#環境変数-13">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__temperature=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>think</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>—</code></span></summary>
+<p>これをサポートするモデル（例：Qwen3、GLM-4）で連鎖的思考（chain-of-thought）を有効または無効にします。<code>true</code> で思考をオンにし、<code>false</code> でオフにします。<code>None</code>（デフォルト）の場合はモデルが判断します。リクエストボディ内で <code>enable_thinking</code> として転送され、Ollama プロバイダーの <code>think</code> フィールドに対応します。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-14"><a class="header" href="#ゲートウェイダッシュボード-14">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.think</code> フィールドを設定してください。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.think</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.think &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-14"><a class="header" href="#環境変数-14">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__think=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>timeout_secs</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>—</code></span></summary>
+<p>HTTPリクエストのタイムアウト（秒単位）。低速なローカルmodel_providers（CPU上のOllama、大規模なローカルモデル）や高レイテンシのネットワークの場合はこの値を引き上げてください。それ以外の場合は未設定のままにしてください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-15"><a class="header" href="#ゲートウェイダッシュボード-15">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開いて、<code>providers.models.custom.&lt;alias&gt;.timeout_secs</code> フィールドを設定してください。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.timeout_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-15"><a class="header" href="#環境変数-15">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uri</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>クライアントが接続するエンドポイント URI。セルフホスト型のゲートウェイ（LiteLLM、vLLM、Ollama）、カスタムプロキシ、または非標準の URL を指定する場合に、ファミリーのデフォルトエンドポイントを上書きします。未設定のままにすると、ファミリーの <code>ModelEndpoint</code> 実装によるデフォルト URI が使用されます。これにはエンドポイントの完全な URL を設定してください。パスサフィックス用の個別フィールドはありません。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-16"><a class="header" href="#ゲートウェイダッシュボード-16">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.uri</code> フィールドを設定します。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.uri</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.uri &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-16"><a class="header" href="#環境変数-16">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__uri=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>wire_api</code> <span class="cfg-field-meta"><code>WireApi</code> · default <code>—</code></span></summary>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-17"><a class="header" href="#ゲートウェイダッシュボード-17">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/providers.models/custom"><code>/config/providers.models/custom</code></a> を開き、<code>providers.models.custom.&lt;alias&gt;.wire_api</code> フィールドを設定してください。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>providers.models.custom.&lt;alias&gt;.wire_api</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set providers.models.custom.&lt;alias&gt;.wire_api &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-17"><a class="header" href="#環境変数-17">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_providers__models__custom__&lt;alias&gt;__wire_api=
+</code></pre>
+</div>
+
+</details>
+</div>
+
 <p><strong>思考モードの制御</strong>はモデルファミリーによって異なります。<code>think = false</code> はリクエスト内のトップレベルの <code>enable_thinking</code> フィールドを設定します。一部のモデル（例: Qwen3）は、代わりに <code>chat_template_kwargs</code> を介して Jinja テンプレートからこのフラグを読み取ります:</p>
-<pre><code class="language-toml">[providers.models.llamacpp.qwen3]
-uri = "http://127.0.0.1:8033/v1"
-model = "Qwen/Qwen3-30B-A3B-GGUF"
-think = false
-# Qwen3 は enable_thinking をトップレベルのフィールドではなく Jinja テンプレートから読み取ります:
-chat_template_kwargs = { enable_thinking = false }
+<p>他のモデルファミリーでは異なるテンプレート変数名を使用します。お使いのモデルのチャットテンプレートを確認し、<code>chat_template_kwargs</code>の下に適切なキーを設定してください。</p>
+<h3 id="sglang-スロット-sglang"><a class="header" href="#sglang-スロット-sglang">SGLang: スロット <code>sglang</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
 </code></pre>
-<p>他のモデルファミリーでは異なるテンプレート変数名を使用します。お使いのモデルのチャットテンプレートを確認し、<code>chat_template_kwargs</code> の下に適切なキーを設定してください。</p>
-<h3 id="sglang--スロット-sglang"><a class="header" href="#sglang--スロット-sglang">SGLang — スロット <code>sglang</code></a></h3>
-<pre><code class="language-bash">python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
+</div>
+
+<h3 id="vllm-スロット-vllm"><a class="header" href="#vllm-スロット-vllm">vLLM: スロット <code>vllm</code></a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">vllm serve meta-llama/Llama-3.1-8B-Instruct
 </code></pre>
-<pre><code class="language-toml">[providers.models.sglang.local]
-uri   = "http://localhost:30000/v1"      # ファミリーのデフォルト
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
-<h3 id="vllm--スロット-vllm"><a class="header" href="#vllm--スロット-vllm">vLLM — スロット <code>vllm</code></a></h3>
-<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct
-</code></pre>
-<pre><code class="language-toml">[providers.models.vllm.local]
-uri   = "http://localhost:8000/v1"       # ファミリーのデフォルト
-model = "meta-llama/Llama-3.1-8B-Instruct"
-</code></pre>
+</div>
+
 <h3 id="lm-studio-osaurus-litellm"><a class="header" href="#lm-studio-osaurus-litellm">LM Studio, Osaurus, LiteLLM</a></h3>
-<p>スロット <code>lmstudio</code>、<code>osaurus</code>、<code>litellm</code> も同じパターンに従います — <a href="./catalog.html">catalog</a> を参照してください。</p>
-<h2 id="wire-protocol--wire_api--responses"><a class="header" href="#wire-protocol--wire_api--responses">Wire protocol — <code>wire_api = "responses"</code></a></h2>
-<p>Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI <strong>responses</strong> wire (some self-hosted vLLM / TGI deployments) needs an explicit opt-in:</p>
-<pre><code class="language-toml">[providers.models.custom.vllm]
-uri      = "http://10.0.0.15:8000/v1"
-model    = "Qwen/Qwen3-30B-A3B"
-wire_api = "responses"                  # default is "chat_completions"
+<p>スロット <code>lmstudio</code>、<code>osaurus</code>、<code>litellm</code> も同じパターンに従います。詳しくは<a href="./catalog.html">カタログ</a>を参照してください。</p>
+<h2 id="ワイヤープロトコル-wire_api--responses"><a class="header" href="#ワイヤープロトコル-wire_api--responses">ワイヤープロトコル: <code>wire_api = "responses"</code></a></h2>
+<p>Bring-your-own-endpoint スロットは、デフォルトで OpenAI chat-completions ワイヤーを使用します。OpenAI <strong>responses</strong> ワイヤーのみに対応するエンドポイント（一部のセルフホスト型 vLLM / TGI デプロイメント）では、エイリアスエントリに明示的な <code>wire_api = "responses"</code> のオプトインが必要です。</p>
+<p><code>"responses"</code> に設定すると、プロバイダーはチャット補完プロバイダーではなく <code>OpenAiResponsesModelProvider</code>（responses プロトコル経由のフルストリーミングツール呼び出し）として構築されます。デフォルトのワイヤーを使用するには、このフィールドを省略するか、<code>"chat_completions"</code> を設定してください。</p>
+<p><code>wire_api</code> is honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field, with one exception: <code>opencode</code> honors <code>wire_api = "responses"</code> because OpenCode Zen serves both wires. With no <code>uri</code> override, the OpenCode responses route targets <code>https://opencode.ai/zen/v1/responses</code>:</p>
+<pre><code class="language-toml">[providers.models.opencode.default]
+model    = "big-pickle"
+wire_api = "responses"
 </code></pre>
-<p>When set to <code>"responses"</code>, the provider is built as an <code>OpenAiResponsesModelProvider</code> (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set <code>"chat_completions"</code>, for the default wire.</p>
-<p><code>wire_api</code> is only honored by the bring-your-own-endpoint families where the wire is operator-configurable: <code>openai</code>, <code>llamacpp</code>, and <code>custom</code> (plus the generic openai-compatible path). Branded vendor slots (<code>groq</code>, <code>mistral</code>, <code>deepseek</code>, …) have a fixed wire protocol and ignore the field. The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
+<p>The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares <code>wire_api = "responses"</code> reaches the endpoint over the responses wire.</p>
 <h2 id="検証"><a class="header" href="#検証">検証</a></h2>
 <p>アプローチに関わらず：</p>
-<pre><code class="language-bash">zeroclaw config list                          # 設定を読み込む。検証に失敗した場合は stderr に出力される
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">zeroclaw config list                          # 設定を読み込む。検証に失敗した場合は stderr に出力される
 zeroclaw models refresh --provider &lt;type&gt;.&lt;alias&gt;   # list models the endpoint advertises
 zeroclaw agent -a &lt;alias&gt; -m "hello"          # `[agents.&lt;alias&gt;]` のエージェントに対するスモークテスト
 </code></pre>
+</div>
+
 <h2 id="新しい-modelprovider-トレイトの実装"><a class="header" href="#新しい-modelprovider-トレイトの実装">新しい <code>ModelProvider</code> トレイトの実装</a></h2>
 <p>エンドポイントが OpenAI 互換ではなく、ローカルサーバースロットのいずれにも該当しない場合は、コードが必要です。</p>
 <p>このトレイトは <code>crates/zeroclaw-api/src/model_provider.rs</code> にあります:</p>
@@ -357,45 +751,43 @@ impl ModelEndpoint for MyProviderEndpoint {
 <h2 id="トラブルシューティング"><a class="header" href="#トラブルシューティング">トラブルシューティング</a></h2>
 <h3 id="認証エラー"><a class="header" href="#認証エラー">認証エラー</a></h3>
 <ul>
-<li>APIキーがエンドポイントと一致しているか確認してください（多くのベンダーはキープレフィックスを使用しています — <code>sk-</code>、<code>gsk_</code>、<code>sk-ant-</code>）。</li>
+<li>APIキーがエンドポイントと一致していることを確認してください（多くのベンダーはキーのプレフィックスを使用しています：<code>sk-</code>、<code>gsk_</code>、<code>sk-ant-</code>）。</li>
 <li><code>uri</code> にスキーム（<code>http://</code> / <code>https://</code>）が含まれていること、およびエンドポイントが必要とする場合は <code>/v1</code> パスが含まれていることを確認してください。</li>
 <li>VPN またはプロキシの背後にあるエンドポイントですか？ZeroClaw ホストからのルーティングを確認してください。</li>
 </ul>
 <h3 id="モデルが見つかりません"><a class="header" href="#モデルが見つかりません">モデルが見つかりません</a></h3>
 <ul>
-<li>
-<p>エンドポイントが宣伝しているものをリストします：</p>
-<pre><code class="language-bash">curl -sS $URI/models -H `Authorization: Bearer $API_KEY` | jq
-</code></pre>
-</li>
-<li>
-<p>エンドポイントが <code>/models</code> を実装していない場合は、直接チャットリクエストを送信してエラーを確認してください。ほとんどのエンドポイントは、期待されるモデルファミリーをエラーボディで返します。</p>
-</li>
-<li>
-<p>ゲートウェイサービスは多くの場合、アップストリームモデルの一部のみを公開します。</p>
-</li>
+<li>エンドポイントが宣伝しているものをリストします：</li>
 </ul>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">  curl -sS $URI/models -H `Authorization: Bearer $API_KEY` | jq
+</code></pre>
+</div>
+
+- If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
+- Gateway services often expose only a subset of upstream models.
 <h3 id="接続の問題"><a class="header" href="#接続の問題">接続の問題</a></h3>
 <ul>
-<li><code>curl -I $URI</code> — 応答がありますか？</li>
+<li><code>curl -I $URI</code>、応答はありますか？</li>
 <li>ファイアウォール、プロキシ、egressルールは？VPSプロバイダーは送信用の高位ポートをブロックすることがあります。</li>
 <li>ホステッドサービスの場合はベンダーのステータスページ。</li>
 </ul>
-<h3 id="gateway-rejects-temperature"><a class="header" href="#gateway-rejects-temperature">Gateway rejects <code>temperature</code></a></h3>
-<p>Some gateways (e.g. a LiteLLM proxy fronting <code>claude-opus-4-7</code>) return an error when a <code>temperature</code> field is present at all. ZeroClaw honors the <code>Option</code> contract: if you leave <code>temperature</code> unset in config, the field is <strong>omitted</strong> from the request body entirely and the backend picks its own default. Only set <code>temperature</code> explicitly when the endpoint accepts it.</p>
+<h3 id="ゲートウェイが-temperature-を拒否します"><a class="header" href="#ゲートウェイが-temperature-を拒否します">ゲートウェイが <code>temperature</code> を拒否します</a></h3>
+<p>一部のゲートウェイ（例えば <code>claude-opus-4-7</code> をフロントエンドとする LiteLLM プロキシ）は、<code>temperature</code> フィールドが存在するだけでエラーを返します。ZeroClaw は <code>Option</code> の規約を尊重します。設定で <code>temperature</code> を未設定のままにした場合、そのフィールドはリクエストボディから完全に<strong>省略</strong>され、バックエンドが独自のデフォルト値を選択します。エンドポイントが受け付ける場合にのみ、<code>temperature</code> を明示的に設定してください。</p>
 <h2 id="関連項目も参照してください"><a class="header" href="#関連項目も参照してください">関連項目も参照してください</a></h2>
 <ul>
-<li><a href="./overview.html">概要</a> — プロバイダーモデルとエージェントごとのディスパッチの仕組み</li>
-<li><a href="./configuration.html">設定</a> — <code>[providers.*]</code> スキーマの全容、Azure 型付き設定、リージョナルおよび OAuth バリアント</li>
-<li><a href="./catalog.html">Catalog</a> — すべての正規スロットと実用的なTOMLの例</li>
-<li><a href="../developing/plugin-protocol.html">開発 → プラグインプロトコル</a> — プラグインがファーストクラスのクレートよりも適している場合</li>
+<li><a href="./overview.html">概要</a>: プロバイダーモデルとエージェントごとのディスパッチの仕組み</li>
+<li><a href="./configuration.html">設定</a>: 完全な <code>[providers.*]</code> スキーマ、Azure 型付き設定、リージョンおよび OAuth バリアント</li>
+<li><a href="./catalog.html">カタログ</a>: すべての正規スロットと実際の TOML 例</li>
+<li><a href="../developing/plugin-protocol.html">開発 → プラグインプロトコル</a>: プラグインがファーストクラスのクレートよりもうまく機能する場合</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../providers/catalog.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../providers/routing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -409,7 +801,7 @@ impl ModelEndpoint for MyProviderEndpoint {
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../providers/catalog.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../providers/routing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -435,6 +827,114 @@ impl ModelEndpoint for MyProviderEndpoint {
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

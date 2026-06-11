@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-7b5e949d.js";
+            window.path_to_searchindex_js = "../searchindex-098b429f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-2e5901bf.js"></script>
+        <script src="../toc-f27dd488.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -229,21 +306,18 @@
 </tbody>
 </table>
 </div>
-<p>Se rellenan por separado y se almacenan por separado. Ambos usan un pipeline de relleno agnóstico del proveedor: configura cualquier endpoint compatible con OpenAI en <code>~/.zeroclaw/config.toml</code> bajo <code>[providers.models.&lt;kind&gt;.&lt;alias&gt;]</code> y pasa <code>--model-provider &lt;alias&gt;</code> a los comandos de relleno. Se puede elegir cualquier alias configurado: un alias simple (<code>--model-provider &lt;alias&gt;</code>), o un calificador <code>kind.alias</code> (<code>--model-provider anthropic.&lt;alias&gt;</code>) cuando el mismo alias existe bajo más de un kind. El resolver lee <code>uri</code>, <code>model</code> y <code>api_key</code> directamente de la entrada coincidente; la ausencia de <code>uri</code> o <code>model</code> es un error grave, no un valor predeterminado adivinado.</p>
-<p>Los modelos locales mediante <a href="https://ollama.com">Ollama</a> son una opción de primera clase: no se requieren claves de API ni hay costo por llamada. Un proveedor alojado también es válido para una calidad apta para producción. La traducción es una operación local. Ejecuta <code>cargo mdbook sync</code> para PRs dedicados a la caché de traducción, pasadas de traducción para lanzamientos y nuevas configuraciones regionales; los PRs rutinarios de documentación en inglés pueden posponer los cambios masivos generados en <code>.po</code> a un seguimiento específico.</p>
+<p>Se rellenan por separado y se almacenan por separado. Ambos usan una canalización de relleno agnóstica al proveedor: configure cualquier endpoint compatible con OpenAI en <code>providers.models.&lt;kind&gt;.&lt;alias&gt;</code> y pase <code>--model-provider &lt;alias&gt;</code> a los comandos de relleno. Cualquier alias configurado es seleccionable: un alias simple (<code>--model-provider &lt;alias&gt;</code>), o un calificador <code>kind.alias</code> (<code>--model-provider anthropic.&lt;alias&gt;</code>) cuando el mismo alias existe en más de un tipo. El resolvedor lee <code>uri</code>, <code>model</code> y <code>api_key</code> directamente de la entrada coincidente; un <code>uri</code> o <code>model</code> faltante es un error grave, no un valor predeterminado adivinado.</p>
+<p>Los modelos locales mediante <a href="https://ollama.com">Ollama</a> son una opción de primera clase: no se requieren claves de API ni hay costo por llamada. Un proveedor alojado también es adecuado para calidad de nivel de lanzamiento. La traducción es una operación local. Ejecuta <code>cargo mdbook sync</code> para PRs dedicados a la caché de traducción, pasadas de traducción de lanzamiento y nuevas configuraciones regionales; los PRs rutinarios de documentación en inglés pueden aplazar los cambios masivos generados en archivos <code>.po</code> a un seguimiento específico posterior.</p>
 <h2 id="configuración-del-proveedor"><a class="header" href="#configuración-del-proveedor">Configuración del proveedor</a></h2>
-<p>Ollama es la fuente canónica actual para la documentación. Asegúrate de tener <a href="https://ollama.com/">Ollama</a> instalado y de haber descargado <code>qwen3.6:35-a3b</code>. Luego, en <code>~/.zeroclaw/config.toml</code> (o en tu directorio de configuración establecido):</p>
-<pre><code class="language-toml"># Local mediante Ollama — gratis, se ejecuta en tu máquina
-[providers.models.ollama.local]
-uri   = "http://localhost:11434/v1/chat/completions"
-model = "qwen3.6:35b-a3b" # Modelo preferido actual
-</code></pre>
-<p><code>uri</code> es la URL completa del endpoint y es <strong>opcional</strong>: déjala sin definir para usar el endpoint predeterminado de la familia de proveedores (resuelto por la pila de proveedores del runtime). Defínela solo para apuntar a una gateway o proxy autoalojado. Funciona cualquier familia configurada (Anthropic, OpenAI, OpenRouter, Ollama, …); las herramientas de traducción construyen el proveedor real del runtime, por lo que el endpoint, el encabezado de autenticación y el protocolo de comunicación de cada familia se gestionan automáticamente, sin requisito de compatibilidad con OpenAI.</p>
+<p>Ollama es la fuente canónica actual para la documentación. Asegúrate de tener <a href="https://ollama.com/">Ollama</a> instalado y de haber descargado <code>qwen3:30b-a3b</code>, luego configura una entrada de proveedor de Ollama. <code>uri</code> es la URL completa del endpoint y es <strong>opcional</strong>: déjala sin definir para usar el endpoint predeterminado de la familia del proveedor (resuelto por la pila de proveedores en tiempo de ejecución). Defínela solo para apuntar a una puerta de enlace o proxy autoalojado. Cualquier familia configurada funciona (Anthropic, OpenAI, OpenRouter, Ollama, …); las herramientas de traducción construyen el proveedor real en tiempo de ejecución, de modo que el endpoint, el encabezado de autenticación y el protocolo de comunicación de cada familia se gestionan automáticamente: no hay requisito de compatibilidad con OpenAI.</p>
 <h2 id="compilar-la-documentación-localmente"><a class="header" href="#compilar-la-documentación-localmente">Compilar la documentación localmente</a></h2>
-<h1 id="compilar-la-documentación-localmente-1"><a class="header" href="#compilar-la-documentación-localmente-1">Compilar la documentación localmente</a></h1>
-<p>El sitio de documentación que estás leyendo se publica desde <code>docs/book/</code>. Puedes construir el mismo sitio en tu propia máquina, lo cual es útil para leer sin conexión, previsualizar cambios antes de abrir un PR o desarrollar traducciones.</p>
+<!-- Canonical local docs-build commands and tooling. Edit here; reuse via
+     {{#include}}. Shared by developing/building-docs and
+     maintainers/docs-and-translations. -->
 <h2 id="inicio-rápido-con-un-solo-comando"><a class="header" href="#inicio-rápido-con-un-solo-comando">Inicio rápido con un solo comando</a></h2>
-<pre><code class="language-bash">cargo mdbook serve                       # servir todas las localizaciones en http://localhost:3000/en/
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook serve                       # servir todas las localizaciones en http://localhost:3000/en/
 cargo mdbook serve --locale ja           # recarga en vivo contra fuentes en japonés
 cargo mdbook build                       # compilación estática de cada localización en docs/book/book/
 cargo mdbook refs                        # regenerar las páginas de referencia generadas automáticamente
@@ -254,6 +328,8 @@ cargo mdbook sync --locale ja --force    # forzar la retraducción de una config
 cargo mdbook stats                       # mostrar traducidos/ambiguos/no traducidos por localización
 cargo mdbook check                       # validar el formato .po (ejecutar antes de un PR de traducción)
 </code></pre>
+</div>
+
 <blockquote>
 <p>Utiliza siempre el contenedor <code>cargo mdbook …</code>. Ejecutar <code>mdbook build</code> directamente desde <code>docs/book/</code> omite el paso de xtask que renderiza <code>theme/lang-switcher.js</code> a partir de <code>locales.toml</code>, lo que provoca un fallo en la compilación con el error <code>failed to open theme/lang-switcher.js for hashing</code>.</p>
 </blockquote>
@@ -286,105 +362,48 @@ cargo mdbook check                       # validar el formato .po (ejecutar ante
 </tbody>
 </table>
 </div>
-<p>Los dos archivos <code>reference/*.md</code> se generan a partir de los <code>clap</code> derives y el esquema JSON en el código; nunca los edites manualmente. Edita los comentarios de documentación <code>///</code> en los tipos de Rust correspondientes en su lugar.</p>
-<h2 id="cómo-se-mantienen-actualizadas-las-traducciones"><a class="header" href="#cómo-se-mantienen-actualizadas-las-traducciones">Cómo se mantienen actualizadas las traducciones</a></h2>
-<p>El formato Markdown en inglés es la única fuente mantenida por humanos. Las traducciones se almacenan en los archivos <code>docs/book/po/&lt;locale&gt;.po</code>, que actúan como una caché — no como copias de los documentos.</p>
+<p>Los dos archivos <code>reference/*.md</code> se generan a partir de las derivaciones <code>clap</code> reales y del esquema JSON en el código; nunca los edites a mano. En su lugar, edita los comentarios de documentación <code>///</code> en los tipos de Rust relevantes.</p>
+<p><code>cargo mdbook</code> es un alias de <code>cargo run -p xtask --bin mdbook --</code> (definido en la configuración de cargo). Para una versión más concisa de esta sección orientada a colaboradores, consulte <a href="../developing/building-docs.html">Building the docs locally</a>.</p>
+<h3 id="cómo-se-mantienen-actualizadas-las-traducciones"><a class="header" href="#cómo-se-mantienen-actualizadas-las-traducciones">Cómo se mantienen actualizadas las traducciones</a></h3>
 <p>Cuando cambia la fuente en inglés, <code>cargo mdbook sync</code> ejecuta dos etapas:</p>
 <ol>
-<li><strong>Extraer</strong>: <code>mdbook-xgettext</code> regenera <code>po/messages.pot</code> a partir de la fuente actual en inglés</li>
-<li><strong>Merge</strong>: <code>msgmerge</code> actualiza el archivo <code>.po</code> de cada idioma; las cadenas nuevas se establecen con un <code>msgstr ""</code> vacío; las cadenas modificadas se marcan con <code>#, fuzzy</code> y se conserva la traducción anterior como punto de partida.</li>
+<li><strong>Extraer</strong>: <code>mdbook-xgettext</code> regenera <code>po/messages.pot</code> a partir de la fuente actual en inglés.</li>
+<li><strong>Merge</strong>: <code>msgmerge</code> actualiza el archivo <code>.po</code> de cada configuración regional; las cadenas nuevas reciben un <code>msgstr ""</code> vacío; las cadenas modificadas se marcan con <code>#, fuzzy</code> y la traducción anterior se conserva como punto de partida.</li>
 </ol>
-<p>Luego, el comando cuenta las entradas difusas y sin traducir. Si hay un delta y se proporciona <code>--provider</code>, la herramienta <code>fill-translations</code> traduce únicamente esas entradas. <strong>Las cadenas sin cambios no tienen costo</strong> — el caché del archivo <code>.po</code> significa que volver a ejecutarlo contra el código fuente sin cambios es una operación que no realiza ninguna acción.</p>
-<p>Sin <code>--provider</code>, <code>cargo mdbook sync</code> sigue ejecutando extract + merge e informa cuántas cadenas necesitan traducción. Las cadenas sin <code>msgstr</code> se vuelven a traducir al inglés en el momento de la representación; las traducciones parciales son válidas.</p>
-<p><code>cargo mdbook sync</code> normaliza los catálogos gettext generados con reglas de salida estables (<code>msgcat --sort-output --no-wrap --add-location=file</code>). Esto mantiene los diffs centrados en los cambios reales del código fuente y evita la modificación global de los números de línea por ediciones pequeñas.</p>
-<p>Variación inevitable esperada:</p>
-<ul>
-<li>Actualizaciones de metadatos de encabezado (por ejemplo <code>POT-Creation-Date</code> / <code>PO-Revision-Date</code>)</li>
-<li>Actualiza la referencia cuando una cadena se mueve a un archivo de origen diferente</li>
-<li>Adiciones, eliminaciones y ediciones reales de cadenas de origen</li>
-</ul>
-<p>Verificación rápida de estabilidad después de una pequeña edición de documentación:</p>
-<pre><code class="language-bash">cargo mdbook sync
-git diff --numstat -- docs/book/po
-</code></pre>
-<p>Las PR rutinarias de documentación en inglés no necesitan incluir el ruido de archivos <code>.po</code> generados cuando la salida de sincronización es amplia y difícil de revisar. Mantén la PR de texto enfocada, deja la actualización del catálogo generado para una PR dedicada de caché de traducción, e indícalo en el cuerpo de la PR:</p>
-<blockquote>
-<p>Se omitió la confirmación de las actualizaciones generadas de <code>.po</code>: este es un cambio que solo afecta a la documentación en inglés, y <code>cargo mdbook sync</code> produciría una amplia rotación en el catálogo de gettext. Las actualizaciones de la caché de traducción se aplazan a un PR de seguimiento dedicado.</p>
-</blockquote>
-<p>Incluye actualizaciones de <code>.po</code> solo cuando se cumpla una de estas condiciones:</p>
-<ul>
-<li>El PR es específicamente un paso de caché de traducción o de traducción de versión.</li>
-<li>La PR agrega una nueva configuración regional.</li>
-<li><code>cargo mdbook sync</code> produce un diff pequeño y revisable, limitado a las cadenas modificadas por el PR.</li>
-</ul>
-<h2 id="añadiendo-una-nueva-configuración-regional"><a class="header" href="#añadiendo-una-nueva-configuración-regional">Añadiendo una nueva configuración regional</a></h2>
-<ol>
-<li>
-<p>Edita <code>locales.toml</code> en la raíz del repositorio — el <strong>único</strong> archivo que necesitas modificar:</p>
-<pre><code class="language-toml">[[locale]]
-code = "xx"
-label = "Nombre del idioma"
-</code></pre>
-<p>Todo lo demás (<code>lang-switcher.js</code>, CI, <code>cargo fluent fill</code>, <code>cargo mdbook sync</code>) lee automáticamente desde este archivo.</p>
-</li>
-<li>
-<p>Iniciar y completar las traducciones de la documentación:</p>
-<pre><code class="language-bash">cargo mdbook sync --locale xx --provider ollama
-</code></pre>
-<p>Si el archivo <code>.po</code> no existe, se inicializa automáticamente y luego se rellenan todas las entradas.</p>
-</li>
-<li>
-<p>Validar y previsualizar:</p>
-<pre><code class="language-bash">cargo mdbook check              # sale con código de salida no cero en errores de formato
-cargo mdbook stats              # mostrar los conteos de cobertura
-cargo mdbook serve --locale xx
-</code></pre>
-</li>
-</ol>
-<h2 id="flujo-de-trabajo-de-traducción-de-la-versión"><a class="header" href="#flujo-de-trabajo-de-traducción-de-la-versión">Flujo de trabajo de traducción de la versión</a></h2>
-<p>Antes de etiquetar una versión, ejecuta un pase completo de traducción localmente y confirma los archivos <code>.po</code> actualizados.</p>
-<pre><code class="language-bash"># Paso rápido de delta (solo cadenas nuevas o modificadas desde la última versión)
-cargo mdbook sync --provider ollama
-
-# OR: pase de calidad — volver a traducir todo
-cargo mdbook sync --provider ollama --force
-
-cargo mdbook check   # validar antes de confirmar
-cargo mdbook stats   # cobertura de revisión
-</code></pre>
-<p>El modelo utilizado es el que esté configurado en <code>[providers.models.&lt;name&gt;]</code> en <code>config.toml</code>.</p>
-<h2 id="consejos"><a class="header" href="#consejos">Consejos</a></h2>
-<ul>
-<li><strong>Iteración rápida en el texto:</strong> <code>cargo mdbook serve</code> reconstruye automáticamente al guardar. Omite <code>cargo mdbook refs</code> a menos que hayas modificado las banderas de la CLI o el esquema de configuración.</li>
-<li><strong>Iteración rápida en las traducciones:</strong> edita <code>po/&lt;locale&gt;.po</code> y recarga el navegador — mdbook serve detecta los cambios en <code>.po</code> y reconstruye automáticamente.</li>
-<li><strong>Limpieza:</strong> <code>rm -rf docs/book/book target/doc</code> elimina todo lo generado.</li>
-<li><strong>Ejecuciones sin costo:</strong> <code>cargo mdbook sync</code> contra la fuente en inglés sin cambios se completa en segundos: sin llamadas a IA, sin costo.</li>
-</ul>
+<p>Luego el comando cuenta las entradas difusas + sin traducir y, cuando se proporciona <code>--model-provider</code>, completa solo esas. Las cadenas sin cambios no cuestan nada: la caché de <code>.po</code> significa que volver a ejecutar contra un código fuente sin cambios es una operación nula. Sin <code>--model-provider</code>, sync aún ejecuta extract + merge e informa el delta; las cadenas sin <code>msgstr</code> recurren al inglés en el momento del renderizado.</p>
+<p>La sincronización normaliza los catálogos con reglas de salida estables (<code>msgcat --sort-output --no-wrap --add-location=file</code>), de modo que los diffs se mantienen enfocados en los cambios reales del código fuente. Cambios inevitables: metadatos del encabezado (<code>POT-Creation-Date</code>, etc.), actualizaciones de ubicaciones de referencia cuando una cadena cambia de archivo, y ediciones reales de cadenas de origen.</p>
+<p>Los PRs rutinarios de documentación en inglés pueden aplazar cambios extensos en archivos <code>.po</code> a un seguimiento específico. Incluya actualizaciones de <code>.po</code> solo cuando el PR sea una pasada de caché de traducciones, una pasada de traducciones de versión, agregue una configuración regional o produzca un diff pequeño y fácil de revisar.</p>
 <h2 id="rellenar-cadenas-de-la-aplicación-fluent"><a class="header" href="#rellenar-cadenas-de-la-aplicación-fluent">Rellenar cadenas de la aplicación (Fluent)</a></h2>
 <p>Las cadenas de la aplicación se encuentran en <code>crates/zeroclaw-runtime/locales/</code>. El inglés es la fuente de verdad y se incrusta en tiempo de compilación.</p>
 <blockquote>
-<p><strong>Advertencia sobre la carga en tiempo de ejecución (verifícalo antes de depender de esto).</strong> Al momento de escribir esto, solo <code>en</code> y <code>zh-CN</code> están integrados en el runtime: <code>crates/zeroclaw-runtime/src/i18n.rs</code> los incrusta mediante <code>include_str!</code>, y <code>builtin_cli_ftl_source()</code> devuelve <code>None</code> para cualquier otra configuración regional. Existe una ruta de sobrescritura en disco (<code>load_ftl_from_disk</code> → <code>workspace_dir_from_config</code>), pero resuelve una clave de configuración de nivel superior <code>workspace_dir</code> que ya no existe en v0.8.0 y recurre a <code>~/.zeroclaw/workspace</code>, que v0.8.0 no crea. <strong>Por lo tanto, un archivo <code>ja/cli.ftl</code> recién completado se genera y se confirma, pero en realidad no se carga en tiempo de ejecución</strong> hasta que se agregue la configuración regional a <code>builtin_cli_ftl_source()</code> o se repare la ruta de sobrescritura en disco. Confirma el estado actual en <code>i18n.rs</code> en lugar de confiar en esta nota.</p>
+<p><strong>Advertencia sobre carga en tiempo de ejecución (verifíquelo antes de confiar en esto).</strong> Solo <code>en</code> y <code>zh-CN</code> están integrados en el runtime como predefinidos: <code>crates/zeroclaw-runtime/src/i18n.rs</code> incrusta <code>en</code> mediante <code>include_str!</code>, y <code>builtin_cli_ftl_source()</code> devuelve el catálogo <code>zh-CN</code> incrustado para <code>zh-CN</code> y <code>None</code> para cualquier otra configuración regional. Existe una ruta de anulación en disco: <code>load_ftl_from_disk</code> resuelve <code>zeroclaw_config::schema::ftl_locale_dir(locale)</code>, es decir, <code>&lt;config-dir&gt;/data/ftl/&lt;locale&gt;/cli.ftl</code> (la misma ubicación que rellena <code>zeroclaw locales fetch</code>). <strong>Por lo tanto, un <code>ja/cli.ftl</code> recién completado se genera y se confirma en el repositorio, pero no se carga en tiempo de ejecución</strong> a menos que la configuración regional se añada a <code>builtin_cli_ftl_source()</code> o el <code>cli.ftl</code> completado se coloque en <code>&lt;config-dir&gt;/data/ftl/ja/</code>. Confirme el estado actual en <code>i18n.rs</code> y <code>zeroclaw_config::schema::ftl_locale_dir</code> en lugar de fiarse de esta nota.</p>
+<p>La TUI de <code>apps/zerocode</code> mantiene un catálogo Fluent independiente (<code>apps/zerocode/locales/</code>), consulta <a href="#zerocode-strings-fluent-independent">cadenas de zerocode</a> más abajo. <code>cargo fluent</code> recorre <strong>ambas</strong> raíces de catálogos (runtime + zerocode), por lo que cada subcomando a continuación cubre ambas de forma predeterminada.</p>
 </blockquote>
-<blockquote>
-<p>La TUI de <code>apps/zerocode</code> mantiene un catálogo Fluent independiente (<code>apps/zerocode/locales/</code>) — consulta <a href="#zerocode-strings-fluent-independent">cadenas de zerocode</a> más abajo. <code>cargo fluent</code> recorre <strong>ambas</strong> raíces de catálogos (runtime + zerocode), por lo que cada subcomando que aparece a continuación cubre ambas de forma predeterminada.</p>
-</blockquote>
-<pre><code class="language-bash">cargo fluent stats                                                   # cobertura por configuración regional, por catálogo
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">cargo fluent stats                                                   # cobertura por configuración regional, por catálogo
 cargo fluent check                                                   # validar la sintaxis de `.ftl` en ambos catálogos
 cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt;             # fill missing keys (default batch 50)
 cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --batch 10  # lotes más pequeños: menos entradas por solicitud (reduce los límites de tasa / truncamiento)
 cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --force     # volver a traducir todo
 cargo fluent scan                                                    # Buscar claves obsoletas o faltantes frente al código fuente de Rust
 </code></pre>
-<p><strong>Limitación a un catálogo</strong> — cada subcomando admite <code>--catalog &lt;runtime|zerocode&gt;</code> (predeterminado: ambos). Para traducir solo la TUI:</p>
-<pre><code class="language-bash">cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --catalog zerocode
+</div>
+
+<p><strong>Limitar a un solo catálogo</strong>: cada subcomando acepta <code>--catalog &lt;runtime|zerocode&gt;</code> (predeterminado: ambos). Para traducir solo la TUI:</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">cargo fluent fill --locale ja --model-provider anthropic.&lt;alias&gt; --catalog zerocode
 cargo fluent check --catalog zerocode                                # solo verificación de sintaxis zerocode
 </code></pre>
+</div>
+
 <p>Un valor <code>--catalog</code> desconocido genera un error con las opciones válidas.</p>
-<p><code>fill</code> genera <code>&lt;locale&gt;/&lt;domain&gt;.ftl</code> para cada raíz de catálogo seleccionada que tenga un directorio <code>en/</code> — los <code>cli.ftl</code>/<code>tools.ftl</code> del runtime y el <code>zerocode.ftl</code> de zerocode.</p>
-<p><strong>La resolución de proveedores se comparte con el runtime.</strong> <code>--model-provider</code> acepta cualquier alias configurado bajo <code>[providers.models.&lt;kind&gt;.&lt;alias&gt;]</code> — un alias simple (<code>&lt;alias&gt;</code>) o un calificador <code>kind.alias</code> (<code>anthropic.&lt;alias&gt;</code>) cuando es ambiguo. La herramienta construye el proveedor de runtime real, por lo que el endpoint, la cabecera de autenticación y el protocolo de comunicación se resuelven por familia (Anthropic <code>/v1/messages</code> + <code>x-api-key</code>, compatible con OpenAI <code>/v1/chat/completions</code> + <code>Bearer</code>, etc.) — no se asume nada. Los valores <code>api_key</code> cifrados se descifran mediante el <code>SecretStore</code> canónico. Usa <code>--config-dir &lt;dir&gt;</code> (refleja <code>zeroclaw --config-dir</code>) para leer la configuración + <code>.secret-key</code> desde una ubicación no predeterminada; por defecto es <code>~/.zeroclaw</code> y luego <code>~/.config/zeroclaw</code>.</p>
-<p><strong>Procesamiento por lotes:</strong> <code>fill</code> envía una solicitud por lote (las N entradas como un único objeto JSON); <code>--batch</code> reduce N para aliviar los límites de tasa del proveedor o el truncamiento de respuestas en entradas largas. Cada lote se escribe en disco antes de la siguiente solicitud, por lo que un fallo a mitad de ejecución solo pierde el lote en curso. Al volver a ejecutarlo, se omiten las claves que ya existen en el <code>.ftl</code> de destino, así que la reanudación es automática — no se necesita <code>--force</code>.</p>
+<p><code>fill</code> genera <code>&lt;locale&gt;/&lt;domain&gt;.ftl</code> para cada raíz de catálogo seleccionada que tenga un directorio <code>en/</code>: los archivos <code>cli.ftl</code>/<code>tools.ftl</code> del runtime y <code>zerocode.ftl</code> de zerocode.</p>
+<p><strong>La resolución de proveedores se comparte con el runtime.</strong> <code>--model-provider</code> acepta cualquier alias configurado bajo <code>[providers.models.&lt;kind&gt;.&lt;alias&gt;]</code>: un alias simple (<code>&lt;alias&gt;</code>) o un calificador <code>kind.alias</code> (<code>anthropic.&lt;alias&gt;</code>) cuando hay ambigüedad. La herramienta construye el proveedor real del runtime, por lo que el endpoint, el encabezado de autenticación y el protocolo de transmisión se resuelven por familia (Anthropic <code>/v1/messages</code> + <code>x-api-key</code>, compatible con OpenAI <code>/v1/chat/completions</code> + <code>Bearer</code>, etc.): nada se da por supuesto. Los valores de <code>api_key</code> cifrados se descifran mediante el <code>SecretStore</code> canónico. Use <code>--config-dir &lt;dir&gt;</code> (equivalente a <code>zeroclaw --config-dir</code>) para leer la configuración + <code>.secret-key</code> desde una ubicación no predeterminada; por defecto usa <code>~/.zeroclaw</code> y luego <code>~/.config/zeroclaw</code>.</p>
+<p><strong>Procesamiento por lotes:</strong> <code>fill</code> envía una solicitud por lote (las N entradas como un único objeto JSON); <code>--batch</code> reduce N para aliviar los límites de tasa del proveedor o el truncamiento de respuestas en entradas largas. Cada lote se escribe en disco antes de la siguiente solicitud, por lo que un fallo a mitad de ejecución solo pierde el lote en curso. Al volver a ejecutar se omiten las claves que ya existen en el <code>.ftl</code> de destino, de modo que la reanudación es automática: no se necesita <code>--force</code>.</p>
 <h2 id="zerocode-strings-fluent-independiente"><a class="header" href="#zerocode-strings-fluent-independiente">zerocode strings (Fluent, independiente)</a></h2>
-<p><code>apps/zerocode</code> incluye su propia configuración de Fluent autónoma, independiente de los catálogos de runtime anteriores. La TUI está intencionalmente desacoplada del resto del workspace: no tiene ninguna dependencia del crate <code>zeroclaw-*</code>, y sus strings residen junto a su código fuente en lugar de bajo <code>zeroclaw-runtime/locales/</code>.</p>
+<p><code>apps/zerocode</code> incluye su propia configuración de Fluent autocontenida, separada de los catálogos del runtime mencionados arriba. La TUI está intencionalmente desacoplada del resto del workspace: no tiene ninguna dependencia de crates <code>zeroclaw-*</code>, y sus cadenas residen junto a su código fuente en lugar de bajo <code>zeroclaw-runtime/locales/</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -403,62 +422,87 @@ cargo fluent check --catalog zerocode                                # solo veri
 <h3 id="espacio-de-nombres-de-claves"><a class="header" href="#espacio-de-nombres-de-claves">Espacio de nombres de claves</a></h3>
 <p>Todas las claves zerocode llevan el prefijo <code>zc-</code> y nunca colisionan con los espacios de nombres <code>cli-</code>, <code>channel-</code> ni <code>tool-</code> del runtime. La convención dentro de <code>zc-</code> es <code>zc-&lt;pane&gt;-&lt;purpose&gt;</code>:</p>
 <ul>
-<li><code>zc-pane-&lt;name&gt;</code> — etiquetas de la barra de modo de nivel superior</li>
-<li><code>zc-app-&lt;purpose&gt;</code> — cadenas gestionadas por <code>app.rs</code> (diálogos, ayuda, estado)</li>
-<li><code>zc-&lt;pane&gt;-&lt;purpose&gt;</code> — cadenas locales a un panel específico (<code>zc-dashboard-*</code>, <code>zc-chat-*</code>, …)</li>
+<li><code>zc-pane-&lt;name&gt;</code>: etiquetas de la barra de modos de nivel superior</li>
+<li><code>zc-app-&lt;purpose&gt;</code>: cadenas pertenecientes a <code>app.rs</code> (diálogos, ayuda, estado)</li>
+<li><code>zc-&lt;pane&gt;-&lt;purpose&gt;</code>: cadenas locales de un panel específico (<code>zc-dashboard-*</code>, <code>zc-chat-*</code>, …)</li>
 </ul>
 <h3 id="los-acordes-literales-no-se-traducen"><a class="header" href="#los-acordes-literales-no-se-traducen">Los acordes literales no se traducen</a></h3>
 <p>Los glifos de combinación de teclas como <code>Ctrl+C</code>, <code>Esc</code>, <code>Shift+Up</code> son protocolo, no idioma. Los constructores <code>HelpEntry</code> y <code>HelpNode</code> reciben el vector de combinaciones como <code>&amp;'static str</code> y la descripción como <code>String</code>, de modo que los literales de combinación permanecen codificados de forma fija mientras que las descripciones pasan por <code>t()</code>. Cuando la prosa incrusta una combinación de teclas en línea, usa un espacio reservado de Fluent <code>{ $keys }</code> y pasa la combinación en el momento del renderizado en lugar de concatenar texto traducido alrededor de un literal.</p>
 <h3 id="resolución-de-configuración-regional"><a class="header" href="#resolución-de-configuración-regional">Resolución de configuración regional</a></h3>
-<p>Locale comes from a top-level <code>locale</code> field in <code>zerocode-config.toml</code>. When unset, <code>i18n::detect_locale()</code> reads a single file — <code>&lt;config-dir&gt;/zerocode-config.toml</code>, where the config dir is resolved as <code>--config-dir</code>, then <code>ZEROCLAW_CONFIG_DIR</code>, then <code>~/.zeroclaw</code> — and otherwise falls back to <code>en</code>. zerocode resolves its locale independently from its own <code>zerocode-config.toml</code>; it does not share the daemon’s lookup.</p>
+<p>La configuración regional proviene de un campo <code>locale</code> de nivel superior en la configuración de zerocode. Cuando no está establecido, <code>i18n::detect_locale()</code> lee el directorio de configuración resuelto como <code>--config-dir</code>, luego <code>ZEROCLAW_CONFIG_DIR</code>, luego <code>~/.zeroclaw</code>, y en caso contrario recurre a <code>en</code> como valor predeterminado. zerocode resuelve su configuración regional de forma independiente a partir de su propia configuración; no comparte la búsqueda del daemon.</p>
 <h3 id="agregando-cadenas"><a class="header" href="#agregando-cadenas">Agregando cadenas</a></h3>
 <ol>
 <li>Añade la clave + el valor en inglés a <code>apps/zerocode/locales/en/zerocode.ftl</code>. Agrupa las claves por archivo de origen con un comentario de sección para que el catálogo siga siendo fácil de revisar.</li>
-<li>Reemplaza el literal en el código fuente por <code>crate::i18n::t("zc-…")</code>. Para los brazos <code>match</code> de enum→etiqueta, devuelve la constante de clave (<code>&amp;'static str</code>) desde un método <code>fluent_key()</code> y llama a <code>t()</code> en el punto de renderizado — nunca uses <code>match</code> sobre una cadena.</li>
+<li>Reemplaza el literal en el código fuente con <code>crate::i18n::t("zc-…")</code>. Para los brazos de <code>match</code> de enum→etiqueta, devuelve la constante de clave (<code>&amp;'static str</code>) desde un método <code>fluent_key()</code> y llama a <code>t()</code> en el punto de renderizado, nunca hagas <code>match</code> sobre una cadena.</li>
 <li><code>cargo check -p zerocode</code> y las pruebas unitarias de <code>i18n</code> (<code>cargo test -p zerocode i18n</code>) detectan las claves faltantes en tiempo de compilación/prueba. Las claves faltantes en tiempo de ejecución se muestran como <code>{zc-key-name}</code> y emiten una advertencia única por <code>stderr</code>.</li>
 </ol>
 <h3 id="rellenando-traducciones"><a class="header" href="#rellenando-traducciones">Rellenando traducciones</a></h3>
 <p><code>cargo fluent</code> recorre el catálogo de zerocode junto con el del runtime, por lo que no se necesita ningún paso manual. Al ejecutar <code>cargo fluent fill --locale &lt;code&gt; --model-provider &lt;alias&gt;</code> se genera <code>apps/zerocode/locales/&lt;code&gt;/zerocode.ftl</code> en la misma pasada que rellena el catálogo del runtime. <code>cargo fluent check</code> y <code>cargo fluent stats</code> también informan sobre zerocode; <code>scan</code> indexa <code>apps/</code>, de modo que las referencias a claves <code>zc-</code> se resuelven contra el código fuente de zerocode. El archivo <code>&lt;code&gt;/zerocode.ftl</code> generado se incrusta en el árbol de código en tiempo de compilación, o puede colocarse en cualquiera de las rutas de búsqueda en disco mencionadas arriba para realizar pruebas con <code>--config-dir</code>.</p>
 <h2 id="rellenando-traducciones-de-documentación-gettext"><a class="header" href="#rellenando-traducciones-de-documentación-gettext">Rellenando traducciones de documentación (gettext)</a></h2>
-<p>Las traducciones de la documentación se encuentran en <code>docs/book/po/</code>. <code>cargo mdbook sync</code> ejecuta extract → merge → strip obsolete → AI-fill en un solo paso. Sin <code>--model-provider</code>, sync sigue ejecutando extract + merge e informa cuántas cadenas necesitan traducción; las traducciones parciales recurren al inglés al renderizar.</p>
-<pre><code class="language-bash">cargo mdbook sync --model-provider anthropic.&lt;alias&gt;              # delta fill
+<p>Las traducciones de documentación se encuentran en <code>docs/book/po/</code>. <code>cargo mdbook sync</code> ejecuta extract → merge → strip obsolete → AI-fill en un solo paso. Sin <code>--model-provider</code>, sync igualmente ejecuta extract + merge e informa cuántas cadenas necesitan traducción: las traducciones parciales recurren al inglés en el momento del renderizado.</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook sync --model-provider anthropic.&lt;alias&gt;              # delta fill
 cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --force      # pase de calidad: volver a traducir todas las entradas
 cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --batch 1    # escribir después de cada entrada (reanudación más segura)
 cargo mdbook sync --locale ja --model-provider anthropic.&lt;alias&gt;  # single locale
 cargo mdbook sync --model-provider anthropic.&lt;alias&gt; --config-dir ~/.zeroclaw  # alias calificado + directorio de configuración explícito
 </code></pre>
-<p><code>--model-provider</code> se resuelve a través de la misma ruta compartida de proveedor en tiempo de ejecución que <code>cargo fluent</code> (cualquier familia/alias configurado, endpoint por familia + autenticación + protocolo de cable, descifrado de <code>SecretStore</code>, compatibilidad con <code>--config-dir</code>). A diferencia de <code>cargo fluent</code> —que envía un lote completo como un único objeto JSON— el rellenador de gettext emite <strong>una solicitud por cada cadena de origen</strong> para mantener inequívoca la asignación <code>msgid → msgstr</code>, por lo que <code>--batch</code> controla con qué frecuencia se vuelca el <code>.po</code> al disco (el intervalo de checkpoint), no el tamaño de la solicitud. Un locale de catálogo completo son miles de solicitudes secuenciales; para rellenos delta rutinarios, un alias local económico de Ollama es la opción rentable.</p>
+</div>
+
+<p><code>--model-provider</code> se resuelve a través de la misma ruta compartida de proveedor en tiempo de ejecución que <code>cargo fluent</code> (cualquier familia/alias configurado, endpoint por familia + autenticación + protocolo de transmisión, descifrado de <code>SecretStore</code>, compatibilidad con <code>--config-dir</code>). A diferencia de <code>cargo fluent</code>, que envía un lote completo como un único objeto JSON, el rellenador de gettext emite <strong>una solicitud por cada cadena de origen</strong> para mantener inequívoca la correspondencia <code>msgid → msgstr</code>, por lo que <code>--batch</code> controla con qué frecuencia se vuelca el <code>.po</code> a disco (el intervalo de punto de control), no el tamaño de la solicitud. Una configuración regional con el catálogo completo supone miles de solicitudes secuenciales; para rellenos incrementales rutinarios, un alias local económico de Ollama es la opción más rentable.</p>
 <p>El pipeline tiene resiliencia integrada:</p>
 <ul>
-<li><strong>Detección de fugas</strong> — si un modelo devuelve sus propias instrucciones en lugar de una traducción, la herramienta detecta el patrón (mediante la relación de longitud de la respuesta y la estructura de lista con viñetas), intenta recuperar la traducción real a partir del final de la respuesta y omite la entrada para su re-traducción si la recuperación falla.</li>
-<li><strong>Escrituras incrementales</strong> — después de cada lote, el archivo <code>.po</code> se vuelve a escribir. Un Ctrl-C durante la ejecución no pierde el progreso alcanzado hasta ese momento.</li>
-<li><strong>Eliminación de cadenas obsoletas</strong> — <code>msgmerge</code> + <code>msgattrib --no-obsolete</code> evita que las cadenas de origen eliminadas se acumulen como entradas <code>#~</code>.</li>
+<li><strong>Detección de fugas</strong>: si un modelo devuelve sus propias instrucciones en lugar de una traducción, la herramienta detecta el patrón (mediante la proporción de longitud de la respuesta y la estructura de listas con viñetas), intenta recuperar la traducción real del final de la respuesta y deja la entrada en blanco para volver a traducirla si la recuperación falla.</li>
+<li><strong>Verificaciones de literales protegidos</strong>: <code>cargo mdbook check</code> también rechaza corrupción de literales de alta confianza en los archivos <code>.po</code> generados. Los nombres de producto como <code>ZeroClaw Maturity Framework</code>, los literales de comandos como <code>zeroclaw daemon</code> y los literales de secciones/claves TOML en bloques delimitados deben permanecer intactos byte por byte dentro de las traducciones. Traduce la prosa circundante, no el texto destinado a las máquinas.</li>
+<li><strong>Escrituras incrementales</strong>: después de cada lote, el archivo <code>.po</code> se reescribe. Un Ctrl-C a mitad de la ejecución no pierde el progreso logrado hasta ese momento.</li>
+<li><strong>Eliminación de obsoletos</strong>: <code>msgmerge</code> + <code>msgattrib --no-obsolete</code> evitan que las cadenas eliminadas del código fuente se acumulen como entradas <code>#~</code>.</li>
 </ul>
 <p>Los mantenedores deben aceptar la excepción habitual de documentación en inglés documentada en <a href="../developing/building-docs.html">Building the docs locally</a>. Solicita actualizaciones de <code>.po</code> solo cuando el PR sea en sí mismo una pasada de caché de traducción, una pasada de traducción de versión, un cambio de nuevo idioma, o el diff generado sea lo suficientemente pequeño como para revisarlo.</p>
-<h2 id="añadiendo-una-nueva-configuración-regional-1"><a class="header" href="#añadiendo-una-nueva-configuración-regional-1">Añadiendo una nueva configuración regional</a></h2>
+<h2 id="añadiendo-una-nueva-configuración-regional"><a class="header" href="#añadiendo-una-nueva-configuración-regional">Añadiendo una nueva configuración regional</a></h2>
 <ol>
 <li>
-<p>Edita <code>locales.toml</code> en la raíz del repositorio — el <strong>único</strong> archivo que necesitas modificar:</p>
-<pre><code class="language-toml">[[locale]]
-code = "&lt;code&gt;"
-label = "Nombre del idioma"
-</code></pre>
+<p>Edita <code>locales.toml</code> en la raíz del repositorio, el <strong>único</strong> archivo que necesitas modificar:</p>
 </li>
 <li>
 <p>Traduce las cadenas de la aplicación:</p>
-<pre><code class="language-bash">cargo fluent fill --locale &lt;code&gt; --provider ollama
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">cargo fluent fill --locale &lt;code&gt; --model-provider ollama
 </code></pre>
+</div>
+
 </li>
 <li>
 <p>Inicia y completa el archivo de documentación <code>.po</code>:</p>
-<pre><code class="language-bash">cargo mdbook sync --locale &lt;code&gt; --provider ollama
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">cargo mdbook sync --locale &lt;code&gt; --model-provider ollama
 </code></pre>
+</div>
+
 </li>
 <li>
-<p>Para mantener la paridad con zerocode, copia <code>apps/zerocode/locales/en/zerocode.ftl</code> a <code>apps/zerocode/locales/&lt;code&gt;/zerocode.ftl</code> y traduce los valores manualmente. <code>cargo fluent</code> todavía no opera sobre el catálogo de zerocode; el archivo se puede colocar en cualquiera de las rutas de búsqueda en disco o incrustar en el árbol una vez traducido.</p>
+<p>La ejecución de <code>cargo fluent fill</code> en el paso 2 ya genera <code>apps/zerocode/locales/&lt;code&gt;/zerocode.ftl</code> en la misma pasada, dado que <code>cargo fluent</code> recorre tanto los catálogos de runtime como los de zerocode. No se necesita ningún paso manual de zerocode; verifique la cobertura con <code>cargo fluent stats</code>.</p>
 </li>
 </ol>
-<p>Todo lo demás — <code>lang-switcher.js</code>, la lista de destinos de implementación de CI, la salida de <code>cargo mdbook locales</code> — lee automáticamente desde <code>locales.toml</code>.</p>
+<p>Todo lo demás, <code>lang-switcher.js</code>, la lista de destinos de despliegue de CI, la salida de <code>cargo mdbook locales</code>, se lee automáticamente desde <code>locales.toml</code>.</p>
+<h2 id="flujo-de-trabajo-de-traducción-de-la-versión"><a class="header" href="#flujo-de-trabajo-de-traducción-de-la-versión">Flujo de trabajo de traducción de la versión</a></h2>
+<p>Antes de etiquetar una versión, ejecuta un pase completo de traducción localmente y confirma los archivos <code>.po</code> actualizados.</p>
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh"># Paso rápido de delta (solo cadenas nuevas o modificadas desde la última versión)
+cargo mdbook sync --model-provider ollama
+
+# OR: pase de calidad — volver a traducir todo
+cargo mdbook sync --model-provider ollama --force
+
+cargo mdbook check   # validar antes de confirmar
+cargo mdbook stats   # cobertura de revisión
+</code></pre>
+</div>
+
+<p>El modelo utilizado es el que esté configurado en <code>providers.models.&lt;name&gt;</code>.</p>
 <h2 id="notas-sobre-la-calidad-del-modelo"><a class="header" href="#notas-sobre-la-calidad-del-modelo">Notas sobre la calidad del modelo</a></h2>
 <p>La calidad de la traducción varía significativamente según el idioma y el modelo.</p>
 <div class="table-wrapper">
@@ -467,8 +511,8 @@ label = "Nombre del idioma"
 <tr><th>Configuración regional</th><th>Bien fundamentado por</th><th>Notas</th></tr>
 </thead>
 <tbody>
-<tr><td><code>ja</code>, <code>zh-CN</code></td><td>Familia Qwen3.6, ¿algún modelo alojado en la frontera?</td><td>Qwen es de origen chino; también tiene una fuerte presencia en japonés.</td></tr>
-<tr><td><code>es</code>, <code>fr</code></td><td>qwen3.6, mistral, gemma3, alojado</td><td>Los idiomas romances están ampliamente bien entrenados.</td></tr>
+<tr><td><code>ja</code>, <code>zh-CN</code></td><td>familia qwen3, cualquier modelo frontier alojado</td><td>Qwen es de origen chino; también tiene una fuerte presencia en japonés.</td></tr>
+<tr><td><code>es</code>, <code>fr</code></td><td>qwen3, mistral, gemma3, hosted</td><td>Los idiomas romances están ampliamente bien entrenados.</td></tr>
 <tr><td>Idiomas con recursos limitados</td><td>Solo modelos de frontera alojados</td><td>Los modelos locales a menudo alucinan palabras</td></tr>
 </tbody>
 </table>
@@ -519,6 +563,114 @@ label = "Nombre del idioma"
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>

@@ -37,10 +37,84 @@
             const path_to_root = "../";
             const default_light_theme = "default-dark";
             const default_dark_theme = "default-dark";
-            window.path_to_searchindex_js = "../searchindex-229b6d25.js";
+            window.path_to_searchindex_js = "../searchindex-85e3e40f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a643e72b.js"></script>
+        <script src="../toc-98474cc2.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -85,20 +159,22 @@
 
         <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
 
-        <!-- Hide / unhide sidebar before it is displayed -->
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
         <script>
             let sidebar = null;
             const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
-            if (document.body.clientWidth >= 1080) {
-                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
-                sidebar = sidebar || 'visible';
-            } else {
-                sidebar = 'hidden';
-                sidebar_toggle.checked = false;
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
             }
             if (sidebar === 'visible') {
                 sidebar_toggle.checked = true;
             } else {
+                sidebar_toggle.checked = false;
                 html.classList.remove('sidebar-visible');
             }
         </script>
@@ -135,6 +211,7 @@
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
                             <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
@@ -220,96 +297,25 @@
 <p>Le routage se produit au niveau de la <strong>couche agent</strong>. Chaque agent pointe vers exactement un fournisseur ; les canaux pointent vers les agents.</p>
 <p>Deux niveaux de décisions :</p>
 <ol>
-<li><strong>Sélection du backend par appel</strong> — « utiliser le modèle économique sauf si ce prompt ressemble à du raisonnement ». Chaque cible de routage est sa propre entrée <code>[agents.&lt;alias&gt;]</code> avec son propre <code>model_provider</code>. Les canaux sont routés vers l’agent qui doit gérer leur trafic.</li>
-<li><strong>Fiabilité du fournisseur</strong> — la redondance entre prestataires est gérée par un unique fournisseur de premier ordre. Configurez OpenRouter (ou un équivalent) comme fournisseur unique et laissez-le répartir les requêtes entre les prestataires depuis son endpoint.</li>
+<li><strong>Sélection du backend par appel</strong> : « utiliser le modèle économique sauf si ce prompt ressemble à du raisonnement. » Chaque cible de routage est une entrée <code>[agents.&lt;alias&gt;]</code> distincte avec son propre <code>model_provider</code>. Les canaux sont routés vers l’agent qui doit traiter leur trafic.</li>
+<li><strong>Fiabilité des fournisseurs</strong> : la redondance multi-fournisseurs est gérée derrière un seul fournisseur de premier ordre. Configurez OpenRouter (ou un équivalent) comme fournisseur unique et laissez-le gérer la répartition entre fournisseurs au niveau de son point de terminaison.</li>
 </ol>
 <h2 id="répartition-par-agent"><a class="header" href="#répartition-par-agent">Répartition par agent</a></h2>
 <p>Définissez chaque cible de routage comme son propre agent, puis dirigez les canaux vers l’agent qui doit gérer leur trafic.</p>
-<pre><code class="language-toml">[providers.models.anthropic.sonnet]
-model   = "claude-sonnet-4-6"
-api_key = "sk-ant-..."
-
-[providers.models.anthropic.haiku]
-model   = "claude-haiku-4-5-20251001"
-api_key = "sk-ant-..."
-
-[providers.models.deepseek.reasoner]
-model   = "deepseek-reasoner"
-api_key = "sk-..."
-
-[providers.models.gemini.vision]
-model   = "gemini-2.5-pro"
-api_key = "..."
-
-[channels.telegram.home]
-bot_token = "..."
-
-[channels.slack.engineering]
-bot_token = "..."
-
-[channels.slack.research]
-bot_token = "..."
-
-[channels.discord.media]
-bot_token = "..."
-
-[agents.fast]
-model_provider  = "anthropic.haiku"
-risk_profile    = "hardened"
-runtime_profile = "tight"             # réponses publiques réactives
-channels        = ["telegram.home"]
-
-[agents.deep]
-model_provider  = "anthropic.sonnet"
-risk_profile    = "hardened"
-runtime_profile = "deep"              # tâches d'ingénierie approfondies
-channels        = ["slack.engineering"]
-
-[agents.reasoner]
-model_provider  = "deepseek.reasoner"
-risk_profile    = "hardened"
-runtime_profile = "deep"              # chaînes de raisonnement de type recherche
-channels        = ["slack.research"]
-
-[agents.eyes]
-model_provider  = "gemini.vision"
-risk_profile    = "hardened"
-runtime_profile = "tight"             # réponses rapides avec images
-channels        = ["discord.media"]
-
-[risk_profiles.hardened]
-level                            = "supervised"
-workspace_only                   = true
-require_approval_for_medium_risk = true
-block_high_risk_commands         = true
-
-[runtime_profiles.tight]
-max_tool_iterations  = 5
-max_actions_per_hour = 30
-
-[runtime_profiles.deep]
-max_tool_iterations  = 50
-max_actions_per_hour = 200
-</code></pre>
 <p>Chaque canal est lié à un agent. Les canaux passent d’un agent à l’autre en modifiant <code>channels = [...]</code> sur l’agent qui doit les prendre en charge ; <code>Config::validate()</code> s’assure que les références sont résolues.</p>
 <p>Pour le routage multi-étapes ad hoc au sein d’une même conversation, l’outil <code>spawn_subagent</code> permet à un agent d’exécuter un enfant éphémère sous sa propre identité. L’enfant hérite de l’enveloppe de permissions du parent (voir <code>[risk_profiles.&lt;alias&gt;].allowed_tools</code>) et renvoie sa réponse finale à la boucle d’outils du parent.</p>
 <h2 id="routage-de-modèle-basé-sur-des-indications"><a class="header" href="#routage-de-modèle-basé-sur-des-indications">Routage de modèle basé sur des indications</a></h2>
-<p>Un mécanisme plus restreint : <code>[[model_routes]]</code> permet à un agent de remplacer le <code>model_provider</code> configuré pour les prompts marqués d’une chaîne d’indication. Utile lorsqu’un agent doit occasionnellement recourir à un modèle différent sans avoir à démarrer un second agent.</p>
-<pre><code class="language-toml">[[model_routes]]
-hint           = "reasoning"
-model_provider = "deepseek.reasoner"
-model          = "deepseek-reasoner"
-</code></pre>
+<p>Un mécanisme plus restreint : <code>[[model_routes]]</code> permet à un agent de remplacer le <code>model_provider</code> configuré pour les prompts marqués d’une chaîne d’indication. Utile lorsqu’un agent doit occasionnellement recourir à un modèle différent sans lancer un second agent. Chaque entrée de route comporte un <code>hint</code> (la chaîne qu’un prompt doit déclarer pour la déclencher), un <code>model_provider</code> (le profil en notation pointée <code>&lt;type&gt;.&lt;alias&gt;</code> vers lequel basculer, p. ex. <code>deepseek.reasoner</code>) et un <code>model</code> (l’identifiant de modèle local au fournisseur, p. ex. <code>deepseek-reasoner</code>). Configurez les routes via la passerelle, zerocode ou <code>zeroclaw config set</code> ; consultez la <a href="../reference/config.html#model_routes">Config reference</a> pour le schéma des champs.</p>
 <p>Les routes ne se déclenchent que lorsqu’un prompt comporte explicitement l’indice correspondant. Le chemin de requête par défaut utilise le <code>model_provider</code> principal de l’agent.</p>
-<p><code>model_provider</code> is always a provider profile reference in dotted <code>&lt;type&gt;.&lt;alias&gt;</code> form, such as <code>anthropic.sonnet</code> or <code>openai.default</code>. The profile carries the endpoint, credential reference, compatibility flavor, fallback chain, and configured default model. The <code>model</code> field is provider-local state under that profile.</p>
-<h2 id="runtime-model-switching"><a class="header" href="#runtime-model-switching">Runtime model switching</a></h2>
-<p>Runtime switches use the same provider-profile contract as config-backed routing:</p>
+<p><code>model_provider</code> est toujours une référence de profil de fournisseur sous la forme pointée <code>&lt;type&gt;.&lt;alias&gt;</code>, comme <code>anthropic.sonnet</code> ou <code>openai.default</code>. Le profil contient le point de terminaison, la référence d’identifiants, la variante de compatibilité, la chaîne de repli et le modèle par défaut configuré. Le champ <code>model</code> est un état local au fournisseur sous ce profil.</p>
+<h2 id="changement-de-modèle-à-lexécution"><a class="header" href="#changement-de-modèle-à-lexécution">Changement de modèle à l’exécution</a></h2>
+<p>Les commutateurs d’exécution utilisent le même contrat provider-profile que le routage basé sur la configuration :</p>
 <ul>
-<li><code>/models &lt;type&gt;.&lt;alias&gt;</code> selects the active provider profile for the sender session. Channel runtimes can also accept a bare <code>&lt;type&gt;</code> shorthand when exactly one configured alias exists for that provider family.</li>
-<li><code>/model &lt;model-id&gt;</code> selects a model within the active provider profile. If the value matches a <code>[[model_routes]]</code> hint or model, that route can switch both provider profile and model together.</li>
-<li>The <code>model_switch</code> tool uses <code>model_provider = "&lt;type&gt;.&lt;alias&gt;"</code> plus <code>model = "&lt;provider-local-model-id&gt;"</code>.</li>
+<li><code>/models &lt;type&gt;.&lt;alias&gt;</code> sélectionne le profil de fournisseur actif pour la session de l’expéditeur. Les runtimes de canal peuvent également accepter le raccourci <code>&lt;type&gt;</code> seul lorsqu’il existe exactement un alias configuré pour cette famille de fournisseurs.</li>
+<li><code>/model &lt;model-id&gt;</code> sélectionne un modèle au sein du profil de fournisseur actif. Si la valeur correspond à une indication ou un modèle <code>[[model_routes]]</code>, cette route peut changer à la fois le profil de fournisseur et le modèle.</li>
+<li>L’outil <code>model_switch</code> utilise <code>model_provider = "&lt;type&gt;.&lt;alias&gt;"</code> ainsi que <code>model = "&lt;provider-local-model-id&gt;"</code>.</li>
 </ul>
-<p>Runtime switches are session/runtime state. They do not edit <code>config.toml</code>; persisted defaults require an explicit config write. For tool-driven switches, bare provider family names such as <code>openai</code> are not switch targets because they do not identify which configured profile, credential, endpoint, or compatibility mode should be used.</p>
+<p>Les commutateurs d’exécution relèvent de l’état de session/d’exécution. Ils ne modifient pas <code>config.toml</code> ; les valeurs par défaut persistées nécessitent une écriture explicite dans la configuration. Pour les commutateurs pilotés par des outils, les noms de famille de fournisseurs seuls tels que <code>openai</code> ne sont pas des cibles de commutation, car ils n’identifient pas quel profil configuré, quelle information d’identification, quel point de terminaison ou quel mode de compatibilité doit être utilisé.</p>
 <h2 id="observabilité"><a class="header" href="#observabilité">Observabilité</a></h2>
 <p>Les décisions de répartition par agent sont visibles dans les journaux de traçage :</p>
 <pre><code>INFO channel=telegram.home routed to agent=fast
@@ -319,9 +325,9 @@ INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=12
 <p>Pour les déploiements en production, connectez la sortie des journaux à Loki / Grafana. Consultez <a href="../ops/observability.html">Opérations → Journaux et observabilité</a>.</p>
 <h2 id="voir-aussi"><a class="header" href="#voir-aussi">Voir aussi</a></h2>
 <ul>
-<li><a href="./overview.html">Vue d’ensemble</a> — modèle de fournisseur et répartition par agent</li>
-<li><a href="./configuration.html">Configuration</a> — schéma complet <code>[providers.*]</code></li>
-<li><a href="./catalog.html">Catalogue des fournisseurs</a> — chaque emplacement canonique</li>
+<li><a href="./overview.html">Overview</a> : modèle de fournisseur et répartition par agent</li>
+<li><a href="./configuration.html">Configuration</a> : schéma complet <code>[providers.*]</code></li>
+<li><a href="./catalog.html">Catalogue des fournisseurs</a> : chaque emplacement canonique</li>
 </ul>
 
                     </main>
@@ -332,7 +338,7 @@ INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=12
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../providers/catalog.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../providers/custom.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -346,7 +352,7 @@ INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=12
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../providers/catalog.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../providers/custom.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -368,6 +374,114 @@ INFO model_provider=anthropic.haiku stream complete tokens={input=512, output=12
 
         <script src="../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
         <script src="../searcher-c2a407aa.js"></script>
 
         <script src="../clipboard-1626706a.min.js"></script>
