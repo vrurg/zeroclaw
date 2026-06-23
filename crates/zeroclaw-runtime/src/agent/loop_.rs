@@ -1771,6 +1771,7 @@ pub async fn run(
                 &skills,
                 &runtime_capability_names,
                 &config.data_dir,
+                &config.skills.extra_registries,
                 config.skills.install_suggestions.enabled,
             ) {
                 final_output = suggestion;
@@ -2238,6 +2239,7 @@ pub async fn run(
                     &skills,
                     &runtime_capability_names,
                     &config.data_dir,
+                    &config.skills.extra_registries,
                     config.skills.install_suggestions.enabled,
                 ) {
                     final_output = suggestion;
@@ -3217,6 +3219,7 @@ pub async fn process_message(
             &skills,
             &runtime_capability_names,
             &config.data_dir,
+            &config.skills.extra_registries,
             config.skills.install_suggestions.enabled,
         ) {
             return Ok(suggestion);
