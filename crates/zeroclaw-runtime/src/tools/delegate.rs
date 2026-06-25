@@ -4039,7 +4039,7 @@ mod tests {
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
             ])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 1 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4055,7 +4055,7 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
-        assert!(result.output.contains("done"));
+        assert!(result.output.contains("tool count matched: 1"));
     }
 
     #[tokio::test]
