@@ -9,7 +9,7 @@ SubAgents are not a separate configuration concept. There is no `[subagents.*]` 
 Two tools sit nearby. They are not interchangeable.
 
 - **`spawn_subagent`**: runs the SAME agent again under its own identity for a focused subtask. The child sees the parent's full permissions envelope minus any narrowing. Use when the parent wants to scope an internal subtask out of its main conversation history without changing identity.
-- **`delegate`**: hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity and model provider, but delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"` (default is `"forbidden"`), AND the target must share the **same** risk profile as the caller. Use when a sibling agent on the same trust tier is the right specialist for the work. See [Delegation gating](#delegation-gating) below.
+- **`delegate`**: hands the request off to a DIFFERENT configured agent (named by alias). The target agent runs under its own identity and model provider, but delegation is gated: the caller's risk profile must set `delegation_policy mode = "allow"` (default is `"forbidden"`), and the target must be reachable as either a same-profile peer or an explicit `delegates` entry. Explicit entries choose `mode = "bounded"` or `mode = "independent"`, which determines whether the caller's tool ceiling still applies. Use when another configured specialist should own the work. See [Delegation gating](#delegation-gating) below.
 
 This page documents `spawn_subagent` end to end. `delegate` lives at `crates/zeroclaw-runtime/src/tools/delegate.rs` and is a separate surface.
 
@@ -152,7 +152,7 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
    An independent target is available only when explicitly listed with `mode = "independent"`. It still requires `delegation_policy.mode = "allow"` and reachability through `delegates`, but once selected it resolves the target agent's own policy without the caller's non-escalation ceiling, session workspace override, or action/cost tracker.
 
-The advertised roster (the `agent` parameter's enum in the tool schema) lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
+The advertised roster is included in the `agent` parameter description in the tool schema. It lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
 
 In bounded agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full `SecurityPolicy::ensure_no_escalation_beyond` check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.
 
@@ -210,13 +210,13 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 | | `spawn_subagent` | `delegate` |
 |---|---|---|
 | **Identity** | Same as parent (same UUID, same risk profile) | Target agent's identity (different alias; same-profile peer or an explicit cross-profile delegate) |
-| **Permission model** | Parent's policy verbatim (or narrowed subset) | Target agent's own policy (same-profile, or a cross-profile delegate validated non-escalating) |
+| **Permission model** | Parent's policy verbatim (or narrowed subset) | Bounded targets run under the target policy with the caller's agentic tool registry as ceiling; independent targets run under the target policy and target-owned registry |
 | **Model provider** | Parent's | Target agent's configured provider |
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
 | **Gating** | Non-empty `risk_profile.allowed_tools` must list `spawn_subagent`; `excluded_tools` must not list it | The caller's non-empty `risk_profile.allowed_tools` must list `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
-| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one |
+| **Use when** | Internal subtask that should stay within the same identity | Want a different configured specialist (different model, different alias) to own the task under bounded or independent delegation |
 
 ## What's not supported
 

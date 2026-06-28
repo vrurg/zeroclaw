@@ -107,12 +107,9 @@ pub struct DelegateTool {
     runtime_profiles: Arc<HashMap<String, RuntimeProfileConfig>>,
     /// named skill bundles for skills-directory resolution.
     skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
-    /// Optional handle to the loaded root config used to resolve a
-    /// per-target `SecurityPolicy` at delegate time. When set, every
-    /// delegation requires the target agent to share the caller's risk
-    /// profile and inherits the caller's `PerSenderTracker` so action
-    /// / cost budgets are shared between caller and delegated runs.
-    /// When unset (legacy unit-test constructors), DelegateTool falls
+    /// Optional handle to the loaded root config used to resolve delegate
+    /// reachability, target mode, and per-target `SecurityPolicy` at delegate
+    /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
@@ -318,10 +315,9 @@ impl DelegateTool {
         self
     }
 
-    /// Attach the loaded root config so DelegateTool can resolve a
-    /// per-target `SecurityPolicy` at delegate time, require the
-    /// target to share the caller's risk profile, and share the
-    /// caller's `PerSenderTracker` with the delegated run.
+    /// Attach the loaded root config so DelegateTool can resolve delegate
+    /// reachability, target mode, and per-target `SecurityPolicy` from the
+    /// canonical agent config at delegate time.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
         self
@@ -379,10 +375,9 @@ impl DelegateTool {
             )));
         }
 
-        let Some(target_config) = config
-            .reachable_delegate_target_configs(&self.caller_alias)
-            .into_iter()
-            .find(|target| target.agent() == target_alias)
+        // Resolve reachability and execution mode through `Config` so
+        // admission follows the same canonical roster advertised to callers.
+        let Some(target_mode) = config.delegate_target_mode(&self.caller_alias, target_alias)
         else {
             let error = self.unreachable_target_error(config, target_alias);
             let caller_profile = config
@@ -409,7 +404,6 @@ impl DelegateTool {
             );
             return Err(anyhow::Error::msg(error));
         };
-        let target_mode = target_config.mode();
 
         let mut target_policy = SecurityPolicy::for_agent(config, target_alias).map_err(|e| {
             ::zeroclaw_log::record!(
@@ -5843,7 +5837,7 @@ mod tests {
             ..Config::default()
         };
         // The caller delegates from the `narrow` profile, so that profile must
-        // allow delegation before the same-profile gate under test is reached.
+        // allow delegation before reachability/mode checks run.
         config.risk_profiles.insert(
             "narrow".to_string(),
             RiskProfileConfig {
@@ -6242,8 +6236,8 @@ mod tests {
 
     #[tokio::test]
     async fn delegate_allows_explicit_cross_profile_target_that_narrows() {
-        // target on a narrower profile (lower max_actions) is a valid
-        // explicit delegate: in the roster and non-escalating.
+        // A bounded explicit delegate may use a different, narrower profile;
+        // the caller's filtered tool registry still remains the agentic ceiling.
         let config = config_with_two_agents("caller", 50, "target", 5);
         let mut config = (*config).clone();
         config
@@ -6293,7 +6287,7 @@ mod tests {
 
         let target_policy = tool
             .policy_for_target("target")
-            .expect("non-escalating target resolves");
+            .expect("bounded target resolves");
         assert!(
             !target_policy.tracker.record_within(bucket_key, max),
             "delegated target must consume from the caller's bucket; spawning the target should not reset the budget"
@@ -6756,10 +6750,9 @@ mod tests {
         );
     }
 
-    /// Build a config where `caller` (`broad` profile) is authorized to
-    /// delegate to `target`, but `target` sits on a different (`narrow`)
-    /// profile. Delegation requires caller and target to share a risk
-    /// profile, so this exercises the same-profile rejection gate.
+    /// Build a config where `caller` (`broad` profile) can delegate, but
+    /// `target` is a different-profile peer that is not in the explicit
+    /// delegate roster. This exercises the reachable-set rejection path.
     fn config_with_narrowed_target() -> Arc<zeroclaw_config::schema::Config> {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
