@@ -10966,6 +10966,7 @@ dependencies = [
  "whatsapp-rust-ureq-http-client",
  "wiremock",
  "zeroclaw-api",
+ "zeroclaw-commands",
  "zeroclaw-config",
  "zeroclaw-infra",
  "zeroclaw-log",
@@ -10975,6 +10976,13 @@ dependencies = [
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",
  "zeroclaw-tools",
+]
+
+[[package]]
+name = "zeroclaw-commands"
+version = "0.8.2"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -11076,6 +11084,7 @@ dependencies = [
  "uuid",
  "zeroclaw-api",
  "zeroclaw-channels",
+ "zeroclaw-commands",
  "zeroclaw-config",
  "zeroclaw-hardware",
  "zeroclaw-infra",
@@ -11557,6 +11566,7 @@ dependencies = [
  "unic-langid",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "zeroclaw-commands",
 ]
 
 [[package]]
