@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_UNTRUSTED_PAYLOAD_BYTES","MAX_UNTRUSTED_TOPIC_BYTES"],"fn":["cap_untrusted","frame_trigger","frame_untrusted","sanitize_topic","sanitize_untrusted"]};

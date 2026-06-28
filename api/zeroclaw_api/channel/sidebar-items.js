@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ChannelApprovalResponse","RoomVisibility"],"struct":["ChannelApprovalRequest","ChannelMessage","RoomCreationOptions","SendMessage"],"trait":["Channel"]};
