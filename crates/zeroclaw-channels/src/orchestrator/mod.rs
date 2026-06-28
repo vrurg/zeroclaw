@@ -513,6 +513,20 @@ struct ChannelRuntimeContext {
     show_receipts_in_response: bool,
     last_applied_config_stamp: Arc<Mutex<Option<ConfigFileStamp>>>,
     runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
+    /// Per-conversation-history-key locks that serialize persistence mutations
+    /// (append / remove_last / delete_session) for the same sender without
+    /// serializing the full message-processing loop.  See #7753.
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+}
+
+/// Acquire the per-conversation-history-key persistence lock so that
+/// append/remove_last/delete_session operations for the same sender are
+/// serialized without blocking the full message-processing loop (#7753).
+fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync::Mutex<()>> {
+    let mut map = ctx.persist_locks.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key.to_string())
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+        .clone()
 }
 
 #[derive(Clone)]
@@ -1902,6 +1916,11 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+    // Serialize per-sender persistence to prevent interleaving across concurrent
+    // workers that share the same conversation_history_key (#7753).
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
         && let Err(e) = store.append(sender_key, &turn)
@@ -1971,6 +1990,11 @@ fn rollback_orphan_user_turn(
     sender_key: &str,
     expected_content: &str,
 ) -> bool {
+    // Serialize per-sender persistence to prevent interleaving across concurrent
+    // workers that share the same conversation_history_key (#7753).
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -2642,6 +2666,9 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
+            // Serialize per-sender persistence to prevent interleaving (#7753).
+            let persist_lock = acquire_persist_lock(ctx, &sender_key);
+            let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
             clear_sender_history(ctx, &sender_key);
             ctx.thinking_overrides
                 .lock()
@@ -4393,6 +4420,9 @@ async fn process_channel_message_body(
     if force_fresh_session {
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
+        // Serialize per-sender persistence to prevent interleaving (#7753).
+        let persist_lock = acquire_persist_lock(ctx.as_ref(), &history_key);
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
@@ -9682,6 +9712,7 @@ pub async fn start_channels(
             show_receipts_in_response: agent.resolved.tool_receipts.show_in_response,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -10117,6 +10148,188 @@ pub async fn deliver_announcement(
 #[cfg(feature = "channel-wechat")]
 fn expand_tilde_in_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
+}
+
+// ── Concurrent persist lock test (#7753) ─────────────────────────
+// Lives outside `mod tests` so it has direct access to private parent items.
+
+#[cfg(test)]
+#[test]
+fn concurrent_persist_lock_serialization() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+    use zeroclaw_runtime::approval::ApprovalManager;
+    use zeroclaw_runtime::observability::NoopObserver;
+
+    /// Backend that records the append *sequence* (not just a count)
+    /// and introduces a per-caller varying delay **after** the push.
+    /// Without the per-sender persist lock in `append_sender_turn`,
+    /// threads exit `store.append` in a different order than they
+    /// entered, so the backend sequence diverges from the in-memory
+    /// `conversation_histories` order.  The persist lock makes the
+    /// store-append + history-push atomic → orders must match.
+    struct OrderBackend {
+        sequence: Arc<Mutex<Vec<String>>>,
+        call_n: Arc<AtomicUsize>,
+    }
+    impl SessionBackend for OrderBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            vec![]
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            let content = msg.content.clone();
+            let n = self.call_n.fetch_add(1, Ordering::SeqCst);
+            self.sequence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(content);
+            // Delay outside the sequence lock: later callers get
+            // shorter delays → they exit earlier and can win the
+            // history-push race.
+            std::thread::sleep(Duration::from_millis(8_u64.saturating_sub(n as u64 * 2)));
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(true)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    let sender = "concurrent_test_key".to_string();
+    let sequence = Arc::new(Mutex::new(Vec::new()));
+    let backend = OrderBackend {
+        sequence: sequence.clone(),
+        call_n: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(HashMap::new()),
+        model_provider: Arc::new(tests::DummyModelProvider),
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(Arc::new(backend) as Arc<dyn SessionBackend>),
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        )),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            Duration::ZERO,
+        )),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+    });
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![ChatMessage::user("start")]);
+
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = vec![];
+    for i in 0..4 {
+        let ctx = ctx.clone();
+        let key = sender.clone();
+        let b = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            append_sender_turn(&ctx, &key, ChatMessage::user(format!("msg-{i}")));
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // ── Assertion ────────────────────────────────────────────────
+    // Under the per-sender persist lock every (append, history-push)
+    // pair is atomic, so the backend sequence must equal the
+    // in-memory history for this sender (minus the initial "start").
+    let backend_order: Vec<String> = sequence.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let history: Vec<String> = {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(&sender)
+            .expect("history must exist for sender");
+        turns
+            .iter()
+            .filter(|m| m.content != "start")
+            .map(|m| m.content.clone())
+            .collect()
+    };
+    assert_eq!(
+        backend_order, history,
+        "backend append order must equal in-memory history order;\
+         a mismatch means the per-sender persist lock is not serializing\
+         store.append + history.push atomically"
+    );
+    assert_eq!(
+        backend_order.len(),
+        4,
+        "all 4 concurrent appends must be recorded"
+    );
 }
 
 #[cfg(test)]
@@ -10565,6 +10778,7 @@ temperature = 0.3
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -11157,6 +11371,7 @@ temperature = 0.3
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -11630,6 +11845,7 @@ api_key = "anthropic-key"
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -11724,6 +11940,7 @@ api_key = "anthropic-key"
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -11836,6 +12053,7 @@ api_key = "anthropic-key"
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -11952,6 +12170,7 @@ api_key = "anthropic-key"
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -11979,7 +12198,7 @@ api_key = "anthropic-key"
         assert_eq!(persisted[1].content, "ok");
     }
 
-    struct DummyModelProvider;
+    pub(crate) struct DummyModelProvider;
 
     #[async_trait::async_trait]
     impl ModelProvider for DummyModelProvider {
@@ -12350,6 +12569,7 @@ api_key = "anthropic-key"
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -13115,6 +13335,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -13197,6 +13418,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -13312,6 +13534,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -13439,6 +13662,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: true,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -13589,6 +13813,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -13708,6 +13933,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -13845,6 +14071,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -13968,6 +14195,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14076,6 +14304,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14204,6 +14433,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14349,6 +14579,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14557,6 +14788,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14663,6 +14895,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14776,6 +15009,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -14812,7 +15046,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    struct NoopMemory;
+    pub(crate) struct NoopMemory;
 
     #[async_trait::async_trait]
     impl Memory for NoopMemory {
@@ -15145,6 +15379,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -15287,6 +15522,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -15439,6 +15675,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -15594,6 +15831,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -15739,6 +15977,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -15866,6 +16105,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -15974,6 +16214,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -16096,6 +16337,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -16266,6 +16508,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -17867,6 +18110,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -18035,6 +18279,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -18461,6 +18706,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -18604,6 +18850,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -20086,6 +20333,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -20201,6 +20449,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -20353,6 +20602,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -20584,6 +20834,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -20732,6 +20983,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -20872,6 +21124,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -21032,6 +21285,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -21431,6 +21685,7 @@ This is an example JSON object for profile settings."#;
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
