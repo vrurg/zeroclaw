@@ -851,6 +851,7 @@ goal-command-help = /goal start [--tokens=N|unlimited] [--cost=N|unlimited] <obj
 goal-command-paused = Goal `{$task_id}` paused.
 goal-command-resumed = Goal `{$task_id}` resumed.
 goal-command-cancelled = Goal `{$task_id}` cancelled.
+goal-command-completed = Goal `{$task_id}` completed.
 goal-command-budget-updated = Goal `{$task_id}` budget updated.
 goal-command-status = Goal `{$task_id}` is {$status}: {$objective}
 goal-command-status-paused = Goal `{$task_id}` is {$status}: {$objective} (paused: {$reason})
@@ -893,6 +894,9 @@ channel-goal-start-work-prompt =
 
     Objective:
     {$objective}
+channel-goal-continue-work-prompt =
+    Continue durable goal {$task_id}. Use the prior goal transcript and keep working autonomously while policy permits it. If you are blocked, say exactly what blocks progress.
+channel-goal-controller-failed = Goal controller failed: {$error}
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})

@@ -705,6 +705,7 @@ mod tests {
 
         let mut old_goal = rec("old-goal", "main", 1, "boot-1");
         old_goal.kind = TaskKind::Goal;
+        old_goal.originator_route = Some("route-old".into());
         old_goal.started_at = "2026-06-18T00:00:00Z".into();
         s.create(old_goal).await.unwrap();
 
@@ -778,6 +779,7 @@ mod tests {
 
         let mut older_valid_goal = rec("older-valid-goal", "main", 1, "boot-1");
         older_valid_goal.kind = TaskKind::Goal;
+        older_valid_goal.originator_route = Some("route-valid".into());
         older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
         s.create(older_valid_goal).await.unwrap();
 

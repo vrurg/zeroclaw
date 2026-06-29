@@ -13,6 +13,7 @@ use super::task_registry::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord, TaskKind,
     TaskRecord, TaskRegistry, TaskStatus,
 };
+use super::verifier::{GoalVerifierDecision, verifier_outage_pause, verify_goal_completion};
 
 tokio::task_local! {
     static GOAL_ADMISSION_CONTEXT: Option<GoalAdmissionContext>;
@@ -104,6 +105,13 @@ pub struct GoalAdmission {
     pub task_id: Option<String>,
     pub status: TaskStatus,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalTurnEvaluation {
+    Completed { task_id: String, message: String },
+    Continue { task_id: String, notes: String },
+    Paused { task_id: String, message: String },
 }
 
 impl GoalAdmissionContext {
@@ -484,6 +492,98 @@ pub async fn admit_goal_command(
     Ok(admission)
 }
 
+pub async fn evaluate_goal_turn(
+    ctx: &GoalAdmissionContext,
+    config: &Config,
+    candidate_summary: &str,
+) -> Result<Option<GoalTurnEvaluation>> {
+    let cp = match control_plane() {
+        Some(cp) => cp,
+        None => return Ok(None),
+    };
+    let Some(task) = cp
+        .store
+        .latest_active_goal_for_context(
+            &ctx.agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
+    else {
+        return Ok(None);
+    };
+    ensure_goal_visible(&task, ctx)?;
+    if task.status != TaskStatus::Running {
+        return Ok(None);
+    }
+    let goal = cp
+        .store
+        .get_goal_task(&task.id)
+        .await
+        .with_context(|| msg("goal-command-error-status-failed", &[]))?
+        .with_context(|| {
+            msg(
+                "goal-command-error-extension-missing",
+                &[("task_id", &task.id)],
+            )
+        })?;
+
+    match verify_goal_completion(config, &task.agent, &goal, candidate_summary).await {
+        Ok(GoalVerifierDecision::Complete { notes: _ }) => {
+            cp.store
+                .update_status(
+                    &task.id,
+                    TaskStatus::Completed,
+                    Some(candidate_summary.to_string()),
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    msg("goal-command-error-update-failed", &[("task_id", &task.id)])
+                })?;
+            let admission = GoalAdmission {
+                task_id: Some(task.id.clone()),
+                status: TaskStatus::Completed,
+                message: msg("goal-command-completed", &[("task_id", &task.id)]),
+            };
+            publish_goal_state_update(&admission);
+            Ok(Some(GoalTurnEvaluation::Completed {
+                task_id: task.id,
+                message: admission.message,
+            }))
+        }
+        Ok(GoalVerifierDecision::Continue { notes }) => Ok(Some(GoalTurnEvaluation::Continue {
+            task_id: task.id,
+            notes,
+        })),
+        Ok(GoalVerifierDecision::Blocked { pause }) => {
+            let admission =
+                pause_goal_for_blocker(cp.store.as_ref(), ctx, Some(task.id.clone()), pause)
+                    .await?;
+            publish_goal_state_update(&admission);
+            Ok(Some(GoalTurnEvaluation::Paused {
+                task_id: task.id,
+                message: admission.message,
+            }))
+        }
+        Err(error) => {
+            let admission = pause_goal_for_blocker(
+                cp.store.as_ref(),
+                ctx,
+                Some(task.id.clone()),
+                verifier_outage_pause(&error),
+            )
+            .await?;
+            publish_goal_state_update(&admission);
+            Ok(Some(GoalTurnEvaluation::Paused {
+                task_id: task.id,
+                message: admission.message,
+            }))
+        }
+    }
+}
+
 async fn start_goal(
     store: &dyn TaskRegistry,
     boot_id: &str,
@@ -820,11 +920,29 @@ fn nonempty(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
+    use std::sync::Arc;
 
     fn test_config() -> Config {
         let mut config = Config::default();
         config.goal.allowed_channel_types.push("channel".into());
         config
+    }
+
+    fn global_test_store() -> Arc<dyn TaskRegistry> {
+        match crate::control_plane::control_plane() {
+            Some(control_plane) => Arc::clone(&control_plane.store),
+            None => {
+                let store: Arc<dyn TaskRegistry> =
+                    Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                let _ = crate::control_plane::init_control_plane(
+                    crate::control_plane::ControlPlaneHandle {
+                        store: Arc::clone(&store),
+                        boot_id: "test-boot".into(),
+                    },
+                );
+                Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+            }
+        }
     }
 
     #[test]
@@ -908,6 +1026,65 @@ mod tests {
         assert_eq!(
             rx.recv().await.as_deref(),
             Some("Goal update: Goal `goal-1` started.")
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_completes_running_goal_when_verifier_disabled() {
+        let store = global_test_store();
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let ctx = GoalAdmissionContext::new(agent.clone())
+            .with_originator_route(Some(route.clone()))
+            .with_principal_id(Some(principal.clone()));
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.clone(),
+                    kind: TaskKind::Goal,
+                    agent: agent.clone(),
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "ship it".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut config = test_config();
+        config.goal.verifier.enabled = false;
+
+        let outcome = evaluate_goal_turn(&ctx, &config, "done").await.unwrap();
+
+        assert_eq!(
+            outcome,
+            Some(GoalTurnEvaluation::Completed {
+                task_id: task_id.clone(),
+                message: msg("goal-command-completed", &[("task_id", &task_id)]),
+            })
+        );
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed
         );
     }
 

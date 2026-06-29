@@ -334,6 +334,10 @@ mod context {
         }
     }
 
+    pub(super) fn should_prepend_thread_preamble(body: &str) -> bool {
+        !body.trim_start().starts_with('/')
+    }
+
     /// Returns `true` iff this thread had not been seen before — caller should
     /// fetch the root and inject the preamble. Also marks the thread seen.
     pub(super) async fn claim_first_visit(
@@ -1799,7 +1803,8 @@ mod inbound {
 
         let thread_id = extract_thread_id(&raw);
         let mut content = body.clone();
-        if let Some(tid) = thread_id.as_ref()
+        if ctx_mod::should_prepend_thread_preamble(&body)
+            && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
         {
             match room.event(tid, None).await {
@@ -4334,7 +4339,9 @@ mod tests {
     }
 
     mod context {
-        use super::super::context::{claim_first_visit, format_preamble, mark_seen};
+        use super::super::context::{
+            claim_first_visit, format_preamble, mark_seen, should_prepend_thread_preamble,
+        };
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id};
         use std::{collections::HashSet, sync::Arc};
         use tokio::sync::RwLock;
@@ -4353,6 +4360,16 @@ mod tests {
         fn preamble_skips_body_when_empty() {
             let p = format_preamble("@alice:server", "");
             assert_eq!(p, "[Thread root from @alice:server]\n\n");
+        }
+
+        #[test]
+        fn thread_preamble_is_skipped_for_runtime_slash_commands() {
+            // Runtime slash commands are parsed by the channel orchestrator
+            // before the model sees the message. A Matrix thread-root preamble
+            // would hide the leading command token and leak `/goal` to the LLM.
+            assert!(!should_prepend_thread_preamble("/goal start ship it"));
+            assert!(!should_prepend_thread_preamble(" \n\t/models openrouter"));
+            assert!(should_prepend_thread_preamble("please run /goal later"));
         }
 
         #[tokio::test]

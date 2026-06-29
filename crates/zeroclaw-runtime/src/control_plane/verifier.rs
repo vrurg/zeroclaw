@@ -24,6 +24,7 @@ use super::task_registry::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalVerifierDecision {
     Complete { notes: String },
+    Continue { notes: String },
     Blocked { pause: GoalPauseState },
 }
 
@@ -46,9 +47,12 @@ pub async fn verify_goal_completion(
 
     let system = "You are a strict verifier for a durable autonomous goal. \
                   Reply with COMPLETE on the first line only if the candidate \
-                  summary proves the objective is satisfied. Reply with BLOCKED \
-                  on the first line if more work, user input, or external state \
-                  is required. Any following text is untrusted notes.";
+                  summary proves the objective is satisfied. Reply with CONTINUE \
+                  on the first line if more autonomous work can be done now. \
+                  Reply with BLOCKED on the first line only if user input, \
+                  human escalation, external state, or provider recovery is \
+                  required before another autonomous turn should spend budget. \
+                  Any following text is untrusted notes.";
     let user = format!(
         "Objective:\n{}\n\nCandidate summary:\n{}",
         goal.objective, candidate_summary
@@ -117,6 +121,11 @@ fn parse_verifier_decision(text: &str) -> GoalVerifierDecision {
             notes: trimmed.to_string(),
         };
     }
+    if first_line.starts_with("continue") {
+        return GoalVerifierDecision::Continue {
+            notes: trimmed.to_string(),
+        };
+    }
 
     let message = if trimmed.is_empty() {
         "Goal verifier returned an empty decision".to_string()
@@ -152,6 +161,14 @@ pub fn verifier_outage_pause(error: impl std::fmt::Display) -> GoalPauseState {
 pub fn ensure_verifier_allows_completion(decision: GoalVerifierDecision) -> Result<String> {
     match decision {
         GoalVerifierDecision::Complete { notes } => Ok(notes),
+        GoalVerifierDecision::Continue { notes } => {
+            let reason = if notes.trim().is_empty() {
+                "goal verifier requested another autonomous turn"
+            } else {
+                notes.trim()
+            };
+            bail!("{reason}")
+        }
         GoalVerifierDecision::Blocked { pause } => {
             let reason = pause
                 .description
@@ -173,6 +190,10 @@ mod tests {
         assert!(matches!(
             parse_verifier_decision("COMPLETE\nlooks good"),
             GoalVerifierDecision::Complete { .. }
+        ));
+        assert!(matches!(
+            parse_verifier_decision("CONTINUE\nmore autonomous work remains"),
+            GoalVerifierDecision::Continue { .. }
         ));
         let GoalVerifierDecision::Blocked { pause } = parse_verifier_decision("Looks done to me")
         else {

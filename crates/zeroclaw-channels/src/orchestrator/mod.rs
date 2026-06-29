@@ -355,6 +355,11 @@ enum RuntimeCommandOutcome {
     ContinueGoalStart { task_id: String, objective: String },
 }
 
+enum ChannelProcessOutcome {
+    Done,
+    Continue(Box<zeroclaw_api::channel::ChannelMessage>),
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ModelCacheState {
     entries: Vec<ModelCacheEntry>,
@@ -1389,6 +1394,65 @@ fn goal_channel_status_updates_enabled(
     channel_name: &str,
 ) -> bool {
     channel_name != "cli" && config.goal.channel_status_updates
+}
+
+const GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE: usize = 16;
+
+fn goal_continuation_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    task_id: &str,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let mut next = msg.clone();
+    next.id = format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4());
+    next.content = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-goal-continue-work-prompt",
+        &[("task_id", task_id)],
+    );
+    next.attachments.clear();
+    next.passive_context = false;
+    next
+}
+
+fn goal_controller_limit_pause_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_api::channel::ChannelMessage {
+    let mut next = msg.clone();
+    next.id = format!("{}:goal-limit:{}", msg.id, uuid::Uuid::new_v4());
+    next.content =
+        "/goal pause goal controller reached the autonomous continuation safety limit".to_string();
+    next.attachments.clear();
+    next.passive_context = false;
+    next
+}
+
+async fn send_goal_controller_update(
+    config: &zeroclaw_config::schema::Config,
+    channel: Option<&Arc<dyn Channel>>,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    message: &str,
+) {
+    if !goal_channel_status_updates_enabled(config, msg.channel.as_str()) {
+        return;
+    }
+    let Some(channel) = channel else {
+        return;
+    };
+    let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+        "channel-goal-state-update",
+        &[("message", message)],
+    );
+    if let Err(err) = channel
+        .send(&SendMessage::new(text, &msg.reply_target).in_thread(followup_thread_id(msg)))
+        .await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "failed to send goal controller update"
+        );
+    }
 }
 
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
@@ -4229,9 +4293,9 @@ async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
-) {
+) -> ChannelProcessOutcome {
     if cancellation_token.is_cancelled() {
-        return;
+        return ChannelProcessOutcome::Done;
     }
 
     let channel_composite = match &msg.channel_alias {
@@ -4249,10 +4313,10 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await
         }
     )
-    .await;
+    .await
 }
 
 /// Resolve the effective `ack_reactions` value for a channel message.
@@ -4393,7 +4457,7 @@ async fn process_channel_message_body(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
-) {
+) -> ChannelProcessOutcome {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -4420,7 +4484,7 @@ async fn process_channel_message_body(
                         .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
                     "incoming message dropped by hook"
                 );
-                return;
+                return ChannelProcessOutcome::Done;
             }
             zeroclaw_runtime::hooks::HookResult::Continue(modified) => modified,
         }
@@ -4450,7 +4514,7 @@ async fn process_channel_message_body(
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "dropping self-authored inbound message (self-loop guard, sdk layer)"
             );
-            return;
+            return ChannelProcessOutcome::Done;
         }
         if zeroclaw_runtime::peers::should_drop_self_loop(
             &msg.sender,
@@ -4462,7 +4526,7 @@ async fn process_channel_message_body(
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
             );
-            return;
+            return ChannelProcessOutcome::Done;
         }
     }
 
@@ -4470,7 +4534,7 @@ async fn process_channel_message_body(
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
-        return;
+        return ChannelProcessOutcome::Done;
     }
 
     // The early ack is spawned (fire-and-forget) so it lands before the
@@ -4604,7 +4668,7 @@ async fn process_channel_message_body(
                 Some("\u{2705}"),
             )
             .await;
-            return;
+            return ChannelProcessOutcome::Done;
         }
         RuntimeCommandOutcome::ContinueGoalStart { task_id, objective } => {
             msg.content = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
@@ -4664,7 +4728,7 @@ async fn process_channel_message_body(
                 Some("\u{26A0}\u{FE0F}"),
             )
             .await;
-            return;
+            return ChannelProcessOutcome::Done;
         }
     };
     let history_user_content = msg.content.clone();
@@ -4999,7 +5063,7 @@ async fn process_channel_message_body(
                 })),
             "channel_message_no_reply"
         );
-        return;
+        return ChannelProcessOutcome::Done;
     }
 
     let use_draft_streaming = target_channel
@@ -5476,6 +5540,7 @@ async fn process_channel_message_body(
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
         _ => "\u{26A0}\u{FE0F}",                                // ⚠️
     };
+    let mut goal_controller_next: Option<zeroclaw_api::channel::ChannelMessage> = None;
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
@@ -5539,7 +5604,7 @@ async fn process_channel_message_body(
                         {
                             let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                         }
-                        return;
+                        return ChannelProcessOutcome::Done;
                     }
                     zeroclaw_runtime::hooks::HookResult::Continue((
                         hook_channel,
@@ -5759,6 +5824,55 @@ async fn process_channel_message_body(
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "failed to send tool receipts block"
                     );
+                }
+            }
+
+            if !cancellation_token.is_cancelled()
+                && let Some(goal_ctx) = goal_admission_context.as_ref()
+            {
+                match zeroclaw_runtime::control_plane::evaluate_goal_turn(
+                    goal_ctx,
+                    runtime_defaults.config.as_ref(),
+                    &delivered_response,
+                )
+                .await
+                {
+                    Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Completed {
+                        message,
+                        ..
+                    }))
+                    | Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Paused {
+                        message,
+                        ..
+                    })) => {
+                        send_goal_controller_update(
+                            runtime_defaults.config.as_ref(),
+                            target_channel.as_ref(),
+                            &msg,
+                            &message,
+                        )
+                        .await;
+                    }
+                    Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Continue {
+                        task_id,
+                        ..
+                    })) => {
+                        goal_controller_next = Some(goal_continuation_message(&msg, &task_id));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                            "channel-goal-controller-failed",
+                            &[("error", &error.to_string())],
+                        );
+                        send_goal_controller_update(
+                            runtime_defaults.config.as_ref(),
+                            target_channel.as_ref(),
+                            &msg,
+                            &error_text,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -5983,6 +6097,11 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+
+    match goal_controller_next {
+        Some(message) => ChannelProcessOutcome::Continue(Box::new(message)),
+        None => ChannelProcessOutcome::Done,
+    }
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path
@@ -6030,7 +6149,38 @@ async fn dispatch_worker(
         }
     }
 
-    process_channel_message(ctx, msg, cancellation_token).await;
+    let mut next_message = Some(msg);
+    let mut goal_continuations = 0usize;
+    while let Some(current_msg) = next_message {
+        if cancellation_token.is_cancelled() {
+            break;
+        }
+        next_message = match process_channel_message(
+            Arc::clone(&ctx),
+            current_msg,
+            cancellation_token.clone(),
+        )
+        .await
+        {
+            ChannelProcessOutcome::Done => None,
+            ChannelProcessOutcome::Continue(message) => Some(*message),
+        };
+        if next_message.is_some() {
+            goal_continuations = goal_continuations.saturating_add(1);
+            if goal_continuations >= GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE {
+                if let Some(limit_msg) = next_message.take() {
+                    let pause_msg = goal_controller_limit_pause_message(&limit_msg);
+                    let _ = process_channel_message(
+                        Arc::clone(&ctx),
+                        pause_msg,
+                        cancellation_token.clone(),
+                    )
+                    .await;
+                }
+                break;
+            }
+        }
+    }
 
     if register_in_flight {
         let mut active = in_flight.lock().await;
