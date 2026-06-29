@@ -151,6 +151,30 @@ mod markers {
 mod mention {
     use matrix_sdk::ruma::UserId;
 
+    pub(super) fn strip_leading_command_address<'a>(
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        body: &'a str,
+    ) -> Option<&'a str> {
+        // Matrix clients reserve naked `/commands`, so users often address bot
+        // commands as mentions. Strip only when the addressed payload is itself
+        // a runtime slash command; normal conversational mentions stay intact.
+        let mut addresses = vec![bot_user_id.to_string()];
+        let localpart = format!("@{}", bot_user_id.localpart());
+        addresses.push(localpart);
+        if let Some(display_name) = bot_display_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            addresses.push(display_name.to_string());
+            if !display_name.starts_with('@') {
+                addresses.push(format!("@{display_name}"));
+            }
+        }
+
+        crate::addressed_command::strip_leading_addressed_command(body, addresses)
+    }
+
     pub(super) fn is_mentioned(
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
@@ -1782,8 +1806,8 @@ mod inbound {
             return Ok(());
         }
 
+        let display_name = ctx.bot_display_name.read().await.clone();
         if ctx.config.mention_only && is_group_room(&room).await {
-            let display_name = ctx.bot_display_name.read().await.clone();
             let mention_user_ids = extract_mentions_user_ids(&raw);
             if !mention::is_mentioned(
                 &ctx.bot_user_id,
@@ -1802,8 +1826,14 @@ mod inbound {
         }
 
         let thread_id = extract_thread_id(&raw);
-        let mut content = body.clone();
-        if ctx_mod::should_prepend_thread_preamble(&body)
+        let mut content = mention::strip_leading_command_address(
+            &ctx.bot_user_id,
+            display_name.as_deref(),
+            &body,
+        )
+        .unwrap_or(&body)
+        .to_string();
+        if ctx_mod::should_prepend_thread_preamble(&content)
             && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
         {
@@ -4191,7 +4221,7 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::is_mentioned;
+        use super::super::mention::{is_mentioned, strip_leading_command_address};
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -4232,6 +4262,65 @@ mod tests {
         fn body_fallback_display_name() {
             let bot = user_id!("@bot:example.org");
             assert!(is_mentioned(bot, Some("ZeroClaw"), None, "hi zeroclaw!"));
+        }
+
+        #[test]
+        fn addressed_runtime_command_strips_localpart_alias() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(bot, None, "@zc-architect /goal status"),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, None, "@zc-architect: /goal start ship it"),
+                Some("/goal start ship it")
+            );
+        }
+
+        #[test]
+        fn addressed_runtime_command_strips_full_mxid_and_display_name() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Architect"),
+                    "@zc-architect:crayfish.lflat.org: /goal status"
+                ),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@architect /goal status"),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Task Orchestrator"),
+                    "Task Orchestrator: /goal status"
+                ),
+                Some("/goal status")
+            );
+        }
+
+        #[test]
+        fn addressed_runtime_command_does_not_strip_non_commands_or_other_mentions() {
+            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@zc-architect hello /goal"),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Architect"),
+                    "@zc-architect-helper: /goal"
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@other: /goal status"),
+                None
+            );
         }
 
         #[test]

@@ -1588,6 +1588,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     }
 }
 
+fn strip_leading_channel_command_address<'a>(
+    content: &'a str,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> Option<&'a str> {
+    let mention = target_channel.and_then(|channel| channel.self_addressed_mention())?;
+    crate::addressed_command::strip_leading_addressed_command(content, [mention.as_str()])
+}
+
 /// Verify `name` matches a canonical model provider family known to the
 /// runtime registry. Returns the canonical (case-corrected) name, or `None`
 /// when the input doesn't name a known family. Used by the channel
@@ -4535,6 +4543,16 @@ async fn process_channel_message_body(
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return ChannelProcessOutcome::Done;
+    }
+
+    if let Some(command_content) =
+        strip_leading_channel_command_address(&msg.content, target_channel.as_ref())
+            .map(str::to_string)
+    {
+        // Several chat clients reserve naked `/commands` locally. Accept the
+        // platform-native bot mention as an address prefix only when the
+        // addressed payload is itself a runtime slash command.
+        msg.content = command_content;
     }
 
     // The early ack is spawned (fire-and-forget) so it lands before the
@@ -11180,6 +11198,47 @@ temperature = 0.3
         assert!(
             !prompt_clamps.contains("<@222>"),
             "clamps prompt leaked the peer's mention: {prompt_clamps}"
+        );
+    }
+
+    #[test]
+    fn addressed_runtime_commands_strip_channel_native_mentions() {
+        let mattermost = mention_mock("mattermost", "@zeroclaw");
+        let discord = mention_mock("discord", "<@12345>");
+        let irc = mention_mock("irc", "zc_bot");
+
+        assert_eq!(
+            strip_leading_channel_command_address("@zeroclaw /goal status", Some(&mattermost)),
+            Some("/goal status")
+        );
+        assert_eq!(
+            strip_leading_channel_command_address("@zeroclaw: /goal status", Some(&mattermost)),
+            Some("/goal status")
+        );
+        assert_eq!(
+            strip_leading_channel_command_address("<@12345> /goal status", Some(&discord)),
+            Some("/goal status")
+        );
+        assert_eq!(
+            strip_leading_channel_command_address("zc_bot, /goal status", Some(&irc)),
+            Some("/goal status")
+        );
+    }
+
+    #[test]
+    fn addressed_runtime_commands_do_not_strip_plain_mentions() {
+        let mattermost = mention_mock("mattermost", "@zeroclaw");
+        assert_eq!(
+            strip_leading_channel_command_address("@zeroclaw please run /goal", Some(&mattermost)),
+            None
+        );
+        assert_eq!(
+            strip_leading_channel_command_address("@zeroclaw-helper: /goal", Some(&mattermost)),
+            None
+        );
+        assert_eq!(
+            strip_leading_channel_command_address("@zeroclaw: /goal", None),
+            None
         );
     }
 
