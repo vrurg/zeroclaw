@@ -3719,6 +3719,10 @@ pub struct GoalConfig {
     /// Enable durable goal mode.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Emit goal state/status updates into channel threads when goal admission
+    /// happens inside a channel turn.
+    #[serde(default = "default_true")]
+    pub channel_status_updates: bool,
     /// Command surfaces allowed to start or manage durable goals.
     #[serde(default = "default_goal_allowed_command_surfaces")]
     pub allowed_command_surfaces: Vec<String>,
@@ -3742,6 +3746,7 @@ impl Default for GoalConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            channel_status_updates: true,
             allowed_command_surfaces: default_goal_allowed_command_surfaces(),
             allowed_channel_types: default_goal_allowed_channel_types(),
             token_budget: None,
@@ -21670,6 +21675,7 @@ enabled = true
             r#"
 [goal]
 enabled = true
+channel_status_updates = false
 allowed_command_surfaces = ["web", "tui", "channel"]
 allowed_channel_types = ["matrix", "telegram"]
 token_budget = 50000
@@ -21693,6 +21699,7 @@ enabled = false
         );
         assert_eq!(c.goal.token_budget, Some(50_000));
         assert_eq!(c.goal.cost_budget_usd, Some(2.50));
+        assert!(!c.goal.channel_status_updates);
         assert!(!c.agents["researcher"].goal.enabled);
         assert!(validate_goal_config(&c.goal).is_ok());
     }

@@ -887,6 +887,7 @@ goal-command-error-wrong-route = Goal `{$task_id}` is not visible from this rout
 goal-command-error-wrong-principal = Goal `{$task_id}` is not visible to this principal.
 channel-goal-command-failed = Goal command failed: {$error}
 channel-goal-command-invalid = Invalid goal command: {$raw}
+channel-goal-state-update = Goal update: {$message}
 channel-goal-start-work-prompt =
     Durable goal {$task_id} has been admitted. Continue working on this active goal.
 

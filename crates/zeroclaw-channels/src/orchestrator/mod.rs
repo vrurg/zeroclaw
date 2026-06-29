@@ -1384,6 +1384,13 @@ fn goal_channel_type(channel_name: &str) -> String {
         .to_string()
 }
 
+fn goal_channel_status_updates_enabled(
+    config: &zeroclaw_config::schema::Config,
+    channel_name: &str,
+) -> bool {
+    channel_name != "cli" && config.goal.channel_status_updates
+}
+
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -5150,6 +5157,32 @@ async fn process_channel_message_body(
         }))
     };
 
+    let goal_status_updates_enabled = goal_channel_status_updates_enabled(
+        runtime_defaults_snapshot(ctx.as_ref()).config.as_ref(),
+        msg.channel.as_str(),
+    );
+    let (goal_state_update_scope, goal_state_update_task) = if goal_status_updates_enabled
+        && let Some(channel) = target_channel.clone()
+    {
+        let (goal_state_tx, mut goal_state_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reply_target = msg.reply_target.clone();
+        let thread_ts = followup_thread_id(&msg);
+        (
+            Some(zeroclaw_runtime::control_plane::GoalStateUpdateSink::new(
+                goal_state_tx,
+            )),
+            Some(zeroclaw_spawn::spawn!(async move {
+                while let Some(text) = goal_state_rx.recv().await {
+                    let _ = channel
+                        .send(&SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()))
+                        .await;
+                }
+            })),
+        )
+    } else {
+        (None, None)
+    };
+
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
@@ -5290,6 +5323,10 @@ async fn process_channel_message_body(
                 goal_admission_context.clone(),
                 tool_loop,
             );
+            let tool_loop = zeroclaw_runtime::control_plane::scope_goal_state_updates(
+                goal_state_update_scope.clone(),
+                tool_loop,
+            );
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             // This future captures the full channel turn, provider dispatch,
@@ -5410,6 +5447,10 @@ async fn process_channel_message_body(
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(handle) = notify_task {
+        let _ = handle.await;
+    }
+    drop(goal_state_update_scope);
+    if let Some(handle) = goal_state_update_task {
         let _ = handle.await;
     }
 
@@ -18173,6 +18214,16 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("telegram", "/goal"),
             Some(ChannelRuntimeCommand::InvalidGoal(_))
         ));
+    }
+
+    #[test]
+    fn goal_channel_status_updates_follow_config_and_skip_cli() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        assert!(goal_channel_status_updates_enabled(&config, "matrix"));
+        assert!(!goal_channel_status_updates_enabled(&config, "cli"));
+
+        config.goal.channel_status_updates = false;
+        assert!(!goal_channel_status_updates_enabled(&config, "matrix"));
     }
 
     #[test]

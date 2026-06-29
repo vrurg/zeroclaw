@@ -43,6 +43,7 @@ per-agent opt-out lives under `[agents.<alias>.goal]`.
 ```toml
 [goal]
 enabled = true
+channel_status_updates = true
 allowed_command_surfaces = ["web", "tui", "channel"]
 allowed_channel_types = ["matrix", "telegram"]
 token_budget = 50000
@@ -62,6 +63,11 @@ enabled = true
 `allowed_channel_types` applies when the surface is `channel`; values are bare
 channel types such as `matrix` or `telegram`, not aliases like
 `matrix.default`.
+
+`channel_status_updates` controls extra in-channel goal state/status messages
+emitted by goal admission inside an agent turn, such as a model-initiated
+`goal_start`. Direct `/goal` command replies are still sent as command
+responses.
 
 Budget resolution is per dimension: explicit command value, then `[goal]`
 default, then unlimited. Configured budget defaults apply only when a goal is

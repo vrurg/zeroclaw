@@ -16,6 +16,18 @@ use super::task_registry::{
 
 tokio::task_local! {
     static GOAL_ADMISSION_CONTEXT: Option<GoalAdmissionContext>;
+    static GOAL_STATE_UPDATE_SINK: Option<GoalStateUpdateSink>;
+}
+
+#[derive(Clone)]
+pub struct GoalStateUpdateSink {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl GoalStateUpdateSink {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self { tx }
+    }
 }
 
 fn msg(key: &str, args: &[(&str, &str)]) -> String {
@@ -142,6 +154,25 @@ where
     F: std::future::Future,
 {
     GOAL_ADMISSION_CONTEXT.scope(ctx, future).await
+}
+
+pub async fn scope_goal_state_updates<F>(sink: Option<GoalStateUpdateSink>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    GOAL_STATE_UPDATE_SINK.scope(sink, future).await
+}
+
+fn publish_goal_state_update(admission: &GoalAdmission) {
+    let _ = GOAL_STATE_UPDATE_SINK.try_with(|sink| {
+        if let Some(sink) = sink {
+            let message = msg(
+                "channel-goal-state-update",
+                &[("message", &admission.message)],
+            );
+            let _ = sink.tx.send(message);
+        }
+    });
 }
 
 pub fn parse_goal_command(input: &str) -> Result<GoalCommand> {
@@ -403,7 +434,7 @@ pub async fn admit_goal_command(
     }
     let cp = control_plane()
         .with_context(|| msg("goal-command-error-control-plane-unavailable", &[]))?;
-    match command.action {
+    let admission = match command.action {
         GoalCommandAction::Help => unreachable!("handled before control-plane access"),
         GoalCommandAction::Start => {
             let objective = command
@@ -448,7 +479,9 @@ pub async fn admit_goal_command(
         }
         GoalCommandAction::Resume => resume_goal(cp.store.as_ref(), &ctx, command.task_id).await,
         GoalCommandAction::Cancel => cancel_goal(cp.store.as_ref(), &ctx, command.task_id).await,
-    }
+    }?;
+    publish_goal_state_update(&admission);
+    Ok(admission)
 }
 
 async fn start_goal(
@@ -856,6 +889,26 @@ mod tests {
         config.goal.allowed_channel_types = vec!["telegram".into()];
         let err = ensure_goal_admitted_by_config(&ctx, &config, None).unwrap_err();
         assert!(err.to_string().contains("channel type `channel`"));
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_state_update_publishes_channel_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let admission = GoalAdmission {
+            task_id: Some("goal-1".into()),
+            status: TaskStatus::Running,
+            message: "Goal `goal-1` started.".into(),
+        };
+
+        scope_goal_state_updates(Some(GoalStateUpdateSink::new(tx)), async {
+            publish_goal_state_update(&admission);
+        })
+        .await;
+
+        assert_eq!(
+            rx.recv().await.as_deref(),
+            Some("Goal update: Goal `goal-1` started.")
+        );
     }
 
     #[tokio::test]
