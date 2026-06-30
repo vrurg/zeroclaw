@@ -532,19 +532,28 @@ mod streaming {
         }
     }
 
-    /// Keep multiline tool/status details from becoming accidental Matrix
-    /// Markdown lists or code blocks inside the editable draft. This is a
-    /// Matrix presentation shim only; if upstream tool-progress normalization
-    /// ever provides the same guarantee, reconsider this channel-local step.
+    /// Keep multiline tool/status details and Markdown punctuation from
+    /// becoming accidental Matrix formatting inside the editable draft. This
+    /// is a Matrix presentation shim only; if upstream tool-progress
+    /// normalization ever provides the same guarantee, reconsider this
+    /// channel-local step.
     pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
-        text.trim_end_matches(&['\r', '\n'][..])
-            .chars()
-            .map(|ch| match ch {
-                '\n' => '␊',
-                '\r' => '␍',
-                _ => ch,
-            })
-            .collect()
+        let mut normalized = String::with_capacity(text.len());
+        for ch in text.trim_end_matches(&['\r', '\n'][..]).chars() {
+            match ch {
+                '\n' => normalized.push('␊'),
+                '\r' => normalized.push('␍'),
+                '\u{000b}' => normalized.push('␋'),
+                '\u{000c}' => normalized.push('␌'),
+                '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.'
+                | '!' | '>' | '|' => {
+                    normalized.push('\\');
+                    normalized.push(ch);
+                }
+                _ => normalized.push(ch),
+            }
+        }
+        normalized
     }
 
     /// Render the newest progress entries that fit within the Matrix text-body
@@ -4936,6 +4945,10 @@ mod tests {
             assert_eq!(
                 normalize_matrix_progress_line("shell: printf 'a\\nb'\nnext\r\n"),
                 "shell: printf 'a\\nb'␊next"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line("delegate: prompt=Check **service**\nthen _report_"),
+                "delegate: prompt=Check \\*\\*service\\*\\*␊then \\_report\\_"
             );
         }
 
