@@ -25,8 +25,9 @@ pub struct ControlPlaneHandle {
 
 impl ControlPlaneHandle {
     /// Open the durable store at `<data_dir>/control_plane.db`, mint a fresh
-    /// `boot_id`, and run the one-shot crash-recovery sweep (prior-boot `Running`
-    /// orphans → `Lost`). Additive and fail-safe: a fresh install gets an empty DB.
+    /// `boot_id`, and run the one-shot crash-recovery sweep. Prior-boot non-goal
+    /// `Running` tasks become `Lost`; prior-boot goals become paused, resumable
+    /// work. Additive and fail-safe: a fresh install gets an empty DB.
     ///
     /// SINGLE-WRITER ASSUMPTION (review finding #8): recovery treats a *different*
     /// `boot_id` as proof the prior owner is gone. That holds under the deployment
@@ -44,15 +45,15 @@ impl ControlPlaneHandle {
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
         let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
-        let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
-        if reclaimed > 0 {
+        let recovered = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
+        if recovered > 0 {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(
-                        ::serde_json::json!({ "reclaimed": reclaimed, "boot_id": boot_id })
+                        ::serde_json::json!({ "recovered": recovered, "boot_id": boot_id })
                     ),
-                "control-plane: reclaimed prior-boot orphan tasks at startup"
+                "control-plane: recovered prior-boot tasks at startup"
             );
         }
         Ok(Self { store, boot_id })
@@ -121,7 +122,7 @@ mod tests {
             })
             .await
             .unwrap();
-        // Second boot recovers the orphan at startup.
+        // Second boot recovers the non-goal orphan at startup.
         let h2 = ControlPlaneHandle::start_with_boot_id(dir.path(), "boot-2".into())
             .await
             .unwrap();

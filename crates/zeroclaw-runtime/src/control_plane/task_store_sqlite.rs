@@ -457,6 +457,21 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
+    async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE tasks
+                SET owner_pid = ?1,
+                    owner_boot_id = ?2,
+                    heartbeat_at = NULL
+              WHERE id = ?3
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            params![owner_pid as i64, owner_boot_id, id],
+        )
+        .context("claim task owner")?;
+        Ok(())
+    }
+
     async fn get(&self, id: &str) -> Result<Option<TaskRecord>> {
         let conn = self.conn.lock();
         let rec = conn
@@ -943,5 +958,18 @@ mod tests {
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_none());
         s.heartbeat("a", "boot-1").await.unwrap(); // owner: stamps
         assert!(s.get("a").await.unwrap().unwrap().heartbeat_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn claim_owner_updates_canonical_owner_fields_for_resumed_task() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("a", "main", 1, "boot-old")).await.unwrap();
+
+        s.claim_owner("a", 42, "boot-new").await.unwrap();
+
+        let got = s.get("a").await.unwrap().unwrap();
+        assert_eq!(got.owner_pid, 42);
+        assert_eq!(got.owner_boot_id, "boot-new");
+        assert!(got.heartbeat_at.is_none());
     }
 }

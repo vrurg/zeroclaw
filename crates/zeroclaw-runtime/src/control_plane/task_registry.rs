@@ -75,6 +75,7 @@ pub enum GoalPauseReason {
     ExternalDependency,
     ProviderUnavailable,
     VerifierBlocked,
+    #[serde(rename = "daemon_restarted", alias = "daemon_restart")]
     DaemonRestart,
 }
 
@@ -192,6 +193,17 @@ pub trait TaskRegistry: Send + Sync {
         output: Option<String>,
         error: Option<String>,
     ) -> anyhow::Result<()>;
+    /// Claim a resumable task for the current daemon owner.
+    ///
+    /// This updates the canonical ownership fields on [`TaskRecord`]. It does
+    /// not create a secondary ownership cache; callers use it when a durable
+    /// paused task becomes eligible to run under a new daemon boot.
+    async fn claim_owner(
+        &self,
+        id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<()>;
     async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>>;
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
@@ -258,6 +270,17 @@ mod tests {
         assert_eq!(s, "\"goal\"");
         let back: TaskKind = serde_json::from_str(&s).unwrap();
         assert_eq!(back, TaskKind::Goal);
+    }
+
+    #[test]
+    fn daemon_restart_pause_reason_uses_rfc_name_with_legacy_alias() {
+        // Restart recovery is an RFC-visible persisted reason; old local rows
+        // that used the draft spelling must continue to deserialize.
+        let serialized = serde_json::to_string(&GoalPauseReason::DaemonRestart).unwrap();
+        assert_eq!(serialized, "\"daemon_restarted\"");
+
+        let legacy: GoalPauseReason = serde_json::from_str("\"daemon_restart\"").unwrap();
+        assert_eq!(legacy, GoalPauseReason::DaemonRestart);
     }
 
     #[test]

@@ -16,8 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::json;
 
-use super::task_registry::{TaskRegistry, TaskStatus};
+use super::authority::is_authoritative;
+use super::task_registry::{
+    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, TaskKind, TaskRecord,
+    TaskRegistry, TaskStatus,
+};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -33,22 +38,25 @@ fn age_secs(ts: &str, now: DateTime<Utc>) -> Option<i64> {
         .map(|t| (now - t.with_timezone(&Utc)).num_seconds())
 }
 
-/// One-shot crash-recovery sweep: reclaim every `Running` record left behind by a
-/// PRIOR boot. Safe to run at every startup — same-boot records are not yet present
-/// (this runs before the reaper spawns) and the authority guard protects any that
-/// are. Returns the number of records reclaimed.
+/// One-shot crash-recovery sweep.
+///
+/// Prior-boot non-goal `Running` records are reclaimed as `Lost`. Prior-boot
+/// `Goal` records recover as paused, resumable work with a typed restart
+/// blocker. Same-boot records are not yet present during normal startup, and
+/// the authority guard protects against split-brain cases.
 pub async fn recovery_pass(store: &dyn TaskRegistry, boot_id: &str) -> anyhow::Result<usize> {
-    let mut reclaimed = 0usize;
+    let mut recovered = 0usize;
     for rec in store.list_running().await? {
-        if rec.owner_boot_id != boot_id && store.reconcile_lost(&rec.id, boot_id).await? {
-            reclaimed += 1;
+        if rec.owner_boot_id != boot_id && recover_prior_boot_running(store, &rec, boot_id).await? {
+            recovered += 1;
         }
     }
-    Ok(reclaimed)
+    Ok(recovered)
 }
 
 /// The periodic supervision loop. Runs until `cancel` is triggered. Each tick:
-///   * prior-boot `Running` records → `Lost` (orphan recovery, authority-guarded);
+///   * prior-boot non-goal `Running` records → `Lost`;
+///   * prior-boot goal `Running` records → `Paused` with `daemon_restarted`;
 ///   * same-boot `Running` records whose heartbeat is older than `max_runtime_secs`
 ///     → `TimedOut` (the daemon's own hung task — we own it, so we may time it out);
 ///   * fresh same-boot records → skipped.
@@ -90,8 +98,7 @@ pub async fn sweep(
     let now = Utc::now();
     for rec in store.list_running().await? {
         if rec.owner_boot_id != boot_id {
-            // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
-            let _ = store.reconcile_lost(&rec.id, boot_id).await?;
+            let _ = recover_prior_boot_running(store, &rec, boot_id).await?;
         } else {
             // Our own boot: the owning daemon (this process) is alive, so the only
             // legitimate reason to terminate is a task that USES heartbeats and has gone
@@ -113,6 +120,57 @@ pub async fn sweep(
         }
     }
     Ok(())
+}
+
+async fn recover_prior_boot_running(
+    store: &dyn TaskRegistry,
+    rec: &TaskRecord,
+    boot_id: &str,
+) -> anyhow::Result<bool> {
+    if rec.kind != TaskKind::Goal {
+        return store.reconcile_lost(&rec.id, boot_id).await;
+    }
+
+    if !is_authoritative(rec, boot_id) {
+        return Ok(false);
+    }
+
+    if store.get_goal_task(&rec.id).await?.is_none() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "task_id": rec.id })),
+            "control-plane: goal task missing extension during restart recovery"
+        );
+        return store.reconcile_lost(&rec.id, boot_id).await;
+    }
+
+    store
+        .update_goal_pause(&rec.id, Some(daemon_restart_pause(rec, boot_id)))
+        .await?;
+    store
+        .update_status(&rec.id, TaskStatus::Paused, None, None)
+        .await?;
+    Ok(matches!(
+        store.get(&rec.id).await?,
+        Some(task) if task.status == TaskStatus::Paused
+    ))
+}
+
+fn daemon_restart_pause(rec: &TaskRecord, boot_id: &str) -> GoalPauseState {
+    GoalPauseState {
+        reason: GoalPauseReason::DaemonRestart,
+        description: Some("Goal paused after daemon restart.".into()),
+        blockers: vec![GoalBlocker {
+            kind: GoalBlockerKind::RestartRecovery,
+            message: "The daemon restarted while this goal was running.".into(),
+            payload: Some(json!({
+                "previous_boot_id": rec.owner_boot_id,
+                "recovered_by_boot_id": boot_id,
+            })),
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +219,39 @@ mod tests {
             s.get("mine").await.unwrap().unwrap().status,
             TaskStatus::Running
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_pauses_prior_boot_goals_instead_of_losing_them() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut goal = rec("goal", "boot-OLD", 999_999, None);
+        goal.kind = TaskKind::Goal;
+        s.create_goal(
+            goal,
+            crate::control_plane::task_registry::GoalTaskRecord {
+                task_id: "goal".into(),
+                objective: "keep working".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let n = recovery_pass(&s, "boot-NEW").await.unwrap();
+
+        assert_eq!(n, 1);
+        assert_eq!(
+            s.get("goal").await.unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+        let recovered = s.get_goal_task("goal").await.unwrap().unwrap();
+        assert_eq!(recovered.pause_reason, Some(GoalPauseReason::DaemonRestart));
+        assert_eq!(recovered.blockers.len(), 1);
+        assert_eq!(recovered.blockers[0].kind, GoalBlockerKind::RestartRecovery);
     }
 
     #[tokio::test]

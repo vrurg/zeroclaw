@@ -841,20 +841,24 @@ channel-runtime-model-switched = Model switched to `{ $model }` (model_provider:
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 
 # ── Goal mode runtime surfaces (#8303 / ADR-008) ─────────────────────
-goal-command-started = Goal `{$task_id}` started.
+goal-budget-limit-unlimited = unlimited
+goal-budget-cost-value = ${$amount}
+goal-budget-summary = Budget: tokens {$tokens_used}/{$token_limit}; cost {$cost_used}/{$cost_limit}.
+goal-budget-summary-unavailable = Budget: usage unavailable; limits tokens {$token_limit}, cost {$cost_limit}.
+goal-command-started = 🎯 Goal `{$task_id}` started. {$budget}
 goal-command-help = /goal start [--tokens=N|unlimited] [--cost=N|unlimited] <objective>
     /goal status [task_id]
     /goal budget --tokens=N|unlimited --cost=N|unlimited
     /goal pause [reason]
     /goal resume [task_id]
     /goal cancel [task_id]
-goal-command-paused = Goal `{$task_id}` paused.
-goal-command-resumed = Goal `{$task_id}` resumed.
-goal-command-cancelled = Goal `{$task_id}` cancelled.
-goal-command-completed = Goal `{$task_id}` completed.
-goal-command-budget-updated = Goal `{$task_id}` budget updated.
-goal-command-status = Goal `{$task_id}` is {$status}: {$objective}
-goal-command-status-paused = Goal `{$task_id}` is {$status}: {$objective} (paused: {$reason})
+goal-command-paused = ⏸️ Goal `{$task_id}` paused. {$budget}
+goal-command-resumed = ▶️ Goal `{$task_id}` resumed. {$budget}
+goal-command-cancelled = 🛑 Goal `{$task_id}` cancelled. {$budget}
+goal-command-completed = ✅ Goal `{$task_id}` completed. {$budget}
+goal-command-budget-updated = 💰 Goal `{$task_id}` budget updated. {$budget}
+goal-command-status = 📊 Goal `{$task_id}` is {$status}: {$objective}. {$budget}
+goal-command-status-paused = ⏸️ Goal `{$task_id}` is {$status}: {$objective} (reason: {$reason}). {$budget}
 goal-terminal-reason-cancelled-by-controller = cancelled by goal controller
 goal-command-error-control-plane-unavailable = Goal mode requires a running control plane.
 goal-command-error-disabled = Goal mode is disabled by `goal.enabled = false`.
@@ -886,9 +890,9 @@ goal-command-error-not-goal = Task `{$task_id}` is not a goal.
 goal-command-error-wrong-agent = Goal `{$task_id}` is not owned by this agent.
 goal-command-error-wrong-route = Goal `{$task_id}` is not visible from this route.
 goal-command-error-wrong-principal = Goal `{$task_id}` is not visible to this principal.
-channel-goal-command-failed = Goal command failed: {$error}
-channel-goal-command-invalid = Invalid goal command: {$raw}
-channel-goal-state-update = Goal update: {$message}
+channel-goal-command-failed = ⚠️ Goal command failed: {$error}
+channel-goal-command-invalid = ⚠️ Invalid goal command: {$raw}
+channel-goal-state-update = {$message}
 channel-goal-start-work-prompt =
     Durable goal {$task_id} has been admitted. Continue working on this active goal.
 
@@ -896,7 +900,7 @@ channel-goal-start-work-prompt =
     {$objective}
 channel-goal-continue-work-prompt =
     Continue durable goal {$task_id}. Use the prior goal transcript and keep working autonomously while policy permits it. If you are blocked, say exactly what blocks progress.
-channel-goal-controller-failed = Goal controller failed: {$error}
+channel-goal-controller-failed = ⚠️ Goal controller failed: {$error}
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
 cli-alias-list-empty = (no entries under {$section})
