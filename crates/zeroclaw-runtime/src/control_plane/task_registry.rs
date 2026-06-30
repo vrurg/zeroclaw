@@ -75,6 +75,8 @@ pub enum GoalPauseReason {
     ExternalDependency,
     ProviderUnavailable,
     VerifierBlocked,
+    BudgetExhausted,
+    BudgetUnavailable,
     #[serde(rename = "daemon_restarted", alias = "daemon_restart")]
     DaemonRestart,
 }
@@ -98,6 +100,7 @@ pub enum GoalBlockerKind {
     ExternalDependency,
     Provider,
     Verifier,
+    Budget,
     RestartRecovery,
 }
 

@@ -846,6 +846,7 @@ goal-budget-cost-value = ${$amount}
 goal-budget-summary = Budget: tokens {$tokens_used}/{$token_limit}; cost {$cost_used}/{$cost_limit}.
 goal-budget-summary-unavailable = Budget: usage unavailable; limits tokens {$token_limit}, cost {$cost_limit}.
 goal-command-started = 🎯 Goal `{$task_id}` started. {$budget}
+goal-command-started-budget-unavailable = 🎯 Goal `{$task_id}` started but is paused because budget accounting is unavailable. {$budget}
 goal-command-help = /goal start [--tokens=N|unlimited] [--cost=N|unlimited] <objective>
     /goal status [task_id]
     /goal budget --tokens=N|unlimited --cost=N|unlimited
@@ -859,6 +860,14 @@ goal-command-completed = ✅ Goal `{$task_id}` completed. {$budget}
 goal-command-continuing = 🔁 Goal `{$task_id}` continuing. {$budget}
 goal-command-verifying = 🔎 Verifying goal `{$task_id}` status. {$budget}
 goal-command-budget-updated = 💰 Goal `{$task_id}` budget updated. {$budget}
+goal-command-budget-updated-paused = 💰 Goal `{$task_id}` budget updated; goal is paused. {$budget}
+goal-command-budget-updated-resumed = ▶️ Goal `{$task_id}` budget updated and resumed. {$budget}
+goal-command-budget-exhausted = ⏸️ Goal `{$task_id}` remains paused because its budget is exhausted. {$budget}
+goal-command-budget-unavailable = ⏸️ Goal `{$task_id}` remains paused because budget accounting is unavailable. {$budget}
+goal-command-budget-exhausted-description = Goal budget exhausted. {$budget}
+goal-command-budget-exhausted-blocker = Goal budget exhausted. {$budget}
+goal-command-budget-unavailable-description = Goal budget accounting unavailable. {$budget}
+goal-command-budget-unavailable-blocker = Goal budget accounting unavailable. {$budget}
 goal-command-status = 📊 Goal `{$task_id}` is {$status}: {$objective}. {$budget}
 goal-command-status-paused = ⏸️ Goal `{$task_id}` is {$status}: {$objective} (reason: {$reason}). {$budget}
 goal-terminal-reason-cancelled-by-controller = cancelled by goal controller
@@ -904,6 +913,8 @@ channel-goal-continue-work-prompt =
     Continue durable goal {$task_id}. Use the prior goal transcript and keep working autonomously while policy permits it. If you are blocked, say exactly what blocks progress.
 channel-goal-resume-work-prompt =
     The operator resumed durable goal {$task_id}. Continue from the prior goal transcript and keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
+channel-goal-budget-work-prompt =
+    The operator updated durable goal {$task_id} budget and the goal is admitted to continue. Continue from the prior goal transcript and keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
 channel-goal-restart-work-prompt =
     The daemon restarted while durable goal {$task_id} was running. Continue from the prior goal transcript and keep working autonomously while policy permits it. Treat any session-interrupted marker as a daemon interruption boundary, not as user cancellation. If you cannot safely continue, report the blocker instead of guessing.
 channel-goal-controller-failed = ⚠️ Goal controller failed: {$error}

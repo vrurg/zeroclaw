@@ -363,6 +363,7 @@ enum GoalContinuationPrompt {
     Start { objective: String },
     Continue,
     Resume,
+    Budget,
     Restart,
 }
 
@@ -1466,6 +1467,12 @@ fn goal_continuation_prompt(task_id: &str, prompt: &GoalContinuationPrompt) -> S
         GoalContinuationPrompt::Resume => {
             zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 "channel-goal-resume-work-prompt",
+                &[("task_id", task_id)],
+            )
+        }
+        GoalContinuationPrompt::Budget => {
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-budget-work-prompt",
                 &[("task_id", task_id)],
             )
         }
@@ -3196,6 +3203,9 @@ async fn handle_runtime_command_if_needed(
                 zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
                     Some(GoalContinuationPrompt::Resume)
                 }
+                zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
+                    Some(GoalContinuationPrompt::Budget)
+                }
                 _ => None,
             };
             let defaults_snapshot = runtime_defaults_snapshot(ctx);
@@ -3215,8 +3225,9 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => {
-                    if let (Some(task_id), Some(prompt)) =
-                        (admission.task_id.clone(), continuation_prompt)
+                    if admission.continue_goal
+                        && let (Some(task_id), Some(prompt)) =
+                            (admission.task_id.clone(), continuation_prompt)
                     {
                         outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
                     }
@@ -18878,6 +18889,29 @@ BTC is currently around $65,000 based on latest tool output."#
             next.content
                 .contains("operator resumed durable goal goal-1")
         );
+        assert!(!next.content.contains("last_state"));
+    }
+
+    #[test]
+    fn goal_budget_continuation_uses_runtime_prompt() {
+        let original = zeroclaw_api::channel::ChannelMessage::new(
+            "msg-1",
+            "@operator:example.org",
+            "!room:example.org",
+            "/goal budget --tokens=50000",
+            "matrix",
+            1,
+        );
+
+        let next = goal_continuation_message_with_prompt(
+            &original,
+            "goal-1",
+            &GoalContinuationPrompt::Budget,
+        );
+
+        assert_ne!(next.id, original.id);
+        assert!(!next.passive_context);
+        assert!(next.content.contains("updated durable goal goal-1 budget"));
         assert!(!next.content.contains("last_state"));
     }
 
