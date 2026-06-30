@@ -333,6 +333,7 @@ pub enum GoalTurnEvaluation {
     },
     Continue {
         task_id: String,
+        objective: String,
         notes: String,
         message: String,
     },
@@ -867,6 +868,7 @@ pub async fn evaluate_goal_turn(
             publish_goal_state_update(&admission);
             Ok(Some(GoalTurnEvaluation::Continue {
                 task_id: task.id,
+                objective: goal.objective,
                 notes,
                 message: admission.message,
             }))

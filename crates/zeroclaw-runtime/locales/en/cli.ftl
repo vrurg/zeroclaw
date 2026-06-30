@@ -910,13 +910,25 @@ channel-goal-start-work-prompt =
     Objective:
     {$objective}
 channel-goal-continue-work-prompt =
-    Continue durable goal {$task_id}. Use the prior goal transcript and keep working autonomously while policy permits it. If you are blocked, say exactly what blocks progress.
+    Continue durable goal {$task_id}. Use the objective and prior goal transcript; keep working autonomously while policy permits it. If you are blocked, say exactly what blocks progress.
+
+    Objective:
+    {$objective}
 channel-goal-resume-work-prompt =
-    The operator resumed durable goal {$task_id}. Continue from the prior goal transcript and keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
+    The operator resumed durable goal {$task_id}. Continue from the objective and prior goal transcript; keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
+
+    Objective:
+    {$objective}
 channel-goal-budget-work-prompt =
-    The operator updated durable goal {$task_id} budget and the goal is admitted to continue. Continue from the prior goal transcript and keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
+    The operator updated durable goal {$task_id} budget and the goal is admitted to continue. Continue from the objective and prior goal transcript; keep working autonomously while policy permits it. If you cannot safely continue, report the blocker instead of guessing.
+
+    Objective:
+    {$objective}
 channel-goal-restart-work-prompt =
-    The daemon restarted while durable goal {$task_id} was running. Continue from the prior goal transcript and keep working autonomously while policy permits it. Treat any session-interrupted marker as a daemon interruption boundary, not as user cancellation. If you cannot safely continue, report the blocker instead of guessing.
+    The daemon restarted while durable goal {$task_id} was running. Continue from the objective and prior goal transcript; keep working autonomously while policy permits it. Treat any session-interrupted marker as a daemon interruption boundary, not as user cancellation. If you cannot safely continue, report the blocker instead of guessing.
+
+    Objective:
+    {$objective}
 channel-goal-controller-failed = ⚠️ Goal controller failed: {$error}
 
 # ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──

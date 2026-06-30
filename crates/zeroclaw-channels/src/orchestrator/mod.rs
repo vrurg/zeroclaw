@@ -361,10 +361,10 @@ enum RuntimeCommandOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GoalContinuationPrompt {
     Start { objective: String },
-    Continue,
-    Resume,
-    Budget,
-    Restart,
+    Continue { objective: String },
+    Resume { objective: String },
+    Budget { objective: String },
+    Restart { objective: String },
 }
 
 enum ChannelProcessOutcome {
@@ -1458,28 +1458,28 @@ fn goal_continuation_prompt(task_id: &str, prompt: &GoalContinuationPrompt) -> S
                 &[("task_id", task_id), ("objective", objective)],
             )
         }
-        GoalContinuationPrompt::Continue => {
+        GoalContinuationPrompt::Continue { objective } => {
             zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 "channel-goal-continue-work-prompt",
-                &[("task_id", task_id)],
+                &[("task_id", task_id), ("objective", objective)],
             )
         }
-        GoalContinuationPrompt::Resume => {
+        GoalContinuationPrompt::Resume { objective } => {
             zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 "channel-goal-resume-work-prompt",
-                &[("task_id", task_id)],
+                &[("task_id", task_id), ("objective", objective)],
             )
         }
-        GoalContinuationPrompt::Budget => {
+        GoalContinuationPrompt::Budget { objective } => {
             zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 "channel-goal-budget-work-prompt",
-                &[("task_id", task_id)],
+                &[("task_id", task_id), ("objective", objective)],
             )
         }
-        GoalContinuationPrompt::Restart => {
+        GoalContinuationPrompt::Restart { objective } => {
             zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 "channel-goal-restart-work-prompt",
-                &[("task_id", task_id)],
+                &[("task_id", task_id), ("objective", objective)],
             )
         }
     }
@@ -1488,8 +1488,13 @@ fn goal_continuation_prompt(task_id: &str, prompt: &GoalContinuationPrompt) -> S
 fn goal_continuation_message(
     msg: &zeroclaw_api::channel::ChannelMessage,
     task_id: &str,
+    objective: String,
 ) -> zeroclaw_api::channel::ChannelMessage {
-    goal_continuation_message_with_prompt(msg, task_id, &GoalContinuationPrompt::Continue)
+    goal_continuation_message_with_prompt(
+        msg,
+        task_id,
+        &GoalContinuationPrompt::Continue { objective },
+    )
 }
 
 fn goal_continuation_message_with_prompt(
@@ -1513,13 +1518,14 @@ fn unix_timestamp_secs() -> u64 {
 
 fn recovered_goal_continuation_message(
     task_id: &str,
+    objective: String,
     context: zeroclaw_runtime::control_plane::TaskContinuationContext,
 ) -> zeroclaw_api::channel::ChannelMessage {
     let mut msg = zeroclaw_api::channel::ChannelMessage::new(
         format!("goal-restart:{task_id}:{}", uuid::Uuid::new_v4()),
         context.sender,
         context.reply_target,
-        goal_continuation_prompt(task_id, &GoalContinuationPrompt::Restart),
+        goal_continuation_prompt(task_id, &GoalContinuationPrompt::Restart { objective }),
         context.channel,
         unix_timestamp_secs(),
     );
@@ -1533,6 +1539,28 @@ fn recovered_goal_continuation_message(
 
 fn is_recovered_goal_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
     msg.id.starts_with("goal-restart:")
+}
+
+async fn goal_objective_for_prompt(task_id: &str) -> String {
+    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
+        return goal_objective_unavailable(task_id, "control plane unavailable");
+    };
+    match control_plane.store.get_goal_task(task_id).await {
+        Ok(Some(goal)) => goal.objective,
+        Ok(None) => goal_objective_unavailable(task_id, "goal extension missing"),
+        Err(error) => goal_objective_unavailable(task_id, &format!("{error:#}")),
+    }
+}
+
+fn goal_objective_unavailable(task_id: &str, reason: &str) -> String {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "task_id": task_id, "reason": reason })),
+        "goal continuation prompt missing objective"
+    );
+    format!("Objective unavailable from durable goal state for task {task_id}.")
 }
 
 fn goal_controller_limit_pause_message(
@@ -3195,19 +3223,8 @@ async fn handle_runtime_command_if_needed(
             "Unknown thinking level `{raw}`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`."
         ),
         ChannelRuntimeCommand::Goal(command) => {
-            let continuation_prompt = match command.action {
-                zeroclaw_runtime::control_plane::GoalCommandAction::Start => command
-                    .objective
-                    .clone()
-                    .map(|objective| GoalContinuationPrompt::Start { objective }),
-                zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
-                    Some(GoalContinuationPrompt::Resume)
-                }
-                zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
-                    Some(GoalContinuationPrompt::Budget)
-                }
-                _ => None,
-            };
+            let action = command.action;
+            let command_objective = command.objective.clone();
             let defaults_snapshot = runtime_defaults_snapshot(ctx);
             match zeroclaw_runtime::control_plane::admit_goal_command(
                 zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
@@ -3226,10 +3243,29 @@ async fn handle_runtime_command_if_needed(
             {
                 Ok(admission) => {
                     if admission.continue_goal
-                        && let (Some(task_id), Some(prompt)) =
-                            (admission.task_id.clone(), continuation_prompt)
+                        && let Some(task_id) = admission.task_id.clone()
                     {
-                        outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
+                        let prompt = match action {
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
+                                command_objective
+                                    .clone()
+                                    .map(|objective| GoalContinuationPrompt::Start { objective })
+                            }
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
+                                Some(GoalContinuationPrompt::Resume {
+                                    objective: goal_objective_for_prompt(&task_id).await,
+                                })
+                            }
+                            zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
+                                Some(GoalContinuationPrompt::Budget {
+                                    objective: goal_objective_for_prompt(&task_id).await,
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(prompt) = prompt {
+                            outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
+                        }
                     }
                     admission.message
                 }
@@ -6071,9 +6107,11 @@ async fn process_channel_message_body(
                     })) => {}
                     Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Continue {
                         task_id,
+                        objective,
                         ..
                     })) => {
-                        goal_controller_next = Some(goal_continuation_message(&msg, &task_id));
+                        goal_controller_next =
+                            Some(goal_continuation_message(&msg, &task_id, objective));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -6714,7 +6752,8 @@ async fn enqueue_recovered_goal_continuations(
             }
         };
 
-        let msg = recovered_goal_continuation_message(&task.id, context);
+        let objective = goal_objective_for_prompt(&task.id).await;
+        let msg = recovered_goal_continuation_message(&task.id, objective, context);
         if find_channel_for_message(&ctx.channels_by_name, &msg).is_none() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -18878,7 +18917,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let next = goal_continuation_message_with_prompt(
             &original,
             "goal-1",
-            &GoalContinuationPrompt::Resume,
+            &GoalContinuationPrompt::Resume {
+                objective: "finish the smoke test".into(),
+            },
         );
 
         assert_ne!(next.id, original.id);
@@ -18889,6 +18930,7 @@ BTC is currently around $65,000 based on latest tool output."#
             next.content
                 .contains("operator resumed durable goal goal-1")
         );
+        assert!(next.content.contains("finish the smoke test"));
         assert!(!next.content.contains("last_state"));
     }
 
@@ -18906,12 +18948,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let next = goal_continuation_message_with_prompt(
             &original,
             "goal-1",
-            &GoalContinuationPrompt::Budget,
+            &GoalContinuationPrompt::Budget {
+                objective: "finish the budget smoke".into(),
+            },
         );
 
         assert_ne!(next.id, original.id);
         assert!(!next.passive_context);
         assert!(next.content.contains("updated durable goal goal-1 budget"));
+        assert!(next.content.contains("finish the budget smoke"));
         assert!(!next.content.contains("last_state"));
     }
 
@@ -18928,7 +18973,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::control_plane::TaskContinuationConversationScope::ReplyTarget,
         };
 
-        let msg = recovered_goal_continuation_message("goal-1", context.clone());
+        let msg = recovered_goal_continuation_message(
+            "goal-1",
+            "finish the restart smoke".into(),
+            context.clone(),
+        );
 
         assert!(is_recovered_goal_continuation_message(&msg));
         assert_eq!(msg.channel, context.channel);
@@ -18942,6 +18991,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelConversationScope::ReplyTarget
         );
         assert!(msg.content.contains("daemon restarted"));
+        assert!(msg.content.contains("finish the restart smoke"));
         assert!(!msg.content.contains("last_state"));
     }
 
