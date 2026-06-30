@@ -162,7 +162,7 @@ async fn recover_prior_boot_running(
     }
 
     match goal_restart_recovery {
-        GoalRestartRecovery::PreserveState => {
+        GoalRestartRecovery::LastState => {
             store
                 .claim_owner(&rec.id, std::process::id(), boot_id)
                 .await?;
@@ -173,7 +173,7 @@ async fn recover_prior_boot_running(
                         && task.owner_boot_id == boot_id
             ))
         }
-        GoalRestartRecovery::PauseRunning => {
+        GoalRestartRecovery::Paused => {
             store
                 .update_goal_pause(&rec.id, Some(daemon_restart_pause(rec, boot_id)))
                 .await?;
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_preserves_prior_boot_running_goals_by_default() {
+    async fn recovery_keeps_prior_boot_running_goals_in_last_state_by_default() {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut goal = rec("goal", "boot-OLD", 999_999, None);
         goal.kind = TaskKind::Goal;
@@ -307,7 +307,7 @@ mod tests {
         .await
         .unwrap();
 
-        let n = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::PauseRunning)
+        let n = recovery_pass(&s, "boot-NEW", GoalRestartRecovery::Paused)
             .await
             .unwrap();
 

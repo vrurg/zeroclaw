@@ -3769,9 +3769,9 @@ impl Default for GoalConfig {
 pub enum GoalRestartRecovery {
     /// Keep a running goal running, re-owned by the new daemon boot.
     #[default]
-    PreserveState,
+    LastState,
     /// Pause a running goal with a typed restart-recovery blocker.
-    PauseRunning,
+    Paused,
 }
 
 fn default_goal_allowed_command_surfaces() -> Vec<String> {
@@ -21691,14 +21691,14 @@ enabled = true
     async fn goal_config_deserializes_rfc_policy_shape() {
         assert_eq!(
             Config::default().goal.restart_recovery,
-            GoalRestartRecovery::PreserveState
+            GoalRestartRecovery::LastState
         );
         let c = parse_test_config(
             r#"
 [goal]
 enabled = true
 channel_status_updates = false
-restart_recovery = "pause_running"
+restart_recovery = "paused"
 allowed_command_surfaces = ["web", "tui", "channel"]
 allowed_channel_types = ["matrix", "telegram"]
 token_budget = 50000
@@ -21723,7 +21723,7 @@ enabled = false
         assert_eq!(c.goal.token_budget, Some(50_000));
         assert_eq!(c.goal.cost_budget_usd, Some(2.50));
         assert!(!c.goal.channel_status_updates);
-        assert_eq!(c.goal.restart_recovery, GoalRestartRecovery::PauseRunning);
+        assert_eq!(c.goal.restart_recovery, GoalRestartRecovery::Paused);
         assert!(!c.agents["researcher"].goal.enabled);
         assert!(validate_goal_config(&c.goal).is_ok());
     }
