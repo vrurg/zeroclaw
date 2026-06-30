@@ -1455,6 +1455,84 @@ async fn send_goal_controller_update(
     }
 }
 
+fn spawn_goal_state_update_task(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    thread_ts: Option<String>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<
+        zeroclaw_runtime::control_plane::GoalStateUpdateEvent,
+    >,
+) -> tokio::task::JoinHandle<()> {
+    let supports_drafts = channel.supports_draft_updates();
+    zeroclaw_spawn::spawn!(async move {
+        use zeroclaw_runtime::control_plane::GoalStateUpdateEvent;
+
+        let mut verifier_draft_id: Option<String> = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                GoalStateUpdateEvent::VerifierStarted(text) if supports_drafts => {
+                    match channel
+                        .send_draft(
+                            &SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        Ok(Some(draft_id)) => verifier_draft_id = Some(draft_id),
+                        Ok(None) => {}
+                        Err(err) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                                "goal verifier draft send failed"
+                            );
+                        }
+                    }
+                }
+                GoalStateUpdateEvent::VerifierStarted(_) => {}
+                GoalStateUpdateEvent::Status(text) => {
+                    if let Some(draft_id) = verifier_draft_id.take() {
+                        if let Err(err) = channel
+                            .finalize_draft(&reply_target, &draft_id, &text)
+                            .await
+                        {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                                "goal verifier draft finalize failed; sending final status"
+                            );
+                            let _ = channel
+                                .send(
+                                    &SendMessage::new(&text, &reply_target)
+                                        .in_thread(thread_ts.clone()),
+                                )
+                                .await;
+                        }
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(&text, &reply_target)
+                                    .in_thread(thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+        if let Some(draft_id) = verifier_draft_id.take() {
+            let _ = channel.cancel_draft(&reply_target, &draft_id).await;
+        }
+    })
+}
+
 fn parse_thinking_command_arg(raw: Option<&str>) -> Result<Option<ThinkingLevel>, String> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -5243,27 +5321,27 @@ async fn process_channel_message_body(
         runtime_defaults_snapshot(ctx.as_ref()).config.as_ref(),
         msg.channel.as_str(),
     );
-    let (goal_state_update_scope, goal_state_update_task) = if goal_status_updates_enabled
-        && let Some(channel) = target_channel.clone()
-    {
-        let (goal_state_tx, mut goal_state_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let reply_target = msg.reply_target.clone();
-        let thread_ts = followup_thread_id(&msg);
-        (
-            Some(zeroclaw_runtime::control_plane::GoalStateUpdateSink::new(
-                goal_state_tx,
-            )),
-            Some(zeroclaw_spawn::spawn!(async move {
-                while let Some(text) = goal_state_rx.recv().await {
-                    let _ = channel
-                        .send(&SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()))
-                        .await;
-                }
-            })),
-        )
-    } else {
-        (None, None)
-    };
+    let (goal_state_update_scope, goal_state_update_task) =
+        if goal_status_updates_enabled && let Some(channel) = target_channel.clone() {
+            let (goal_state_tx, goal_state_rx) = tokio::sync::mpsc::unbounded_channel::<
+                zeroclaw_runtime::control_plane::GoalStateUpdateEvent,
+            >();
+            let reply_target = msg.reply_target.clone();
+            let thread_ts = followup_thread_id(&msg);
+            (
+                Some(zeroclaw_runtime::control_plane::GoalStateUpdateSink::new(
+                    goal_state_tx,
+                )),
+                Some(spawn_goal_state_update_task(
+                    channel,
+                    reply_target,
+                    thread_ts,
+                    goal_state_rx,
+                )),
+            )
+        } else {
+            (None, None)
+        };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -5529,10 +5607,6 @@ async fn process_channel_message_body(
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(handle) = notify_task {
-        let _ = handle.await;
-    }
-    drop(goal_state_update_scope);
-    if let Some(handle) = goal_state_update_task {
         let _ = handle.await;
     }
 
@@ -5848,29 +5922,22 @@ async fn process_channel_message_body(
             if !cancellation_token.is_cancelled()
                 && let Some(goal_ctx) = goal_admission_context.as_ref()
             {
-                match zeroclaw_runtime::control_plane::evaluate_goal_turn(
-                    goal_ctx,
-                    runtime_defaults.config.as_ref(),
-                    &delivered_response,
+                let evaluation = zeroclaw_runtime::control_plane::scope_goal_state_updates(
+                    goal_state_update_scope.clone(),
+                    zeroclaw_runtime::control_plane::evaluate_goal_turn(
+                        goal_ctx,
+                        runtime_defaults.config.as_ref(),
+                        &delivered_response,
+                    ),
                 )
-                .await
-                {
+                .await;
+                match evaluation {
                     Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Completed {
-                        message,
                         ..
                     }))
                     | Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Paused {
-                        message,
                         ..
-                    })) => {
-                        send_goal_controller_update(
-                            runtime_defaults.config.as_ref(),
-                            target_channel.as_ref(),
-                            &msg,
-                            &message,
-                        )
-                        .await;
-                    }
+                    })) => {}
                     Ok(Some(zeroclaw_runtime::control_plane::GoalTurnEvaluation::Continue {
                         task_id,
                         ..
@@ -5883,13 +5950,23 @@ async fn process_channel_message_body(
                             "channel-goal-controller-failed",
                             &[("error", &error.to_string())],
                         );
-                        send_goal_controller_update(
-                            runtime_defaults.config.as_ref(),
-                            target_channel.as_ref(),
-                            &msg,
-                            &error_text,
-                        )
-                        .await;
+                        if let Some(sink) = goal_state_update_scope.as_ref() {
+                            let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                                "channel-goal-state-update",
+                                &[("message", &error_text)],
+                            );
+                            sink.send(
+                                zeroclaw_runtime::control_plane::GoalStateUpdateEvent::Status(text),
+                            );
+                        } else {
+                            send_goal_controller_update(
+                                runtime_defaults.config.as_ref(),
+                                target_channel.as_ref(),
+                                &msg,
+                                &error_text,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -6098,6 +6175,11 @@ async fn process_channel_message_body(
                 }
             }
         }
+    }
+
+    drop(goal_state_update_scope);
+    if let Some(handle) = goal_state_update_task {
+        let _ = handle.await;
     }
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
@@ -12879,6 +12961,14 @@ api_key = "anthropic-key"
     }
 
     #[derive(Default)]
+    struct GoalDraftRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        draft_messages: tokio::sync::Mutex<Vec<String>>,
+        finalized_drafts: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[derive(Default)]
     struct TelegramRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -13083,6 +13173,73 @@ api_key = "anthropic-key"
                 message_id.to_string(),
                 emoji.to_string(),
             ));
+            Ok(())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalDraftRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for GoalDraftRecordingChannel {
+        fn name(&self) -> &str {
+            "goal-draft-channel"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.draft_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(Some("draft-1".into()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                text.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push((recipient.to_string(), message_id.to_string()));
             Ok(())
         }
     }
@@ -18433,6 +18590,62 @@ BTC is currently around $65,000 based on latest tool output."#
 
         config.goal.channel_status_updates = false;
         assert!(!goal_channel_status_updates_enabled(&config, "matrix"));
+    }
+
+    #[tokio::test]
+    async fn goal_state_update_task_replaces_verifier_draft_with_status() {
+        let channel_impl = Arc::new(GoalDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_goal_state_update_task(channel, "room".into(), Some("thread".into()), rx);
+
+        tx.send(
+            zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(
+                "checking goal".into(),
+            ),
+        )
+        .unwrap();
+        tx.send(zeroclaw_runtime::control_plane::GoalStateUpdateEvent::Status("goal done".into()))
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *channel_impl.draft_messages.lock().await,
+            vec!["room:checking goal".to_string()]
+        );
+        assert_eq!(
+            *channel_impl.finalized_drafts.lock().await,
+            vec![(
+                "room".to_string(),
+                "draft-1".to_string(),
+                "goal done".to_string()
+            )]
+        );
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_state_update_task_cancels_unfinished_verifier_draft() {
+        let channel_impl = Arc::new(GoalDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_goal_state_update_task(channel, "room".into(), Some("thread".into()), rx);
+
+        tx.send(
+            zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(
+                "checking goal".into(),
+            ),
+        )
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        assert_eq!(
+            *channel_impl.cancelled_drafts.lock().await,
+            vec![("room".to_string(), "draft-1".to_string())]
+        );
+        assert!(channel_impl.finalized_drafts.lock().await.is_empty());
     }
 
     #[test]

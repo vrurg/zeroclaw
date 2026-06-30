@@ -24,12 +24,22 @@ tokio::task_local! {
 
 #[derive(Clone)]
 pub struct GoalStateUpdateSink {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<GoalStateUpdateEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalStateUpdateEvent {
+    Status(String),
+    VerifierStarted(String),
 }
 
 impl GoalStateUpdateSink {
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<GoalStateUpdateEvent>) -> Self {
         Self { tx }
+    }
+
+    pub fn send(&self, event: GoalStateUpdateEvent) {
+        let _ = self.tx.send(event);
     }
 }
 
@@ -156,9 +166,19 @@ pub struct GoalAdmission {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalTurnEvaluation {
-    Completed { task_id: String, message: String },
-    Continue { task_id: String, notes: String },
-    Paused { task_id: String, message: String },
+    Completed {
+        task_id: String,
+        message: String,
+    },
+    Continue {
+        task_id: String,
+        notes: String,
+        message: String,
+    },
+    Paused {
+        task_id: String,
+        message: String,
+    },
 }
 
 impl GoalAdmissionContext {
@@ -225,7 +245,21 @@ fn publish_goal_state_update(admission: &GoalAdmission) {
                 "channel-goal-state-update",
                 &[("message", &admission.message)],
             );
-            let _ = sink.tx.send(message);
+            sink.send(GoalStateUpdateEvent::Status(message));
+        }
+    });
+}
+
+fn publish_goal_verifier_started(task_id: &str, goal: &GoalTaskRecord, config: &Config) {
+    let usage = goal_usage_summary(Some(config), task_id);
+    let budget = goal_budget_summary(goal, usage.as_ref());
+    let message = msg(
+        "goal-command-verifying",
+        &[("task_id", task_id), ("budget", &budget)],
+    );
+    let _ = GOAL_STATE_UPDATE_SINK.try_with(|sink| {
+        if let Some(sink) = sink {
+            sink.send(GoalStateUpdateEvent::VerifierStarted(message));
         }
     });
 }
@@ -590,6 +624,10 @@ pub async fn evaluate_goal_turn(
             )
         })?;
 
+    if config.goal.verifier.enabled {
+        publish_goal_verifier_started(&task.id, &goal, config);
+    }
+
     match verify_goal_completion(config, &task.agent, &goal, candidate_summary).await {
         Ok(GoalVerifierDecision::Complete { notes: _ }) => {
             cp.store
@@ -619,10 +657,24 @@ pub async fn evaluate_goal_turn(
                 message: admission.message,
             }))
         }
-        Ok(GoalVerifierDecision::Continue { notes }) => Ok(Some(GoalTurnEvaluation::Continue {
-            task_id: task.id,
-            notes,
-        })),
+        Ok(GoalVerifierDecision::Continue { notes }) => {
+            let usage = goal_usage_summary(Some(config), &task.id);
+            let budget = goal_budget_summary(&goal, usage.as_ref());
+            let admission = GoalAdmission {
+                task_id: Some(task.id.clone()),
+                status: TaskStatus::Running,
+                message: msg(
+                    "goal-command-continuing",
+                    &[("task_id", &task.id), ("budget", &budget)],
+                ),
+            };
+            publish_goal_state_update(&admission);
+            Ok(Some(GoalTurnEvaluation::Continue {
+                task_id: task.id,
+                notes,
+                message: admission.message,
+            }))
+        }
         Ok(GoalVerifierDecision::Blocked { pause }) => {
             let admission = pause_goal_for_blocker(
                 cp.store.as_ref(),
@@ -1178,7 +1230,39 @@ mod tests {
         })
         .await;
 
-        assert_eq!(rx.recv().await.as_deref(), Some("Goal `goal-1` started."));
+        assert_eq!(
+            rx.recv().await,
+            Some(GoalStateUpdateEvent::Status(
+                "Goal `goal-1` started.".into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_verifier_start_publishes_progress_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = test_config();
+        config.goal.verifier.enabled = true;
+        let goal = GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship it".into(),
+            effective_token_limit: Some(10_000),
+            effective_cost_limit_usd: Some(1.25),
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+
+        scope_goal_state_updates(Some(GoalStateUpdateSink::new(tx)), async {
+            publish_goal_verifier_started("goal-1", &goal, &config);
+        })
+        .await;
+
+        let Some(GoalStateUpdateEvent::VerifierStarted(message)) = rx.recv().await else {
+            panic!("verifier progress should use a typed progress event");
+        };
+        assert!(message.starts_with("🔎 Verifying goal `goal-1` status."));
+        assert!(message.contains("Budget:"));
     }
 
     #[tokio::test]

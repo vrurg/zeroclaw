@@ -3723,6 +3723,9 @@ pub struct GoalConfig {
     /// happens inside a channel turn.
     #[serde(default = "default_true")]
     pub channel_status_updates: bool,
+    /// Recovery policy for goals that were running when the daemon restarted.
+    #[serde(default)]
+    pub restart_recovery: GoalRestartRecovery,
     /// Command surfaces allowed to start or manage durable goals.
     #[serde(default = "default_goal_allowed_command_surfaces")]
     pub allowed_command_surfaces: Vec<String>,
@@ -3747,6 +3750,7 @@ impl Default for GoalConfig {
         Self {
             enabled: true,
             channel_status_updates: true,
+            restart_recovery: GoalRestartRecovery::default(),
             allowed_command_surfaces: default_goal_allowed_command_surfaces(),
             allowed_channel_types: default_goal_allowed_channel_types(),
             token_budget: None,
@@ -3754,6 +3758,20 @@ impl Default for GoalConfig {
             verifier: GoalVerifierConfig::default(),
         }
     }
+}
+
+/// How prior-boot running goals recover after daemon restart.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoalRestartRecovery {
+    /// Keep a running goal running, re-owned by the new daemon boot.
+    #[default]
+    PreserveState,
+    /// Pause a running goal with a typed restart-recovery blocker.
+    PauseRunning,
 }
 
 fn default_goal_allowed_command_surfaces() -> Vec<String> {
@@ -21671,11 +21689,16 @@ enabled = true
 
     #[test]
     async fn goal_config_deserializes_rfc_policy_shape() {
+        assert_eq!(
+            Config::default().goal.restart_recovery,
+            GoalRestartRecovery::PreserveState
+        );
         let c = parse_test_config(
             r#"
 [goal]
 enabled = true
 channel_status_updates = false
+restart_recovery = "pause_running"
 allowed_command_surfaces = ["web", "tui", "channel"]
 allowed_channel_types = ["matrix", "telegram"]
 token_budget = 50000
@@ -21700,6 +21723,7 @@ enabled = false
         assert_eq!(c.goal.token_budget, Some(50_000));
         assert_eq!(c.goal.cost_budget_usd, Some(2.50));
         assert!(!c.goal.channel_status_updates);
+        assert_eq!(c.goal.restart_recovery, GoalRestartRecovery::PauseRunning);
         assert!(!c.agents["researcher"].goal.enabled);
         assert!(validate_goal_config(&c.goal).is_ok());
     }

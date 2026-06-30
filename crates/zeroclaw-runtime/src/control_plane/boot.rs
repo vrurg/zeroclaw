@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_config::schema::GoalRestartRecovery;
 
 use super::reaper;
 use super::task_registry::TaskRegistry;
@@ -26,8 +27,9 @@ pub struct ControlPlaneHandle {
 impl ControlPlaneHandle {
     /// Open the durable store at `<data_dir>/control_plane.db`, mint a fresh
     /// `boot_id`, and run the one-shot crash-recovery sweep. Prior-boot non-goal
-    /// `Running` tasks become `Lost`; prior-boot goals become paused, resumable
-    /// work. Additive and fail-safe: a fresh install gets an empty DB.
+    /// `Running` tasks become `Lost`; prior-boot goals follow the configured
+    /// restart recovery policy. Additive and fail-safe: a fresh install gets an
+    /// empty DB.
     ///
     /// SINGLE-WRITER ASSUMPTION (review finding #8): recovery treats a *different*
     /// `boot_id` as proof the prior owner is gone. That holds under the deployment
@@ -36,16 +38,24 @@ impl ControlPlaneHandle {
     /// (`flock`/`O_EXCL` lockfile on `data_dir`) so two concurrent daemons can never both
     /// run recovery and reap each other's live tasks. Until that lock lands, do not run
     /// two daemons on one workspace.
-    pub async fn start(data_dir: &Path) -> Result<Self> {
+    pub async fn start(
+        data_dir: &Path,
+        goal_restart_recovery: GoalRestartRecovery,
+    ) -> Result<Self> {
         let run_id = uuid::Uuid::new_v4().to_string();
-        Self::start_with_boot_id(data_dir, run_id).await
+        Self::start_with_boot_id(data_dir, run_id, goal_restart_recovery).await
     }
 
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
-    pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
+    pub async fn start_with_boot_id(
+        data_dir: &Path,
+        boot_id: String,
+        goal_restart_recovery: GoalRestartRecovery,
+    ) -> Result<Self> {
         let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
-        let recovered = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
+        let recovered =
+            reaper::recovery_pass(store.as_ref(), &boot_id, goal_restart_recovery).await?;
         if recovered > 0 {
             ::zeroclaw_log::record!(
                 INFO,
@@ -64,7 +74,12 @@ impl ControlPlaneHandle {
     ///
     /// Uses `zeroclaw_spawn::spawn!` (NOT raw `tokio::spawn`, which `clippy.toml`
     /// bans workspace-wide) so the reaper task inherits the caller's tracing span.
-    pub fn spawn_reaper(&self, max_runtime_secs: i64, cancel: CancellationToken) -> JoinHandle<()> {
+    pub fn spawn_reaper(
+        &self,
+        max_runtime_secs: i64,
+        goal_restart_recovery: GoalRestartRecovery,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
         // Hoist owned clones to locals so the spawn! future captures them by value
         // (not `&self`, which the macro would otherwise hold across the 'static boundary).
         let store = Arc::clone(&self.store);
@@ -73,6 +88,7 @@ impl ControlPlaneHandle {
             store,
             boot_id,
             max_runtime_secs,
+            goal_restart_recovery,
             cancel
         ))
     }
@@ -85,11 +101,13 @@ mod tests {
     #[tokio::test]
     async fn start_in_tempdir_and_reap_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let h = ControlPlaneHandle::start(dir.path()).await.unwrap();
+        let h = ControlPlaneHandle::start(dir.path(), GoalRestartRecovery::default())
+            .await
+            .unwrap();
         assert!(!h.boot_id.is_empty());
         // a reaper spawns and stops cleanly on cancel
         let cancel = CancellationToken::new();
-        let jh = h.spawn_reaper(600, cancel.clone());
+        let jh = h.spawn_reaper(600, GoalRestartRecovery::default(), cancel.clone());
         cancel.cancel();
         jh.await.unwrap();
     }
@@ -99,9 +117,13 @@ mod tests {
         use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
         let dir = tempfile::tempdir().unwrap();
         // First "boot" registers a running task, then the daemon "dies".
-        let h1 = ControlPlaneHandle::start_with_boot_id(dir.path(), "boot-1".into())
-            .await
-            .unwrap();
+        let h1 = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "boot-1".into(),
+            GoalRestartRecovery::default(),
+        )
+        .await
+        .unwrap();
         h1.store
             .create(TaskRecord {
                 id: "t".into(),
@@ -123,9 +145,13 @@ mod tests {
             .await
             .unwrap();
         // Second boot recovers the non-goal orphan at startup.
-        let h2 = ControlPlaneHandle::start_with_boot_id(dir.path(), "boot-2".into())
-            .await
-            .unwrap();
+        let h2 = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "boot-2".into(),
+            GoalRestartRecovery::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             h2.store.get("t").await.unwrap().unwrap().status,
             TaskStatus::Lost

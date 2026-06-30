@@ -28,12 +28,12 @@ pub mod verifier;
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
-pub use goal::GoalStateUpdateSink;
 pub use goal::{
     GoalAdmission, GoalAdmissionContext, GoalCommand, GoalCommandAction, GoalTurnEvaluation,
     admit_goal_command, current_goal_admission_context, evaluate_goal_turn,
     scope_goal_admission_context, scope_goal_state_updates,
 };
+pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;
 pub use verifier::{

@@ -44,6 +44,7 @@ per-agent opt-out lives under `[agents.<alias>.goal]`.
 [goal]
 enabled = true
 channel_status_updates = true
+restart_recovery = "preserve_state"
 allowed_command_surfaces = ["web", "tui", "channel"]
 allowed_channel_types = ["matrix", "telegram"]
 token_budget = 50000
@@ -66,8 +67,16 @@ channel types such as `matrix` or `telegram`, not aliases like
 
 `channel_status_updates` controls extra in-channel goal state/status messages
 emitted by goal admission inside an agent turn, such as a model-initiated
-`goal_start`. Direct `/goal` command replies are still sent as command
+`goal_start`, controller transitions, and verifier progress. When the channel
+supports draft edits, verifier progress is shown as a draft and replaced by the
+final goal status. Direct `/goal` command replies are still sent as command
 responses.
+
+`restart_recovery` controls prior-boot goals that were `running` when the
+daemon stopped. The default, `preserve_state`, keeps the goal running and
+re-owns it under the new daemon boot. Set `pause_running` to pause such goals
+with a typed restart blocker instead. Paused goals keep their existing paused
+state and blockers.
 
 Budget resolution is per dimension: explicit command value, then `[goal]`
 default, then unlimited. Configured budget defaults apply only when a goal is
