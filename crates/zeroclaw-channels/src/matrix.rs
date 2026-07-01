@@ -48,7 +48,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
     RoomVisibility, SendMessage,
 };
-use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode, TranscriptionConfig};
+use zeroclaw_config::schema::{MatrixConfig, StreamMode, TranscriptionConfig};
 
 // ─── markers ───────────────────────────────────────────────────────────────
 mod markers {
@@ -378,7 +378,7 @@ mod streaming {
     use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 
-    use super::markers;
+    use super::{StreamMode, markers};
 
     const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
 
@@ -450,22 +450,83 @@ mod streaming {
         pub sent_so_far: usize,
     }
 
+    /// Live draft storage for the Matrix stream mode selected at channel
+    /// construction. A channel handle has an immutable `MatrixConfig`, so
+    /// keeping only the active draft map prevents impossible cross-mode state
+    /// while preserving concurrent draft isolation within that mode.
     #[derive(Default, Debug)]
-    pub(super) struct State {
-        pub partial: HashMap<DraftKey, PartialDraft>,
-        pub single: HashMap<DraftKey, SingleDraft>,
-        pub multi: HashMap<DraftKey, MultiDraft>,
+    pub(super) enum State {
+        #[default]
+        Off,
+        Partial(HashMap<DraftKey, PartialDraft>),
+        Single(HashMap<DraftKey, SingleDraft>),
+        Multi(HashMap<DraftKey, MultiDraft>),
+    }
+
+    impl State {
+        /// Create the draft store matching the immutable Matrix stream mode.
+        pub(super) fn for_stream_mode(mode: StreamMode) -> Self {
+            match mode {
+                StreamMode::Off => Self::Off,
+                StreamMode::Partial => Self::Partial(HashMap::new()),
+                StreamMode::SingleMessage => Self::Single(HashMap::new()),
+                StreamMode::MultiMessage => Self::Multi(HashMap::new()),
+            }
+        }
+    }
+
+    pub(super) fn insert_partial(
+        state: &mut State,
+        key: DraftKey,
+        draft: PartialDraft,
+    ) -> Result<()> {
+        let State::Partial(drafts) = state else {
+            bail!("matrix: partial draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
     }
 
     pub(super) fn partial_for_update<'a>(
         state: &'a mut State,
         key: &DraftKey,
     ) -> Option<&'a mut PartialDraft> {
-        state.partial.get_mut(key)
+        match state {
+            State::Partial(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
     }
 
     pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
-        state.partial.remove(key)
+        match state {
+            State::Partial(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Partial(drafts) if drafts.contains_key(key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_len(state: &State) -> usize {
+        match state {
+            State::Partial(drafts) => drafts.len(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn insert_single(
+        state: &mut State,
+        key: DraftKey,
+        draft: SingleDraft,
+    ) -> Result<()> {
+        let State::Single(drafts) = state else {
+            bail!("matrix: single-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
     }
 
     /// Return the editable `single_message` draft for this room+draft id, if it
@@ -474,24 +535,54 @@ mod streaming {
         state: &'a mut State,
         key: &DraftKey,
     ) -> Option<&'a mut SingleDraft> {
-        state.single.get_mut(key)
+        match state {
+            State::Single(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
     }
 
     /// Remove the `single_message` draft from live state at finalize/cancel so
     /// a late progress update cannot keep editing a completed response.
     pub(super) fn take_single(state: &mut State, key: &DraftKey) -> Option<SingleDraft> {
-        state.single.remove(key)
+        match state {
+            State::Single(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn single_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Single(drafts) if drafts.contains_key(key))
+    }
+
+    pub(super) fn insert_multi(state: &mut State, key: DraftKey, draft: MultiDraft) -> Result<()> {
+        let State::Multi(drafts) = state else {
+            bail!("matrix: multi-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
     }
 
     pub(super) fn multi_for_update<'a>(
         state: &'a mut State,
         key: &DraftKey,
     ) -> Option<&'a mut MultiDraft> {
-        state.multi.get_mut(key)
+        match state {
+            State::Multi(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
     }
 
     pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
-        state.multi.remove(key)
+        match state {
+            State::Multi(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Multi(drafts) if drafts.contains_key(key))
     }
 
     pub(super) fn partial_should_edit(
@@ -3619,6 +3710,7 @@ impl MatrixChannel {
         // `.with_ack_reactions(...)` after construction to thread the
         // actual `[channels].ack_reactions` global through.
         let ack_reactions = config.ack_reactions.unwrap_or(true);
+        let streaming_state = streaming::State::for_stream_mode(config.stream_mode);
         Ok(Self {
             config: Arc::new(config),
             alias: alias.into(),
@@ -3628,7 +3720,7 @@ impl MatrixChannel {
             transcription: None,
             client: tokio::sync::OnceCell::new(),
             pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
-            streaming_state: Arc::new(TokioRwLock::new(streaming::State::default())),
+            streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
             reaction_log: Arc::new(TokioMutex::new(HashMap::new())),
@@ -3908,11 +4000,11 @@ impl Channel for MatrixChannel {
         // true. Partial, SingleMessage, and MultiMessage all need streaming
         // setup; the channel decides internally whether to edit answer text,
         // edit progress only, or emit paragraphs.
-        !matches!(self.config.stream_mode, MatrixStreamMode::Off)
+        !matches!(self.config.stream_mode, StreamMode::Off)
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage)
+        matches!(self.config.stream_mode, StreamMode::MultiMessage)
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
@@ -3923,8 +4015,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let room_id = streaming_room(&message.recipient)?;
         match self.config.stream_mode {
-            MatrixStreamMode::Off => Ok(None),
-            MatrixStreamMode::Partial => {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
                 // Send the placeholder draft now so subsequent update_draft
                 // calls have an event to edit.
                 let event_id = outbound::send(&self.outbox(client), message).await?;
@@ -3932,7 +4024,8 @@ impl Channel for MatrixChannel {
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
                 let key = streaming::draft_key(room_id, event_id.as_ref())?;
                 let mut state = self.streaming_state.write().await;
-                state.partial.insert(
+                streaming::insert_partial(
+                    &mut state,
                     key,
                     streaming::PartialDraft {
                         event_id: event_id.clone(),
@@ -3940,10 +4033,10 @@ impl Channel for MatrixChannel {
                         last_text: message.content.clone(),
                         last_edit: Instant::now(),
                     },
-                );
+                )?;
                 Ok(Some(event_id.to_string()))
             }
-            MatrixStreamMode::SingleMessage => {
+            StreamMode::SingleMessage => {
                 // Single-message mode starts with one editable progress draft.
                 // Final answer text is never copied here; finalize_draft sends
                 // the answer as a separate Matrix message.
@@ -3957,7 +4050,8 @@ impl Channel for MatrixChannel {
                     ))
                     .unwrap_or_else(Instant::now);
                 let mut state = self.streaming_state.write().await;
-                state.single.insert(
+                streaming::insert_single(
+                    &mut state,
                     key,
                     streaming::SingleDraft {
                         event_id: event_id.clone(),
@@ -3966,10 +4060,10 @@ impl Channel for MatrixChannel {
                         last_text: message.content.clone(),
                         last_edit: first_edit_ready,
                     },
-                );
+                )?;
                 Ok(Some(event_id.to_string()))
             }
-            MatrixStreamMode::MultiMessage => {
+            StreamMode::MultiMessage => {
                 // No initial message — paragraphs are emitted by update_draft
                 // as they appear. Capture the thread anchor up front so each
                 // paragraph lands in the same thread as the user's message.
@@ -3981,13 +4075,14 @@ impl Channel for MatrixChannel {
                 let draft_id = streaming::new_multi_message_draft_id();
                 let key = streaming::draft_key(room_id, &draft_id)?;
                 let mut state = self.streaming_state.write().await;
-                state.multi.insert(
+                streaming::insert_multi(
+                    &mut state,
                     key,
                     streaming::MultiDraft {
                         thread_anchor,
                         sent_so_far: 0,
                     },
-                );
+                )?;
                 Ok(Some(draft_id))
             }
         }
@@ -3995,10 +4090,10 @@ impl Channel for MatrixChannel {
 
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         match self.config.stream_mode {
-            MatrixStreamMode::Off => Ok(()),
-            MatrixStreamMode::Partial => self.partial_update(recipient, message_id, text).await,
-            MatrixStreamMode::SingleMessage => Ok(()),
-            MatrixStreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            StreamMode::SingleMessage => Ok(()),
+            StreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
 
@@ -4009,14 +4104,14 @@ impl Channel for MatrixChannel {
         text: &str,
     ) -> Result<()> {
         match self.config.stream_mode {
-            MatrixStreamMode::Partial => self.update_draft(recipient, message_id, text).await,
-            MatrixStreamMode::SingleMessage => {
+            StreamMode::Partial => self.update_draft(recipient, message_id, text).await,
+            StreamMode::SingleMessage => {
                 self.single_update_progress(recipient, message_id, text)
                     .await
             }
             // MultiMessage doesn't have an in-flight draft to update, and Off
             // means the orchestrator should not have created one.
-            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            StreamMode::Off | StreamMode::MultiMessage => Ok(()),
         }
     }
 
@@ -4024,8 +4119,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
-            MatrixStreamMode::Off => Ok(()),
-            MatrixStreamMode::Partial => {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_partial(&mut state, &key)
@@ -4135,7 +4230,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            MatrixStreamMode::SingleMessage => {
+            StreamMode::SingleMessage => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_single(&mut state, &key)
@@ -4221,7 +4316,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            MatrixStreamMode::MultiMessage => {
+            StreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
                 let multi = {
@@ -4250,8 +4345,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
-            MatrixStreamMode::Off => Ok(()),
-            MatrixStreamMode::Partial => {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_partial(&mut state, &key)
@@ -4267,7 +4362,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            MatrixStreamMode::SingleMessage => {
+            StreamMode::SingleMessage => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_single(&mut state, &key)
@@ -4288,7 +4383,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            MatrixStreamMode::MultiMessage => {
+            StreamMode::MultiMessage => {
                 // Already-sent paragraphs are independent room messages and
                 // are not redacted on cancel — partial output is preferable
                 // to silent disappearance. Just drop our state.
@@ -4805,11 +4900,13 @@ mod tests {
         use super::super::streaming;
         use super::super::streaming::{
             MultiDraft, PartialDraft, PartialFinalizeAction, SingleDraft,
-            SingleRetainedDraftAction, State, decide_partial_finalize_action,
-            mark_single_edit_delivered, normalize_matrix_progress_line, partial_should_edit,
+            SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
+            insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
+            normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
             partial_visible_text, push_single_progress_line, single_cancel_deletes_draft,
-            single_edit_interval_elapsed, single_finalize_plan, single_progress_uses_edit_interval,
-            single_render_changed, single_retained_draft_action, single_visible_text_with_budget,
+            single_contains, single_edit_interval_elapsed, single_finalize_plan,
+            single_progress_uses_edit_interval, single_render_changed,
+            single_retained_draft_action, single_visible_text_with_budget,
         };
         use matrix_sdk::config::SyncSettings;
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
@@ -4822,7 +4919,7 @@ mod tests {
             matchers::{body_partial_json, method, path_regex},
         };
         use zeroclaw_api::channel::Channel;
-        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
             PartialDraft {
@@ -5138,7 +5235,7 @@ mod tests {
                 MatrixConfig {
                     homeserver: "https://matrix.invalid".to_string(),
                     access_token: Some("test-token".to_string()),
-                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_mode: StreamMode::SingleMessage,
                     ..MatrixConfig::default()
                 },
                 "matrix",
@@ -5151,17 +5248,21 @@ mod tests {
 
             {
                 let mut state = channel.streaming_state.write().await;
-                state
-                    .single
-                    .insert(key.clone(), single_draft(owned_event_id!("$draft:server")));
+                insert_single(
+                    &mut state,
+                    key.clone(),
+                    single_draft(owned_event_id!("$draft:server")),
+                )
+                .expect("single-message state accepts draft");
             }
 
             Channel::update_draft(&channel, "!room:server", "$draft:server", "final prose")
                 .await
                 .expect("single_message answer deltas are ignored without Matrix I/O");
 
-            let state = channel.streaming_state.read().await;
-            let draft = state.single.get(&key).expect("draft remains active");
+            let mut state = channel.streaming_state.write().await;
+            let draft =
+                streaming::single_for_update(&mut state, &key).expect("draft remains active");
             assert!(draft.lines.is_empty());
             assert_eq!(draft.last_text, "...");
         }
@@ -5317,7 +5418,7 @@ mod tests {
                     user_id: Some("@bot:server".to_string()),
                     device_id: Some("DEVICE".to_string()),
                     allowed_rooms: vec![room_id.to_string()],
-                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_mode: StreamMode::SingleMessage,
                     stream_draft_delete: false,
                     reply_in_thread: false,
                     ack_reactions: Some(false),
@@ -5347,7 +5448,7 @@ mod tests {
                 draft.last_text = "old progress".to_string();
                 push_single_progress_line(&mut draft, "new progress", 10);
                 let mut state = channel.streaming_state.write().await;
-                state.single.insert(key, draft);
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
             }
 
             match tokio::time::timeout(
@@ -5422,8 +5523,9 @@ mod tests {
 
             assert_ne!(first, second);
 
-            let mut state = streaming::State::default();
-            state.partial.insert(
+            let mut state = streaming::State::for_stream_mode(StreamMode::Partial);
+            insert_partial(
+                &mut state,
                 first.clone(),
                 PartialDraft {
                     event_id: owned_event_id!("$draft-a:server"),
@@ -5431,8 +5533,10 @@ mod tests {
                     last_text: "first".to_string(),
                     last_edit: Instant::now(),
                 },
-            );
-            state.partial.insert(
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
                 second.clone(),
                 PartialDraft {
                     event_id: owned_event_id!("$draft-b:server"),
@@ -5440,14 +5544,15 @@ mod tests {
                     last_text: "second".to_string(),
                     last_edit: Instant::now(),
                 },
-            );
+            )
+            .expect("partial state accepts second draft");
 
-            assert_eq!(state.partial.len(), 2);
+            assert_eq!(partial_len(&state), 2);
             assert_eq!(
-                state.partial.remove(&second).map(|draft| draft.event_id),
+                streaming::take_partial(&mut state, &second).map(|draft| draft.event_id),
                 Some(owned_event_id!("$draft-b:server"))
             );
-            assert!(state.partial.contains_key(&first));
+            assert!(partial_contains(&state, &first));
         }
 
         #[test]
@@ -5457,15 +5562,19 @@ mod tests {
             let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
             let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
 
-            let mut state = State::default();
-            state.partial.insert(
+            let mut state = State::for_stream_mode(StreamMode::Partial);
+            insert_partial(
+                &mut state,
                 first.clone(),
                 partial_draft(owned_event_id!("$draft-a:server"), "first"),
-            );
-            state.partial.insert(
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
                 second.clone(),
                 partial_draft(owned_event_id!("$draft-b:server"), "second"),
-            );
+            )
+            .expect("partial state accepts second draft");
 
             streaming::partial_for_update(&mut state, &second)
                 .expect("second draft remains addressable")
@@ -5481,18 +5590,20 @@ mod tests {
             let finalized = streaming::take_partial(&mut state, &second)
                 .expect("finalize removes only the addressed draft");
             assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
-            assert!(state.partial.contains_key(&first));
-            assert!(!state.partial.contains_key(&second));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &second));
 
-            state.partial.insert(
+            insert_partial(
+                &mut state,
                 canceled.clone(),
                 partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
-            );
+            )
+            .expect("partial state accepts canceled draft");
             let canceled_draft = streaming::take_partial(&mut state, &canceled)
                 .expect("cancel removes only the addressed draft");
             assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
-            assert!(state.partial.contains_key(&first));
-            assert!(!state.partial.contains_key(&canceled));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &canceled));
         }
 
         #[test]
@@ -5502,15 +5613,19 @@ mod tests {
             let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
             let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
 
-            let mut state = State::default();
-            state.single.insert(
+            let mut state = State::for_stream_mode(StreamMode::SingleMessage);
+            insert_single(
+                &mut state,
                 first.clone(),
                 single_draft(owned_event_id!("$draft-a:server")),
-            );
-            state.single.insert(
+            )
+            .expect("single state accepts first draft");
+            insert_single(
+                &mut state,
                 second.clone(),
                 single_draft(owned_event_id!("$draft-b:server")),
-            );
+            )
+            .expect("single state accepts second draft");
 
             push_single_progress_line(
                 streaming::single_for_update(&mut state, &second)
@@ -5530,18 +5645,20 @@ mod tests {
             let finalized = streaming::take_single(&mut state, &second)
                 .expect("finalize removes only the addressed draft");
             assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
-            assert!(state.single.contains_key(&first));
-            assert!(!state.single.contains_key(&second));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &second));
 
-            state.single.insert(
+            insert_single(
+                &mut state,
                 canceled.clone(),
                 single_draft(owned_event_id!("$draft-c:server")),
-            );
+            )
+            .expect("single state accepts canceled draft");
             let canceled_draft = streaming::take_single(&mut state, &canceled)
                 .expect("cancel removes only the addressed draft");
             assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
-            assert!(state.single.contains_key(&first));
-            assert!(!state.single.contains_key(&canceled));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &canceled));
         }
 
         #[test]
@@ -5554,21 +5671,25 @@ mod tests {
             let canceled =
                 super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
 
-            let mut state = State::default();
-            state.multi.insert(
+            let mut state = State::for_stream_mode(StreamMode::MultiMessage);
+            insert_multi(
+                &mut state,
                 first.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 5,
                 },
-            );
-            state.multi.insert(
+            )
+            .expect("multi state accepts first draft");
+            insert_multi(
+                &mut state,
                 second.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 0,
                 },
-            );
+            )
+            .expect("multi state accepts second draft");
 
             streaming::multi_for_update(&mut state, &second)
                 .expect("second multi-message draft remains addressable")
@@ -5584,21 +5705,23 @@ mod tests {
             let finalized = streaming::take_multi(&mut state, &second)
                 .expect("finalize removes only the addressed multi-message draft");
             assert_eq!(finalized.sent_so_far, 12);
-            assert!(state.multi.contains_key(&first));
-            assert!(!state.multi.contains_key(&second));
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &second));
 
-            state.multi.insert(
+            insert_multi(
+                &mut state,
                 canceled.clone(),
                 MultiDraft {
                     thread_anchor: None,
                     sent_so_far: 3,
                 },
-            );
+            )
+            .expect("multi state accepts canceled draft");
             let canceled_draft = streaming::take_multi(&mut state, &canceled)
                 .expect("cancel removes only the addressed multi-message draft");
             assert_eq!(canceled_draft.sent_so_far, 3);
-            assert!(state.multi.contains_key(&first));
-            assert!(!state.multi.contains_key(&canceled));
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &canceled));
         }
 
         #[test]
@@ -5622,9 +5745,11 @@ mod tests {
         use matrix_sdk::config::SyncSettings;
         use tempfile::TempDir;
         use zeroclaw_api::channel::{Channel, SendMessage};
-        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
 
-        use super::super::{MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming_key};
+        use super::super::{
+            MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming, streaming_key,
+        };
 
         fn env_first(primary: &str, fallback: &str) -> String {
             env::var(primary)
@@ -5654,7 +5779,7 @@ mod tests {
                 homeserver,
                 access_token: Some(access_token),
                 allowed_rooms: vec![room_id.clone()],
-                stream_mode: MatrixStreamMode::Partial,
+                stream_mode: StreamMode::Partial,
                 draft_update_interval_ms: 50,
                 multi_message_delay_ms: 0,
                 stream_draft_lines: 10,
@@ -5702,8 +5827,8 @@ mod tests {
             let second_key = streaming_key(&room_id, &second).expect("second draft key");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.contains_key(&first_key));
-                assert!(state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(streaming::partial_contains(&state, &second_key));
             }
 
             tokio::time::sleep(Duration::from_millis(60)).await;
@@ -5713,15 +5838,13 @@ mod tests {
                 .await
                 .expect("update first draft by id");
             {
-                let state = channel.streaming_state.read().await;
+                let mut state = channel.streaming_state.write().await;
                 assert_eq!(
-                    state
-                        .partial
-                        .get(&first_key)
+                    streaming::partial_for_update(&mut state, &first_key)
                         .map(|draft| draft.last_text.as_str()),
                     Some(first_update.as_str())
                 );
-                assert!(state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &second_key));
             }
 
             channel
@@ -5734,8 +5857,8 @@ mod tests {
                 .expect("finalize second draft by id");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.contains_key(&first_key));
-                assert!(!state.partial.contains_key(&second_key));
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(!streaming::partial_contains(&state, &second_key));
             }
 
             channel
@@ -5744,7 +5867,7 @@ mod tests {
                 .expect("cancel first draft by id");
             {
                 let state = channel.streaming_state.read().await;
-                assert!(state.partial.is_empty());
+                assert_eq!(streaming::partial_len(&state), 0);
             }
         }
 
@@ -5816,7 +5939,7 @@ mod tests {
                 homeserver,
                 access_token: Some(access_token),
                 allowed_rooms: vec![room_id.clone()],
-                stream_mode: MatrixStreamMode::Off,
+                stream_mode: StreamMode::Off,
                 reply_in_thread: false,
                 ack_reactions: Some(false),
                 ..MatrixConfig::default()

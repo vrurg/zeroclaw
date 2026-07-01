@@ -4193,7 +4193,7 @@ fn matrix_single_message_streaming_enabled_for_config(
         return false;
     };
     config.channels.matrix.get(alias).is_some_and(|config| {
-        config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
+        config.stream_mode == zeroclaw_config::schema::StreamMode::SingleMessage
     })
 }
 
@@ -10673,14 +10673,14 @@ mod tests {
         config.channels.matrix.insert(
             "single".to_string(),
             zeroclaw_config::schema::MatrixConfig {
-                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                stream_mode: zeroclaw_config::schema::StreamMode::SingleMessage,
                 ..Default::default()
             },
         );
         config.channels.matrix.insert(
             "partial".to_string(),
             zeroclaw_config::schema::MatrixConfig {
-                stream_mode: zeroclaw_config::schema::MatrixStreamMode::Partial,
+                stream_mode: zeroclaw_config::schema::StreamMode::Partial,
                 ..Default::default()
             },
         );
