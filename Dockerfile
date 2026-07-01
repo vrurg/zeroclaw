@@ -38,6 +38,14 @@ COPY . .
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-web-target,target=/app/target,sharing=locked \
+    rm -rf target/release/.fingerprint/zeroclaw-* \
+           target/release/deps/zeroclaw_* \
+           target/release/deps/libzeroclaw_* \
+           target/release/incremental/zeroclaw_* \
+           target/release/.fingerprint/xtask-* \
+           target/release/deps/xtask-* \
+           target/release/deps/libxtask-* \
+           target/release/incremental/xtask-* && \
     cargo web build
 
 # ── Stage 1: Build ────────────────────────────────────────────
