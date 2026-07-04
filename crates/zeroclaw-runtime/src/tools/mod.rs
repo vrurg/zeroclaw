@@ -1981,6 +1981,7 @@ mod tests {
             Some(engine),
             None,
             None,
+            GoalAdmissionToolPolicy::Omit,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
