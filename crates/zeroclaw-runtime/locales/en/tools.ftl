@@ -59,6 +59,7 @@ tool-cron-update = Patch an existing cron job (schedule, command, prompt, enable
 tool-data-management = Workspace data retention, purge, and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
+tool-delegate-error-background-goal-context = Background delegation is disabled while a durable goal is active; use synchronous delegation until parent-linked completion and usage reporting are available.
 
 tool-file-edit = Edit a file by replacing an exact string match with new content
 
