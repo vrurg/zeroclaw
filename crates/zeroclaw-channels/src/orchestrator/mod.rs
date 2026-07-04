@@ -3495,6 +3495,7 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
+    let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -3682,17 +3683,9 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::Goal(command) => {
             let action = command.action;
             let command_objective = command.objective.clone();
-            let resume_reason = command.resume_reason.clone();
             let defaults_snapshot = runtime_defaults_snapshot(ctx);
             match zeroclaw_runtime::control_plane::admit_goal_command(
-                zeroclaw_runtime::control_plane::GoalAdmissionContext::new(
-                    ctx.agent_alias.as_ref().clone(),
-                )
-                .with_command_surface(CommandSurface::Channel)
-                .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
-                .with_originator_route(Some(sender_key.clone()))
-                .with_principal_id(goal_principal_id(msg))
-                .with_continuation_context(Some(goal_continuation_context_from_message(msg))),
+                goal_admission_context.clone(),
                 command,
                 defaults_snapshot.config.as_ref(),
                 Some(ctx.agent_cfg.as_ref()),
@@ -3712,7 +3705,7 @@ async fn handle_runtime_command_if_needed(
                             zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
                                 Some(GoalContinuationPrompt::Resume {
                                     objective: goal_objective_for_prompt(&task_id).await,
-                                    resume_reason: resume_reason.clone(),
+                                    resume_reason: admission.continuation_reason.clone(),
                                 })
                             }
                             zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
@@ -15799,6 +15792,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let provider: Arc<dyn ModelProvider> = provider_impl.clone();
             let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
             let mut config = zeroclaw_config::schema::Config::default();
+            config.goal.enabled = true;
             config.goal.allowed_channel_types = vec!["test-channel".into()];
             config.goal.verifier.enabled = false;
             let runtime_ctx = dispatch_test_context(channel, provider, agent_alias.clone(), config);

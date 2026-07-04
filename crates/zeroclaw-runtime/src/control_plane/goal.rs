@@ -211,6 +211,14 @@ fn goal_usage_totals(config: Option<&Config>, task_id: &str) -> Option<GoalUsage
     goal_usage_totals_from_tracker(Some(tracker.as_ref()), task_id)
 }
 
+fn goal_usage_totals_if_tracker_ready(
+    config: Option<&Config>,
+    task_id: &str,
+) -> Option<GoalUsageTotals> {
+    let tracker = existing_cost_tracker(config)?;
+    goal_usage_totals_from_tracker(Some(tracker.as_ref()), task_id)
+}
+
 fn goal_usage_totals_from_tracker(
     tracker: Option<&CostTracker>,
     task_id: &str,
@@ -251,6 +259,11 @@ fn enabled_cost_tracker(config: Option<&Config>) -> Option<std::sync::Arc<CostTr
     tracker.is_enabled().then_some(tracker)
 }
 
+fn existing_cost_tracker(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
+    let config = config?;
+    CostTracker::existing_global(config.cost.clone(), &config.data_dir)
+}
+
 fn goal_budget_summary(goal: &GoalTaskRecord, usage: Option<&GoalUsageTotals>) -> String {
     let token_limit = token_limit_label(goal.effective_token_limit);
     let cost_limit = cost_limit_label(goal.effective_cost_limit_usd);
@@ -285,7 +298,7 @@ fn task_goal_budget_summary(task_goal: &TaskGoal, config: Option<&Config>) -> St
 /// the canonical goal extension record at delivery time so objective changes
 /// and consumed budget stay consistent with the rest of the control plane.
 pub fn goal_recovery_status_message(goal: &GoalTaskRecord, config: Option<&Config>) -> String {
-    let usage = goal_usage_totals(config, &goal.task_id);
+    let usage = goal_usage_totals_if_tracker_ready(config, &goal.task_id);
     let budget = goal_budget_summary(goal, usage.as_ref());
     msg(
         "goal-command-recovered",
@@ -1644,7 +1657,7 @@ async fn status_goal(
     config: Option<&Config>,
 ) -> Result<GoalAdmission> {
     let task_goal = resolve_goal(store, goal_store, ctx, task_id).await?;
-    let usage = goal_usage_totals(config, task_goal.task_id());
+    let usage = goal_usage_totals_if_tracker_ready(config, task_goal.task_id());
     let budget = goal_budget_summary(task_goal.goal(), usage.as_ref());
     Ok(GoalAdmission {
         task_id: Some(task_goal.task_id().to_string()),
@@ -3866,6 +3879,42 @@ mod tests {
         assert!(!status.message.contains("daemon_restarted"));
         assert!(status.message.contains("restart recovery"));
         assert!(status.message.contains("finish restart validation"));
+    }
+
+    #[tokio::test]
+    async fn goal_status_does_not_initialize_cost_tracker_storage() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let started = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "inspect status only".into(),
+            Some(10_000),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.clone().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = test_config();
+        config.data_dir = tmp.path().to_path_buf();
+        config.cost.enabled = true;
+
+        let status = status_goal(&store, &store, &ctx, Some(task_id), Some(&config))
+            .await
+            .unwrap();
+
+        assert_eq!(status.status, TaskStatus::Running);
+        assert!(
+            status.message.contains("usage unavailable"),
+            "status should report unavailable usage instead of initializing the ledger"
+        );
+        assert!(
+            !tmp.path().join("state").join("costs.jsonl").exists(),
+            "read-only status must not create cost tracker storage"
+        );
     }
 
     #[tokio::test]
