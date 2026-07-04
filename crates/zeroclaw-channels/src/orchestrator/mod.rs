@@ -19319,6 +19319,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn process_channel_message_refreshes_available_skills_after_new_session() {
+        Box::pin(async {
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
@@ -19560,6 +19561,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+        })
+        .await;
     }
 
     #[tokio::test]
