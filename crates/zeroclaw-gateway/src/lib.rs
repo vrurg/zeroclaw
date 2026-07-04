@@ -881,6 +881,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                tools::GoalAdmissionToolPolicy::Omit,
             );
             // Mint the registry through the gated seam: the built-in
             // allow/deny filter and MCP scope+gate (omission is not a grant)
@@ -1029,6 +1030,7 @@ pub async fn run_gateway(
             sop_engine.clone(),
             sop_audit.clone(),
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         // Same gated seam as the dashboard seed above, so this listing shows
         // the agent's policy-filtered set (filter + MCP). The tools are only
