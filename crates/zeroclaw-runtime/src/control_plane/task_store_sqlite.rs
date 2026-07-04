@@ -20,7 +20,7 @@ use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 6;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
 
 /// SQLite-backed durable task registry.
 ///

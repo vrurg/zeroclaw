@@ -119,6 +119,58 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         )
         .context("apply control-plane schema v6")?;
     }
+    if version < 7 {
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_effective_limits_insert
+                BEFORE INSERT ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.effective_token_limit IS NOT NULL AND NEW.effective_token_limit < 0)
+                  OR (NEW.effective_cost_limit_usd IS NOT NULL
+                      AND NOT (NEW.effective_cost_limit_usd >= 0.0
+                               AND NEW.effective_cost_limit_usd <= 1.7976931348623157e308))
+                BEGIN
+                    SELECT RAISE(ABORT, 'goal effective limits must be non-negative finite values');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_effective_limits_update
+                BEFORE UPDATE OF effective_token_limit, effective_cost_limit_usd ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.effective_token_limit IS NOT NULL AND NEW.effective_token_limit < 0)
+                  OR (NEW.effective_cost_limit_usd IS NOT NULL
+                      AND NOT (NEW.effective_cost_limit_usd >= 0.0
+                               AND NEW.effective_cost_limit_usd <= 1.7976931348623157e308))
+                BEGIN
+                    SELECT RAISE(ABORT, 'goal effective limits must be non-negative finite values');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_task_continuation_contexts_require_goal_insert
+                BEFORE INSERT ON task_continuation_contexts
+                FOR EACH ROW
+                WHEN NOT EXISTS (
+                    SELECT 1
+                      FROM tasks
+                      JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                     WHERE tasks.id = NEW.task_id
+                       AND tasks.kind = 'goal'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'task_continuation_contexts.task_id must reference a goal task');
+                END;
+             CREATE TRIGGER IF NOT EXISTS trg_task_continuation_contexts_require_goal_update
+                BEFORE UPDATE OF task_id ON task_continuation_contexts
+                FOR EACH ROW
+                WHEN NOT EXISTS (
+                    SELECT 1
+                      FROM tasks
+                      JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                     WHERE tasks.id = NEW.task_id
+                       AND tasks.kind = 'goal'
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'task_continuation_contexts.task_id must reference a goal task');
+                END;
+             PRAGMA user_version = 7;",
+        )
+        .context("apply control-plane schema v7")?;
+    }
     Ok(())
 }
 
@@ -173,6 +225,55 @@ fn continuation_context_from_db(value: String) -> rusqlite::Result<TaskContinuat
     })
 }
 
+fn token_limit_to_db(value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .with_context(|| format!("effective token limit {value} exceeds SQLite INTEGER domain"))
+}
+
+fn token_limit_from_db(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    e.into(),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn cost_limit_to_db(value: f64) -> Result<f64> {
+    if !value.is_finite() || value < 0.0 {
+        anyhow::bail!("effective cost limit must be a non-negative finite value");
+    }
+    Ok(value)
+}
+
+fn cost_limit_from_db(value: Option<f64>) -> rusqlite::Result<Option<f64>> {
+    match value {
+        Some(value) if !value.is_finite() || value < 0.0 => {
+            Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Real,
+                format!("invalid effective cost limit {value}").into(),
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+fn goal_limits_to_db(
+    token_limit: Option<u64>,
+    cost_limit_usd: Option<f64>,
+) -> Result<(Option<i64>, Option<f64>)> {
+    Ok((
+        token_limit.map(token_limit_to_db).transpose()?,
+        cost_limit_usd.map(cost_limit_to_db).transpose()?,
+    ))
+}
+
 fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord> {
     let pause_reason = pause_reason_from_db(row.get("pause_reason")?).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
@@ -180,10 +281,8 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
     Ok(GoalTaskRecord {
         task_id: row.get("task_id")?,
         objective: row.get("objective")?,
-        effective_token_limit: row
-            .get::<_, Option<i64>>("effective_token_limit")?
-            .map(|value| value as u64),
-        effective_cost_limit_usd: row.get("effective_cost_limit_usd")?,
+        effective_token_limit: token_limit_from_db(row.get("effective_token_limit")?)?,
+        effective_cost_limit_usd: cost_limit_from_db(row.get("effective_cost_limit_usd")?)?,
         pause_reason,
         pause_description: row.get("pause_description")?,
         blockers: blockers_from_db(row.get("blockers_json")?)?,
@@ -193,6 +292,8 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
 fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
+    let (effective_token_limit, effective_cost_limit_usd) =
+        goal_limits_to_db(rec.effective_token_limit, rec.effective_cost_limit_usd)?;
     conn.execute(
         "INSERT INTO goal_tasks
             (task_id, objective, effective_token_limit, effective_cost_limit_usd,
@@ -202,8 +303,8 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
         params![
             rec.task_id,
             rec.objective,
-            rec.effective_token_limit.map(|value| value as i64),
-            rec.effective_cost_limit_usd,
+            effective_token_limit,
+            effective_cost_limit_usd,
             pause_reason,
             rec.pause_description,
             blockers_json,
@@ -416,25 +517,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
         token_limit: Option<u64>,
         cost_limit_usd: Option<f64>,
     ) -> Result<()> {
+        let (effective_token_limit, effective_cost_limit_usd) =
+            goal_limits_to_db(token_limit, cost_limit_usd)?;
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE goal_tasks
+        let updated = conn
+            .execute(
+                "UPDATE goal_tasks
                 SET effective_token_limit = ?1,
                     effective_cost_limit_usd = ?2
               WHERE task_id = ?3",
-            params![
-                token_limit.map(|value| value as i64),
-                cost_limit_usd,
-                task_id
-            ],
-        )
-        .context("update goal effective limits")?;
+                params![effective_token_limit, effective_cost_limit_usd, task_id],
+            )
+            .context("update goal effective limits")?;
+        if updated == 0 {
+            anyhow::bail!("goal task {task_id} has no goal extension row");
+        }
         Ok(())
     }
 
     async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
         let conn = self.conn.lock();
-        update_goal_pause_record(&conn, task_id, pause)?;
+        let updated = update_goal_pause_record(&conn, task_id, pause)?;
+        if updated == 0 {
+            anyhow::bail!("goal task {task_id} has no goal extension row");
+        }
         Ok(())
     }
 
@@ -493,6 +599,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         context: Option<TaskContinuationContext>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
         match context {
             Some(context) => upsert_continuation_context(&conn, task_id, &context)?,
             None => {
@@ -511,6 +618,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         task_id: &str,
     ) -> Result<Option<TaskContinuationContext>> {
         let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
         conn.query_row(
             "SELECT context_json
              FROM task_continuation_contexts WHERE task_id = ?1",
@@ -546,6 +654,31 @@ mod tests {
             principal_id: None,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
+        }
+    }
+
+    fn goal_record(task_id: &str, objective: &str) -> GoalTaskRecord {
+        GoalTaskRecord {
+            task_id: task_id.into(),
+            objective: objective.into(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        }
+    }
+
+    fn continuation_context() -> TaskContinuationContext {
+        TaskContinuationContext {
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            reply_target: "chat-1".into(),
+            sender: "alice".into(),
+            thread_ts: None,
+            interruption_scope_id: Some("scope-1".into()),
+            conversation_scope:
+                crate::control_plane::goal_task::TaskContinuationConversationScope::Sender,
         }
     }
 
@@ -916,6 +1049,172 @@ mod tests {
             s.get("goal-task").await.unwrap().is_none(),
             "pre-validation failure must not create a generic task row"
         );
+    }
+
+    #[tokio::test]
+    async fn update_goal_limits_rejects_invalid_effective_limits() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-limit-validation", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            goal_record("goal-limit-validation", "validate limits"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = s
+            .update_goal_limits("goal-limit-validation", Some(i64::MAX as u64 + 1), None)
+            .await
+            .expect_err("token limit outside SQLite INTEGER domain must fail");
+        assert!(format!("{err:#}").contains("SQLite INTEGER domain"));
+
+        for invalid in [-1.0, f64::INFINITY, f64::NAN] {
+            let err = s
+                .update_goal_limits("goal-limit-validation", None, Some(invalid))
+                .await
+                .expect_err("invalid cost limit must fail before SQLite bind");
+            assert!(format!("{err:#}").contains("non-negative finite"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_invalid_effective_limit_rows() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-sqlite-limit-validation", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            goal_record("goal-sqlite-limit-validation", "validate SQLite limits"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let conn = s.conn.lock();
+        let err = conn
+            .execute(
+                "UPDATE goal_tasks
+                    SET effective_token_limit = -1
+                  WHERE task_id = ?1",
+                params!["goal-sqlite-limit-validation"],
+            )
+            .expect_err("SQLite must reject negative token limits");
+        assert!(format!("{err:#}").contains("non-negative finite"));
+
+        let err = conn
+            .execute(
+                "UPDATE goal_tasks
+                    SET effective_cost_limit_usd = -0.01
+                  WHERE task_id = ?1",
+                params!["goal-sqlite-limit-validation"],
+            )
+            .expect_err("SQLite must reject negative cost limits");
+        assert!(format!("{err:#}").contains("non-negative finite"));
+
+        let err = conn
+            .execute(
+                "UPDATE goal_tasks
+                    SET effective_cost_limit_usd = 1e999
+                  WHERE task_id = ?1",
+                params!["goal-sqlite-limit-validation"],
+            )
+            .expect_err("SQLite must reject non-finite cost limits");
+        assert!(format!("{err:#}").contains("non-negative finite"));
+    }
+
+    #[tokio::test]
+    async fn get_goal_task_rejects_legacy_negative_token_limit() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-corrupt-limit", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            goal_record("goal-corrupt-limit", "reject legacy corrupt limit"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        {
+            let conn = s.conn.lock();
+            conn.execute("DROP TRIGGER trg_goal_tasks_effective_limits_update", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE goal_tasks
+                    SET effective_token_limit = -1
+                  WHERE task_id = ?1",
+                params!["goal-corrupt-limit"],
+            )
+            .unwrap();
+        }
+
+        let err = s
+            .get_goal_task("goal-corrupt-limit")
+            .await
+            .expect_err("legacy negative token limits must not inflate to u64");
+        assert!(format!("{err:#}").contains("get goal task"));
+    }
+
+    #[tokio::test]
+    async fn goal_extension_updates_reject_missing_goal_rows() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-without-extension", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create(task).await.unwrap();
+
+        let err = s
+            .update_goal_limits("goal-without-extension", Some(100), None)
+            .await
+            .expect_err("limit updates must reject missing goal extension rows");
+        assert!(format!("{err:#}").contains("goal extension"));
+
+        let err = s
+            .update_goal_pause(
+                "goal-without-extension",
+                Some(GoalPauseState {
+                    reason: GoalPauseReason::NeedsUserInput,
+                    description: None,
+                    blockers: Vec::new(),
+                }),
+            )
+            .await
+            .expect_err("pause updates must reject missing goal extension rows");
+        assert!(format!("{err:#}").contains("goal extension"));
+    }
+
+    #[tokio::test]
+    async fn continuation_context_requires_goal_extension_row() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("delegate-context", "main", 1, "boot-1"))
+            .await
+            .unwrap();
+
+        let err = s
+            .set_continuation_context("delegate-context", Some(continuation_context()))
+            .await
+            .expect_err("continuation context must reject non-goal tasks");
+        assert!(format!("{err:#}").contains("goal extension"));
+
+        let err = s
+            .get_continuation_context("delegate-context")
+            .await
+            .expect_err("continuation context reads must reject non-goal tasks");
+        assert!(format!("{err:#}").contains("goal extension"));
+
+        let conn = s.conn.lock();
+        let err = conn
+            .execute(
+                "INSERT INTO task_continuation_contexts (task_id, context_json)
+                    VALUES (?1, ?2)",
+                params![
+                    "delegate-context",
+                    continuation_context_to_db(&continuation_context()).unwrap()
+                ],
+            )
+            .expect_err("SQLite must reject continuation contexts for non-goal tasks");
+        assert!(format!("{err:#}").contains("goal task"));
     }
 
     #[tokio::test]
