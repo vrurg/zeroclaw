@@ -189,7 +189,8 @@ mod tests {
                     )
                 }
             };
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
         let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config.clone()));
         let continuation_context = TaskContinuationContext {
             channel: "matrix".into(),
@@ -268,7 +269,8 @@ mod tests {
                 data_dir_lock: None,
             });
         }
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
         let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config));
         let owner = GoalAdmissionContext::new(agent)
             .with_channel_type(Some("matrix".into()))
@@ -299,6 +301,7 @@ mod tests {
             task_id: Some("goal-paused".into()),
             status: crate::control_plane::TaskStatus::Paused,
             message: "⏸️ Goal `goal-paused` started but paused.".into(),
+            continuation_reason: None,
             continue_goal: false,
         });
 

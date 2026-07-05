@@ -205,6 +205,7 @@ mod tests {
             .await
             .unwrap();
         let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
         config.goal.allowed_channel_types = vec!["test-channel".into()];
         let tool = GoalResumeTool::new(agent.clone(), std::sync::Arc::new(config));
         let owner = GoalAdmissionContext::new(agent)
@@ -243,6 +244,7 @@ mod tests {
             task_id: Some("goal-paused".into()),
             status: TaskStatus::Paused,
             message: "⏸️ Goal `goal-paused` remains paused.".into(),
+            continuation_reason: None,
             continue_goal: false,
         });
 
