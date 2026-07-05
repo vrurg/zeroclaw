@@ -4800,7 +4800,11 @@ pub struct HardwareConfig {
     /// Target chip identifier for `transport = probe` (e.g. `STM32F401RE`, `nRF52840_xxAA`). Passed straight to probe-rs for flash/debug operations; must match a chip probe-rs recognizes.
     #[serde(default)]
     pub probe_target: Option<String>,
-    /// Index PDF schematics and datasheets from the workspace into a local RAG store, so the agent can look up pin assignments and electrical specs inline when you ask hardware questions. Off by default — turn on once the workspace has relevant PDFs dropped in.
+    /// Index pre-converted `.md` and `.txt` datasheets from the workspace into
+    /// a local RAG store, so the agent can look up pin assignments and
+    /// electrical specs inline when you ask hardware questions. PDFs are not
+    /// parsed as text; download or convert them to `.md`/`.txt` first. Off by
+    /// default — turn on once the workspace has relevant text datasheets.
     #[serde(default)]
     pub workspace_datasheets: bool,
 }
@@ -6031,6 +6035,45 @@ pub struct SkillCreationConfig {
     /// Embedding similarity threshold for deduplication.
     /// Skills with descriptions more similar than this value are skipped.
     pub similarity_threshold: f64,
+    /// Synthesize a canonical `SKILL.md` from the execution trace via a
+    /// bounded model-provider reflection call instead of the deterministic
+    /// `SKILL.toml` generator. Requires `enabled = true`. Falls back to
+    /// `SKILL.toml` whenever the reflection call or its output is invalid, so
+    /// turning this on never leaves a skill un-created. This is distinct from
+    /// the `[skills.skill_improvement]` background review fork, which patches
+    /// existing skills after use rather than creating new ones from a trace.
+    /// Default: `false`.
+    #[serde(default = "default_reflection_enabled")]
+    pub reflection_enabled: bool,
+    /// Maximum characters of the final assistant answer fed into the
+    /// reflection prompt. Bounds prompt size so a long answer cannot blow up
+    /// the reflection request. Default: `2000`.
+    #[serde(default = "default_max_final_answer_chars")]
+    pub max_final_answer_chars: usize,
+    /// Maximum characters of the rendered tool-call trace fed into the
+    /// reflection prompt. Default: `4000`.
+    #[serde(default = "default_max_tool_trace_chars")]
+    pub max_tool_trace_chars: usize,
+    /// Maximum characters of the task description fed into the reflection
+    /// prompt. Default: `1000`.
+    #[serde(default = "default_max_task_chars")]
+    pub max_task_chars: usize,
+}
+
+fn default_reflection_enabled() -> bool {
+    false
+}
+
+fn default_max_final_answer_chars() -> usize {
+    2000
+}
+
+fn default_max_tool_trace_chars() -> usize {
+    4000
+}
+
+fn default_max_task_chars() -> usize {
+    1000
 }
 
 impl Default for SkillCreationConfig {
@@ -6039,6 +6082,10 @@ impl Default for SkillCreationConfig {
             enabled: false,
             max_skills: 500,
             similarity_threshold: 0.85,
+            reflection_enabled: default_reflection_enabled(),
+            max_final_answer_chars: default_max_final_answer_chars(),
+            max_tool_trace_chars: default_max_tool_trace_chars(),
+            max_task_chars: default_max_task_chars(),
         }
     }
 }
@@ -10788,6 +10835,31 @@ impl LogLlmRequestPayload {
     }
 }
 
+/// OTel content capture policy. Mirrors [`LogToolIo`] but gates OTel span
+/// attribute emission, not log persistence. Defaults to `Off` for privacy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OtelContentPolicy {
+    #[default]
+    Off,
+    Redacted,
+    Full,
+}
+
+impl OtelContentPolicy {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -10905,6 +10977,36 @@ pub struct ObservabilityConfig {
         deserialize_with = "deserialize_enum_lenient"
     )]
     pub log_llm_request_payload: LogLlmRequestPayload,
+
+    /// OTel GenAI content capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.system_instructions`, `gen_ai.input.messages`,
+    /// and `gen_ai.output.messages` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only metadata.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_genai_content_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub otel_genai_content: OtelContentPolicy,
+
+    /// Per-field character truncation limit for OTel GenAI content when
+    /// `otel_genai_content = "redacted"`. Each string field is truncated
+    /// independently. `0` is treated as `off`.
+    #[serde(default = "default_otel_genai_content_max_chars")]
+    pub otel_genai_content_max_chars: usize,
+
+    /// OTel tool I/O capture: "off" | "redacted" | "full".
+    /// Controls whether `gen_ai.tool.arguments`, `input.value`,
+    /// `gen_ai.tool.result`, and `output.value` are emitted on OTel spans.
+    /// - `off` (default): no content attributes, only tool name + outcome.
+    /// - `redacted`: content is leak-scanned and truncated at `otel_tool_io_max_chars`.
+    /// - `full`: content is leak-scanned but not truncated.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub otel_tool_io: OtelContentPolicy,
+
+    /// Per-field character truncation limit for OTel tool I/O when
+    /// `otel_tool_io = "redacted"`. Each string field is truncated
+    /// independently. `0` is treated as `off`.
+    #[serde(default = "default_otel_tool_io_max_chars")]
+    pub otel_tool_io_max_chars: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -10926,6 +11028,10 @@ impl Default for ObservabilityConfig {
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
             log_llm_request_payload: default_log_llm_request_payload(),
+            otel_genai_content: OtelContentPolicy::Off,
+            otel_genai_content_max_chars: default_otel_genai_content_max_chars(),
+            otel_tool_io: OtelContentPolicy::Off,
+            otel_tool_io_max_chars: default_otel_tool_io_max_chars(),
         }
     }
 }
@@ -10973,6 +11079,14 @@ fn default_log_llm_request_payload() -> LogLlmRequestPayload {
 
 fn default_log_tool_io_truncate_bytes() -> usize {
     40960
+}
+
+fn default_otel_genai_content_max_chars() -> usize {
+    1000
+}
+
+fn default_otel_tool_io_max_chars() -> usize {
+    1000
 }
 
 // ── Hooks ────────────────────────────────────────────────────────
