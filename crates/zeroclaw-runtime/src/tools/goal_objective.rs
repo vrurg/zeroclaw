@@ -195,6 +195,7 @@ mod tests {
             .unwrap();
 
         let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
         config.goal.allowed_channel_types = vec!["test-channel".into()];
         let tool = GoalObjectiveTool::new(agent.clone(), std::sync::Arc::new(config));
         let owner = GoalAdmissionContext::new(agent)
