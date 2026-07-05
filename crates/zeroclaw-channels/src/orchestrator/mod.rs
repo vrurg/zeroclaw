@@ -1085,6 +1085,48 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
+fn goal_interrupt_command_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> Option<zeroclaw_api::channel::ChannelMessage> {
+    let mut command_msg = msg.clone();
+    if let Some(content) = strip_leading_channel_command_address(&msg.content, target_channel) {
+        command_msg.content = content.to_string();
+    }
+    let Some(ChannelRuntimeCommand::Goal(command)) =
+        parse_runtime_command(&command_msg.channel, &command_msg.content)
+    else {
+        return None;
+    };
+    matches!(
+        command.action,
+        zeroclaw_runtime::control_plane::GoalCommandAction::Pause
+            | zeroclaw_runtime::control_plane::GoalCommandAction::Cancel
+    )
+    .then_some(command_msg)
+}
+
+async fn goal_command_should_interrupt_in_flight(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let sender_key = conversation_history_key(msg);
+    let goal_ctx = goal_admission_context_for_message(ctx, msg, &sender_key);
+    match zeroclaw_runtime::control_plane::has_running_goal_for_context(&goal_ctx).await {
+        Ok(running) => running,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                "goal command interrupt precheck failed"
+            );
+            false
+        }
+    }
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -7347,6 +7389,29 @@ async fn run_message_dispatch_loop(
                     "stop command: no registered channel found for reply"
                 );
             }
+            continue;
+        }
+
+        let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+        if msg.channel != "cli"
+            && let Some(goal_command_msg) =
+                goal_interrupt_command_message(&msg, target_channel.as_ref())
+            && goal_command_should_interrupt_in_flight(ctx.as_ref(), &goal_command_msg).await
+        {
+            let scope_key = interruption_scope_key(&goal_command_msg);
+            let previous = {
+                let mut active = in_flight_by_sender.lock().await;
+                active.remove(&scope_key)
+            };
+            if let Some(state) = previous {
+                cancel_in_flight_chain(&state);
+            }
+            let _ = handle_runtime_command_if_needed(
+                ctx.as_ref(),
+                &goal_command_msg,
+                target_channel.as_ref(),
+            )
+            .await;
             continue;
         }
 
@@ -19054,6 +19119,264 @@ BTC is currently around $65,000 based on latest tool output."#
                     .iter()
                     .any(|message| message.contains("Stop signal sent")),
                 "operator should receive an immediate stop acknowledgement"
+            );
+        });
+    }
+
+    async fn create_running_goal_for_message(
+        agent_alias: &str,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> String {
+        ensure_test_control_plane().await;
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let route = conversation_history_key(msg);
+        let principal = goal_principal_id(msg);
+        let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+        control_plane
+            .goal_store
+            .create_goal(
+                zeroclaw_runtime::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: zeroclaw_runtime::control_plane::TaskKind::Goal,
+                    agent: agent_alias.to_string(),
+                    status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: principal,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                zeroclaw_runtime::control_plane::GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "finish active channel work".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        task_id
+    }
+
+    fn goal_interrupt_test_config() -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_channel_types = vec!["test-channel".into()];
+        config
+    }
+
+    #[test]
+    fn goal_pause_cancels_active_same_scope_goal_turn() {
+        run_channel_dispatch_test(async {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+            let runtime_ctx = dispatch_test_context(
+                channel,
+                Arc::new(CountingDelayProvider {
+                    delay: Duration::from_millis(250),
+                    calls: model_calls.clone(),
+                }),
+                agent_alias.clone(),
+                goal_interrupt_test_config(),
+            );
+            let active_msg = zeroclaw_api::channel::ChannelMessage {
+                id: "goal-pause-active-1".into(),
+                sender: "goal-user".into(),
+                reply_target: "goal-room".into(),
+                content: "keep working".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            };
+            let task_id = create_running_goal_for_message(&agent_alias, &active_msg).await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+            tx.send(active_msg).await.unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "goal-pause-active-2".into(),
+                sender: "goal-user".into(),
+                reply_target: "goal-room".into(),
+                content: "/goal pause".into(),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+            let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Paused
+            );
+            let sent_messages = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("paused")),
+                "pause command should send an immediate goal response: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages.iter().all(|message| {
+                    !(message.contains("echo:") && message.contains("keep working"))
+                }),
+                "active turn should be interrupted before normal model reply: {sent_messages:?}"
+            );
+            assert!(
+                model_calls.load(Ordering::SeqCst) <= 1,
+                "pause should not let queued same-scope work start"
+            );
+        });
+    }
+
+    #[test]
+    fn goal_cancel_cancels_active_same_scope_goal_turn() {
+        run_channel_dispatch_test(async {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+            let runtime_ctx = dispatch_test_context(
+                channel,
+                Arc::new(CountingDelayProvider {
+                    delay: Duration::from_millis(250),
+                    calls: model_calls.clone(),
+                }),
+                agent_alias.clone(),
+                goal_interrupt_test_config(),
+            );
+            let active_msg = zeroclaw_api::channel::ChannelMessage {
+                id: "goal-cancel-active-1".into(),
+                sender: "goal-user-cancel".into(),
+                reply_target: "goal-room-cancel".into(),
+                content: "keep working".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            };
+            let task_id = create_running_goal_for_message(&agent_alias, &active_msg).await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+            tx.send(active_msg).await.unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "goal-cancel-active-2".into(),
+                sender: "goal-user-cancel".into(),
+                reply_target: "goal-room-cancel".into(),
+                content: "/goal cancel".into(),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+            let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Cancelled
+            );
+            let sent_messages = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("cancelled")),
+                "cancel command should send an immediate goal response: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages.iter().all(|message| {
+                    !(message.contains("echo:") && message.contains("keep working"))
+                }),
+                "active turn should be interrupted before normal model reply: {sent_messages:?}"
+            );
+            assert!(
+                model_calls.load(Ordering::SeqCst) <= 1,
+                "cancel should not let queued same-scope work start"
+            );
+        });
+    }
+
+    #[test]
+    fn goal_pause_without_running_goal_does_not_stop_active_turn() {
+        run_channel_dispatch_test(async {
+            ensure_test_control_plane().await;
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let runtime_ctx = dispatch_test_context(
+                channel,
+                Arc::new(CountingDelayProvider {
+                    delay: Duration::from_millis(25),
+                    calls: model_calls.clone(),
+                }),
+                format!("agent-{}", uuid::Uuid::new_v4()),
+                goal_interrupt_test_config(),
+            );
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "goal-pause-no-active-1".into(),
+                sender: "goal-user-no-active".into(),
+                reply_target: "goal-room-no-active".into(),
+                content: "keep working".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "goal-pause-no-active-2".into(),
+                sender: "goal-user-no-active".into(),
+                reply_target: "goal-room-no-active".into(),
+                content: "/goal pause".into(),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+            let sent_messages = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("echo:") && message.contains("keep working")),
+                "normal active turn should complete when no running goal exists: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("No active goal")),
+                "pause should still run as a normal goal command: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages
+                    .iter()
+                    .all(|message| !message.contains("Stop signal")),
+                "no-active goal pause must not behave as /stop: {sent_messages:?}"
             );
         });
     }
