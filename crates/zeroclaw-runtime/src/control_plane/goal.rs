@@ -1634,9 +1634,20 @@ pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<
     let Some(cp) = control_plane() else {
         return Ok(false);
     };
-    latest_active_resolved_goal(cp.goal_store.as_ref(), ctx)
+    let Some(task) = cp
+        .goal_store
+        .latest_active_goal_for_context(
+            &ctx.agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
         .await
-        .map(|goal| goal.is_some_and(|goal| goal.is_running()))
+        .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
+    else {
+        return Ok(false);
+    };
+    ensure_goal_visible(&task, ctx)?;
+    Ok(task.status == TaskStatus::Running)
 }
 
 async fn start_goal(

@@ -1085,16 +1085,13 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
-fn goal_interrupt_command_message(
-    msg: &zeroclaw_api::channel::ChannelMessage,
+fn goal_interrupt_command_content<'a>(
+    msg: &'a zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> Option<zeroclaw_api::channel::ChannelMessage> {
-    let mut command_msg = msg.clone();
-    if let Some(content) = strip_leading_channel_command_address(&msg.content, target_channel) {
-        command_msg.content = content.to_string();
-    }
-    let Some(ChannelRuntimeCommand::Goal(command)) =
-        parse_runtime_command(&command_msg.channel, &command_msg.content)
+) -> Option<&'a str> {
+    let content =
+        strip_leading_channel_command_address(&msg.content, target_channel).unwrap_or(&msg.content);
+    let Some(ChannelRuntimeCommand::Goal(command)) = parse_runtime_command(&msg.channel, content)
     else {
         return None;
     };
@@ -1103,7 +1100,7 @@ fn goal_interrupt_command_message(
         zeroclaw_runtime::control_plane::GoalCommandAction::Pause
             | zeroclaw_runtime::control_plane::GoalCommandAction::Cancel
     )
-    .then_some(command_msg)
+    .then_some(content)
 }
 
 async fn goal_command_should_interrupt_in_flight(
@@ -7394,10 +7391,12 @@ async fn run_message_dispatch_loop(
 
         let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
         if msg.channel != "cli"
-            && let Some(goal_command_msg) =
-                goal_interrupt_command_message(&msg, target_channel.as_ref())
-            && goal_command_should_interrupt_in_flight(ctx.as_ref(), &goal_command_msg).await
+            && let Some(goal_command_content) =
+                goal_interrupt_command_content(&msg, target_channel.as_ref())
+            && goal_command_should_interrupt_in_flight(ctx.as_ref(), &msg).await
         {
+            let mut goal_command_msg = msg.clone();
+            goal_command_msg.content = goal_command_content.to_string();
             let scope_key = interruption_scope_key(&goal_command_msg);
             let previous = {
                 let mut active = in_flight_by_sender.lock().await;
