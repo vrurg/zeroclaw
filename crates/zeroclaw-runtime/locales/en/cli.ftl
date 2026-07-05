@@ -992,6 +992,7 @@ goal-command-error-unexpected-arguments = Unexpected goal arguments `{$args}`.
 goal-command-error-unknown-action = Unknown goal action `{$action}`; use start, objective, status, budget, pause, resume, cancel, or help.
 goal-command-error-extension-missing = Goal extension missing for task `{$task_id}`.
 goal-command-error-already-terminal = Goal `{$task_id}` is already terminal ({$status}).
+goal-command-error-already-running = Goal `{$task_id}` is already running.
 goal-command-error-pause-failed = Failed to pause goal `{$task_id}`.
 goal-command-error-resume-failed = Failed to resume goal `{$task_id}`.
 goal-command-error-not-found = Goal `{$task_id}` was not found.

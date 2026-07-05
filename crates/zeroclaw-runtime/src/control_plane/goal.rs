@@ -424,6 +424,73 @@ fn goal_budget_gate_pause(
     }
 }
 
+fn declared_blocker_pause(candidate_summary: &str) -> Option<GoalPauseState> {
+    let message = candidate_summary.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    let explicitly_blocked = lower.starts_with("blocked:")
+        || lower.starts_with("blocker:")
+        || lower.starts_with("blocked -")
+        || lower.starts_with("blocked\n");
+    let cannot_continue = [
+        "cannot continue",
+        "can't continue",
+        "unable to continue",
+        "cannot proceed",
+        "can't proceed",
+        "unable to proceed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if !explicitly_blocked && !cannot_continue {
+        return None;
+    }
+
+    let human_terms = [
+        "user",
+        "operator",
+        "human",
+        "approval",
+        "permission",
+        "input",
+        "confirmation",
+        "authorization",
+    ];
+    let external_terms = [
+        "external action",
+        "external dependency",
+        "external system",
+        "manual action",
+        "someone",
+    ];
+    let human_blocker = human_terms.iter().any(|needle| lower.contains(needle));
+    let external_blocker = external_terms.iter().any(|needle| lower.contains(needle));
+    if !human_blocker && !external_blocker {
+        return None;
+    }
+
+    let kind = if lower.contains("human escalation") || lower.contains("escalate to human") {
+        GoalBlockerKind::HumanEscalation
+    } else if human_blocker {
+        GoalBlockerKind::NeedsUserInput
+    } else {
+        GoalBlockerKind::ExternalDependency
+    };
+    Some(GoalPauseState {
+        reason: reason_for_blocker_kind(kind),
+        description: Some(message.to_string()),
+        blockers: vec![GoalBlocker {
+            kind,
+            message: message.to_string(),
+            payload: Some(serde_json::json!({
+                "source": "agent_declared_blocker",
+            })),
+        }],
+    })
+}
+
 fn reason_for_blocker_kind(kind: GoalBlockerKind) -> GoalPauseReason {
     match kind {
         GoalBlockerKind::OperatorPause => GoalPauseReason::OperatorPaused,
@@ -1449,6 +1516,20 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Ok(GoalVerifierDecision::Continue { notes }) => {
             let task_id = resolved.task_id().to_string();
+            if let Some(pause) = declared_blocker_pause(candidate_summary) {
+                let admission = pause_goal_for_known_blocker(
+                    cp.goal_store.as_ref(),
+                    resolved,
+                    Some(config),
+                    pause,
+                )
+                .await?;
+                publish_goal_state_update(&admission);
+                return Ok(Some(GoalTurnEvaluation::Paused {
+                    task_id,
+                    message: admission.message,
+                }));
+            }
             let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id);
             if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
                 let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
@@ -1547,6 +1628,15 @@ pub async fn pause_current_goal_for_human_gate(
     .await?;
     publish_goal_state_update(&admission);
     Ok(Some(admission))
+}
+
+pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<bool> {
+    let Some(cp) = control_plane() else {
+        return Ok(false);
+    };
+    latest_active_resolved_goal(cp.goal_store.as_ref(), ctx)
+        .await
+        .map(|goal| goal.is_some_and(|goal| goal.is_running()))
 }
 
 async fn start_goal(
@@ -1918,6 +2008,15 @@ async fn resume_goal(
             msg(
                 "goal-command-error-already-terminal",
                 &[("task_id", current.task_id()), ("status", &status)]
+            )
+        );
+    }
+    if current.is_running() {
+        bail!(
+            "{}",
+            msg(
+                "goal-command-error-already-running",
+                &[("task_id", current.task_id())]
             )
         );
     }
@@ -3289,6 +3388,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_despite_verifier_continue() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = true;
+        let verifier = StubGoalVerifier {
+            decision: GoalVerifierDecision::Continue {
+                notes: "CONTINUE\nstub missed the blocker".into(),
+            },
+        };
+
+        let outcome = evaluate_goal_turn_with_verifier(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused {
+            task_id: paused_id,
+            message,
+        }) = outcome
+        else {
+            panic!("explicit candidate blocker must override verifier continue");
+        };
+        assert_eq!(paused_id, fixture.task_id);
+        assert!(message.starts_with("⏸️ Goal"));
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+        let goal = fixture
+            .goal_store
+            .get_goal_task(&fixture.task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(goal.blockers.len(), 1);
+        assert_eq!(goal.blockers[0].kind, GoalBlockerKind::NeedsUserInput);
+        assert_eq!(
+            goal.blockers[0].payload.as_ref().unwrap()["source"],
+            "agent_declared_blocker"
+        );
+    }
+
+    #[tokio::test]
     async fn evaluate_goal_turn_pauses_when_verifier_errors() {
         let fixture = create_running_goal_fixture("ship it").await;
         let mut config = test_config();
@@ -3977,6 +4130,36 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("already active"));
+    }
+
+    #[tokio::test]
+    async fn resume_goal_rejects_already_running_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let started = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "ship it".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = resume_goal(&store, &store, "boot-b", &ctx, None, None)
+            .await
+            .unwrap_err();
+
+        let task_id = started.task_id.unwrap();
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error: {err:#}"
+        );
+        let task = store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.owner_boot_id, "boot-a");
     }
 
     #[tokio::test]
