@@ -1085,18 +1085,26 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
-fn goal_interrupt_command_content<'a>(
+fn goal_command_content_and_action<'a>(
     msg: &'a zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> Option<&'a str> {
+) -> Option<(&'a str, zeroclaw_runtime::control_plane::GoalCommandAction)> {
     let content =
         strip_leading_channel_command_address(&msg.content, target_channel).unwrap_or(&msg.content);
     let Some(ChannelRuntimeCommand::Goal(command)) = parse_runtime_command(&msg.channel, content)
     else {
         return None;
     };
+    Some((content, command.action))
+}
+
+fn goal_interrupt_command_content<'a>(
+    msg: &'a zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> Option<&'a str> {
+    let (content, action) = goal_command_content_and_action(msg, target_channel)?;
     matches!(
-        command.action,
+        action,
         zeroclaw_runtime::control_plane::GoalCommandAction::Pause
             | zeroclaw_runtime::control_plane::GoalCommandAction::Cancel
     )
@@ -7064,6 +7072,7 @@ async fn process_channel_message_body(
 async fn pre_register_in_flight_before_permit(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
     task_sequence: &AtomicU64,
 ) -> InFlightPreRegistration {
@@ -7071,9 +7080,15 @@ async fn pre_register_in_flight_before_permit(
         return InFlightPreRegistration::NotNeeded;
     }
 
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    // Goal commands are control-plane commands. Generic "new message"
+    // interruption must not turn rejected or read-only commands, such as
+    // `/goal resume` on an already running goal, into `/stop`. Active-goal
+    // `/goal pause` and `/goal cancel` keep their explicit escape hatch above.
+    let is_goal_command = goal_command_content_and_action(msg, target_channel).is_some();
+    let interrupt_enabled = !is_goal_command
+        && ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(msg);
     let mut active = in_flight.lock().await;
     let predecessor = active.get(&sender_scope_key).cloned();
@@ -7420,6 +7435,7 @@ async fn run_message_dispatch_loop(
         // them with a real user message would merge two different authorities.
         let msg = if msg.channel != "cli"
             && !is_recovered_goal_continuation_message(&msg)
+            && goal_command_content_and_action(&msg, target_channel.as_ref()).is_none()
             && ctx.debouncer.enabled()
         {
             let debounce_key = conversation_history_key(&msg);
@@ -7444,9 +7460,13 @@ async fn run_message_dispatch_loop(
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
+                        let debounce_target_channel =
+                            find_channel_for_message(&debounce_ctx.channels_by_name, &debounce_msg)
+                                .cloned();
                         let pre_registration = pre_register_in_flight_before_permit(
                             debounce_ctx.as_ref(),
                             &debounce_msg,
+                            debounce_target_channel.as_ref(),
                             debounce_in_flight.as_ref(),
                             debounce_task_seq.as_ref(),
                         )
@@ -7500,6 +7520,7 @@ async fn run_message_dispatch_loop(
         let pre_registration = pre_register_in_flight_before_permit(
             worker_ctx.as_ref(),
             &msg,
+            target_channel.as_ref(),
             in_flight.as_ref(),
             task_sequence.as_ref(),
         )
@@ -19376,6 +19397,88 @@ BTC is currently around $65,000 based on latest tool output."#
                     .iter()
                     .all(|message| !message.contains("Stop signal")),
                 "no-active goal pause must not behave as /stop: {sent_messages:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn goal_resume_already_running_does_not_interrupt_active_turn() {
+        run_channel_dispatch_test(async {
+            let channel_impl = Arc::new(TelegramRecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.goal.enabled = true;
+            config.goal.allowed_channel_types = vec!["telegram".into()];
+            let runtime_ctx = dispatch_test_context_with(
+                channel,
+                Arc::new(CountingDelayProvider {
+                    delay: Duration::from_millis(250),
+                    calls: model_calls.clone(),
+                }),
+                agent_alias.clone(),
+                config,
+                |ctx| {
+                    ctx.interrupt_on_new_message.telegram = true;
+                },
+            );
+            let active_msg = zeroclaw_api::channel::ChannelMessage {
+                id: "goal-resume-active-1".into(),
+                sender: "goal-user-resume".into(),
+                reply_target: "goal-room-resume".into(),
+                content: "keep working".into(),
+                channel: "telegram".into(),
+                timestamp: 1,
+                ..Default::default()
+            };
+            let task_id = create_running_goal_for_message(&agent_alias, &active_msg).await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+            let send_task = zeroclaw_spawn::spawn!(async move {
+                tx.send(active_msg).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                tx.send(zeroclaw_api::channel::ChannelMessage {
+                    id: "goal-resume-active-2".into(),
+                    sender: "goal-user-resume".into(),
+                    reply_target: "goal-room-resume".into(),
+                    content: "/goal resume".into(),
+                    channel: "telegram".into(),
+                    timestamp: 2,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            });
+
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+            send_task.await.unwrap();
+
+            let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Running,
+                "already-running resume errors must not mutate the active goal"
+            );
+            let sent_messages = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("echo:") && message.contains("keep working")),
+                "generic interruption must not cancel the active turn: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("already running")),
+                "resume command should still report the controller error: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages.iter().all(|message| {
+                    !(message.contains("echo:") && message.contains("/goal resume"))
+                }),
+                "goal resume command should not be routed to the model: {sent_messages:?}"
             );
         });
     }
