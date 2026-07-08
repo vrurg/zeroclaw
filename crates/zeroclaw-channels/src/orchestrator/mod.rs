@@ -4227,6 +4227,355 @@ fn matrix_stream_reasoning(
     matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
+fn matrix_draft_update_interval_ms_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    let default_interval = zeroclaw_config::schema::MatrixConfig::default()
+        .draft_update_interval_ms
+        .max(50);
+    if msg.channel != "matrix" {
+        return default_interval;
+    }
+    let Some(alias) = msg.channel_alias.as_ref() else {
+        return default_interval;
+    };
+    config
+        .channels
+        .matrix
+        .get(alias)
+        .map_or(default_interval, |config| {
+            config.draft_update_interval_ms.max(50)
+        })
+}
+
+fn matrix_draft_update_interval_ms(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    matrix_draft_update_interval_ms_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_stream_draft_lines_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    let default_lines = zeroclaw_config::schema::MatrixConfig::default().stream_draft_lines;
+    if msg.channel != "matrix" {
+        return default_lines;
+    }
+    let Some(alias) = msg.channel_alias.as_ref() else {
+        return default_lines;
+    };
+    config
+        .channels
+        .matrix
+        .get(alias)
+        .map_or(default_lines, |config| config.stream_draft_lines)
+}
+
+fn matrix_stream_draft_lines(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    matrix_stream_draft_lines_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_message_max_bytes_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    let default_bytes = zeroclaw_config::schema::MatrixConfig::default()
+        .message_max_bytes
+        .max(1);
+    if msg.channel != "matrix" {
+        return default_bytes;
+    }
+    let Some(alias) = msg.channel_alias.as_ref() else {
+        return default_bytes;
+    };
+    config
+        .channels
+        .matrix
+        .get(alias)
+        .map_or(default_bytes, |config| config.message_max_bytes.max(1))
+}
+
+fn matrix_message_max_bytes(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    matrix_message_max_bytes_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+fn single_message_pending_thinking_round(text: &str) -> Option<usize> {
+    zeroclaw_runtime::agent::loop_::thinking_status_round(text)
+}
+
+fn single_message_pending_is_thinking_status(text: &str) -> bool {
+    single_message_pending_thinking_round(text).is_some()
+}
+
+fn single_message_pending_is_reasoning(text: &str) -> bool {
+    single_message_pending_has_prefix(text, zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && !single_message_pending_is_thinking_status(text)
+}
+
+fn single_message_pending_visible_lines(text: &str) -> usize {
+    if single_message_pending_is_reasoning(text) {
+        text.trim_end_matches(&['\r', '\n'][..])
+            .split('\n')
+            .count()
+            .max(1)
+    } else {
+        1
+    }
+}
+
+fn removing_pending_line_merges_reasoning(pending: &[String], idx: usize) -> bool {
+    idx > 0
+        && idx + 1 < pending.len()
+        && single_message_pending_is_reasoning(&pending[idx - 1])
+        && single_message_pending_is_reasoning(&pending[idx + 1])
+}
+
+fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+    if remove_lines == 0 {
+        return text.to_string();
+    }
+
+    let rendered = text.trim_end_matches(&['\r', '\n'][..]);
+    let total = single_message_pending_visible_lines(rendered);
+    if remove_lines >= total {
+        return String::new();
+    }
+
+    let retained = rendered
+        .split('\n')
+        .skip(remove_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if single_message_pending_is_reasoning(text)
+        && !retained.starts_with(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+    {
+        format!(
+            "{}{retained}",
+            zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX
+        )
+    } else {
+        retained
+    }
+}
+
+fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    let mut total_lines = pending
+        .iter()
+        .map(|line| single_message_pending_visible_lines(line))
+        .sum::<usize>();
+    while total_lines > max_lines {
+        let remove_lines = total_lines - max_lines;
+        let newest = pending.len().saturating_sub(1);
+        let remove_at = pending
+            .iter()
+            .enumerate()
+            .position(|(idx, line)| {
+                idx != newest
+                    && !single_message_pending_is_reasoning(line)
+                    && !single_message_pending_is_thinking_status(line)
+                    && !removing_pending_line_merges_reasoning(pending, idx)
+            })
+            .unwrap_or(0);
+        let line_count = single_message_pending_visible_lines(&pending[remove_at]);
+        if remove_lines >= line_count {
+            pending.remove(remove_at);
+            total_lines = total_lines.saturating_sub(line_count);
+        } else {
+            pending[remove_at] =
+                trim_pending_visible_lines_from_front(&pending[remove_at], remove_lines);
+            break;
+        }
+    }
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn push_matrix_single_message_pending(
+    pending: &mut Vec<String>,
+    text: String,
+    max_lines: usize,
+    max_bytes: usize,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let text = truncate_utf8_bytes(&text, max_bytes);
+
+    if let Some(incoming_round) = single_message_pending_thinking_round(&text)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_thinking_status(existing)
+    {
+        if incoming_round >= single_message_pending_thinking_round(existing).unwrap_or(0) {
+            *existing = text;
+        }
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    if let Some(fragment) = text.strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_reasoning(existing)
+    {
+        existing.push_str(fragment);
+        if existing.len() > max_bytes {
+            *existing = truncate_utf8_bytes(existing, max_bytes);
+        }
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    pending.push(text);
+    trim_matrix_single_message_pending(pending, max_lines);
+}
+
+async fn run_matrix_single_message_draft_updater(
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    interval_ms: u64,
+    stream_draft_lines: usize,
+    message_max_bytes: usize,
+) {
+    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+    let interval = Duration::from_millis(interval_ms.max(50));
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    let mut pending = Vec::<String>::new();
+    let mut rx_open = true;
+    let mut flush_in_flight = false;
+
+    macro_rules! progress_text {
+        ($event:expr) => {
+            match $event {
+                StreamDelta::Status(text) => Some(strip_think_tags_inline(&text)),
+                StreamDelta::Reasoning(text) => Some(strip_think_tags_inline(&format!(
+                    "{REASONING_FULL_PREFIX}{text}"
+                ))),
+                StreamDelta::Text(_) => None,
+            }
+        };
+    }
+
+    macro_rules! queue_progress {
+        ($event:expr) => {
+            if let Some(text) = progress_text!($event) {
+                push_matrix_single_message_pending(
+                    &mut pending,
+                    text,
+                    stream_draft_lines,
+                    message_max_bytes,
+                );
+            }
+        };
+    }
+
+    macro_rules! drain_ready {
+        () => {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => queue_progress!(event),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        rx_open = false;
+                        break;
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! start_flush {
+        () => {
+            if !flush_in_flight && !pending.is_empty() {
+                let batch = std::mem::take(&mut pending);
+                let channel = Arc::clone(&channel);
+                let reply_target = reply_target.clone();
+                let draft_id = draft_id.clone();
+                let flush_tx = flush_tx.clone();
+                flush_in_flight = true;
+                zeroclaw_spawn::spawn!(async move {
+                    let result = channel
+                        .update_draft_progress_batch(&reply_target, &draft_id, &batch)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = flush_tx.send(result.err()).await;
+                });
+            }
+        };
+    }
+
+    loop {
+        if !rx_open && !flush_in_flight {
+            start_flush!();
+            if pending.is_empty() && !flush_in_flight {
+                break;
+            }
+        }
+
+        tokio::select! {
+            maybe_event = rx.recv(), if rx_open => {
+                match maybe_event {
+                    Some(event) => {
+                        queue_progress!(event);
+                        drain_ready!();
+                    }
+                    None => {
+                        rx_open = false;
+                    }
+                }
+            }
+            _ = ticker.tick(), if !flush_in_flight && !pending.is_empty() => {
+                start_flush!();
+            }
+            maybe_error = flush_rx.recv(), if flush_in_flight => {
+                flush_in_flight = false;
+                if let Some(Some(error)) = maybe_error {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({"error": error})),
+                        "Coalesced draft progress update failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Resolve the effective `ack_reactions` value for a channel message.
 ///
 /// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
@@ -5023,52 +5372,92 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
-            Some(zeroclaw_spawn::spawn!(async move {
-                use zeroclaw_runtime::agent::loop_::StreamDelta;
-                let mut accumulated = String::new();
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        StreamDelta::Status(text) => {
-                            let visible = strip_think_tags_inline(&text);
-                            if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft progress update failed"
-                                );
+            if matrix_single_message_streaming {
+                let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
+                let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
+                let message_max_bytes = matrix_message_max_bytes(ctx.as_ref(), &msg);
+                Some(zeroclaw_spawn::spawn!(async move {
+                    run_matrix_single_message_draft_updater(
+                        rx,
+                        channel,
+                        reply_target,
+                        draft_id,
+                        interval_ms,
+                        stream_draft_lines,
+                        message_max_bytes,
+                    )
+                    .await;
+                }))
+            } else {
+                Some(zeroclaw_spawn::spawn!(async move {
+                    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+                    let mut accumulated = String::new();
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            StreamDelta::Status(text) => {
+                                let visible = strip_think_tags_inline(&text);
+                                if let Err(e) = channel
+                                    .update_draft_progress(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft progress update failed"
+                                    );
+                                }
                             }
-                        }
-                        StreamDelta::Text(text) => {
-                            if matrix_single_message_streaming {
-                                continue;
+                            StreamDelta::Reasoning(text) => {
+                                let visible = strip_think_tags_inline(&format!(
+                                    "{REASONING_FULL_PREFIX}{text}"
+                                ));
+                                if let Err(e) = channel
+                                    .update_draft_progress(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft reasoning update failed"
+                                    );
+                                }
                             }
-                            accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
-                            if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft update failed"
-                                );
+                            StreamDelta::Text(text) => {
+                                accumulated.push_str(&text);
+                                let visible = strip_think_tags_inline(&accumulated);
+                                if let Err(e) = channel
+                                    .update_draft(&reply_target, &draft_id, &visible)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "Draft update failed"
+                                    );
+                                }
                             }
                         }
                     }
-                }
-            }))
+                }))
+            }
         } else {
             None
         }
@@ -10751,6 +11140,274 @@ mod tests {
         assert!(!matrix_single_message_streaming_enabled_for_config(
             &config, &slack_msg
         ));
+    }
+
+    #[test]
+    fn matrix_single_message_pending_splits_reasoning_after_tool_progress() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        for idx in 0..10 {
+            let fragment = if idx == 0 {
+                format!("{REASONING_FULL_PREFIX}Thinking (round 2) r{idx}")
+            } else {
+                format!("{REASONING_FULL_PREFIX} r{idx}")
+            };
+            push_matrix_single_message_pending(&mut pending, fragment, 3, usize::MAX);
+            push_matrix_single_message_pending(
+                &mut pending,
+                format!("tool-{idx}\n"),
+                3,
+                usize::MAX,
+            );
+        }
+
+        assert!(
+            pending.len() <= 3,
+            "bounded pending buffer should honor stream_draft_lines, got {pending:?}"
+        );
+        assert!(
+            pending.iter().all(|line| !line.contains("r7 r8")),
+            "reasoning after tool progress must start a new entry, got {pending:?}"
+        );
+        assert!(
+            !pending.iter().any(|line| line == "tool-0\n"),
+            "old non-reasoning progress should be trimmed first: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_keeps_separator_between_reasoning_entries() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}before tool"),
+            2,
+            usize::MAX,
+        );
+        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2, usize::MAX);
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}after tool"),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            pending,
+            vec![
+                "tool call".to_string(),
+                format!("{REASONING_FULL_PREFIX}after tool")
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_caps_reasoning_to_message_budget() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}abcd"),
+            3,
+            max_bytes,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}efgh"),
+            3,
+            max_bytes,
+        );
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcd")]);
+        assert!(pending.iter().all(|line| line.len() <= max_bytes));
+    }
+
+    #[test]
+    fn matrix_single_message_pending_limit_counts_visible_lines_not_events() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
+
+        push_matrix_single_message_pending(
+            &mut pending,
+            "tool line\nwith detail\n".to_string(),
+            2,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            pending,
+            vec![
+                format!("{REASONING_FULL_PREFIX}three"),
+                "tool line\nwith detail\n".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_does_not_downgrade_thinking_round() {
+        use zeroclaw_runtime::agent::loop_::thinking_status_text;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3, usize::MAX);
+
+        assert_eq!(pending, vec![thinking_status_text(1)]);
+
+        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3, usize::MAX);
+
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3, usize::MAX);
+
+        assert_eq!(
+            pending,
+            vec![
+                thinking_status_text(1),
+                "tool\n".to_string(),
+                thinking_status_text(2)
+            ]
+        );
+    }
+
+    struct SlowBatchChannel {
+        batches: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+        delay: Duration,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SlowBatchChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "slow-batch"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlowBatchChannel {
+        fn name(&self) -> &str {
+            "slow-batch"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_draft_progress_batch(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            texts: &[String],
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.batches.lock().await.push(texts.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_progress_coalesces_slow_flush() {
+        use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+        let batches = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let channel: Arc<dyn Channel> = Arc::new(SlowBatchChannel {
+            batches: Arc::clone(&batches),
+            delay: Duration::from_millis(150),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let updater = zeroclaw_spawn::spawn!(run_matrix_single_message_draft_updater(
+            rx,
+            channel,
+            "room".to_string(),
+            "draft".to_string(),
+            50,
+            5,
+            128,
+        ));
+
+        for idx in 0..20 {
+            tx.send(StreamDelta::Reasoning(format!(" pre{idx}")))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        for idx in 0..80 {
+            tx.send(StreamDelta::Text(format!("answer-{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Reasoning(format!(" post{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Status(format!("tool-{idx}\n")))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_secs(3), updater)
+            .await
+            .expect("single-message updater should finish")
+            .expect("single-message updater task should not panic");
+
+        let batches = batches.lock().await.clone();
+        assert!(
+            (2..=4).contains(&batches.len()),
+            "slow flush should coalesce many deltas into a few batch edits, got {batches:?}"
+        );
+        assert!(
+            batches.iter().all(|batch| batch.len() <= 5),
+            "batch staging should be bounded by stream_draft_lines, got {batches:?}"
+        );
+        assert!(
+            batches.iter().flatten().all(|line| line.len() <= 128),
+            "batch staging should honor Matrix message_max_bytes, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .filter(|line| line.starts_with(REASONING_FULL_PREFIX))
+                .count()
+                > batches.len(),
+            "interleaved tool progress should keep reasoning split into multiple entries, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("tool-")),
+            "latest tool progress should remain available as a boundary line, got {batches:?}"
+        );
+        assert!(
+            !batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("answer-")),
+            "single-message progress updater must ignore assistant Text deltas: {batches:?}"
+        );
     }
 
     #[tokio::test]

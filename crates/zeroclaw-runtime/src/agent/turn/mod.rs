@@ -79,7 +79,8 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
     DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, StreamDelta,
-    THINKING_STATUS_PREFIX,
+    THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,

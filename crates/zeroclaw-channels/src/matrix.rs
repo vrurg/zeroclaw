@@ -378,7 +378,7 @@ mod streaming {
     use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
     use zeroclaw_runtime::agent::loop_::{
-        DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX,
+        DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
     };
 
     use super::{StreamMode, markers};
@@ -613,30 +613,143 @@ mod streaming {
     /// Append one progress update to a single-message draft, dropping the
     /// oldest entries once the configured window is full. A zero limit
     /// intentionally means "unlimited".
-    pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
-        let text = normalize_matrix_progress_line(text);
+    pub(super) fn push_single_progress_line(
+        draft: &mut SingleDraft,
+        text: &str,
+        max_lines: usize,
+        max_bytes: usize,
+    ) {
+        let text = truncate_utf8_bytes(&normalize_matrix_progress_line(text), max_bytes);
         if text.is_empty() {
             return;
         }
+        if merge_single_progress_line(draft, &text, max_bytes) {
+            trim_single_visible_lines(draft, max_lines);
+            return;
+        }
         draft.lines.push_back(text);
-        if max_lines > 0 {
-            while draft.lines.len() > max_lines {
+        trim_single_visible_lines(draft, max_lines);
+    }
+
+    /// Reasoning arrives as provider stream fragments. Keep it as one Matrix
+    /// transcript entry and let `draft_update_interval_ms` decide how often
+    /// that growing text is edited into the room.
+    fn merge_single_progress_line(draft: &mut SingleDraft, text: &str, max_bytes: usize) -> bool {
+        if let Some(incoming_round) = single_thinking_status_round(text)
+            && let Some(existing) = draft.lines.back_mut()
+            && is_single_thinking_status(existing)
+        {
+            if incoming_round >= single_thinking_status_round(existing).unwrap_or(0) {
+                *existing = text.to_string();
+            }
+            return true;
+        }
+
+        if let Some(fragment) = text.strip_prefix(REASONING_FULL_PREFIX)
+            && let Some(existing) = draft.lines.back_mut()
+            && existing.starts_with(REASONING_FULL_PREFIX)
+            && !is_single_thinking_status(existing)
+        {
+            existing.push_str(fragment);
+            if existing.len() > max_bytes {
+                *existing = truncate_utf8_bytes(existing, max_bytes);
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn single_thinking_status_round(text: &str) -> Option<usize> {
+        thinking_status_round(text)
+    }
+
+    fn is_single_thinking_status(text: &str) -> bool {
+        single_thinking_status_round(text).is_some()
+    }
+
+    fn is_single_reasoning_progress(text: &str) -> bool {
+        text.starts_with(REASONING_FULL_PREFIX) && !is_single_thinking_status(text)
+    }
+
+    fn visible_line_count(text: &str) -> usize {
+        single_render_line(text).split('\n').count().max(1)
+    }
+
+    fn trim_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+        if remove_lines == 0 {
+            return text.to_string();
+        }
+
+        let rendered = single_render_line(text);
+        let total = visible_line_count(rendered);
+        if remove_lines >= total {
+            return String::new();
+        }
+
+        let retained = rendered
+            .split('\n')
+            .skip(remove_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.starts_with(REASONING_FULL_PREFIX) && !retained.starts_with(REASONING_FULL_PREFIX) {
+            format!("{REASONING_FULL_PREFIX}{retained}")
+        } else {
+            retained
+        }
+    }
+
+    fn trim_single_visible_lines(draft: &mut SingleDraft, max_lines: usize) {
+        if max_lines == 0 {
+            return;
+        }
+        let mut total_lines = draft
+            .lines
+            .iter()
+            .map(|line| visible_line_count(line))
+            .sum::<usize>();
+        while total_lines > max_lines {
+            let remove_lines = total_lines - max_lines;
+            let Some(front) = draft.lines.front_mut() else {
+                break;
+            };
+            let front_lines = visible_line_count(front);
+            if remove_lines >= front_lines {
                 draft.lines.pop_front();
+                total_lines = total_lines.saturating_sub(front_lines);
+            } else {
+                *front = trim_visible_lines_from_front(front, remove_lines);
+                break;
             }
         }
     }
 
-    /// Keep multiline tool/status details and Markdown punctuation from
-    /// becoming accidental Matrix formatting inside the editable draft. This
-    /// is a Matrix presentation shim only; if upstream tool-progress
-    /// normalization ever provides the same guarantee, reconsider this
-    /// channel-local step.
+    /// Keep multiline reasoning readable while preventing tool/status details
+    /// and Markdown punctuation from becoming accidental Matrix formatting.
+    /// Tool/status progress remains one logical line; only raw reasoning gets
+    /// real newlines.
     pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
+        if is_thinking_status_text(text) {
+            return text.to_string();
+        }
+
+        let preserve_newlines = is_single_reasoning_progress(text);
         let mut normalized = String::with_capacity(text.len());
-        for ch in text.trim_end_matches(&['\r', '\n'][..]).chars() {
+        let mut chars = text.trim_end_matches(&['\r', '\n'][..]).chars().peekable();
+        while let Some(ch) = chars.next() {
             match ch {
+                '\n' if preserve_newlines => normalized.push('\n'),
                 '\n' => normalized.push('␊'),
-                '\r' => normalized.push('␍'),
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    if preserve_newlines {
+                        normalized.push('\n');
+                    } else {
+                        normalized.push('␊');
+                    }
+                }
                 '\u{000b}' => normalized.push('␋'),
                 '\u{000c}' => normalized.push('␌'),
                 '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '.'
@@ -648,6 +761,14 @@ mod streaming {
             }
         }
         normalized
+    }
+
+    fn single_render_line(line: &str) -> &str {
+        if is_single_thinking_status(line) {
+            line.trim_end_matches('\n')
+        } else {
+            line
+        }
     }
 
     /// Render the newest progress entries that fit within the Matrix text-body
@@ -662,6 +783,7 @@ mod streaming {
         let mut selected_count = 0usize;
         let mut bytes = 0usize;
         for line in draft.lines.iter().rev() {
+            let line = single_render_line(line);
             let separator = usize::from(selected_count > 0);
             let next_bytes = line.len().saturating_add(separator);
             if bytes.saturating_add(next_bytes) <= max_bytes {
@@ -677,6 +799,7 @@ mod streaming {
         let start = draft.lines.len().saturating_sub(selected_count);
         let mut text = String::with_capacity(bytes);
         for line in draft.lines.iter().skip(start) {
+            let line = single_render_line(line);
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -709,14 +832,6 @@ mod streaming {
         min_interval: Duration,
     ) -> bool {
         now.saturating_duration_since(existing.last_edit) >= min_interval
-    }
-
-    /// Only thinking/reasoning entries use the Matrix edit debounce. Tool
-    /// progress, denials, replacements, and other durable entries edit the
-    /// existing draft immediately so fast operations do not look buffered.
-    pub(super) fn single_progress_uses_edit_interval(text: &str) -> bool {
-        let trimmed = text.trim_start();
-        trimmed.starts_with(THINKING_STATUS_PREFIX) || trimmed.starts_with(REASONING_FULL_PREFIX)
     }
 
     /// Avoid duplicate Matrix edits after rendering confirms that the visible
@@ -3830,13 +3945,16 @@ impl MatrixChannel {
             let Some(draft) = streaming::single_for_update(&mut state, &key) else {
                 return Ok(());
             };
-            streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+            streaming::push_single_progress_line(
+                draft,
+                text,
+                self.config.stream_draft_lines,
+                max_body_bytes,
+            );
 
             let now = Instant::now();
             let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
-            if streaming::single_progress_uses_edit_interval(text)
-                && !streaming::single_edit_interval_elapsed(draft, now, interval)
-            {
+            if !streaming::single_edit_interval_elapsed(draft, now, interval) {
                 return Ok(());
             }
 
@@ -3845,14 +3963,59 @@ impl MatrixChannel {
                 return Ok(());
             }
             draft.last_edit = now;
-            (draft.event_id.clone(), visible_text, now)
+            (draft.event_id.clone(), visible_text)
         };
         let client = self.ensure_client().await?;
         outbound::edit(client, recipient, &update.0, &update.1).await?;
         {
             let mut state = self.streaming_state.write().await;
             if let Some(draft) = streaming::single_for_update(&mut state, &key) {
-                streaming::mark_single_edit_delivered(draft, &update.0, update.1, update.2);
+                streaming::mark_single_edit_delivered(draft, &update.0, update.1, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a burst of single-message progress entries and publish the
+    /// coalesced transcript with one Matrix edit. The caller owns pacing.
+    async fn single_update_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        if texts.is_empty() {
+            return Ok(());
+        }
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.message_max_bytes.max(1);
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            for text in texts {
+                streaming::push_single_progress_line(
+                    draft,
+                    text,
+                    self.config.stream_draft_lines,
+                    max_body_bytes,
+                );
+            }
+
+            let visible_text = streaming::single_visible_text_with_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = Instant::now();
+            (draft.event_id.clone(), visible_text)
+        };
+        let client = self.ensure_client().await?;
+        outbound::edit(client, recipient, &update.0, &update.1).await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, update.1, Instant::now());
             }
         }
         Ok(())
@@ -4045,11 +4208,7 @@ impl Channel for MatrixChannel {
                 let thread_anchor =
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
                 let key = streaming::draft_key(room_id, event_id.as_ref())?;
-                let first_edit_ready = Instant::now()
-                    .checked_sub(Duration::from_millis(
-                        self.config.draft_update_interval_ms.max(50),
-                    ))
-                    .unwrap_or_else(Instant::now);
+                let first_edit_ready = Instant::now();
                 let mut state = self.streaming_state.write().await;
                 streaming::insert_single(
                     &mut state,
@@ -4113,6 +4272,28 @@ impl Channel for MatrixChannel {
             // MultiMessage doesn't have an in-flight draft to update, and Off
             // means the orchestrator should not have created one.
             StreamMode::Off | StreamMode::MultiMessage => Ok(()),
+        }
+    }
+
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            StreamMode::SingleMessage => {
+                self.single_update_progress_batch(recipient, message_id, texts)
+                    .await
+            }
+            StreamMode::Off | StreamMode::MultiMessage => Ok(()),
+            StreamMode::Partial => {
+                for text in texts {
+                    self.update_draft_progress(recipient, message_id, text)
+                        .await?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -4917,8 +5098,7 @@ mod tests {
             normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
             partial_visible_text, push_single_progress_line, single_cancel_deletes_draft,
             single_contains, single_edit_interval_elapsed, single_finalize_plan,
-            single_progress_uses_edit_interval, single_render_changed,
-            single_retained_draft_action, single_visible_text_with_budget,
+            single_render_changed, single_retained_draft_action, single_visible_text_with_budget,
         };
         use matrix_sdk::config::SyncSettings;
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id, owned_room_id};
@@ -4933,7 +5113,7 @@ mod tests {
         use zeroclaw_api::channel::Channel;
         use zeroclaw_config::schema::{MatrixConfig, StreamMode};
         use zeroclaw_runtime::agent::loop_::{
-            DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX,
+            DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
         };
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
@@ -5016,9 +5196,9 @@ mod tests {
         #[test]
         fn single_progress_slides_oldest_entries() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "one", 2);
-            push_single_progress_line(&mut draft, "two", 2);
-            push_single_progress_line(&mut draft, "three", 2);
+            push_single_progress_line(&mut draft, "one", 2, usize::MAX);
+            push_single_progress_line(&mut draft, "two", 2, usize::MAX);
+            push_single_progress_line(&mut draft, "three", 2, usize::MAX);
 
             assert_eq!(
                 single_visible_text_with_budget(&draft, usize::MAX),
@@ -5027,11 +5207,189 @@ mod tests {
         }
 
         #[test]
+        fn single_progress_limit_counts_visible_lines_not_events() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+                2,
+                usize::MAX,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}two\nthree")
+            );
+
+            push_single_progress_line(&mut draft, "shell: printf 'a\\nb'\nnext\r\n", 2, usize::MAX);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}three\nshell: printf 'a\\nb'␊next")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_updates_existing_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}Thinking (round 2) through"),
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} carefully"),
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} now"),
+                10,
+                usize::MAX,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}Thinking \\(round 2\\) through carefully now")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_caps_retained_line_to_message_budget() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}abcd"),
+                10,
+                max_bytes,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}efgh"),
+                10,
+                max_bytes,
+            );
+
+            let retained = draft.lines.front().expect("reasoning line retained");
+            assert_eq!(retained, &format!("{REASONING_FULL_PREFIX}abcd"));
+            assert!(retained.len() <= max_bytes);
+        }
+
+        #[test]
+        fn single_reasoning_progress_does_not_merge_into_static_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{THINKING_STATUS_PREFIX}Thinking...\n"),
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}The"),
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} answer"),
+                10,
+                usize::MAX,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...\n{REASONING_FULL_PREFIX}The answer")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}The"),
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                "\u{2705} shell: command=true (0s)\n",
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} answer"),
+                10,
+                usize::MAX,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{REASONING_FULL_PREFIX}The\n✅ shell: command=true \\(0s\\)\n{REASONING_FULL_PREFIX} answer"
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_remains_one_static_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            push_single_progress_line(&mut draft, &status, 10, usize::MAX);
+            push_single_progress_line(&mut draft, &status, 10, usize::MAX);
+            push_single_progress_line(&mut draft, &status, 10, usize::MAX);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...")
+            );
+        }
+
+        #[test]
+        fn single_status_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10, usize::MAX);
+            push_single_progress_line(
+                &mut draft,
+                "\u{2705} shell: command=true (0s)\n",
+                10,
+                usize::MAX,
+            );
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10, usize::MAX);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{THINKING_STATUS_PREFIX}Thinking...\n✅ shell: command=true \\(0s\\)\n{THINKING_STATUS_PREFIX}Thinking (round 2)..."
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_does_not_downgrade_round_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10, usize::MAX);
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10, usize::MAX);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking (round 2)...")
+            );
+        }
+
+        #[test]
         fn single_progress_zero_limit_keeps_all_entries() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "one", 0);
-            push_single_progress_line(&mut draft, "two", 0);
-            push_single_progress_line(&mut draft, "three", 0);
+            push_single_progress_line(&mut draft, "one", 0, usize::MAX);
+            push_single_progress_line(&mut draft, "two", 0, usize::MAX);
+            push_single_progress_line(&mut draft, "three", 0, usize::MAX);
 
             assert_eq!(
                 single_visible_text_with_budget(&draft, usize::MAX),
@@ -5042,9 +5400,9 @@ mod tests {
         #[test]
         fn single_progress_byte_budget_drops_oldest_entries_after_line_limit() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "one", 0);
-            push_single_progress_line(&mut draft, "two", 0);
-            push_single_progress_line(&mut draft, "three", 0);
+            push_single_progress_line(&mut draft, "one", 0, usize::MAX);
+            push_single_progress_line(&mut draft, "two", 0, usize::MAX);
+            push_single_progress_line(&mut draft, "three", 0, usize::MAX);
 
             assert_eq!(
                 single_visible_text_with_budget(&draft, "two\nthree".len()),
@@ -5055,7 +5413,7 @@ mod tests {
         #[test]
         fn single_progress_byte_budget_truncates_oversized_utf8_line() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "😀😀😀", 0);
+            push_single_progress_line(&mut draft, "😀😀😀", 0, usize::MAX);
 
             let visible = single_visible_text_with_budget(&draft, 5);
 
@@ -5073,6 +5431,12 @@ mod tests {
             assert_eq!(
                 normalize_matrix_progress_line("delegate: prompt=Check **service**\nthen _report_"),
                 "delegate: prompt=Check \\*\\*service\\*\\*␊then \\_report\\_"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line(&format!(
+                    "{REASONING_FULL_PREFIX}Check **service**\nthen _report_"
+                )),
+                format!("{REASONING_FULL_PREFIX}Check \\*\\*service\\*\\*\nthen \\_report\\_")
             );
         }
 
@@ -5097,34 +5461,6 @@ mod tests {
         }
 
         #[test]
-        fn single_only_thinking_progress_uses_edit_debounce() {
-            for line in [
-                format!("{THINKING_STATUS_PREFIX}Thinking...\n"),
-                format!("{THINKING_STATUS_PREFIX}Thinking (round 2)...\n"),
-                format!("{REASONING_FULL_PREFIX}considering options\n"),
-            ] {
-                assert!(
-                    single_progress_uses_edit_interval(&line),
-                    "expected debounced thinking/reasoning progress for {line:?}"
-                );
-            }
-
-            for line in [
-                "\u{1f4ac} Got 2 tool call(s) (1s)\n",
-                "\u{23f3} shell: command=uname -a\n",
-                "\u{2705} shell: command=uname -a (0s)\n",
-                "\u{274c} shell: command=false (0s): failed\n",
-                "\u{270f} shell: replaced by user\n",
-                "plain durable progress\n",
-            ] {
-                assert!(
-                    !single_progress_uses_edit_interval(line),
-                    "expected immediate durable progress edit for {line:?}"
-                );
-            }
-        }
-
-        #[test]
         fn single_render_changed_skips_duplicate_matrix_edits() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
             draft.last_text = "one\ntwo".to_string();
@@ -5136,7 +5472,7 @@ mod tests {
         #[test]
         fn failed_single_edit_leaves_retained_draft_flushable() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "one", 10, usize::MAX);
 
             // Simulate a rendered edit body whose Matrix request fails: the
             // line buffer advanced, but the delivery checkpoint must not.
@@ -5198,8 +5534,8 @@ mod tests {
         fn single_retained_draft_action_flushes_latest_unflushed_progress() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
             draft.last_text = "one".to_string();
-            push_single_progress_line(&mut draft, "one", 10);
-            push_single_progress_line(&mut draft, "two", 10);
+            push_single_progress_line(&mut draft, "one", 10, usize::MAX);
+            push_single_progress_line(&mut draft, "two", 10, usize::MAX);
 
             assert_eq!(
                 single_retained_draft_action(&draft, usize::MAX),
@@ -5210,7 +5546,7 @@ mod tests {
         #[test]
         fn single_retained_draft_action_keeps_current_visible_text() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
-            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "one", 10, usize::MAX);
             draft.last_text = "one".to_string();
 
             assert_eq!(
@@ -5234,7 +5570,7 @@ mod tests {
             let mut draft = single_draft(owned_event_id!("$single:server"));
             assert!(single_cancel_deletes_draft(&draft, false));
 
-            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "one", 10, usize::MAX);
             assert!(single_cancel_deletes_draft(&draft, false));
 
             draft.last_text = "one".to_string();
@@ -5460,7 +5796,7 @@ mod tests {
             {
                 let mut draft = single_draft(draft_id.clone());
                 draft.last_text = "old progress".to_string();
-                push_single_progress_line(&mut draft, "new progress", 10);
+                push_single_progress_line(&mut draft, "new progress", 10, usize::MAX);
                 let mut state = channel.streaming_state.write().await;
                 insert_single(&mut state, key, draft).expect("single-message state accepts draft");
             }
@@ -5855,6 +6191,7 @@ mod tests {
                     .expect("second draft remains addressable"),
                 "second updated",
                 10,
+                usize::MAX,
             );
 
             assert_eq!(

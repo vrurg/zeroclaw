@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
+/// Minimum characters per chunk when relaying live model text to draft surfaces.
 pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
@@ -21,9 +21,47 @@ pub const DRAFT_PLACEHOLDER: &str = "...";
 /// Prefix for liveness-only thinking/reasoning progress.
 pub const THINKING_STATUS_PREFIX: &str = "\u{1f914} ";
 /// Prefix for opt-in raw reasoning progress.
-pub const REASONING_FULL_PREFIX: &str = "\u{1f9e0} ";
+pub const REASONING_FULL_PREFIX: &str = THINKING_STATUS_PREFIX;
+const THINKING_STATUS_LABEL: &str = "Thinking...";
+const THINKING_STATUS_ROUND_PREFIX: &str = "Thinking (round ";
+const THINKING_STATUS_ROUND_SUFFIX: &str = ")...";
+
 /// Status-mode reasoning tick that does not expose raw reasoning text.
-pub const REASONING_STATUS_TEXT: &str = "\u{1f914} Thinking...\n";
+pub fn thinking_status_text(iteration: usize) -> String {
+    let round = iteration + 1;
+    if round == 1 {
+        format!("{THINKING_STATUS_PREFIX}{THINKING_STATUS_LABEL}\n")
+    } else {
+        format!(
+            "{THINKING_STATUS_PREFIX}{THINKING_STATUS_ROUND_PREFIX}{round}{THINKING_STATUS_ROUND_SUFFIX}\n"
+        )
+    }
+}
+
+/// Parse the label portion of a generated status-mode reasoning line.
+pub fn thinking_status_label_round(label: &str) -> Option<usize> {
+    if label == THINKING_STATUS_LABEL {
+        return Some(1);
+    }
+    label
+        .strip_prefix(THINKING_STATUS_ROUND_PREFIX)
+        .and_then(|rest| rest.strip_suffix(THINKING_STATUS_ROUND_SUFFIX))
+        .and_then(|round| round.parse::<usize>().ok())
+        .filter(|round| *round > 1)
+}
+
+/// Comparable round number for a generated status-mode reasoning line.
+pub fn thinking_status_round(text: &str) -> Option<usize> {
+    let label = text
+        .strip_prefix(THINKING_STATUS_PREFIX)?
+        .strip_suffix('\n')?;
+    thinking_status_label_round(label)
+}
+
+/// Whether a progress line is one of the liveness-only thinking status lines.
+pub fn is_thinking_status_text(text: &str) -> bool {
+    thinking_status_round(text).is_some()
+}
 
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
@@ -33,6 +71,8 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// Provider reasoning text. Channel surfaces must opt in before rendering.
+    Reasoning(String),
 }
 
 /// Backwards-compatible alias while callers are migrated.
@@ -165,6 +205,20 @@ mod tests {
             duration: Duration::ZERO,
             receipt: None,
         }
+    }
+
+    #[test]
+    fn thinking_status_parser_requires_exact_generated_status_text() {
+        assert!(is_thinking_status_text(&thinking_status_text(0)));
+        assert_eq!(thinking_status_round(&thinking_status_text(0)), Some(1));
+        assert!(is_thinking_status_text(&thinking_status_text(1)));
+        assert_eq!(thinking_status_round(&thinking_status_text(1)), Some(2));
+        assert!(!is_thinking_status_text(&format!(
+            "{REASONING_FULL_PREFIX}Thinking (round 2) through the next option"
+        )));
+        assert!(!is_thinking_status_text(&format!(
+            "{THINKING_STATUS_PREFIX}Thinking (round 1)...\n"
+        )));
     }
 
     /// Text-protocol calls have no id; the pair must still correlate via a

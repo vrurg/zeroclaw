@@ -939,7 +939,8 @@ pub use super::turn::{
     ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, ResolvedAgentExecution,
     ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, StreamDelta, THINKING_STATUS_PREFIX,
     ToolLoop, ToolLoopCancelled, drain_steering_messages, is_model_switch_requested,
-    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+    thinking_status_label_round, thinking_status_round, thinking_status_text,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -2505,6 +2506,7 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::Reasoning(_) => {}
                         }
                     }
                 });
@@ -9652,6 +9654,9 @@ This is an example, not an invocation."#;
             deltas.iter().all(|delta| match delta {
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
+                StreamDelta::Reasoning(text) => {
+                    !text.contains("private chain of thought") && !text.contains("<think>")
+                }
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9746,6 +9751,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -9834,6 +9840,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -10739,6 +10746,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -11196,6 +11204,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
             }
         }
 
@@ -13306,6 +13315,7 @@ Let me check the result."#;
             .iter()
             .map(|d| match d {
                 StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
+                StreamDelta::Reasoning(_) => "",
             })
             .collect();
 

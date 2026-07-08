@@ -1,6 +1,6 @@
 //! Streaming provider-response consumption for the turn loop.
 
-use super::events::{DraftEvent, REASONING_FULL_PREFIX, REASONING_STATUS_TEXT, StreamDelta};
+use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
 use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -80,7 +80,6 @@ pub(crate) async fn consume_provider_streaming_response(
     // suppression-buffered text) is the partial that may be persisted as
     // already-delivered output.
     let mut forwarded_text = String::new();
-
     macro_rules! forward_visible {
         ($text:expr, $count_visible:tt) => {{
             let visible = $text;
@@ -203,29 +202,21 @@ pub(crate) async fn consume_provider_streaming_response(
                 // even when `chunk.delta` is empty — otherwise model_providers
                 // that require reasoning to round-trip on subsequent turns
                 // (DeepSeek V4 thinking mode; see #6059) reject the next
-                // request with a 400. Reasoning is never forwarded as a
-                // visible response delta — it is the model's internal
-                // monologue, kept for replay only.
+                // request with a 400. Reasoning is never forwarded as
+                // assistant response text, but it may be sent to the channel
+                // progress transcript when the operator explicitly opts into
+                // raw reasoning with `stream_reasoning = "full"`.
                 if let Some(reasoning) = chunk.reasoning.as_deref()
                     && !reasoning.is_empty()
                 {
                     outcome.reasoning_content.push_str(reasoning);
                     match draft_reasoning {
                         StreamReasoningMode::Off => {}
-                        StreamReasoningMode::Status => {
-                            if let Some(tx) = on_delta {
-                                let _ = tx
-                                    .send(StreamDelta::Status(REASONING_STATUS_TEXT.to_string()))
-                                    .await;
-                            }
-                        }
+                        StreamReasoningMode::Status => {}
                         StreamReasoningMode::Full => {
                             if let Some(tx) = on_delta {
-                                let _ = tx
-                                    .send(StreamDelta::Status(format!(
-                                        "{REASONING_FULL_PREFIX}{reasoning}"
-                                    )))
-                                    .await;
+                                let _ =
+                                    tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
                             }
                         }
                     }
@@ -439,6 +430,63 @@ mod tests {
         }
     }
 
+    struct MultiReasoningProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for MultiReasoningProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MultiReasoningProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for MultiReasoningProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("first"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning(" second"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("final"))),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -475,8 +523,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_status_mode_emits_liveness_without_raw_reasoning() {
-        let provider = ReasoningProvider;
+    async fn reasoning_status_mode_captures_reasoning_without_draft_delta() {
+        let provider = MultiReasoningProvider;
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
         let outcome = consume_provider_streaming_response(
@@ -495,24 +543,21 @@ mod tests {
         .expect("stream consume should succeed");
         drop(delta_tx);
 
-        let mut deltas = Vec::new();
-        while let Some(delta) = delta_rx.recv().await {
-            deltas.push(delta);
+        while let Ok(delta) = delta_rx.try_recv() {
+            match delta {
+                StreamDelta::Text(text) => assert_eq!(text, "final"),
+                StreamDelta::Status(text) => assert!(!text.contains("first second")),
+                StreamDelta::Reasoning(text) => {
+                    panic!("status mode must not emit raw reasoning: {text}")
+                }
+            }
         }
 
-        assert_eq!(outcome.reasoning_content, "private reasoning");
-        assert!(deltas.iter().any(|delta| matches!(
-            delta,
-            StreamDelta::Status(text) if text == REASONING_STATUS_TEXT
-        )));
-        assert!(deltas.iter().all(|delta| match delta {
-            StreamDelta::Status(text) | StreamDelta::Text(text) =>
-                !text.contains("private reasoning"),
-        }));
+        assert_eq!(outcome.reasoning_content, "first second");
     }
 
     #[tokio::test]
-    async fn reasoning_full_mode_emits_raw_reasoning_as_status() {
+    async fn reasoning_full_mode_emits_raw_reasoning_delta() {
         let provider = ReasoningProvider;
         let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
@@ -540,8 +585,7 @@ mod tests {
         assert_eq!(outcome.reasoning_content, "private reasoning");
         assert!(deltas.iter().any(|delta| matches!(
             delta,
-            StreamDelta::Status(text)
-                if text == &format!("{REASONING_FULL_PREFIX}private reasoning")
+            StreamDelta::Reasoning(text) if text == "private reasoning"
         )));
     }
 }
