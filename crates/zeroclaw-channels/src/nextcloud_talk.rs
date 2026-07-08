@@ -85,17 +85,7 @@ impl NextcloudTalkChannel {
     /// `mode` — `Off` disables draft updates entirely; `Partial` enables live edits.
     /// `interval_ms` — minimum delay between consecutive OCS edit calls per room.
     pub fn with_streaming(mut self, mode: StreamMode, interval_ms: u64) -> Self {
-        self.stream_mode = match mode {
-            StreamMode::SingleMessage => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "nextcloud_talk: stream_mode=single_message is not supported; falling back to off"
-                );
-                StreamMode::Off
-            }
-            other => other,
-        };
+        self.stream_mode = mode;
         self.draft_update_interval_ms = interval_ms;
         self
     }
@@ -674,11 +664,11 @@ impl Channel for NextcloudTalkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != StreamMode::Off && self.stream_mode != StreamMode::SingleMessage
+        self.stream_mode != StreamMode::Off
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if self.stream_mode == StreamMode::Off || self.stream_mode == StreamMode::SingleMessage {
+        if self.stream_mode == StreamMode::Off {
             return Ok(None);
         }
 

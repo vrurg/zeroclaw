@@ -48,7 +48,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
     RoomVisibility, SendMessage,
 };
-use zeroclaw_config::schema::{MatrixConfig, StreamMode, TranscriptionConfig};
+use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode, TranscriptionConfig};
 
 // ─── markers ───────────────────────────────────────────────────────────────
 mod markers {
@@ -381,7 +381,7 @@ mod streaming {
         DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
     };
 
-    use super::{StreamMode, markers};
+    use super::{MatrixStreamMode, markers};
 
     const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
 
@@ -468,12 +468,12 @@ mod streaming {
 
     impl State {
         /// Create the draft store matching the immutable Matrix stream mode.
-        pub(super) fn for_stream_mode(mode: StreamMode) -> Self {
+        pub(super) fn for_stream_mode(mode: MatrixStreamMode) -> Self {
             match mode {
-                StreamMode::Off => Self::Off,
-                StreamMode::Partial => Self::Partial(HashMap::new()),
-                StreamMode::SingleMessage => Self::Single(HashMap::new()),
-                StreamMode::MultiMessage => Self::Multi(HashMap::new()),
+                MatrixStreamMode::Off => Self::Off,
+                MatrixStreamMode::Partial => Self::Partial(HashMap::new()),
+                MatrixStreamMode::SingleMessage => Self::Single(HashMap::new()),
+                MatrixStreamMode::MultiMessage => Self::Multi(HashMap::new()),
             }
         }
     }
@@ -619,7 +619,7 @@ mod streaming {
         max_lines: usize,
         max_bytes: usize,
     ) {
-        let text = truncate_utf8_bytes(&normalize_matrix_progress_line(text), max_bytes);
+        let text = truncate_utf8_bytes_owned(normalize_matrix_progress_line(text), max_bytes);
         if text.is_empty() {
             return;
         }
@@ -820,6 +820,13 @@ mod streaming {
             end -= 1;
         }
         text[..end].to_string()
+    }
+
+    fn truncate_utf8_bytes_owned(text: String, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            return text;
+        }
+        truncate_utf8_bytes(&text, max_bytes)
     }
 
     /// Check the Matrix edit-attempt interval before rendering the draft body.
@@ -4164,11 +4171,11 @@ impl Channel for MatrixChannel {
         // true. Partial, SingleMessage, and MultiMessage all need streaming
         // setup; the channel decides internally whether to edit answer text,
         // edit progress only, or emit paragraphs.
-        !matches!(self.config.stream_mode, StreamMode::Off)
+        !matches!(self.config.stream_mode, MatrixStreamMode::Off)
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        matches!(self.config.stream_mode, StreamMode::MultiMessage)
+        matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage)
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
@@ -4179,8 +4186,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let room_id = streaming_room(&message.recipient)?;
         match self.config.stream_mode {
-            StreamMode::Off => Ok(None),
-            StreamMode::Partial => {
+            MatrixStreamMode::Off => Ok(None),
+            MatrixStreamMode::Partial => {
                 // Send the placeholder draft now so subsequent update_draft
                 // calls have an event to edit.
                 let event_id = outbound::send(&self.outbox(client), message).await?;
@@ -4200,7 +4207,7 @@ impl Channel for MatrixChannel {
                 )?;
                 Ok(Some(event_id.to_string()))
             }
-            StreamMode::SingleMessage => {
+            MatrixStreamMode::SingleMessage => {
                 // Single-message mode starts with one editable progress draft.
                 // Final answer text is never copied here; finalize_draft sends
                 // the answer as a separate Matrix message.
@@ -4223,7 +4230,7 @@ impl Channel for MatrixChannel {
                 )?;
                 Ok(Some(event_id.to_string()))
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::MultiMessage => {
                 // No initial message — paragraphs are emitted by update_draft
                 // as they appear. Capture the thread anchor up front so each
                 // paragraph lands in the same thread as the user's message.
@@ -4250,10 +4257,10 @@ impl Channel for MatrixChannel {
 
     async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => self.partial_update(recipient, message_id, text).await,
-            StreamMode::SingleMessage => Ok(()),
-            StreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => Ok(()),
+            MatrixStreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
 
@@ -4264,14 +4271,14 @@ impl Channel for MatrixChannel {
         text: &str,
     ) -> Result<()> {
         match self.config.stream_mode {
-            StreamMode::Partial => self.update_draft(recipient, message_id, text).await,
-            StreamMode::SingleMessage => {
+            MatrixStreamMode::Partial => self.update_draft(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => {
                 self.single_update_progress(recipient, message_id, text)
                     .await
             }
             // MultiMessage doesn't have an in-flight draft to update, and Off
             // means the orchestrator should not have created one.
-            StreamMode::Off | StreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
         }
     }
 
@@ -4282,12 +4289,12 @@ impl Channel for MatrixChannel {
         texts: &[String],
     ) -> Result<()> {
         match self.config.stream_mode {
-            StreamMode::SingleMessage => {
+            MatrixStreamMode::SingleMessage => {
                 self.single_update_progress_batch(recipient, message_id, texts)
                     .await
             }
-            StreamMode::Off | StreamMode::MultiMessage => Ok(()),
-            StreamMode::Partial => {
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
                 for text in texts {
                     self.update_draft_progress(recipient, message_id, text)
                         .await?;
@@ -4307,8 +4314,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_partial(&mut state, &key)
@@ -4418,7 +4425,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            StreamMode::SingleMessage => {
+            MatrixStreamMode::SingleMessage => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_single(&mut state, &key)
@@ -4515,7 +4522,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
                 let multi = {
@@ -4544,8 +4551,8 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?;
         let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_partial(&mut state, &key)
@@ -4561,7 +4568,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            StreamMode::SingleMessage => {
+            MatrixStreamMode::SingleMessage => {
                 let draft = {
                     let mut state = self.streaming_state.write().await;
                     streaming::take_single(&mut state, &key)
@@ -4582,7 +4589,7 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::MultiMessage => {
                 // Already-sent paragraphs are independent room messages and
                 // are not redacted on cancel — partial output is preferable
                 // to silent disappearance. Just drop our state.
@@ -5117,7 +5124,7 @@ mod tests {
             matchers::{body_partial_json, method, path_regex},
         };
         use zeroclaw_api::channel::Channel;
-        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
         use zeroclaw_runtime::agent::loop_::{
             DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
         };
@@ -5591,7 +5598,7 @@ mod tests {
                 MatrixConfig {
                     homeserver: "https://matrix.invalid".to_string(),
                     access_token: Some("test-token".to_string()),
-                    stream_mode: StreamMode::SingleMessage,
+                    stream_mode: MatrixStreamMode::SingleMessage,
                     ..MatrixConfig::default()
                 },
                 "matrix",
@@ -5774,7 +5781,7 @@ mod tests {
                     user_id: Some("@bot:server".to_string()),
                     device_id: Some("DEVICE".to_string()),
                     allowed_rooms: vec![room_id.to_string()],
-                    stream_mode: StreamMode::SingleMessage,
+                    stream_mode: MatrixStreamMode::SingleMessage,
                     stream_draft_delete: false,
                     reply_in_thread: false,
                     ack_reactions: Some(false),
@@ -5967,7 +5974,7 @@ mod tests {
                     user_id: Some("@bot:server".to_string()),
                     device_id: Some("DEVICE".to_string()),
                     allowed_rooms: vec![room_id.to_string()],
-                    stream_mode: StreamMode::SingleMessage,
+                    stream_mode: MatrixStreamMode::SingleMessage,
                     stream_draft_delete: true,
                     reply_in_thread: false,
                     ack_reactions: Some(false),
@@ -6088,7 +6095,7 @@ mod tests {
 
             assert_ne!(first, second);
 
-            let mut state = streaming::State::for_stream_mode(StreamMode::Partial);
+            let mut state = streaming::State::for_stream_mode(MatrixStreamMode::Partial);
             insert_partial(
                 &mut state,
                 first.clone(),
@@ -6127,7 +6134,7 @@ mod tests {
             let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
             let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
 
-            let mut state = State::for_stream_mode(StreamMode::Partial);
+            let mut state = State::for_stream_mode(MatrixStreamMode::Partial);
             insert_partial(
                 &mut state,
                 first.clone(),
@@ -6178,7 +6185,7 @@ mod tests {
             let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
             let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
 
-            let mut state = State::for_stream_mode(StreamMode::SingleMessage);
+            let mut state = State::for_stream_mode(MatrixStreamMode::SingleMessage);
             insert_single(
                 &mut state,
                 first.clone(),
@@ -6237,7 +6244,7 @@ mod tests {
             let canceled =
                 super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
 
-            let mut state = State::for_stream_mode(StreamMode::MultiMessage);
+            let mut state = State::for_stream_mode(MatrixStreamMode::MultiMessage);
             insert_multi(
                 &mut state,
                 first.clone(),
@@ -6311,7 +6318,7 @@ mod tests {
         use matrix_sdk::config::SyncSettings;
         use tempfile::TempDir;
         use zeroclaw_api::channel::{Channel, SendMessage};
-        use zeroclaw_config::schema::{MatrixConfig, StreamMode};
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
 
         use super::super::{
             MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming, streaming_key,
@@ -6345,7 +6352,7 @@ mod tests {
                 homeserver,
                 access_token: Some(access_token),
                 allowed_rooms: vec![room_id.clone()],
-                stream_mode: StreamMode::Partial,
+                stream_mode: MatrixStreamMode::Partial,
                 draft_update_interval_ms: 50,
                 multi_message_delay_ms: 0,
                 stream_draft_lines: 10,
@@ -6506,7 +6513,7 @@ mod tests {
                 homeserver,
                 access_token: Some(access_token),
                 allowed_rooms: vec![room_id.clone()],
-                stream_mode: StreamMode::Off,
+                stream_mode: MatrixStreamMode::Off,
                 reply_in_thread: false,
                 ack_reactions: Some(false),
                 ..MatrixConfig::default()

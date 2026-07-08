@@ -1010,14 +1010,6 @@ impl LarkChannel {
                 );
                 StreamMode::Off
             }
-            StreamMode::SingleMessage => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,),
-                    "lark: stream_mode=single_message is not supported by Feishu's editable-card surface; falling back to off"
-                );
-                StreamMode::Off
-            }
             other => other,
         };
         self.stream_mode = effective_stream_mode;

@@ -322,7 +322,6 @@ impl WeComWsChannel {
         workspace_dir: &Path,
     ) -> Result<Self> {
         let unsupported_stream_mode = match config.stream_mode {
-            StreamMode::SingleMessage => Some("single_message"),
             StreamMode::MultiMessage => Some("multi_message"),
             StreamMode::Off | StreamMode::Partial => None,
         };

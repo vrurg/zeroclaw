@@ -4245,7 +4245,7 @@ fn matrix_single_message_streaming_enabled_for_config(
         return false;
     };
     config.channels.matrix.get(alias).is_some_and(|config| {
-        config.stream_mode == zeroclaw_config::schema::StreamMode::SingleMessage
+        config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
     })
 }
 
@@ -4468,6 +4468,13 @@ fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
+fn truncate_utf8_bytes_owned(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    truncate_utf8_bytes(&text, max_bytes)
+}
+
 fn push_matrix_single_message_pending(
     pending: &mut Vec<String>,
     text: String,
@@ -4477,7 +4484,7 @@ fn push_matrix_single_message_pending(
     if text.is_empty() {
         return;
     }
-    let text = truncate_utf8_bytes(&text, max_bytes);
+    let text = truncate_utf8_bytes_owned(text, max_bytes);
 
     if let Some(incoming_round) = single_message_pending_thinking_round(&text)
         && let Some(existing) = pending.last_mut()
@@ -11503,14 +11510,14 @@ mod tests {
         config.channels.matrix.insert(
             "single".to_string(),
             zeroclaw_config::schema::MatrixConfig {
-                stream_mode: zeroclaw_config::schema::StreamMode::SingleMessage,
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
                 ..Default::default()
             },
         );
         config.channels.matrix.insert(
             "partial".to_string(),
             zeroclaw_config::schema::MatrixConfig {
-                stream_mode: zeroclaw_config::schema::StreamMode::Partial,
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::Partial,
                 ..Default::default()
             },
         );

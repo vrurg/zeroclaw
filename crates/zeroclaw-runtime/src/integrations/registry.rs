@@ -138,7 +138,9 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::Config;
-    use zeroclaw_config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use zeroclaw_config::schema::{
+        IMessageConfig, MatrixConfig, MatrixStreamMode, StreamMode, TelegramConfig,
+    };
     use zeroclaw_config::traits::ChannelConfig;
 
     #[test]
@@ -296,7 +298,7 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
                 stream_draft_lines: 10,

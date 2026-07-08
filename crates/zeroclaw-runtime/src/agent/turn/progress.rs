@@ -8,9 +8,8 @@ use super::redact::scrub_credentials;
 use crate::util::truncate_with_ellipsis;
 use serde_json::Value;
 
-const MAX_PROGRESS_FIELDS: usize = 4;
-const MAX_PROGRESS_VALUE_CHARS: usize = 96;
-const MAX_PROGRESS_HINT_CHARS: usize = 240;
+const MAX_PROGRESS_VALUE_CHARS: usize = 60;
+const TOOL_ARGUMENT_HINT_KEYS: &[&str] = &["command", "path", "action", "query"];
 
 /// Render the start line for a tool call using the same argument hint that
 /// completion lines use.
@@ -40,56 +39,33 @@ pub(crate) fn render_tool_completion_progress(
     } else if let Some(reason) = error_reason {
         format!(
             "\u{274c} {subject} ({secs}s): {}\n",
-            truncate_with_ellipsis(&scrub_credentials(reason), 200)
+            truncate_with_ellipsis(&scrub_and_collapse_display(reason), 200)
         )
     } else {
         format!("\u{274c} {subject} ({secs}s)\n")
     }
 }
 
-/// Build a compact, tool-agnostic argument summary. This deliberately avoids
-/// tool-name branching: every tool gets the same object-key rendering path.
+/// Build a compact, tool-agnostic argument summary from a conservative key
+/// allowlist. This keeps start/completion lines useful without publishing
+/// arbitrary tool arguments into chat-visible progress.
 fn tool_argument_hint(args: &Value) -> Option<String> {
-    let hint = match args {
-        Value::Object(map) => {
-            let mut parts = Vec::new();
-            let mut omitted = 0usize;
-            for (key, value) in map {
-                // `approved` is runtime control metadata injected after the
-                // model call; showing it would add noise and would not help
-                // operators distinguish parallel calls.
-                if key == "approved" {
-                    continue;
-                }
-                let Some(value) = render_argument_value(value) else {
-                    omitted += 1;
-                    continue;
-                };
-                if parts.len() >= MAX_PROGRESS_FIELDS {
-                    omitted += 1;
-                    continue;
-                }
-                parts.push(format!(
-                    "{key}={}",
-                    truncate_with_ellipsis(&value, MAX_PROGRESS_VALUE_CHARS)
-                ));
-            }
-            if parts.is_empty() {
-                return None;
-            }
-            if omitted > 0 {
-                parts.push(format!("+{omitted} more"));
-            }
-            parts.join(", ")
-        }
-        Value::Null => return None,
-        value => {
-            let value = render_argument_value(value)?;
-            format!("args={value}")
-        }
+    let Value::Object(map) = args else {
+        return None;
     };
 
-    Some(truncate_with_ellipsis(&hint, MAX_PROGRESS_HINT_CHARS))
+    let parts: Vec<String> = TOOL_ARGUMENT_HINT_KEYS
+        .iter()
+        .filter_map(|key| {
+            let value = render_argument_value(map.get(*key)?)?;
+            Some(format!(
+                "{key}={}",
+                truncate_with_ellipsis(&value, MAX_PROGRESS_VALUE_CHARS)
+            ))
+        })
+        .collect();
+
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Convert one JSON argument value to compact display text while scrubbing
@@ -102,7 +78,7 @@ fn render_argument_value(value: &Value) -> Option<String> {
             serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
         }
     };
-    let rendered = scrub_credentials(&rendered);
+    let rendered = scrub_and_collapse_display(&rendered);
     if rendered.is_empty() {
         None
     } else {
@@ -110,44 +86,54 @@ fn render_argument_value(value: &Value) -> Option<String> {
     }
 }
 
+fn scrub_and_collapse_display(value: &str) -> String {
+    scrub_credentials(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{render_tool_completion_progress, render_tool_start_progress};
     use serde_json::json;
 
-    /// Delegate has no bespoke formatter; generic argument rendering is enough
-    /// to make the target and task visible in streamed progress.
     #[test]
-    fn start_progress_reports_generic_tool_arguments() {
+    fn start_progress_reports_only_allowlisted_arguments() {
         let line = render_tool_start_progress(
             "delegate",
             &json!({
                 "agent": "sysadmin",
                 "prompt": "Check **service**\nthen report",
+                "query": "current state",
                 "background": true
             }),
         );
 
-        assert_eq!(
-            line,
-            "\u{23f3} delegate: agent=sysadmin, background=true, prompt=Check **service**\nthen report\n"
-        );
+        assert_eq!(line, "\u{23f3} delegate: query=current state\n");
     }
 
     #[test]
     fn completion_progress_reuses_argument_hint() {
         let line = render_tool_completion_progress(
             "web_fetch",
-            &json!({"url": "https://example.test/a?b=c", "method": "GET"}),
+            &json!({"url": "https://example.test/a?b=c", "method": "GET", "path": "/tmp/out"}),
             3,
             true,
             None,
         );
 
-        assert_eq!(
-            line,
-            "\u{2705} web_fetch: method=GET, url=https://example.test/a?b=c (3s)\n"
+        assert_eq!(line, "\u{2705} web_fetch: path=/tmp/out (3s)\n");
+    }
+
+    #[test]
+    fn progress_omits_arguments_without_allowlisted_keys() {
+        let line = render_tool_start_progress(
+            "delegate",
+            &json!({"agent": "sysadmin", "prompt": "private details"}),
         );
+
+        assert_eq!(line, "\u{23f3} delegate\n");
     }
 
     #[test]
@@ -169,6 +155,35 @@ mod tests {
             "raw secret leaked: {line}"
         );
         assert!(line.contains("path=/tmp/config.toml"));
+    }
+
+    #[test]
+    fn completion_progress_failure_keeps_error_reason_on_one_line() {
+        let line = render_tool_completion_progress(
+            "shell",
+            &json!({"command": "printf fail"}),
+            1,
+            false,
+            Some("first line\nsecond line"),
+        );
+
+        assert_eq!(
+            line,
+            "\u{274c} shell: command=printf fail (1s): first line second line\n"
+        );
+    }
+
+    #[test]
+    fn progress_truncates_allowlisted_values_to_sixty_chars() {
+        let line = render_tool_start_progress(
+            "shell",
+            &json!({"command": "012345678901234567890123456789012345678901234567890123456789tail"}),
+        );
+
+        assert_eq!(
+            line,
+            "\u{23f3} shell: command=012345678901234567890123456789012345678901234567890123456789...\n"
+        );
     }
 
     #[test]
