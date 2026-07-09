@@ -46,6 +46,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
@@ -95,7 +96,7 @@ pub use zeroclaw_tools::mcp_client::McpRegistry;
 pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
-    build_deferred_tools_section_filtered,
+    build_deferred_tools_section_excluding, build_deferred_tools_section_filtered,
 };
 pub use zeroclaw_tools::mcp_prompts_tool::McpPromptsTool;
 pub use zeroclaw_tools::mcp_resources_tool::McpResourcesTool;
@@ -162,6 +163,7 @@ pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
 pub use sop_workshop::SopWorkshopTool;
 pub use spawn_subagent::SpawnSubagentTool;
+pub use todo_write::TodoWriteTool;
 pub use verifiable_intent::VerifiableIntentTool;
 
 /// Re-entrant agent-spawning tools that must never be collapsed by the
@@ -732,6 +734,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
+        Arc::new(TodoWriteTool::new()),
     ];
 
     if matches!(goal_admission_tools, GoalAdmissionToolPolicy::Include) {
@@ -2972,5 +2975,14 @@ mod tests {
             !names.contains(&"read_skill"),
             "full runtime-profile override should omit read_skill even when global is compact"
         );
+    }
+}
+
+#[cfg(test)]
+mod todo_registration_tests {
+    #[test]
+    fn todo_write_tool_name_is_stable() {
+        use zeroclaw_api::tool::Tool;
+        assert_eq!(super::todo_write::TodoWriteTool::new().name(), "TodoWrite");
     }
 }
