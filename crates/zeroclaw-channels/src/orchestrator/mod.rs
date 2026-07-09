@@ -4328,7 +4328,14 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            // Keep the large body future off the caller's stack in debug builds.
+            Box::pin(process_channel_message_body(
+                ctx,
+                msg,
+                cancellation_token,
+                composite_for_body,
+            ))
+            .await;
         }
     )
     .await;
