@@ -6712,6 +6712,7 @@ mod tests {
                 message_max_bytes: 48_000,
                 stream_draft_delete: true,
                 stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 mention_only: false,
                 recovery_key: None,
                 password: password.map(String::from),
