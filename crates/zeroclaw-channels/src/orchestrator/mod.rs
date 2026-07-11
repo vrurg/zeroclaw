@@ -754,6 +754,8 @@ struct ChannelRuntimeContext {
     /// (append / remove_last / delete_session) for the same sender without
     /// serializing the full message-processing loop. See #7753.
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -12313,6 +12315,8 @@ pub async fn start_channels(
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: sop_engine.clone(),
+            sop_audit: sop_audit.clone(),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -12883,6 +12887,8 @@ fn concurrent_persist_lock_serialization() {
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
         runtime_defaults_override: Arc::new(Mutex::new(None)),
         persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
     });
     ctx.conversation_histories
         .lock()
@@ -13470,6 +13476,8 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -14064,6 +14072,8 @@ temperature = 0.3
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
@@ -14565,6 +14575,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -14660,6 +14672,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -14773,6 +14787,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -14890,6 +14906,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -15598,6 +15616,8 @@ api_key = "anthropic-key"
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -16835,6 +16855,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -16918,6 +16940,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17036,6 +17060,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17166,6 +17192,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17319,6 +17347,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17441,6 +17471,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -17581,6 +17613,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17707,6 +17741,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17818,6 +17854,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -17949,6 +17987,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18097,6 +18137,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18305,6 +18347,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18753,6 +18797,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18862,6 +18908,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -18978,6 +19026,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -19406,6 +19456,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         };
         configure(&mut ctx);
         Arc::new(ctx)
@@ -19500,6 +19552,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -19652,6 +19706,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -19861,6 +19917,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -19990,6 +20048,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -20459,6 +20519,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20617,6 +20679,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20780,6 +20844,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -20933,6 +20999,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -21066,6 +21134,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -21177,6 +21247,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -21302,6 +21374,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -21475,6 +21549,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -24214,6 +24290,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -24388,6 +24466,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -24788,6 +24868,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -25300,6 +25382,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -25448,6 +25532,8 @@ BTC is currently around $65,000 based on latest tool output."#
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -27090,6 +27176,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -27208,6 +27296,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -27365,6 +27455,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -27601,6 +27693,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -27752,6 +27846,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -27895,6 +27991,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -28058,6 +28156,8 @@ This is an example JSON object for profile settings."#;
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
         });
 
         process_channel_message(
@@ -28468,6 +28568,8 @@ This is an example JSON object for profile settings."#;
                 last_applied_config_stamp: Arc::new(Mutex::new(None)),
                 runtime_defaults_override: Arc::new(Mutex::new(None)),
                 persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                sop_engine: None,
+                sop_audit: None,
             });
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);

@@ -416,7 +416,7 @@ use config::Config;
 pub use zeroclaw::{
     AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
     HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands,
+    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -2498,8 +2498,8 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = Config::map_key_sections()
         .into_iter()
-        .filter(|section| section.path.starts_with("providers."))
         .filter(|section| section.kind == zeroclaw_config::traits::MapKeyKind::Map)
+        .filter(|section| !section.resource_key)
         .filter_map(|section| {
             let key = map_key_for_prop_path(section.path, prop_path)?;
             Some((section.path, key))
@@ -2509,10 +2509,37 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
-    let created = config
-        .create_map_key(section_path, key)
-        .map_err(anyhow::Error::msg)?;
+    // Route through the shared `create_map_key_checked` (not raw
+    // `create_map_key`) so this CLI path inherits the reserved `default`
+    // agent guard from the one place it's defined, rather than re-deriving
+    // `section == "agents" && is_reserved_agent_alias(key)` here too. Without
+    // this, widening past `providers.*` would let `config set
+    // agents.default.enabled ...` auto-create the reserved runtime-fallback
+    // agent alias, which the rename guard then refuses to ever rename.
+    let created =
+        match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
+            Ok(created) => created,
+            Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
+            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+        };
     if created {
+        // The section matched and the alias was newly materialized, but the
+        // requested prop path might still not resolve (typo'd trailing field
+        // name, or belt-and-suspenders against a resource-key path that
+        // slipped past the `!resource_key` filter above). Roll back rather
+        // than leave a phantom alias, falling through to the normal
+        // "Unknown property" error exactly as before this alias existed.
+        //
+        // IMPORTANT: this probe/rollback must stay strictly inside the
+        // `if created` branch. `create_map_key` returns `Ok(false)` when the
+        // alias already existed (idempotent case) — never run this rollback
+        // when `created == false`, or a bogus tail-field on an
+        // ALREADY-EXISTING alias would delete a legitimate, pre-existing
+        // config entry that has nothing to do with this call.
+        if config.get_prop(prop_path).is_err() {
+            let _ = config.delete_map_key(section_path, key);
+            return Ok(false);
+        }
         config.mark_dirty(&format!("{section_path}.{key}"));
     }
     Ok(created)
@@ -4157,9 +4184,8 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // Build SOP engine + audit per iteration from current_config.
-                // This ensures reload picks up config changes (new sops_dir,
-                // changed path, or removed sops_dir).
+                // SOP loading is gated on `[sop] sops_dir`: unset disables all
+                // SOP runtime behavior, matching the documented rollback path.
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory(
@@ -8837,11 +8863,85 @@ mod tests {
             &mut config,
             "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
         )
-        .expect("non-provider map paths should be ignored, not rejected");
+        .expect("resource-key map paths should be ignored, not rejected");
 
         assert!(
             !created,
-            "auto-materialization must stay scoped to typed provider aliases"
+            "auto-materialization must stay scoped to alias-keyed sections, excluding #[resource_key] sections"
+        );
+        assert!(
+            config.cost.rates.providers.models.openai.is_empty(),
+            "no bogus model-id key should have been materialized under cost.rates",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_materializes_non_provider_alias_sections() {
+        for (path, value) in [
+            ("risk_profiles.newprofile.level", "supervised"),
+            ("channels.telegram.main.enabled", "true"),
+            ("channels.telegram.main.bot_token", "tok"),
+            ("peer_groups.pi400_owner.channel", "telegram.main"),
+        ] {
+            let mut config = Config::default();
+            assert!(
+                config.set_prop(path, value).is_err(),
+                "precondition: {path} should be unknown on a fresh config"
+            );
+            let created = ensure_map_key_for_prop_path(&mut config, path)
+                .expect("newly-widened alias sections should materialize");
+            assert!(created, "{path}'s alias should be created");
+            assert!(
+                config.set_prop(path, value).is_ok(),
+                "{path} must be settable after map-key materialization"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_refuses_reserved_default_agent() {
+        let mut config = Config::default();
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.default.enabled")
+            .expect("agents is a known map-keyed section; refusal is not an error");
+        assert!(
+            !created,
+            "must refuse to auto-create the reserved `default` agent alias"
+        );
+        assert!(
+            config.agents.is_empty(),
+            "no `agents.default` entry should have been left behind by the refused create"
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "agents.researcher.enabled")
+            .expect("non-reserved agent aliases should still materialize");
+        assert!(
+            created,
+            "agents.<non-default> must still auto-materialize like every other widened section"
+        );
+        assert!(
+            config.agents.contains_key("researcher"),
+            "researcher alias should have been created"
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_rolls_back_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        let path = "risk_profiles.newprofile.not_a_real_field";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("section resolves; only the tail field is bogus");
+        assert!(
+            !created,
+            "must not report success when the tail field doesn't resolve"
+        );
+        assert!(
+            config
+                .get_map_keys("risk_profiles")
+                .unwrap_or_default()
+                .is_empty(),
+            "the tentatively-created alias must be rolled back, not left dangling",
         );
     }
 
@@ -8879,6 +8979,7 @@ mod tests {
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            agent: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
