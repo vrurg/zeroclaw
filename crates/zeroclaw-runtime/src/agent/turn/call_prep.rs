@@ -72,6 +72,7 @@ async fn record_duplicate_tool_call(
         error_reason: Some(duplicate),
         duration: Duration::ZERO,
         receipt: None,
+        output_data: None,
     }
 }
 
@@ -133,6 +134,7 @@ pub(crate) async fn prepare_tool_calls(
                         error_reason: Some(reason),
                         duration: Duration::ZERO,
                         receipt: None,
+                        output_data: None,
                     };
                     // Streaming consumers still see the call and its
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
