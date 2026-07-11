@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ModelProviderConfig,
     ResolvedRuntime, RiskProfileConfig, RuntimeProfileConfig, SkillBundleConfig,
@@ -34,16 +34,23 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
-async fn active_goal_task_id_from_cost_context() -> Option<String> {
-    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String>> {
+    let Some(ctx) = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
-        .flatten()?;
+        .flatten()
+    else {
+        return Ok(None);
+    };
     if !ctx.goal_attribution_enabled() {
-        return None;
+        return Ok(None);
     }
-    let agent_alias = ctx.agent_alias.as_deref()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("goal state lookup is missing agent identity")
+    })?;
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Err(anyhow::anyhow!("goal control plane unavailable"));
+    };
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -52,16 +59,19 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
 }
 
-async fn active_goal_task_id_from_runtime_context() -> Option<String> {
+async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
     if !crate::control_plane::current_goal_turn_evaluation_requested() {
-        return None;
+        return Ok(None);
     }
-    let ctx = crate::control_plane::current_goal_admission_context()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    let Some(ctx) = crate::control_plane::current_goal_admission_context() else {
+        return Ok(None);
+    };
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Err(anyhow::anyhow!("goal control plane unavailable"));
+    };
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -70,13 +80,12 @@ async fn active_goal_task_id_from_runtime_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
 }
 
-async fn active_goal_task_id_for_delegate_policy() -> Option<String> {
-    if let Some(task_id) = active_goal_task_id_from_runtime_context().await {
-        return Some(task_id);
+async fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context().await? {
+        return Ok(Some(task_id));
     }
     active_goal_task_id_from_cost_context().await
 }
@@ -324,6 +333,22 @@ impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
+
+    /// Bounded delegates inherit caller tools but may not mutate durable goal
+    /// lifecycle or open a goal human gate on behalf of their parent.
+    fn is_goal_control_tool(name: &str) -> bool {
+        matches!(
+            name,
+            crate::tools::GoalStartTool::NAME
+                | crate::tools::GoalObjectiveTool::NAME
+                | crate::tools::GoalResumeTool::NAME
+                | "goal_pause"
+                | "goal_cancel"
+                | "goal_status"
+                | "ask_user"
+                | "escalate_to_human"
+        )
+    }
     const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
@@ -777,7 +802,7 @@ impl DelegateTool {
 
         Some(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(format!(
                 "delegate target {target_alias:?} cannot run in independent mode from {:?}: \
                  risk profile {target_risk_profile:?} has always_ask entries ({}). \
@@ -966,9 +991,13 @@ impl DelegateTool {
             },
         )
         .await;
+        // Independent delegation injects one combined MCP prompt block: the harness
+        // composes the deferred tool-search listing with any pinned MCP resources, so
+        // this can no longer silently lose pinned resources the way a raw-field
+        // destructure could (see `ScopedAssembled::combined_mcp_prompt_section`).
+        let deferred_section = assembled.combined_mcp_prompt_section();
         let crate::tools::scoped::ScopedAssembled {
             registry,
-            deferred_section,
             activated_handle,
             ..
         } = assembled;
@@ -1312,7 +1341,7 @@ impl Tool for DelegateTool {
         let Some(action) = DelegateAction::parse(action_value) else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!(
                     "Unknown action '{action_value}'. Use {}.",
                     DelegateAction::usage()
@@ -1353,7 +1382,7 @@ impl Tool for DelegateTool {
         if agent_name.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'agent' parameter must not be empty".into()),
             });
         }
@@ -1377,7 +1406,7 @@ impl Tool for DelegateTool {
         if prompt.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'prompt' parameter must not be empty".into()),
             });
         }
@@ -1389,7 +1418,9 @@ impl Tool for DelegateTool {
 
         if background {
             if crate::control_plane::current_goal_start_tool_batch_requested()
-                || active_goal_task_id_for_delegate_policy().await.is_some()
+                || active_goal_task_id_for_delegate_policy()
+                    .await
+                    .map_or(true, |task| task.is_some())
             {
                 return Ok(ToolResult {
                     success: false,
@@ -1446,7 +1477,7 @@ impl DelegateTool {
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Unknown agent '{agent_name}'. Available agents: {}",
                         if available.is_empty() {
@@ -1469,7 +1500,7 @@ impl DelegateTool {
         if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Delegation depth limit reached ({depth}/{max}). \
                      Cannot delegate further to prevent infinite loops.",
@@ -1486,7 +1517,7 @@ impl DelegateTool {
             {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -1494,7 +1525,7 @@ impl DelegateTool {
             if let Err(e) = self.policy_for_target(agent_name) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
                 });
             }
@@ -1513,7 +1544,7 @@ impl DelegateTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
                     )),
@@ -1585,7 +1616,7 @@ impl DelegateTool {
             Err(_elapsed) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {timeout_secs}s"
                     )),
@@ -1605,13 +1636,15 @@ impl DelegateTool {
 
                 Ok(ToolResult {
                     success: true,
-                    output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",),
+                    output:
+                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
+                            .into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
             }),
         }
@@ -1637,7 +1670,7 @@ impl DelegateTool {
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Unknown agent '{agent_name}'. Available agents: {}",
                         if available.is_empty() {
@@ -1654,7 +1687,7 @@ impl DelegateTool {
         if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Delegation depth limit reached ({depth}/{max}).",
                     depth = self.depth,
@@ -1669,7 +1702,7 @@ impl DelegateTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -1679,7 +1712,7 @@ impl DelegateTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
                 });
             }
@@ -1696,7 +1729,7 @@ impl DelegateTool {
         ) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Too many background delegations in flight (limit {}). Wait for some to \
                      finish (check_result) or cancel one (cancel_task) before starting more.",
@@ -1841,7 +1874,7 @@ impl DelegateTool {
                         match result {
                             Ok(tool_result) => {
                                 if tool_result.success {
-                                    Ok(tool_result.output)
+                                    Ok(tool_result.output.into_string())
                                 } else {
                                     Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
                                 }
@@ -1926,7 +1959,8 @@ impl DelegateTool {
                 "Background task started for agent '{agent_name}'.\n\
                  task_id: {task_id}\n\
                  Use action='check_result' with task_id='{task_id}' to retrieve the result."
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -1958,7 +1992,7 @@ impl DelegateTool {
         if prompt.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'prompt' parameter must not be empty".into()),
             });
         }
@@ -1972,7 +2006,7 @@ impl DelegateTool {
         if agent_names.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'parallel' array must contain at least one agent name".into()),
             });
         }
@@ -1984,7 +2018,7 @@ impl DelegateTool {
                     self.agents.keys().map(|s: &String| s.as_str()).collect();
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
                         "Unknown agent '{name}' in parallel list. Available: {}",
                         if available.is_empty() {
@@ -2005,7 +2039,7 @@ impl DelegateTool {
             if let Err(e) = self.policy_for_target(name) {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!("{e:#}")),
                 });
             }
@@ -2179,7 +2213,8 @@ impl DelegateTool {
                 "[Parallel delegation: {} agents]\n\n{}",
                 agent_names.len(),
                 outputs.join("\n\n")
-            ),
+            )
+            .into(),
             error: if all_success {
                 None
             } else {
@@ -2331,7 +2366,7 @@ impl DelegateTool {
         if let Err(e) = Self::validate_task_id(task_id) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e),
             });
         }
@@ -2339,7 +2374,7 @@ impl DelegateTool {
         let Some(result) = self.read_background_result(task_id).await? else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
         };
@@ -2349,7 +2384,7 @@ impl DelegateTool {
 
         Ok(ToolResult {
             success,
-            output: serde_json::to_string_pretty(&value)?,
+            output: serde_json::to_string_pretty(&value)?.into(),
             error: if success {
                 None
             } else if let Some(error) = error {
@@ -2371,7 +2406,7 @@ impl DelegateTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(error.to_string()),
                 });
             }
@@ -2381,7 +2416,7 @@ impl DelegateTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(error.to_string()),
                 });
             }
@@ -2432,7 +2467,8 @@ impl DelegateTool {
                         "missing": missing,
                         "failed": failed,
                         "results": results,
-                    }))?,
+                    }))?
+                    .into(),
                     error,
                 });
             }
@@ -2488,7 +2524,7 @@ impl DelegateTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&results)?,
+            output: serde_json::to_string_pretty(&results)?.into(),
             error: None,
         })
     }
@@ -2538,7 +2574,7 @@ impl DelegateTool {
         if let Err(e) = Self::validate_task_id(task_id) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e),
             });
         }
@@ -2547,7 +2583,7 @@ impl DelegateTool {
         if !result_path.exists() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("No task found for task_id '{task_id}'")),
             });
         }
@@ -2559,7 +2595,7 @@ impl DelegateTool {
         if result.status != BackgroundTaskStatus::Running {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Task '{task_id}' is not running (status: {:?})",
                     result.status
@@ -2597,9 +2633,9 @@ impl DelegateTool {
         Ok(ToolResult {
             success: true,
             output: if aborted {
-                format!("Task '{task_id}' cancelled — the running task was aborted.")
+                format!("Task '{task_id}' cancelled: the running task was aborted.").into()
             } else {
-                format!("Task '{task_id}' marked cancelled (it had already settled).")
+                format!("Task '{task_id}' marked cancelled (it had already settled).").into()
             },
             error: None,
         })
@@ -2819,7 +2855,7 @@ impl DelegateTool {
         let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Agent '{agent_name}' is agentic but risk_profile '{}' is not configured",
                     agent_config.risk_profile
@@ -2833,7 +2869,7 @@ impl DelegateTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("{e:#}")),
                     });
                 }
@@ -2877,7 +2913,7 @@ impl DelegateTool {
                     Err(e) => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!(
                                 "Failed to initialize independent delegate tools for target '{agent_name}': {e:#}"
                             )),
@@ -2905,7 +2941,7 @@ impl DelegateTool {
                         Err(e) => {
                             return Ok(ToolResult {
                                 success: false,
-                                output: String::new(),
+                                output: ToolOutput::default(),
                                 error: Some(format!(
                                     "Failed to initialize memory for delegate target '{agent_name}': {e:#}"
                                 )),
@@ -2920,6 +2956,7 @@ impl DelegateTool {
                 parent_tools
                     .iter()
                     .filter(|tool| tool.name() != Self::NAME)
+                    .filter(|tool| !Self::is_goal_control_tool(tool.name()))
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .map(|tool| {
@@ -3060,19 +3097,20 @@ impl DelegateTool {
                     success: true,
                     output: format!(
                         "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    ),
+                    )
+                    .into(),
                     error: None,
                 })
             }
             Ok(Err(e)) if is_tool_loop_cancelled(&e) => Err(e),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
@@ -3114,6 +3152,14 @@ impl Tool for ToolArcRef {
         self.inner.parameters_schema()
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -3138,6 +3184,26 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_delegates_exclude_all_goal_control_tools() {
+        for name in [
+            "goal_start",
+            "goal_objective",
+            "goal_resume",
+            "goal_pause",
+            "goal_cancel",
+            "goal_status",
+            "ask_user",
+            "escalate_to_human",
+        ] {
+            assert!(
+                DelegateTool::is_goal_control_tool(name),
+                "{name} must not reach bounded delegates"
+            );
+        }
+        assert!(!DelegateTool::is_goal_control_tool("shell"));
+    }
     use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
@@ -3500,7 +3566,7 @@ mod tests {
                 .to_string();
             Ok(ToolResult {
                 success: true,
-                output: format!("echo:{value}"),
+                output: format!("echo:{value}").into(),
                 error: None,
             })
         }
@@ -4511,7 +4577,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            active, None,
+            active.unwrap(),
+            None,
             "ordinary channel turns may carry trusted goal admission facts, \
              but must not become active goal work until the controller marks the turn"
         );
@@ -6746,7 +6813,7 @@ mod tests {
             async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -9109,6 +9176,37 @@ command = "echo hi"
         }
     }
 
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.0
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: self.0.into(),
+                error: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NamedTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            self.0
+        }
+    }
+
     struct MockShellTool;
     #[async_trait]
     impl Tool for MockShellTool {
@@ -9124,7 +9222,7 @@ command = "echo hi"
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: None,
             })
         }
@@ -9240,6 +9338,65 @@ command = "echo hi"
             "parent policy should have filtered out file_write, but got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_does_not_expose_goal_controls_or_human_gates_to_the_child() {
+        let control_tools = [
+            "goal_start",
+            "goal_objective",
+            "goal_resume",
+            "goal_pause",
+            "goal_cancel",
+            "goal_status",
+            "ask_user",
+            "escalate_to_human",
+        ];
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(
+                control_tools
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("file_read"))
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(
+                control_tools
+                    .iter()
+                    .map(|name| Arc::new(NamedTool(name)) as Arc<dyn Tool>)
+                    .chain(std::iter::once(Arc::new(FileReadTool) as Arc<dyn Tool>))
+                    .collect(),
+            )));
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &agentic_agent_config(),
+                "openrouter",
+                "model-test",
+                &ToolListInspector {
+                    forbidden_names: control_tools
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
+                },
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bounded child saw a forbidden tool: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("done"));
     }
 
     #[tokio::test]
