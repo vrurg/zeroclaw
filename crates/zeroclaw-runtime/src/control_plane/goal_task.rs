@@ -381,6 +381,18 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// together.
     async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
 
+    /// Atomically pause a goal only while its canonical lifecycle is running.
+    ///
+    /// Recovery uses this compare-and-set operation after asynchronous
+    /// executor classification. A `false` result means another lifecycle
+    /// transition already won; implementations must leave the existing goal
+    /// pause payload untouched in that case.
+    async fn pause_running_goal_task(
+        &self,
+        task_id: &str,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
+
     /// Atomically clear goal pause state, claim ownership, and mark the task running.
     ///
     /// `continuation_context` is written only when supplied by trusted ingress.

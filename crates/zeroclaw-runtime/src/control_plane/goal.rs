@@ -696,6 +696,13 @@ pub struct GoalAdmissionContext {
     pub originator_route: Option<String>,
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
+    /// Exact durable goal task bound to this controller turn, when one exists.
+    ///
+    /// Channel ingress leaves this unset for operator messages. The goal
+    /// controller sets it only on trusted synthetic continuations so later
+    /// admission, verifier, gate, and delegation lookups cannot drift to a
+    /// replacement goal in the same route/principal context.
+    pub goal_task_id: Option<String>,
     /// Minimal durable channel context needed to resume after restart.
     ///
     /// The context itself is persisted by the goal store. The rest of this
@@ -772,6 +779,7 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             continuation_context: None,
         }
     }
@@ -797,6 +805,12 @@ impl GoalAdmissionContext {
     #[must_use]
     pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
         self.principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_goal_task_id(mut self, goal_task_id: Option<String>) -> Self {
+        self.goal_task_id = goal_task_id;
         self
     }
 
@@ -1429,7 +1443,9 @@ pub async fn evaluate_goal_turn_with_verifier(
         Some(cp) => cp,
         None => return Ok(None),
     };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
         return Ok(None);
     };
     if !resolved.is_running() {
@@ -1608,7 +1624,9 @@ pub async fn pause_current_goal_for_human_gate(
     let Some(cp) = control_plane() else {
         return Ok(None);
     };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
         return Ok(None);
     };
     let admission = pause_goal_for_known_blocker(
@@ -2170,7 +2188,9 @@ pub async fn admit_goal_autonomous_turn(
     let Some(cp) = control_plane() else {
         return Ok(None);
     };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
         return Ok(None);
     };
     if !resolved.is_running() {
@@ -2208,12 +2228,12 @@ async fn resolve_goal_task(
     ctx: &GoalAdmissionContext,
     task_id: Option<String>,
 ) -> Result<TaskRecord> {
-    if let Some(task_id) = task_id {
+    if let Some(task_id) = ctx.goal_task_id.as_deref().or(task_id.as_deref()) {
         let task = store
-            .get(&task_id)
+            .get(task_id)
             .await
             .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
-            .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-not-found", &[("task_id", task_id)]))?;
         ensure_goal_visible(&task, ctx)?;
         return Ok(task);
     }
@@ -2258,10 +2278,14 @@ async fn resolve_goal(
     load_goal_extension(goal_store, task).await
 }
 
-async fn latest_active_resolved_goal(
+async fn resolved_goal_for_context(
+    store: &dyn TaskRegistry,
     goal_store: &dyn GoalTaskRegistry,
     ctx: &GoalAdmissionContext,
 ) -> Result<Option<TaskGoal>> {
+    if ctx.goal_task_id.is_some() {
+        return resolve_goal(store, goal_store, ctx, None).await.map(Some);
+    }
     let Some(task) = goal_store
         .latest_active_goal_for_context(
             &ctx.agent_alias,
@@ -3045,6 +3069,138 @@ mod tests {
         let admission = admit_goal_autonomous_turn(&ctx, &config).await.unwrap();
 
         assert!(admission.is_none());
+    }
+
+    #[tokio::test]
+    async fn autonomous_turn_stays_bound_to_recovered_task_after_replacement() {
+        let fixture = create_running_goal_fixture("recover the original goal").await;
+        let recovered_ctx = fixture
+            .ctx
+            .clone()
+            .with_goal_task_id(Some(fixture.task_id.clone()));
+
+        assert!(
+            admit_goal_autonomous_turn(&recovered_ctx, &test_config())
+                .await
+                .unwrap()
+                .is_none(),
+            "the still-running recovered task should be admitted"
+        );
+
+        fixture
+            .store
+            .update_status(
+                &fixture.task_id,
+                TaskStatus::Cancelled,
+                None,
+                Some("cancelled while recovery message was queued".into()),
+            )
+            .await
+            .unwrap();
+        let replacement = start_goal(
+            fixture.goal_store.as_ref(),
+            "test-boot",
+            fixture.ctx.clone(),
+            "replacement goal".into(),
+            None,
+            None,
+            Some(&test_config()),
+        )
+        .await
+        .unwrap();
+        let replacement_id = replacement.task_id.expect("replacement task id");
+
+        let blocked = admit_goal_autonomous_turn(&recovered_ctx, &test_config())
+            .await
+            .unwrap()
+            .expect("cancelled recovered task must block stale continuation");
+        assert_eq!(blocked.task_id.as_deref(), Some(fixture.task_id.as_str()));
+        assert_eq!(blocked.status, TaskStatus::Cancelled);
+        assert!(!blocked.continue_goal);
+        assert_eq!(
+            fixture
+                .store
+                .get(&replacement_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running,
+            "stale recovery admission must not affect the replacement goal"
+        );
+        assert!(
+            admit_goal_autonomous_turn(&fixture.ctx, &test_config())
+                .await
+                .unwrap()
+                .is_none(),
+            "ordinary route resolution should still admit the replacement goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_goal_binding_overrides_untrusted_task_selector() {
+        let fixture = create_running_goal_fixture("bound objective").await;
+        let other_id = format!("goal-{}", uuid::Uuid::new_v4());
+        fixture
+            .goal_store
+            .create_goal(
+                TaskRecord {
+                    id: other_id.clone(),
+                    kind: TaskKind::Goal,
+                    agent: fixture.ctx.agent_alias.clone(),
+                    status: TaskStatus::Completed,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: fixture.ctx.originator_route.clone(),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: fixture.ctx.principal_id.clone(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: Some(chrono::Utc::now().to_rfc3339()),
+                },
+                GoalTaskRecord {
+                    task_id: other_id.clone(),
+                    objective: "selector target".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let bound_ctx = fixture
+            .ctx
+            .clone()
+            .with_goal_task_id(Some(fixture.task_id.clone()));
+
+        let admission = pause_goal_for_blocker(
+            fixture.store.as_ref(),
+            fixture.goal_store.as_ref(),
+            &bound_ctx,
+            Some(other_id.clone()),
+            Some(&test_config()),
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("bound pause".into()),
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(admission.task_id.as_deref(), Some(fixture.task_id.as_str()));
+        assert_eq!(admission.status, TaskStatus::Paused);
+        assert_eq!(
+            fixture.store.get(&other_id).await.unwrap().unwrap().status,
+            TaskStatus::Completed,
+            "untrusted selector must not redirect the bound controller operation"
+        );
     }
 
     #[tokio::test]

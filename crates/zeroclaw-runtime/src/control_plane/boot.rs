@@ -31,8 +31,8 @@ pub struct ControlPlaneHandle {
     pub goal_store: Arc<dyn GoalTaskRegistry>,
     /// Current daemon owner id used by recovery/reaper authority checks.
     pub boot_id: String,
-    /// Goal ids recovered during this boot that need channel continuation after
-    /// channel handles are available.
+    /// Goal ids recovered during process boot or in-process reload that need
+    /// channel continuation after channel handles are available.
     pub(crate) recovered_goal_ids: Arc<Mutex<Vec<String>>>,
     /// Process-wide data-dir ownership guard.
     ///
@@ -98,20 +98,6 @@ impl ControlPlaneHandle {
             recovered_goal_ids: Arc::new(Mutex::new(recovery.restart_goal_ids)),
             data_dir_lock: Some(data_dir_lock),
         })
-    }
-
-    /// Drain goal IDs recovered by this boot's `last_state` policy.
-    ///
-    /// This is an in-memory startup work queue, not canonical lifecycle state.
-    /// If the process crashes before the channel loop consumes it, the next boot
-    /// will recover the goal again under its new `boot_id`.
-    pub fn take_recovered_goal_ids(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .recovered_goal_ids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
     }
 
     /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`
@@ -245,6 +231,153 @@ fn open_locked_file(path: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::goal_task::GoalTaskRecord;
+    use crate::control_plane::recovery::{
+        RecoveredGoalBatch, RecoveredGoalContinuationBlocker,
+        recovered_goal_continuation_blocked_pause,
+    };
+    use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
+
+    fn running_task(id: &str, kind: TaskKind, boot_id: &str) -> TaskRecord {
+        TaskRecord {
+            id: id.into(),
+            kind,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: boot_id.into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(format!("test-route:{id}")),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            started_at: "2020-01-01T00:00:00Z".into(),
+            finished_at: None,
+        }
+    }
+
+    fn make_task_unreadable(data_dir: &Path, task_id: &str) {
+        rusqlite::Connection::open(data_dir.join("control_plane.db"))
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'future-task-kind' WHERE id = ?1",
+                [task_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recovered_goal_blocker_payloads_contain_only_stable_reason_codes() {
+        for (blocker, code) in [
+            (
+                RecoveredGoalContinuationBlocker::AgentUnavailable,
+                "agent_unavailable",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::ProviderUnavailable,
+                "provider_unavailable",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::MissingContinuationContext,
+                "missing_continuation_context",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::ContinuationContextReadFailed,
+                "continuation_context_read_failed",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::InvalidContinuationContext,
+                "invalid_continuation_context",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::MissingGoalExtension,
+                "missing_goal_extension",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::GoalExtensionReadFailed,
+                "goal_extension_read_failed",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::ChannelUnavailable,
+                "channel_unavailable",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::ChannelOwnerUnavailable,
+                "channel_owner_unavailable",
+            ),
+            (
+                RecoveredGoalContinuationBlocker::QueueUnavailable,
+                "queue_unavailable",
+            ),
+        ] {
+            let pause = recovered_goal_continuation_blocked_pause(blocker);
+            let payload = pause.blockers[0]
+                .payload
+                .as_ref()
+                .unwrap()
+                .as_object()
+                .unwrap();
+            assert_eq!(
+                payload.len(),
+                1,
+                "{code} payload must not duplicate runtime state"
+            );
+            assert_eq!(payload["reason_code"], code);
+        }
+    }
+
+    struct BlockingGetTaskRegistry {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskRegistry for BlockingGetTaskRegistry {
+        async fn create(&self, _rec: TaskRecord) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+
+        async fn heartbeat(&self, _id: &str, _owner_boot_id: &str) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: TaskStatus,
+            _output: Option<String>,
+            _error: Option<String>,
+        ) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+
+        async fn claim_owner(
+            &self,
+            _id: &str,
+            _owner_pid: u32,
+            _owner_boot_id: &str,
+        ) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+
+        async fn get(&self, _id: &str) -> Result<Option<TaskRecord>> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn list_running(&self) -> Result<Vec<TaskRecord>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn list_by_agent(&self, _agent: &str) -> Result<Vec<TaskRecord>> {
+            anyhow::bail!("unused")
+        }
+
+        async fn reconcile_lost(&self, _id: &str, _now_boot_id: &str) -> Result<bool> {
+            anyhow::bail!("unused")
+        }
+    }
 
     #[tokio::test]
     async fn start_in_tempdir_and_reap_handle() {
@@ -280,7 +413,6 @@ mod tests {
 
     #[tokio::test]
     async fn boot_id_distinguishes_runs_over_the_same_db() {
-        use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
         let dir = tempfile::tempdir().unwrap();
         // First "boot" registers a running task, then the daemon "dies".
         let h1 = ControlPlaneHandle::start_with_boot_id(
@@ -323,5 +455,225 @@ mod tests {
             h2.store.get("t").await.unwrap().unwrap().status,
             TaskStatus::Lost
         );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_fails_on_unreadable_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        store
+            .create(running_task("unreadable", TaskKind::Goal, "prior-boot"))
+            .await
+            .unwrap();
+        drop(store);
+        make_task_unreadable(dir.path(), "unreadable");
+
+        let error = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .err()
+        .expect("startup recovery must not skip an unreadable running row");
+
+        assert!(error.to_string().contains("decode list_running rows"));
+    }
+
+    #[tokio::test]
+    async fn reload_queues_only_current_boot_running_goals_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+
+        for task in [
+            running_task("current-goal", TaskKind::Goal, "current-boot"),
+            running_task("prior-goal", TaskKind::Goal, "prior-boot"),
+            running_task("delegate", TaskKind::Delegate, "current-boot"),
+        ] {
+            handle.store.create(task).await.unwrap();
+        }
+
+        assert_eq!(handle.queue_running_goals_for_reload().await.unwrap(), 1);
+        assert_eq!(handle.queue_running_goals_for_reload().await.unwrap(), 0);
+        assert_eq!(handle.take_recovered_goal_ids(), vec!["current-goal"]);
+    }
+
+    #[tokio::test]
+    async fn reload_recovery_fails_on_unreadable_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+        handle
+            .store
+            .create(running_task("unreadable", TaskKind::Goal, "current-boot"))
+            .await
+            .unwrap();
+        make_task_unreadable(dir.path(), "unreadable");
+
+        let error = handle
+            .queue_running_goals_for_reload()
+            .await
+            .expect_err("reload recovery must not skip an unreadable running row");
+
+        assert!(error.to_string().contains("decode list_running rows"));
+        assert!(handle.take_recovered_goal_ids().is_empty());
+    }
+
+    #[test]
+    fn recovered_goal_lease_restores_after_batch_commit() {
+        let sqlite_store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let handle = ControlPlaneHandle {
+            store: sqlite_store.clone(),
+            goal_store: sqlite_store,
+            boot_id: "current-boot".into(),
+            recovered_goal_ids: Arc::new(Mutex::new(vec!["goal-1".into()])),
+            data_dir_lock: None,
+        };
+        let batch = RecoveredGoalBatch::take(&handle);
+        let lease = batch.lease("goal-1");
+        batch.commit();
+        assert!(handle.take_recovered_goal_ids().is_empty());
+
+        drop(lease);
+
+        assert_eq!(handle.take_recovered_goal_ids(), vec!["goal-1"]);
+    }
+
+    #[test]
+    fn committed_recovered_goal_lease_does_not_restore() {
+        let sqlite_store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let handle = ControlPlaneHandle {
+            store: sqlite_store.clone(),
+            goal_store: sqlite_store,
+            boot_id: "current-boot".into(),
+            recovered_goal_ids: Arc::new(Mutex::new(vec!["goal-1".into()])),
+            data_dir_lock: None,
+        };
+        let batch = RecoveredGoalBatch::take(&handle);
+        let lease = batch.lease("goal-1");
+        batch.commit();
+
+        lease.commit();
+
+        assert!(handle.take_recovered_goal_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_channel_pause_restores_entire_batch_after_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = ControlPlaneHandle::start_with_boot_id(
+            dir.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+
+        for task_id in ["paused-first", "still-pending"] {
+            handle
+                .goal_store
+                .create_goal(
+                    running_task(task_id, TaskKind::Goal, "current-boot"),
+                    GoalTaskRecord {
+                        task_id: task_id.into(),
+                        objective: "keep working".into(),
+                        effective_token_limit: None,
+                        effective_cost_limit_usd: None,
+                        pause_reason: None,
+                        pause_description: None,
+                        blockers: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        handle
+            .store
+            .create(running_task(
+                "missing-goal-extension",
+                TaskKind::Goal,
+                "current-boot",
+            ))
+            .await
+            .unwrap();
+        *handle
+            .recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = vec![
+            "paused-first".into(),
+            "missing-goal-extension".into(),
+            "still-pending".into(),
+        ];
+
+        let error = handle
+            .pause_recovered_goals_without_channel_executor()
+            .await
+            .expect_err("missing goal extension must fail the atomic pause");
+
+        assert!(error.to_string().contains("missing-goal-extension"));
+        assert_eq!(
+            handle.take_recovered_goal_ids(),
+            vec!["paused-first", "missing-goal-extension", "still-pending"]
+        );
+        assert_eq!(
+            handle
+                .store
+                .get("paused-first")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            handle
+                .store
+                .get("still-pending")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn no_channel_pause_abort_restores_recovery_batch() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let goal_store: Arc<dyn GoalTaskRegistry> =
+            Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let handle = ControlPlaneHandle {
+            store: Arc::new(BlockingGetTaskRegistry {
+                started: Arc::clone(&started),
+            }),
+            goal_store,
+            boot_id: "current-boot".into(),
+            recovered_goal_ids: Arc::new(Mutex::new(vec!["aborted-goal".into()])),
+            data_dir_lock: None,
+        };
+        let worker_handle = handle.clone();
+        let worker = zeroclaw_spawn::spawn!(async move {
+            worker_handle
+                .pause_recovered_goals_without_channel_executor()
+                .await
+        });
+        started.notified().await;
+
+        worker.abort();
+        let _ = worker.await;
+
+        assert_eq!(handle.take_recovered_goal_ids(), vec!["aborted-goal"]);
     }
 }

@@ -188,10 +188,9 @@ fn status_from_db(s: &str) -> Result<TaskStatus> {
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let kind_s: String = row.get("kind")?;
     let status_s: String = row.get("status")?;
-    // serde parse failures map to a SQLite conversion error; callers SKIP such rows
-    // (collect_skipping_bad_rows) rather than failing the whole query. The column index
-    // (`0`) is a placeholder — rusqlite has no by-name conversion-error ctor and the
-    // index is not surfaced to the skip path (review nit #4).
+    // Serde parse failures map to a SQLite conversion error. The column index
+    // (`0`) is a placeholder because rusqlite has no by-name conversion-error
+    // constructor; query callers decide whether one unreadable row is fatal.
     let kind = kind_from_db(&kind_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into())
     })?;
@@ -384,7 +383,8 @@ impl TaskRegistry for SqliteTaskStore {
         let rows = stmt
             .query_map([], row_to_record)
             .context("query list_running")?;
-        Ok(collect_skipping_bad_rows(rows))
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("decode list_running rows")
     }
 
     async fn list_by_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
@@ -483,6 +483,29 @@ mod tests {
         assert_eq!(s.list_running().await.unwrap().len(), 2); // a + c
         assert_eq!(s.list_by_agent("main").await.unwrap().len(), 2); // a + b
         assert_eq!(s.count_by_agent("main").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_running_fails_when_any_running_row_is_unreadable() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("readable", "main", 1, "boot")).await.unwrap();
+        s.create(rec("unreadable", "main", 1, "boot"))
+            .await
+            .unwrap();
+        s.conn
+            .lock()
+            .execute(
+                "UPDATE tasks SET kind = 'future-task-kind' WHERE id = 'unreadable'",
+                [],
+            )
+            .unwrap();
+
+        let error = s
+            .list_running()
+            .await
+            .expect_err("recovery enumeration must not skip an unreadable running row");
+
+        assert!(error.to_string().contains("decode list_running rows"));
     }
 
     #[tokio::test]

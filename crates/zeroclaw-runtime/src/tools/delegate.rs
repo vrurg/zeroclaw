@@ -42,6 +42,9 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
     if !ctx.goal_attribution_enabled() {
         return None;
     }
+    if let Some(task_id) = ctx.goal_task_id {
+        return Some(task_id);
+    }
     let agent_alias = ctx.agent_alias.as_deref()?;
     let control_plane = crate::control_plane::control_plane()?;
     control_plane
@@ -61,6 +64,9 @@ async fn active_goal_task_id_from_runtime_context() -> Option<String> {
         return None;
     }
     let ctx = crate::control_plane::current_goal_admission_context()?;
+    if let Some(task_id) = ctx.goal_task_id {
+        return Some(task_id);
+    }
     let control_plane = crate::control_plane::control_plane()?;
     control_plane
         .goal_store

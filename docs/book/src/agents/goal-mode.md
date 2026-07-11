@@ -45,7 +45,7 @@ acknowledgement is therefore not the goal's first worker response.
 
 ## Configuration
 
-Goal mode is enabled by default. The global policy lives under `[goal]`; the
+Goal mode is disabled by default. The global policy lives under `[goal]`; the
 per-agent opt-out lives under `[agents.<alias>.goal]`.
 
 ```toml
@@ -93,9 +93,39 @@ ordinary model-generated replies.
 daemon stopped. The default, `last_state`, keeps the goal running and re-owns
 it under the new daemon boot. When the channel and continuation context are
 available, recovery queues a trusted continuation prompt built from the durable
-objective and stored route/principal context. Set `paused` to pause such goals
-with a typed restart blocker instead. Paused goals keep their existing paused
-state and blockers.
+objective and stored route/principal context. The queued turn remains bound to
+that exact durable task: immediately before starting its model turn, ZeroClaw
+requires the task to still be visible and `running`. A cancellation, pause, completion,
+or replacement goal makes the stale continuation stop without running as the
+replacement or charging usage to it. Set `paused` to pause prior-boot goals with
+a typed restart blocker instead. Paused goals keep their existing paused state
+and blockers.
+
+An in-process daemon config reload is different from a process restart: it
+keeps the same boot id while rebuilding channel workers. After the old workers
+stop, goals that are still durably `running` are queued through the same trusted
+continuation path when channels start again. This prevents a reload from leaving
+a goal marked running without an executor. The `restart_recovery` setting only
+selects policy for prior-boot goals; it does not pause a running goal during an
+in-process reload when a channel executor remains available. If the reloaded
+configuration has no channel executor, queued goals are paused with a typed
+restart-recovery blocker instead of remaining `running`
+without an executor. If configured channels cannot build an active executor,
+or the reloaded router no longer assigns the continuation channel to the goal's
+owning agent, the same pause applies before the channel component waits for
+another reload. After restoring the agent and channel assignment, inspect the
+goal status and resume it explicitly; recovery never silently transfers a goal
+to a different owner.
+If channel workers cannot confirm shutdown within the daemon reload deadline,
+the complete running-task set cannot be decoded, or continuation recovery
+cannot safely read, validate, or persist a task transition, ZeroClaw refuses
+the unsafe channel/runtime handoff and retains unprocessed recovery work. A
+service-managed process restart can then apply the configured prior-boot
+recovery policy without risking duplicate goal execution. Recovery ownership
+follows each queued turn through channel admission, permit waits, model
+execution, and chained continuations; if that path is cancelled while the task
+is still `running`, its task id returns to the recovery queue instead of being
+silently discarded.
 
 Budget resolution is per dimension: explicit command value, then `[goal]`
 default, then unlimited. Configured budget defaults apply only when a goal is

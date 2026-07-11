@@ -21,6 +21,92 @@ pub enum DaemonExit {
     Reload,
 }
 
+async fn queue_running_goals_for_daemon_exit(
+    exit: DaemonExit,
+    control_plane: Option<&crate::control_plane::ControlPlaneHandle>,
+) -> Result<usize> {
+    if exit != DaemonExit::Reload {
+        return Ok(0);
+    }
+    match control_plane {
+        Some(control_plane) => control_plane.queue_running_goals_for_reload().await,
+        None => Ok(0),
+    }
+}
+
+async fn pause_recovered_goals_without_channel_executor(
+    control_plane: Option<&crate::control_plane::ControlPlaneHandle>,
+) -> Result<usize> {
+    match control_plane {
+        Some(control_plane) => {
+            control_plane
+                .pause_recovered_goals_without_channel_executor()
+                .await
+        }
+        None => Ok(0),
+    }
+}
+
+/// Records when the channel starter proved that its listeners and dispatch
+/// workers had stopped. A timestamp prevents a late completion from satisfying
+/// the reload barrier after its absolute deadline.
+#[derive(Default)]
+struct ChannelShutdownAck(std::sync::Mutex<Option<tokio::time::Instant>>);
+
+impl ChannelShutdownAck {
+    fn reset(&self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn complete(&self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(tokio::time::Instant::now());
+    }
+
+    fn completed_by(&self, deadline: tokio::time::Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some_and(|completed_at| completed_at <= deadline)
+    }
+}
+
+async fn finish_supervised_components(
+    handles: Vec<JoinHandle<()>>,
+    exit: DaemonExit,
+    control_plane: Option<&crate::control_plane::ControlPlaneHandle>,
+    channel_shutdown_complete: Option<&ChannelShutdownAck>,
+) -> Result<usize> {
+    // Cooperative components get a bounded window to observe cancellation and
+    // finish durable state transitions before forced abort.
+    const GRACE_WINDOW: Duration = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
+    let mut remaining = Vec::new();
+    for mut handle in handles {
+        tokio::select! {
+            biased;
+            _ = &mut handle => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                handle.abort();
+                remaining.push(handle);
+            }
+        }
+    }
+    for handle in remaining {
+        let _ = handle.await;
+    }
+
+    if exit == DaemonExit::Reload
+        && channel_shutdown_complete.is_some_and(|complete| !complete.completed_by(deadline))
+    {
+        anyhow::bail!(
+            "channel workers did not finish before the reload deadline; refusing same-boot reload"
+        );
+    }
+
+    queue_running_goals_for_daemon_exit(exit, control_plane).await
+}
+
 /// Wait for either a shutdown signal (SIGINT / SIGTERM / Ctrl+C) or an
 /// in-process reload signal (the gateway's `/admin/reload` writes `true`
 /// on the watch channel). Returns the reason so the outer loop can decide
@@ -490,11 +576,16 @@ pub async fn run(
         crate::health::mark_component_ok("control-plane");
     }
 
-    if let Some(channels_start) = registry.take_channels_start() {
-        if has_supervised_channels(&config) {
+    let mut channel_shutdown_complete = None;
+    let channels_start = registry.take_channels_start();
+    let has_channels = has_supervised_channels(&config);
+    match (channels_start, has_channels) {
+        (Some(channels_start), true) => {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
+            let shutdown_complete = std::sync::Arc::new(ChannelShutdownAck::default());
+            channel_shutdown_complete = Some(std::sync::Arc::clone(&shutdown_complete));
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -504,24 +595,35 @@ pub async fn run(
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
+                    let shutdown_complete = std::sync::Arc::clone(&shutdown_complete);
+                    async move {
+                        shutdown_complete.reset();
+                        let result = start(cfg, cancel).await;
+                        if result.is_ok() {
+                            shutdown_complete.complete();
+                        }
+                        result
+                    }
                 },
             ));
-        } else {
+        }
+        (channels_start, has_channels) => {
+            let paused = pause_recovered_goals_without_channel_executor(
+                crate::control_plane::control_plane(),
+            )
+            .await?;
             crate::health::mark_component_ok("channels");
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "No channels configured; channel supervisor disabled"
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "paused_recovered_goal_count": paused,
+                        "channel_starter_available": channels_start.is_some(),
+                        "configured_channels_available": has_channels,
+                    })),
+                "No channel executor available; channel supervisor disabled"
             );
         }
-    } else {
-        crate::health::mark_component_ok("channels");
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Channels subsystem not wired; channel supervisor disabled"
-        );
     }
 
     // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
@@ -812,36 +914,34 @@ pub async fn run(
     // immediately rather than waiting for a yield point.
     channels_cancel.cancel();
 
-    // Grace window: cooperative components (e.g. the cron scheduler)
-    // get a bounded window to observe the cancellation token and exit
-    // cleanly before forced abort. Without this the abort wins the race
-    // against the supervisor's `cancel.is_cancelled()` check. The
-    // `select!` uses biased priority so an already-finished handle is
-    // drained immediately even before the deadline fires.
-    // Handles that complete during the grace window are dropped; only
-    // handles that must be force-aborted go into `remaining` for
-    // a final bounded await.
-    const GRACE_WINDOW: Duration = Duration::from_millis(500);
-    let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
-    let mut remaining: Vec<JoinHandle<()>> = Vec::new();
-    for mut handle in handles {
-        tokio::select! {
-            biased;
-            _ = &mut handle => {
-                // Cooperative handle exited cleanly during grace window.
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                // Grace window expired; force-abort and re-join later.
-                handle.abort();
-                remaining.push(handle);
-            }
-        }
-    }
-    // Await remaining (aborted) handles. Already-completed handles from
-    // the grace window are not re-await, so "JoinHandle polled after
-    // completion" is avoided.
-    for handle in remaining {
-        let _ = handle.await;
+    // A reload keeps the process-wide boot id but tears down channel workers.
+    // Rebuild the transient continuation queue only after those workers stop;
+    // otherwise a durable `Running` goal can be left without an executor while
+    // restart recovery correctly declines to reclaim its same-boot owner.
+    let queued = finish_supervised_components(
+        handles,
+        exit,
+        crate::control_plane::control_plane(),
+        channel_shutdown_complete.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+            "daemon: refusing unsafe same-boot reload"
+        );
+        error
+    })?;
+    if queued > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({ "queued_goal_count": queued })),
+            "control-plane: queued running goals after daemon reload"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -1812,6 +1912,35 @@ mod tests {
         config
     }
 
+    fn enable_test_channel(config: &mut Config) {
+        config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                bot_token: "test-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.into(),
+                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                draft_update_interval_ms: 1000,
+                interrupt_on_new_message: false,
+                mention_only: false,
+                ack_reactions: None,
+                proxy_url: None,
+                approval_timeout_secs: 120,
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            },
+        );
+    }
+
+    struct AtomicDropGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for AtomicDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     fn add_agent_with_workspace(config: &mut Config, agent_alias: &str, workspace_dir: PathBuf) {
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
             workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
@@ -2529,6 +2658,318 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_reload_queues_stranded_running_goals() {
+        use crate::control_plane::{TaskKind, TaskRecord, TaskStatus};
+        use zeroclaw_config::schema::GoalRestartRecovery;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::start_with_boot_id(
+            tmp.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+        handle
+            .store
+            .create(TaskRecord {
+                id: "stranded-goal".into(),
+                kind: TaskKind::Goal,
+                agent: "main".into(),
+                status: TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "current-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some("matrix:test-room".into()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some("test-user".into()),
+                started_at: "2020-01-01T00:00:00Z".into(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+
+        let channel_shutdown_complete = ChannelShutdownAck::default();
+        assert_eq!(
+            finish_supervised_components(
+                Vec::new(),
+                DaemonExit::Shutdown,
+                Some(&handle),
+                Some(&channel_shutdown_complete),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(handle.take_recovered_goal_ids().is_empty());
+
+        channel_shutdown_complete.complete();
+        assert_eq!(
+            finish_supervised_components(
+                Vec::new(),
+                DaemonExit::Reload,
+                Some(&handle),
+                Some(&channel_shutdown_complete),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(handle.take_recovered_goal_ids(), vec!["stranded-goal"]);
+    }
+
+    #[tokio::test]
+    async fn reload_into_no_channels_pauses_recovered_goals() {
+        use crate::control_plane::{
+            GoalPauseReason, GoalTaskRecord, TaskKind, TaskRecord, TaskStatus,
+        };
+        use zeroclaw_config::schema::GoalRestartRecovery;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::start_with_boot_id(
+            tmp.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+        handle
+            .goal_store
+            .create_goal(
+                TaskRecord {
+                    id: "goal-without-next-channel-executor".into(),
+                    kind: TaskKind::Goal,
+                    agent: "main".into(),
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "current-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("matrix:test-room".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("test-user".into()),
+                    started_at: "2020-01-01T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: "goal-without-next-channel-executor".into(),
+                    objective: "keep working".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let channel_shutdown_complete = ChannelShutdownAck::default();
+        channel_shutdown_complete.complete();
+        assert_eq!(
+            finish_supervised_components(
+                Vec::new(),
+                DaemonExit::Reload,
+                Some(&handle),
+                Some(&channel_shutdown_complete),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            pause_recovered_goals_without_channel_executor(Some(&handle))
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert!(handle.take_recovered_goal_ids().is_empty());
+        assert_eq!(
+            handle
+                .store
+                .get("goal-without-next-channel-executor")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+        let goal = handle
+            .goal_store
+            .get_goal_task("goal-without-next-channel-executor")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+        assert_eq!(
+            goal.blockers[0]
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("reason_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("channel_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_fails_closed_when_running_task_enumeration_is_incomplete() {
+        use zeroclaw_config::schema::GoalRestartRecovery;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::start_with_boot_id(
+            tmp.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+        let conn = rusqlite::Connection::open(tmp.path().join("control_plane.db")).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, started_at
+             ) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
+            rusqlite::params![
+                "unreadable-running-task",
+                "unknown-kind",
+                "main",
+                std::process::id(),
+                "current-boot",
+                "2020-01-01T00:00:00Z",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let channel_shutdown_complete = ChannelShutdownAck::default();
+        channel_shutdown_complete.complete();
+        let error = finish_supervised_components(
+            Vec::new(),
+            DaemonExit::Reload,
+            Some(&handle),
+            Some(&channel_shutdown_complete),
+        )
+        .await
+        .expect_err("reload must fail when any running task row cannot be decoded");
+
+        assert!(error.to_string().contains("decode list_running rows"));
+        assert!(handle.take_recovered_goal_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_goal_terminal_transition_before_requeue() {
+        use crate::control_plane::{TaskKind, TaskRecord, TaskStatus};
+        use tokio_util::sync::CancellationToken;
+        use zeroclaw_config::schema::GoalRestartRecovery;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = crate::control_plane::ControlPlaneHandle::start_with_boot_id(
+            tmp.path(),
+            "current-boot".into(),
+            GoalRestartRecovery::LastState,
+        )
+        .await
+        .unwrap();
+        handle
+            .store
+            .create(TaskRecord {
+                id: "finishing-goal".into(),
+                kind: TaskKind::Goal,
+                agent: "main".into(),
+                status: TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "current-boot".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some("matrix:test-room".into()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some("test-user".into()),
+                started_at: "2020-01-01T00:00:00Z".into(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let store = std::sync::Arc::clone(&handle.store);
+        let worker = zeroclaw_spawn::spawn!(async move {
+            worker_cancel.cancelled().await;
+            store
+                .update_status(
+                    "finishing-goal",
+                    TaskStatus::Completed,
+                    Some("completed during reload".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+        });
+
+        cancel.cancel();
+        let channel_shutdown_complete = ChannelShutdownAck::default();
+        channel_shutdown_complete.complete();
+        assert_eq!(
+            finish_supervised_components(
+                vec![worker],
+                DaemonExit::Reload,
+                Some(&handle),
+                Some(&channel_shutdown_complete),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(handle.take_recovered_goal_ids().is_empty());
+        assert_eq!(
+            handle
+                .store
+                .get("finishing-goal")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_fails_when_channel_shutdown_barrier_misses_deadline() {
+        let channel_shutdown_complete = ChannelShutdownAck::default();
+        let blocked_component = zeroclaw_spawn::spawn!(std::future::pending::<()>());
+
+        let error = finish_supervised_components(
+            vec![blocked_component],
+            DaemonExit::Reload,
+            None,
+            Some(&channel_shutdown_complete),
+        )
+        .await
+        .expect_err("same-boot reload must fail without a channel shutdown acknowledgement");
+
+        assert!(error.to_string().contains("refusing same-boot reload"));
+    }
+
+    #[test]
+    fn channel_shutdown_ack_rejects_completion_after_deadline() {
+        let acknowledgement = ChannelShutdownAck::default();
+        let expired_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+
+        acknowledgement.complete();
+
+        assert!(!acknowledgement.completed_by(expired_deadline));
+        assert!(acknowledgement.completed_by(tokio::time::Instant::now()));
+    }
+
+    #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
@@ -2593,6 +3034,161 @@ mod tests {
         assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[tokio::test]
+    async fn daemon_reload_waits_for_registered_channel_worker_shutdown() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        enable_test_channel(&mut config);
+        let channel_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let worker_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_channels(Box::new({
+            let channel_started = std::sync::Arc::clone(&channel_started);
+            let worker_dropped = std::sync::Arc::clone(&worker_dropped);
+            move |_config, cancel| {
+                let channel_started = std::sync::Arc::clone(&channel_started);
+                let worker_dropped = std::sync::Arc::clone(&worker_dropped);
+                Box::pin(async move {
+                    let mut workers = tokio::task::JoinSet::new();
+                    workers.spawn(async move {
+                        let _drop_guard = AtomicDropGuard(worker_dropped);
+                        channel_started.notify_one();
+                        std::future::pending::<()>().await;
+                    });
+                    cancel.cancelled().await;
+                    workers.shutdown().await;
+                    Ok(())
+                })
+            }
+        }));
+        registry.register_gateway(Box::new({
+            let channel_started = std::sync::Arc::clone(&channel_started);
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_registry| {
+                let channel_started = std::sync::Arc::clone(&channel_started);
+                Box::pin(async move {
+                    channel_started.notified().await;
+                    reload_controls
+                        .expect("daemon should pass reload controls")
+                        .reload_tx
+                        .send(true)
+                        .expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            }
+        }));
+
+        let exit = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".into(), 4242, registry, false),
+        )
+        .await
+        .expect("cooperative channel shutdown should finish before reload deadline")
+        .expect("safe same-boot reload should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            worker_dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "nested channel worker must be dropped before reload returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_reload_rejects_unacknowledged_channel_shutdown() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        enable_test_channel(&mut config);
+        let channel_started = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_channels(Box::new({
+            let channel_started = std::sync::Arc::clone(&channel_started);
+            move |_config, _cancel| {
+                let channel_started = std::sync::Arc::clone(&channel_started);
+                Box::pin(async move {
+                    channel_started.notify_one();
+                    std::future::pending::<Result<()>>().await
+                })
+            }
+        }));
+        registry.register_gateway(Box::new({
+            let channel_started = std::sync::Arc::clone(&channel_started);
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_registry| {
+                let channel_started = std::sync::Arc::clone(&channel_started);
+                Box::pin(async move {
+                    channel_started.notified().await;
+                    reload_controls
+                        .expect("daemon should pass reload controls")
+                        .reload_tx
+                        .send(true)
+                        .expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            }
+        }));
+
+        let error = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".into(), 4242, registry, false),
+        )
+        .await
+        .expect("unsafe reload should fail after the bounded shutdown deadline")
+        .expect_err("same-boot reload must not continue without channel shutdown acknowledgement");
+
+        assert!(error.to_string().contains("refusing same-boot reload"));
+    }
+
+    #[tokio::test]
+    async fn daemon_reload_rejects_failed_channel_start_as_shutdown_acknowledgement() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        enable_test_channel(&mut config);
+        let channel_failed = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_channels(Box::new({
+            let channel_failed = std::sync::Arc::clone(&channel_failed);
+            move |_config, _cancel| {
+                let channel_failed = std::sync::Arc::clone(&channel_failed);
+                Box::pin(async move {
+                    channel_failed.notify_one();
+                    anyhow::bail!("synthetic channel initialization failure")
+                })
+            }
+        }));
+        registry.register_gateway(Box::new({
+            let channel_failed = std::sync::Arc::clone(&channel_failed);
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_registry| {
+                let channel_failed = std::sync::Arc::clone(&channel_failed);
+                Box::pin(async move {
+                    channel_failed.notified().await;
+                    reload_controls
+                        .expect("daemon should pass reload controls")
+                        .reload_tx
+                        .send(true)
+                        .expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            }
+        }));
+
+        let error = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".into(), 4242, registry, false),
+        )
+        .await
+        .expect("failed channel startup should reject reload promptly")
+        .expect_err("a failed starter return must not acknowledge channel shutdown");
+
+        assert!(error.to_string().contains("refusing same-boot reload"));
     }
 
     /// Daemon-boundary evidence for #8465: the cooperative scheduler

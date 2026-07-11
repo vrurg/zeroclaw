@@ -375,4 +375,37 @@ mod tests {
             TaskStatus::Running
         );
     }
+
+    #[tokio::test]
+    async fn sweep_fails_before_mutation_on_unreadable_running_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = SqliteTaskStore::new(dir.path()).unwrap();
+        let me = std::process::id();
+        s.create(rec("stale", "boot-NEW", me, Some(99_999)))
+            .await
+            .unwrap();
+        s.create(rec("unreadable", "boot-NEW", me, None))
+            .await
+            .unwrap();
+        drop(s);
+        rusqlite::Connection::open(dir.path().join("control_plane.db"))
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET kind = 'future-task-kind' WHERE id = 'unreadable'",
+                [],
+            )
+            .unwrap();
+        let s = SqliteTaskStore::new(dir.path()).unwrap();
+
+        let error = sweep(&s, &s, "boot-NEW", 600, GoalRestartRecovery::default())
+            .await
+            .expect_err("reaper must not partially sweep an incomplete running-task list");
+
+        assert!(error.to_string().contains("decode list_running rows"));
+        assert_eq!(
+            s.get("stale").await.unwrap().unwrap().status,
+            TaskStatus::Running,
+            "strict enumeration must fail before mutating readable rows"
+        );
+    }
 }

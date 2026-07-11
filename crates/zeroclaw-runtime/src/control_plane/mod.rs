@@ -10,6 +10,7 @@
 //!     `zeroclaw_infra::acp_session_store`.
 //!   * [`authority`] — `is_authoritative`: the runtime-authority reclaim guard.
 //!   * [`reaper`] — the periodic sweep + one-shot startup crash-recovery pass.
+//!   * [`recovery`] — transient ownership for durable-goal continuation delivery.
 //!   * [`boot`] — the per-run [`ControlPlaneHandle`].
 //!   * [`global`] — the process-global accessor producers reach the handle through.
 //!
@@ -23,6 +24,7 @@ pub mod global;
 pub mod goal;
 pub mod goal_task;
 pub mod reaper;
+pub mod recovery;
 pub mod task_registry;
 pub mod task_store_sqlite;
 pub mod verifier;
@@ -44,6 +46,10 @@ pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
 pub use goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
+};
+pub use recovery::{
+    RecoveredGoalBatch, RecoveredGoalContinuationBlocker, RecoveredGoalLease,
+    recovered_goal_continuation_blocked_pause,
 };
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;

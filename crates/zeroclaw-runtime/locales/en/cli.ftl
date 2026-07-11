@@ -961,6 +961,7 @@ goal-command-restart-recovery-paused-description = Goal paused during restart re
 goal-command-daemon-restarted-blocker = The daemon restarted while this goal was running.
 goal-command-restart-recovery-blocker = Restart recovery could not continue the goal: {$reason}.
 goal-command-restart-recovery-reason-agent-unavailable = agent disabled or unknown
+goal-command-restart-recovery-reason-provider-unavailable = model provider unavailable
 goal-command-restart-recovery-reason-missing-continuation = missing continuation context
 goal-command-restart-recovery-reason-read-continuation-failed = failed to read continuation context
 goal-command-restart-recovery-reason-missing-goal-extension = missing goal extension record
@@ -1141,4 +1142,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-

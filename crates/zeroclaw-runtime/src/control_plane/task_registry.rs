@@ -165,6 +165,10 @@ pub trait TaskRegistry: Send + Sync {
         owner_boot_id: &str,
     ) -> anyhow::Result<()>;
     async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>>;
+    /// Enumerate every running task, failing if any selected row cannot be decoded.
+    ///
+    /// Callers use this list for supervision and executor recovery, so silently
+    /// omitting a row could leave durable work marked `Running` without an owner.
     async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>>;
     async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>>;
     /// Reaper/recovery seam: mark a record terminal-loss ONLY when this process is

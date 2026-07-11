@@ -562,6 +562,36 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
+    async fn pause_running_goal_task(&self, task_id: &str, pause: GoalPauseState) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start conditional goal pause transaction")?;
+        ensure_goal_task_row(&tx, task_id)?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'paused'
+                  WHERE id = ?1
+                    AND kind = 'goal'
+                    AND status = 'running'",
+                params![task_id],
+            )
+            .context("conditionally pause running goal task")?;
+        if updated == 0 {
+            tx.commit()
+                .context("commit unchanged conditional goal pause transaction")?;
+            return Ok(false);
+        }
+        let updated = update_goal_pause_record(&tx, task_id, Some(pause))?;
+        if updated == 0 {
+            anyhow::bail!("goal task {task_id} has no goal extension row");
+        }
+        tx.commit()
+            .context("commit conditional goal pause transaction")?;
+        Ok(true)
+    }
+
     async fn resume_goal_task(
         &self,
         task_id: &str,
@@ -1311,6 +1341,72 @@ mod tests {
         );
         assert_eq!(goal.blockers[0].kind, GoalBlockerKind::OperatorPause);
         assert_eq!(goal.blockers[0].message, "maintenance window");
+    }
+
+    #[tokio::test]
+    async fn recovery_pause_does_not_overwrite_operator_pause() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-operator-wins", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-operator-wins".into(),
+                objective: "preserve the operator pause".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        s.pause_goal_task(
+            "goal-operator-wins",
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("operator requested maintenance".into()),
+                blockers: vec![GoalBlocker {
+                    kind: GoalBlockerKind::OperatorPause,
+                    message: "operator requested maintenance".into(),
+                    payload: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let paused = s
+            .pause_running_goal_task(
+                "goal-operator-wins",
+                GoalPauseState {
+                    reason: GoalPauseReason::DaemonRestart,
+                    description: Some("stale recovery pause".into()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::RestartRecovery,
+                        message: "stale recovery pause".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!paused);
+        let goal = s
+            .get_goal_task("goal-operator-wins")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::OperatorPaused));
+        assert_eq!(
+            goal.pause_description.as_deref(),
+            Some("operator requested maintenance")
+        );
+        assert_eq!(goal.blockers[0].kind, GoalBlockerKind::OperatorPause);
     }
 
     #[tokio::test]
