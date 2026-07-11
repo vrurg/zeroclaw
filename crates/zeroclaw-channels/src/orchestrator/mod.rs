@@ -5580,6 +5580,27 @@ async fn process_channel_message_body(
         }
     }
 
+    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
+        let wants = engine
+            .lock()
+            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
+            .unwrap_or(false);
+        if wants {
+            let topic = match &msg.channel_alias {
+                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+                _ => msg.channel.clone(),
+            };
+            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
+                engine,
+                audit,
+                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+                Some(&topic),
+                Some(&msg.content),
+            )
+            .await;
+        }
+    }
+
     let history_key = conversation_history_key(&msg);
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
