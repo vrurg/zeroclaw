@@ -16622,14 +16622,14 @@ BTC is currently around $65,000 based on latest tool output."#
             if symbol != Some("BTC") {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("unexpected symbol".to_string()),
                 });
             }
 
             Ok(ToolResult {
                 success: true,
-                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
+                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
                 error: None,
             })
         }
@@ -16664,7 +16664,7 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             Ok(ToolResult {
                 success: true,
-                output: String::new(),
+                output: String::new().into(),
                 error: None,
             })
         }
