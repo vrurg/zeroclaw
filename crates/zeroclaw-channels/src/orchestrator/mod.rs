@@ -392,6 +392,14 @@ enum RuntimeCommandOutcome {
     NotCommand,
     /// Command has been handled and should not reach the model.
     Handled,
+    /// A pause/cancel command completed a durable transition. The dispatch
+    /// loop uses this to stop only the in-flight worker whose goal command was
+    /// successfully persisted; command errors must not interrupt unrelated
+    /// same-scope work.
+    HandledGoalControl {
+        task_id: Option<String>,
+        status: zeroclaw_runtime::control_plane::TaskStatus,
+    },
     /// Command changed durable goal state and should enqueue a goal
     /// continuation turn.
     ContinueGoal {
@@ -1139,14 +1147,14 @@ fn goal_interrupt_command_content<'a>(
     .then_some(content)
 }
 
-async fn goal_command_should_interrupt_in_flight(
+async fn running_goal_task_id_for_interrupt(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-) -> bool {
+) -> Option<String> {
     let sender_key = conversation_history_key(msg);
     let goal_ctx = goal_admission_context_for_message(ctx, msg, &sender_key);
-    match zeroclaw_runtime::control_plane::has_running_goal_for_context(&goal_ctx).await {
-        Ok(running) => running,
+    match zeroclaw_runtime::control_plane::running_goal_task_id_for_context(&goal_ctx).await {
+        Ok(task_id) => task_id,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1155,7 +1163,7 @@ async fn goal_command_should_interrupt_in_flight(
                     .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
                 "goal command interrupt precheck failed"
             );
-            false
+            None
         }
     }
 }
@@ -3860,6 +3868,16 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => {
+                    if matches!(
+                        action,
+                        zeroclaw_runtime::control_plane::GoalCommandAction::Pause
+                            | zeroclaw_runtime::control_plane::GoalCommandAction::Cancel
+                    ) {
+                        outcome = RuntimeCommandOutcome::HandledGoalControl {
+                            task_id: admission.task_id.clone(),
+                            status: admission.status,
+                        };
+                    }
                     if admission.continue_goal
                         && let Some(task_id) = admission.task_id.clone()
                     {
@@ -5663,7 +5681,7 @@ async fn process_channel_message_body(
     let mut command_requested_goal_continuation = false;
     match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         RuntimeCommandOutcome::NotCommand => {}
-        RuntimeCommandOutcome::Handled => {
+        RuntimeCommandOutcome::Handled | RuntimeCommandOutcome::HandledGoalControl { .. } => {
             reconcile_early_ack(
                 ctx.as_ref(),
                 &msg,
@@ -7924,25 +7942,33 @@ async fn run_message_dispatch_loop(
         {
             let mut goal_command_msg = msg.clone();
             goal_command_msg.content = goal_command_content.to_string();
+            let running_goal_task_id =
+                running_goal_task_id_for_interrupt(ctx.as_ref(), &goal_command_msg).await;
             // Commit the exact pause/cancel transition before touching the
             // in-flight worker. A bad task id, terminal task, or persistence
             // failure must leave unrelated same-scope work running.
-            let _ = handle_runtime_command_if_needed(
+            let outcome = handle_runtime_command_if_needed(
                 ctx.as_ref(),
                 &goal_command_msg,
                 target_channel.as_ref(),
             )
             .await;
-            if goal_command_should_interrupt_in_flight(ctx.as_ref(), &goal_command_msg).await {
-                continue;
-            }
-            let scope_key = interruption_scope_key(&goal_command_msg);
-            let previous = {
-                let mut active = in_flight_by_sender.lock().await;
-                active.remove(&scope_key)
-            };
-            if let Some(state) = previous {
-                cancel_in_flight_chain(&state);
+            if matches!(
+                outcome,
+                RuntimeCommandOutcome::HandledGoalControl {
+                    task_id: Some(ref task_id),
+                    status: zeroclaw_runtime::control_plane::TaskStatus::Paused
+                        | zeroclaw_runtime::control_plane::TaskStatus::Cancelled,
+                } if running_goal_task_id.as_deref() == Some(task_id)
+            ) {
+                let scope_key = interruption_scope_key(&goal_command_msg);
+                let previous = {
+                    let mut active = in_flight_by_sender.lock().await;
+                    active.remove(&scope_key)
+                };
+                if let Some(state) = previous {
+                    cancel_in_flight_chain(&state);
+                }
             }
             continue;
         }
@@ -16469,7 +16495,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 ..Default::default()
             };
-            let route = conversation_history_key(&msg);
+            let route = goal_originator_route(&msg);
             let principal = goal_principal_id(&msg);
             let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
             control_plane
@@ -20212,7 +20238,7 @@ BTC is currently around $65,000 based on latest tool output."#
     ) -> String {
         ensure_test_control_plane().await;
         let task_id = format!("goal-{}", uuid::Uuid::new_v4());
-        let route = conversation_history_key(msg);
+        let route = goal_originator_route(msg);
         let principal = goal_principal_id(msg);
         let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
         control_plane
@@ -20394,6 +20420,72 @@ BTC is currently around $65,000 based on latest tool output."#
             assert!(
                 model_calls.load(Ordering::SeqCst) <= 1,
                 "cancel should not let queued same-scope work start"
+            );
+        });
+    }
+
+    #[test]
+    fn goal_cancel_with_wrong_task_id_does_not_interrupt_active_goal_turn() {
+        run_channel_dispatch_test(async {
+            let channel_impl = Arc::new(RecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
+            let runtime_ctx = dispatch_test_context(
+                channel,
+                Arc::new(CountingDelayProvider {
+                    delay: Duration::from_millis(100),
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+                agent_alias.clone(),
+                goal_interrupt_test_config(),
+            );
+            let active_msg = zeroclaw_api::channel::ChannelMessage {
+                id: "goal-cancel-wrong-task-1".into(),
+                sender: "goal-user-wrong-task".into(),
+                reply_target: "goal-room-wrong-task".into(),
+                content: "keep working".into(),
+                channel: "test-channel".into(),
+                timestamp: 1,
+                ..Default::default()
+            };
+            let task_id = create_running_goal_for_message(&agent_alias, &active_msg).await;
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+            tx.send(active_msg).await.unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "goal-cancel-wrong-task-2".into(),
+                sender: "goal-user-wrong-task".into(),
+                reply_target: "goal-room-wrong-task".into(),
+                content: format!("/goal cancel goal-{}", uuid::Uuid::new_v4()),
+                channel: "test-channel".into(),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            drop(tx);
+
+            run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+
+            let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
+            let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                zeroclaw_runtime::control_plane::TaskStatus::Running,
+                "a failed targeted cancel must not mutate the matching running goal"
+            );
+            let sent_messages = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("Goal command failed")),
+                "the invalid selector should report its controller error: {sent_messages:?}"
+            );
+            assert!(
+                sent_messages
+                    .iter()
+                    .any(|message| message.contains("echo:") && message.contains("keep working")),
+                "a failed targeted cancel must not interrupt active model work: {sent_messages:?}"
             );
         });
     }

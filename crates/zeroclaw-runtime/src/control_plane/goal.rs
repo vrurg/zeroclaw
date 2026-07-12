@@ -1638,8 +1638,16 @@ pub async fn pause_current_goal_for_human_gate(
 }
 
 pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<bool> {
+    Ok(running_goal_task_id_for_context(ctx).await?.is_some())
+}
+
+/// Return the exact running goal visible to `ctx` for a follow-up operation
+/// that must not act on a replacement task for the same route and principal.
+pub async fn running_goal_task_id_for_context(
+    ctx: &GoalAdmissionContext,
+) -> Result<Option<String>> {
     let Some(cp) = control_plane() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(task) = cp
         .goal_store
@@ -1651,10 +1659,10 @@ pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<
         .await
         .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     ensure_goal_visible(&task, ctx)?;
-    Ok(task.status == TaskStatus::Running)
+    Ok((task.status == TaskStatus::Running).then_some(task.id))
 }
 
 /// Persist a fail-closed budget pause when goal-owned provider usage could not

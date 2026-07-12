@@ -38,8 +38,8 @@ pub use goal::{
     evaluate_goal_turn, evaluate_goal_turn_with_verifier, goal_recovery_status_message,
     has_running_goal_for_context, mark_current_goal_turn_for_evaluation,
     pause_current_goal_for_accounting_unavailable, pause_current_goal_for_human_gate,
-    scope_goal_admission_context, scope_goal_runtime, scope_goal_start_tool_batch,
-    scope_goal_state_updates, scope_goal_turn_evaluation_marker,
+    running_goal_task_id_for_context, scope_goal_admission_context, scope_goal_runtime,
+    scope_goal_start_tool_batch, scope_goal_state_updates, scope_goal_turn_evaluation_marker,
 };
 pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
 pub use goal_task::{
