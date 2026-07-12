@@ -675,6 +675,26 @@ mod tests {
     }
 
     #[test]
+    fn cloned_goal_cost_context_shares_accounting_failure_marker() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let goal_ctx = crate::control_plane::GoalAdmissionContext::new("agent")
+            .with_originator_route(Some("route".into()))
+            .with_principal_id(Some("principal".into()));
+        let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()))
+            .with_goal_admission_context(&goal_ctx);
+        let clone = context.clone();
+        clone.mark_goal_accounting_unavailable();
+        assert!(context.goal_accounting_unavailable());
+    }
+
+    #[test]
     fn config_rate_wins_live_fills_only_gaps() {
         // Config priced ONLY input; live prices all three. Input must stay the
         // configured value; output/cached come from live.
