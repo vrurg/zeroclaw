@@ -166,6 +166,9 @@ pub(crate) async fn gate_tool_approval(
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
+            if !resume_approved_goal_or_cancel(pending_goal_task_id.as_deref(), tool_name).await {
+                return ApprovalGateOutcome::Cancel;
+            }
             if let Some(tx) = ctx.on_delta {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
@@ -201,22 +204,8 @@ pub(crate) async fn gate_tool_approval(
         }
 
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
-            if let Some(task_id) = pending_goal_task_id {
-                if let Err(error) = resume_goal_after_approval(&task_id).await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_category(::zeroclaw_log::EventCategory::Tool)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "tool": tool_name,
-                                "task_id": task_id,
-                                "error": format!("{error:#}"),
-                            })),
-                        "goal approval blocker resume failed"
-                    );
-                    return ApprovalGateOutcome::Cancel;
-                }
+            if !resume_approved_goal_or_cancel(pending_goal_task_id.as_deref(), tool_name).await {
+                return ApprovalGateOutcome::Cancel;
             }
             approval_requirement = ApprovalRequirement::Approved;
         }
@@ -225,6 +214,28 @@ pub(crate) async fn gate_tool_approval(
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
     }
+}
+
+async fn resume_approved_goal_or_cancel(task_id: Option<&str>, tool_name: &str) -> bool {
+    let Some(task_id) = task_id else {
+        return true;
+    };
+    if let Err(error) = resume_goal_after_approval(task_id).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "tool": tool_name,
+                    "task_id": task_id,
+                    "error": format!("{error:#}"),
+                })),
+            "goal approval blocker resume failed"
+        );
+        return false;
+    }
+    true
 }
 
 async fn pause_goal_for_tool_approval(
@@ -473,5 +484,27 @@ mod tests {
         let goal = goal_store.get_goal_task(&task_id).await.unwrap().unwrap();
         assert!(goal.pause_reason.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_approval_resumes_exact_paused_task_before_returning_result() {
+        let (store, goal_store, task_id, _goal_ctx) = create_running_goal().await;
+        goal_store
+            .pause_goal_task(
+                &task_id,
+                control_plane::GoalPauseState {
+                    reason: control_plane::GoalPauseReason::NeedsUserInput,
+                    description: Some("approval required".into()),
+                    blockers: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(resume_approved_goal_or_cancel(Some(&task_id), "file_write").await);
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            control_plane::TaskStatus::Running
+        );
     }
 }
