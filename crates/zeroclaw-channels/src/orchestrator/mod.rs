@@ -23297,6 +23297,30 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn goal_identity_and_route_do_not_normalize_distinct_matrix_principals() {
+        let dotted = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            reply_target: "!room:example.org".into(),
+            sender: "@alice.smith:example.org".into(),
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..Default::default()
+        };
+        let mut underscored = dotted.clone();
+        underscored.sender = "@alice_smith:example.org".into();
+
+        assert_eq!(
+            conversation_history_key(&dotted),
+            conversation_history_key(&underscored),
+            "session storage may intentionally normalize these names"
+        );
+        assert_ne!(goal_principal_id(&dotted), goal_principal_id(&underscored));
+        assert_ne!(
+            goal_originator_route(&dotted),
+            goal_originator_route(&underscored)
+        );
+    }
+
+    #[test]
     fn parse_runtime_command_maps_goal_admission() {
         assert_eq!(
             parse_runtime_command("telegram", "/goal start ship goal mode"),
