@@ -2841,7 +2841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_help_admission_honors_disabled_config() {
+    async fn goal_help_remains_available_when_new_goal_admission_is_disabled() {
         let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
         let command = GoalCommand {
             action: GoalCommandAction::Help,
@@ -2866,10 +2866,10 @@ mod tests {
         assert!(!help.continue_goal);
 
         config.goal.enabled = false;
-        let err = admit_goal_command(ctx, command, &config, None)
+        let help = admit_goal_command(ctx, command, &config, None)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("goal.enabled = false"));
+            .unwrap();
+        assert_eq!(help.message, msg("goal-command-help", &[]));
     }
 
     #[tokio::test]
