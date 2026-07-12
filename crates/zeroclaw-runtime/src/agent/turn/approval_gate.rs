@@ -10,6 +10,7 @@ use crate::control_plane::{
     GoalBlockerKind, current_goal_admission_context, current_goal_turn_evaluation_requested,
     pause_current_goal_for_human_gate,
 };
+use anyhow::Context;
 use std::time::Duration;
 
 /// Outcome of [`gate_tool_approval`] for one tool call.
@@ -45,9 +46,23 @@ pub(crate) async fn gate_tool_approval(
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
         };
-        if pause_goal_for_tool_approval(ctx, &request).await {
-            return ApprovalGateOutcome::Cancel;
-        }
+        let pending_goal_task_id = match pause_goal_for_tool_approval(ctx, &request).await {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": request.tool_name.as_str(),
+                            "error": format!("{error:#}"),
+                        })),
+                    "goal approval blocker pause failed"
+                );
+                return ApprovalGateOutcome::Cancel;
+            }
+        };
 
         // Interactive CLI: prompt the operator.
         // Non-interactive (channels): try the channel's inline
@@ -186,6 +201,23 @@ pub(crate) async fn gate_tool_approval(
         }
 
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+            if let Some(task_id) = pending_goal_task_id {
+                if let Err(error) = resume_goal_after_approval(&task_id).await {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "tool": tool_name,
+                                "task_id": task_id,
+                                "error": format!("{error:#}"),
+                            })),
+                        "goal approval blocker resume failed"
+                    );
+                    return ApprovalGateOutcome::Cancel;
+                }
+            }
             approval_requirement = ApprovalRequirement::Approved;
         }
     }
@@ -195,12 +227,15 @@ pub(crate) async fn gate_tool_approval(
     }
 }
 
-async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalRequest) -> bool {
+async fn pause_goal_for_tool_approval(
+    ctx: &TurnCtx<'_>,
+    request: &ApprovalRequest,
+) -> anyhow::Result<Option<String>> {
     if !current_goal_turn_evaluation_requested() {
-        return false;
+        return Ok(None);
     }
     let Some(goal_ctx) = current_goal_admission_context() else {
-        return false;
+        return Ok(None);
     };
     let arguments_summary = crate::approval::summarize_args(&request.arguments);
     let message = crate::i18n::get_required_cli_string_with_args(
@@ -211,48 +246,39 @@ async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalReque
         "tool": request.tool_name.as_str(),
         "arguments_summary": arguments_summary,
     });
-    match pause_current_goal_for_human_gate(
+    let admission = pause_current_goal_for_human_gate(
         &goal_ctx,
         None,
         GoalBlockerKind::NeedsUserInput,
         message,
         Some(payload),
     )
-    .await
-    {
-        Ok(Some(_)) => {
-            if let Some(tx) = ctx.on_delta {
-                let _ = tx
-                    .send(StreamDelta::Status(
-                        crate::i18n::get_required_cli_string_with_args(
-                            "goal-command-tool-approval-required-status",
-                            &[("tool", &request.tool_name)],
-                        ),
-                    ))
-                    .await;
-            }
-            true
+    .await?;
+    if let Some(admission) = admission {
+        if let Some(tx) = ctx.on_delta {
+            let _ = tx
+                .send(StreamDelta::Status(
+                    crate::i18n::get_required_cli_string_with_args(
+                        "goal-command-tool-approval-required-status",
+                        &[("tool", &request.tool_name)],
+                    ),
+                ))
+                .await;
         }
-        Ok(None) => false,
-        Err(error) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "tool": request.tool_name.as_str(),
-                        "error": format!("{error:#}"),
-                    })),
-                "goal approval blocker pause failed"
-            );
-            // The goal turn has requested a human gate. Continuing into the
-            // ordinary approval path after its durable pause failed could run
-            // an approved tool while the goal still says Running, so cancel
-            // the turn and leave the controller retry/recovery path owning it.
-            true
-        }
+        Ok(admission.task_id)
+    } else {
+        Ok(None)
     }
+}
+
+async fn resume_goal_after_approval(task_id: &str) -> anyhow::Result<()> {
+    let control_plane = crate::control_plane::control_plane()
+        .context("resume approved goal: control plane unavailable")?;
+    control_plane
+        .goal_store
+        .resume_goal_task(task_id, std::process::id(), &control_plane.boot_id, None)
+        .await
+        .with_context(|| format!("resume approved goal {task_id}"))
 }
 
 #[cfg(test)]
@@ -385,11 +411,11 @@ mod tests {
         .await;
 
         match outcome {
-            ApprovalGateOutcome::Cancel => {}
-            ApprovalGateOutcome::Proceed { .. }
-            | ApprovalGateOutcome::Deny(_)
+            ApprovalGateOutcome::Deny(_) => {}
+            ApprovalGateOutcome::Cancel
+            | ApprovalGateOutcome::Proceed { .. }
             | ApprovalGateOutcome::Replace(_) => {
-                panic!("approval prompt in active goal must cancel the turn")
+                panic!("denied approval must leave the active goal paused")
             }
         }
         let task = store.get(&task_id).await.unwrap().unwrap();

@@ -4543,7 +4543,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            active, None,
+            active.unwrap(),
+            None,
             "ordinary channel turns may carry trusted goal admission facts, \
              but must not become active goal work until the controller marks the turn"
         );

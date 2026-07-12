@@ -472,7 +472,8 @@ pub async fn record_tool_loop_cost_usage(
     // A cost-bearing dimension must have an explicit price. Treating a partial
     // rate sheet as a fully priced call would let a budgeted goal spend through
     // the omitted dimension at a fabricated zero cost.
-    let pricing_available = (input_tokens == 0 || input_rate > 0.0)
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let pricing_available = (uncached_input_tokens == 0 || input_rate > 0.0)
         && (output_tokens == 0 || output_rate > 0.0)
         && (cached_input_tokens == 0 || cached_rate > 0.0)
         && (priced_from_catalog || input_rate > 0.0 || output_rate > 0.0 || cached_rate > 0.0);
@@ -990,6 +991,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
             }))
+            .expect("cost recording")
             .expect("cost usage");
 
         let expected = (1_000.0 * 0.27 / 1_000_000.0)
@@ -1034,6 +1036,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("cache-provider", "cache-model", &usage).await
             }))
+            .expect("cost recording")
             .expect("cost usage");
 
         let expected = 5_000.0 * 0.50 / 1_000_000.0;
@@ -1074,20 +1077,17 @@ mod tests {
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (total_tokens, cost_usd) = runtime
-            .block_on(TOOL_LOOP_TURN_USAGE.scope(
-                Some(Arc::clone(&turn_usage)),
-                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
-                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
-                }),
-            ))
-            .expect("cost usage");
+        let result = runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage).await
+            }),
+        ));
+        assert!(result.is_err(), "unwritable ledger must fail closed");
 
         let expected = (1_000.0 * 0.27 / 1_000_000.0)
             + (4_000.0 * 0.027 / 1_000_000.0)
             + (200.0 * 1.10 / 1_000_000.0);
-        assert_eq!(total_tokens, 5_200);
-        assert!((cost_usd - expected).abs() < 1e-12);
 
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 5_000);
@@ -1117,6 +1117,7 @@ mod tests {
             .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
                 record_tool_loop_cost_usage("unpriced-provider", "unpriced-model", &usage).await
             }))
+            .expect("cost recording")
             .expect("cost usage");
 
         assert_eq!(total_tokens, 5_200);
