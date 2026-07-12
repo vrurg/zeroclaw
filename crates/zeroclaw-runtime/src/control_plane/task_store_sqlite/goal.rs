@@ -593,6 +593,19 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
+    async fn complete_running_goal_task(&self, task_id: &str, output: String) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'completed', output = ?1, finished_at = ?2
+                  WHERE id = ?3 AND kind = 'goal' AND status = 'running'",
+                params![output, chrono::Utc::now().to_rfc3339(), task_id],
+            )
+            .context("complete running goal task")?;
+        Ok(updated == 1)
+    }
+
     async fn set_continuation_context(
         &self,
         task_id: &str,

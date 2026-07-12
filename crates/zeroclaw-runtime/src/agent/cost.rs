@@ -1,5 +1,6 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,6 +198,11 @@ pub struct ToolLoopCostTrackingContext {
     /// Trusted principal for this runtime turn. Used only to resolve the active
     /// goal from canonical `TaskRecord` fields at record time.
     pub principal_id: Option<String>,
+    /// Exact durable goal being executed by this scope, when controller
+    /// admission already resolved it. This avoids re-resolving ownership after
+    /// the provider call, when a concurrent lifecycle transition could select
+    /// a different active goal.
+    goal_task_id: Option<String>,
     /// Whether this scoped turn is allowed to resolve a goal for ledger
     /// attribution.
     ///
@@ -218,6 +224,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -236,6 +243,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -275,6 +283,14 @@ impl ToolLoopCostTrackingContext {
         let context = self.with_goal_admission_filters(ctx);
         context.enable_goal_attribution();
         context
+    }
+
+    /// Bind a controller-owned call to the exact durable goal task it admitted.
+    #[must_use]
+    pub fn with_goal_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.goal_task_id = Some(task_id.into());
+        self.enable_goal_attribution();
+        self
     }
 
     /// Mark this scoped context as goal-owned for subsequent usage records.
@@ -398,19 +414,22 @@ pub async fn record_tool_loop_cost_usage(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
-) -> Option<(u64, f64)> {
+) -> Result<Option<(u64, f64)>> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
     let total_tokens = input_tokens.saturating_add(output_tokens);
     if total_tokens == 0 {
-        return None;
+        return Ok(None);
     }
 
     let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
-        .flatten()?;
+        .flatten();
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
     let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
     let config_rates = pricing
         .map(|map| resolve_rates_opt(map, model))
@@ -450,8 +469,13 @@ pub async fn record_tool_loop_cost_usage(
         false
     };
 
-    let pricing_available =
-        priced_from_catalog || input_rate > 0.0 || output_rate > 0.0 || cached_rate > 0.0;
+    // A cost-bearing dimension must have an explicit price. Treating a partial
+    // rate sheet as a fully priced call would let a budgeted goal spend through
+    // the omitted dimension at a fabricated zero cost.
+    let pricing_available = (input_tokens == 0 || input_rate > 0.0)
+        && (output_tokens == 0 || output_rate > 0.0)
+        && (cached_input_tokens == 0 || cached_rate > 0.0)
+        && (priced_from_catalog || input_rate > 0.0 || output_rate > 0.0 || cached_rate > 0.0);
 
     let mut cost_usage = CostTokenUsage::new_with_cache(
         model,
@@ -510,59 +534,47 @@ pub async fn record_tool_loop_cost_usage(
 
     if let Some(tracker) = &ctx.tracker {
         let attributed_task_id = if ctx.goal_attribution_enabled() {
-            match ctx.agent_alias.as_deref() {
-                Some(agent_alias) => {
-                    active_goal_task_id_for_context(
-                        agent_alias,
-                        ctx.originator_route.as_deref(),
-                        ctx.principal_id.as_deref(),
-                    )
-                    .await
-                }
-                None => None,
+            if let Some(task_id) = &ctx.goal_task_id {
+                Some(task_id.clone())
+            } else if let Some(agent_alias) = ctx.agent_alias.as_deref() {
+                active_goal_task_id_for_context(
+                    agent_alias,
+                    ctx.originator_route.as_deref(),
+                    ctx.principal_id.as_deref(),
+                )
+                .await?
+            } else {
+                bail!("goal-attributed cost scope has no agent alias or task id");
             }
         } else {
             None
         };
-        if let Err(error) = tracker.record_scoped_usage_with_owned_task_attribution(
+        tracker.record_scoped_usage_with_owned_task_attribution(
             cost_usage,
             ctx.agent_alias.as_deref(),
             attributed_task_id,
-        ) {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
-        }
+        )?;
     }
 
-    Some(returned_usage)
+    Ok(Some(returned_usage))
 }
 
 async fn active_goal_task_id_for_context(
     agent_alias: &str,
     originator_route: Option<&str>,
     principal_id: Option<&str>,
-) -> Option<String> {
-    let control_plane = crate::control_plane::control_plane()?;
+) -> Result<Option<String>> {
+    let control_plane = crate::control_plane::control_plane()
+        .context("resolve active goal for cost attribution")?;
     match control_plane
         .goal_store
         .latest_active_goal_id_for_context(agent_alias, originator_route, principal_id)
         .await
     {
-        Ok(Some(goal_id)) => Some(goal_id),
-        Ok(None) => None,
-        Err(error) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "agent_alias": agent_alias,
-                        "error": format!("{error}")
-                    })),
-                "Failed to resolve active goal for cost attribution"
-            );
-            None
-        }
+        Ok(goal_id) => Ok(goal_id),
+        Err(error) => Err(error).with_context(|| {
+            format!("resolve active goal for cost attribution for agent `{agent_alias}`")
+        }),
     }
 }
 
