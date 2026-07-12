@@ -166,7 +166,39 @@ pub(crate) async fn interpret_chat_response(
         Some(usage) => match record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage).await
         {
             Ok(Some((_total_tokens, cost_usd))) => Some(cost_usd),
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": ctx.provider_name,
+                            "model": ctx.model,
+                            "reason": "cost usage was not recordable",
+                        })),
+                    "LLM response usage was not recorded"
+                );
+                let _ = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(|scope| {
+                    if let Some(scope) = scope {
+                        scope.mark_goal_accounting_unavailable();
+                    }
+                });
+                None
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": ctx.provider_name,
+                            "model": ctx.model,
+                            "error": format!("{error:#}"),
+                        })),
+                    "Failed to record LLM response usage"
+                );
                 let _ = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(|scope| {
                     if let Some(scope) = scope {
                         scope.mark_goal_accounting_unavailable();
