@@ -12,6 +12,7 @@ use zeroclaw_tools::ask_user::format_question;
 use zeroclaw_tools::escalate::is_valid_urgency_level;
 
 use crate::agent::turn::ToolLoopCancelled;
+use crate::control_plane::TaskContinuationContext;
 use crate::control_plane::{
     GoalBlockerKind, current_goal_admission_context, current_goal_turn_evaluation_requested,
     pause_current_goal_for_human_gate,
@@ -112,6 +113,7 @@ impl GoalHumanGateTool {
             },
         };
 
+        let delivery_context = trusted_goal_delivery_context(&ctx).await.ok().flatten();
         let (kind, message, payload) = gate.pause_packet(self.inner.name());
         let Some(_admission) = pause_current_goal_for_human_gate(
             &ctx,
@@ -125,7 +127,14 @@ impl GoalHumanGateTool {
             return Ok(None);
         };
 
-        if let Err(error) = gate.deliver(&self.channels, self.inner.as_ref()).await {
+        if let Err(error) = gate
+            .deliver(
+                &self.channels,
+                self.inner.as_ref(),
+                delivery_context.as_ref(),
+            )
+            .await
+        {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -216,9 +225,14 @@ impl HumanGatePause {
         }
     }
 
-    async fn deliver(&self, channels: &PerToolChannelHandle, inner: &dyn Tool) -> Result<()> {
+    async fn deliver(
+        &self,
+        channels: &PerToolChannelHandle,
+        inner: &dyn Tool,
+        continuation: Option<&TaskContinuationContext>,
+    ) -> Result<()> {
         match self {
-            Self::AskUser(request) => request.deliver(channels).await,
+            Self::AskUser(request) => request.deliver(channels, continuation).await,
             Self::EscalateToHuman(request) => request.deliver(inner).await,
         }
     }
@@ -271,14 +285,47 @@ fn parse_ask_user_request(args: &Value) -> Option<AskUserRequest> {
 }
 
 impl AskUserRequest {
-    async fn deliver(&self, channels: &PerToolChannelHandle) -> Result<()> {
-        let (channel_name, channel) = resolve_channel(channels, self.channel.as_deref())?;
+    async fn deliver(
+        &self,
+        channels: &PerToolChannelHandle,
+        continuation: Option<&TaskContinuationContext>,
+    ) -> Result<()> {
+        let continuation = continuation.context("goal has no trusted continuation route")?;
+        let channel_key = continuation
+            .channel_alias
+            .as_deref()
+            .unwrap_or(&continuation.channel);
+        let (channel_name, channel) = resolve_channel(channels, Some(channel_key))?;
         let message = format_question(&self.question, self.choices.as_deref());
         channel
-            .send(&SendMessage::new(&message, ""))
+            .send(&SendMessage::new(&message, &continuation.reply_target))
             .await
             .with_context(|| format!("send goal ask_user prompt to channel {channel_name}"))
     }
+}
+
+async fn trusted_goal_delivery_context(
+    ctx: &crate::control_plane::GoalAdmissionContext,
+) -> Result<Option<TaskContinuationContext>> {
+    let control_plane =
+        crate::control_plane::control_plane().context("resolve goal continuation route")?;
+    let Some(task) = control_plane
+        .goal_store
+        .latest_active_goal_for_context(
+            &ctx.agent_alias,
+            ctx.originator_route.as_deref(),
+            ctx.principal_id.as_deref(),
+        )
+        .await
+        .context("resolve active goal for human gate delivery")?
+    else {
+        return Ok(None);
+    };
+    control_plane
+        .goal_store
+        .get_continuation_context(&task.id)
+        .await
+        .context("load trusted goal continuation route")
 }
 
 /// Validated subset of `escalate_to_human` arguments used to pause a goal and

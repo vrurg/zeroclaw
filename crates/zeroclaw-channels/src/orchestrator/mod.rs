@@ -989,11 +989,11 @@ fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Stri
     if sender.is_empty() {
         return None;
     }
-    Some(sanitize_session_key(&format!(
-        "{}_{}",
-        channel_scope(msg),
-        sender
-    )))
+    let scope = channel_scope(msg);
+    // This durable authorization key must be injective. Session-key
+    // sanitization intentionally normalizes punctuation, which makes distinct
+    // Matrix identities collide and grants cross-principal control of a goal.
+    Some(format!("v1:{}:{scope}{sender}", scope.len()))
 }
 
 fn goal_task_conversation_scope(
