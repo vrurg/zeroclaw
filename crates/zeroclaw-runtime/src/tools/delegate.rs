@@ -8,6 +8,7 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
+use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -34,16 +35,22 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
-async fn active_goal_task_id_from_cost_context() -> Option<String> {
+async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String>> {
     let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
-        .flatten()?;
+        .flatten();
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
     if !ctx.goal_attribution_enabled() {
-        return None;
+        return Ok(None);
     }
-    let agent_alias = ctx.agent_alias.as_deref()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    let Some(agent_alias) = ctx.agent_alias.as_deref() else {
+        anyhow::bail!("goal-attributed delegate scope has no agent alias");
+    };
+    let control_plane = crate::control_plane::control_plane()
+        .context("resolve active goal for delegation policy")?;
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -52,16 +59,18 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .context("resolve active goal for delegation policy")
 }
 
-async fn active_goal_task_id_from_runtime_context() -> Option<String> {
+async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
     if !crate::control_plane::current_goal_turn_evaluation_requested() {
-        return None;
+        return Ok(None);
     }
-    let ctx = crate::control_plane::current_goal_admission_context()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    let Some(ctx) = crate::control_plane::current_goal_admission_context() else {
+        return Ok(None);
+    };
+    let control_plane = crate::control_plane::control_plane()
+        .context("resolve active goal for delegation policy")?;
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -70,13 +79,12 @@ async fn active_goal_task_id_from_runtime_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .context("resolve active goal for delegation policy")
 }
 
-async fn active_goal_task_id_for_delegate_policy() -> Option<String> {
-    if let Some(task_id) = active_goal_task_id_from_runtime_context().await {
-        return Some(task_id);
+async fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context().await? {
+        return Ok(Some(task_id));
     }
     active_goal_task_id_from_cost_context().await
 }
@@ -1393,7 +1401,7 @@ impl Tool for DelegateTool {
 
         if background {
             if crate::control_plane::current_goal_start_tool_batch_requested()
-                || active_goal_task_id_for_delegate_policy().await.is_some()
+                || active_goal_task_id_for_delegate_policy().await?.is_some()
             {
                 return Ok(ToolResult {
                     success: false,
@@ -1600,7 +1608,7 @@ impl DelegateTool {
         match result {
             Ok(response) => {
                 if let Some(usage) = &response.usage {
-                    record_tool_loop_cost_usage(&provider_type, &model, usage).await;
+                    record_tool_loop_cost_usage(&provider_type, &model, usage).await?;
                 }
                 let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
@@ -2929,6 +2937,12 @@ impl DelegateTool {
                 parent_tools
                     .iter()
                     .filter(|tool| tool.name() != Self::NAME)
+                    // A bounded child has no trusted lifecycle admission of its
+                    // own. Do not expose tools that can create or mutate a
+                    // durable goal without an approval-forwarding contract.
+                    .filter(|tool| {
+                        !matches!(tool.name(), "goal_start" | "goal_objective" | "goal_resume")
+                    })
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .map(|tool| {

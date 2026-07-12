@@ -1414,17 +1414,18 @@ pub async fn evaluate_goal_turn_with_verifier(
     match verifier_decision {
         Ok(GoalVerifierDecision::Complete { notes: _ }) => {
             let task_id = resolved.task_id().to_string();
-            cp.store
-                .update_status(
-                    &task_id,
-                    TaskStatus::Completed,
-                    Some(candidate_summary.to_string()),
-                    None,
-                )
+            let completed = cp
+                .goal_store
+                .complete_running_goal_task(&task_id, candidate_summary.to_string())
                 .await
                 .with_context(|| {
                     msg("goal-command-error-update-failed", &[("task_id", &task_id)])
                 })?;
+            if !completed {
+                // A pause/cancel won while the verifier was running. Do not
+                // publish a stale completion or overwrite its durable state.
+                return Ok(None);
+            }
             let final_usage = if verifier_enabled {
                 goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id)
             } else {
