@@ -1459,6 +1459,22 @@ pub async fn evaluate_goal_turn_with_verifier(
         }));
     }
 
+    // A clear agent-declared blocker is lifecycle evidence, not a suggestion
+    // for the verifier. Evaluate it before any verifier completion path so a
+    // disabled verifier or a mistaken COMPLETE verdict cannot erase a needed
+    // operator handoff.
+    if let Some(pause) = declared_blocker_pause(candidate_summary) {
+        let task_id = resolved.task_id().to_string();
+        let admission =
+            pause_goal_for_known_blocker(cp.goal_store.as_ref(), resolved, Some(config), pause)
+                .await?;
+        publish_goal_state_update(&admission);
+        return Ok(Some(GoalTurnEvaluation::Paused {
+            task_id,
+            message: admission.message,
+        }));
+    }
+
     let verifier_enabled = config.goal.verifier.enabled;
     if verifier_enabled {
         let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
@@ -1521,20 +1537,6 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Ok(GoalVerifierDecision::Continue { notes }) => {
             let task_id = resolved.task_id().to_string();
-            if let Some(pause) = declared_blocker_pause(candidate_summary) {
-                let admission = pause_goal_for_known_blocker(
-                    cp.goal_store.as_ref(),
-                    resolved,
-                    Some(config),
-                    pause,
-                )
-                .await?;
-                publish_goal_state_update(&admission);
-                return Ok(Some(GoalTurnEvaluation::Paused {
-                    task_id,
-                    message: admission.message,
-                }));
-            }
             let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id);
             if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
                 let budget = goal_budget_summary(resolved.goal(), usage.as_ref());

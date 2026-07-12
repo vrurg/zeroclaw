@@ -246,7 +246,11 @@ async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalReque
                     })),
                 "goal approval blocker pause failed"
             );
-            false
+            // The goal turn has requested a human gate. Continuing into the
+            // ordinary approval path after its durable pause failed could run
+            // an approved tool while the goal still says Running, so cancel
+            // the turn and leave the controller retry/recovery path owning it.
+            true
         }
     }
 }
