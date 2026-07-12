@@ -446,4 +446,32 @@ mod tests {
             Some("file_write")
         );
     }
+
+    #[tokio::test]
+    async fn approved_goal_tool_resumes_exact_paused_task_before_execution() {
+        let (store, goal_store, task_id, _goal_ctx) = create_running_goal().await;
+        goal_store
+            .pause_goal_task(
+                &task_id,
+                control_plane::GoalPauseState {
+                    reason: control_plane::GoalPauseReason::NeedsUserInput,
+                    description: Some("approval required".into()),
+                    blockers: vec![control_plane::GoalBlocker {
+                        kind: control_plane::GoalBlockerKind::NeedsUserInput,
+                        message: "approval required".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        resume_goal_after_approval(&task_id).await.unwrap();
+
+        let task = store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, control_plane::TaskStatus::Running);
+        let goal = goal_store.get_goal_task(&task_id).await.unwrap().unwrap();
+        assert!(goal.pause_reason.is_none());
+        assert!(goal.blockers.is_empty());
+    }
 }
