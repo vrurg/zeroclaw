@@ -637,13 +637,15 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
 /// context is scoped (tests, delegate, CLI without cost config).
 pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
     TOOL_LOOP_COST_TRACKING_CONTEXT
-        .try_with(Clone::clone)
+        .try_with(|ctx| {
+            ctx.as_ref().and_then(|ctx| {
+                ctx.tracker
+                    .as_ref()
+                    .map(|tracker| tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
+            })
+        })
         .ok()
         .flatten()
-        .and_then(|ctx| {
-            ctx.tracker
-                .map(|tracker| tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
-        })
 }
 
 #[cfg(test)]

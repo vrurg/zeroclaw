@@ -113,9 +113,8 @@ impl GoalHumanGateTool {
             },
         };
 
-        let delivery_context = trusted_goal_delivery_context(&ctx).await.ok().flatten();
         let (kind, message, payload) = gate.pause_packet(self.inner.name());
-        let Some(_admission) = pause_current_goal_for_human_gate(
+        let Some(admission) = pause_current_goal_for_human_gate(
             &ctx,
             Some(&self.config),
             kind,
@@ -125,6 +124,15 @@ impl GoalHumanGateTool {
         .await?
         else {
             return Ok(None);
+        };
+
+        let delivery_context = if matches!(gate, HumanGatePause::AskUser(_)) {
+            match admission.task_id.as_deref() {
+                Some(task_id) => trusted_goal_delivery_context(task_id).await.ok().flatten(),
+                None => None,
+            }
+        } else {
+            None
         };
 
         if let Err(error) = gate
@@ -304,26 +312,12 @@ impl AskUserRequest {
     }
 }
 
-async fn trusted_goal_delivery_context(
-    ctx: &crate::control_plane::GoalAdmissionContext,
-) -> Result<Option<TaskContinuationContext>> {
+async fn trusted_goal_delivery_context(task_id: &str) -> Result<Option<TaskContinuationContext>> {
     let control_plane =
         crate::control_plane::control_plane().context("resolve goal continuation route")?;
-    let Some(task) = control_plane
-        .goal_store
-        .latest_active_goal_for_context(
-            &ctx.agent_alias,
-            ctx.originator_route.as_deref(),
-            ctx.principal_id.as_deref(),
-        )
-        .await
-        .context("resolve active goal for human gate delivery")?
-    else {
-        return Ok(None);
-    };
     control_plane
         .goal_store
-        .get_continuation_context(&task.id)
+        .get_continuation_context(task_id)
         .await
         .context("load trusted goal continuation route")
 }
@@ -617,7 +611,16 @@ mod tests {
                     pause_description: None,
                     blockers: Vec::new(),
                 },
-                None,
+                Some(crate::control_plane::TaskContinuationContext {
+                    channel: "matrix".into(),
+                    channel_alias: None,
+                    reply_target: "room".into(),
+                    sender: principal.to_string(),
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    conversation_scope:
+                        crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+                }),
             )
             .await
             .unwrap();
