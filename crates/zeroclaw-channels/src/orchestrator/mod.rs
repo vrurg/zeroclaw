@@ -7190,13 +7190,33 @@ async fn process_channel_message_body(
                 && goal_turn_evaluation_requested.load(Ordering::Acquire)
                 && let Some(goal_ctx) = goal_admission_context.as_ref()
             {
+                let accounting_unavailable = cost_tracking_context
+                    .as_ref()
+                    .is_some_and(|context| context.goal_accounting_unavailable());
                 let evaluation = zeroclaw_runtime::control_plane::scope_goal_state_updates(
                     goal_state_update_scope.clone(),
-                    zeroclaw_runtime::control_plane::evaluate_goal_turn(
-                        goal_ctx,
-                        runtime_defaults.config.as_ref(),
-                        &delivered_response,
-                    ),
+                    async {
+                        if accounting_unavailable
+                            && let Some(admission) = zeroclaw_runtime::control_plane::pause_current_goal_for_accounting_unavailable(
+                                goal_ctx,
+                                runtime_defaults.config.as_ref(),
+                            )
+                            .await?
+                        {
+                            return Ok(Some(
+                                zeroclaw_runtime::control_plane::GoalTurnEvaluation::Paused {
+                                    task_id: admission.task_id.unwrap_or_default(),
+                                    message: admission.message,
+                                },
+                            ));
+                        }
+                        zeroclaw_runtime::control_plane::evaluate_goal_turn(
+                            goal_ctx,
+                            runtime_defaults.config.as_ref(),
+                            &delivered_response,
+                        )
+                        .await
+                    },
                 )
                 .await;
                 match evaluation {

@@ -126,13 +126,9 @@ impl GoalHumanGateTool {
             return Ok(None);
         };
 
-        let delivery_context = if matches!(gate, HumanGatePause::AskUser(_)) {
-            match admission.task_id.as_deref() {
-                Some(task_id) => trusted_goal_delivery_context(task_id).await.ok().flatten(),
-                None => None,
-            }
-        } else {
-            None
+        let delivery_context = match admission.task_id.as_deref() {
+            Some(task_id) => trusted_goal_delivery_context(task_id).await.ok().flatten(),
+            None => None,
         };
 
         if let Err(error) = gate
@@ -236,12 +232,12 @@ impl HumanGatePause {
     async fn deliver(
         &self,
         channels: &PerToolChannelHandle,
-        inner: &dyn Tool,
+        _inner: &dyn Tool,
         continuation: Option<&TaskContinuationContext>,
     ) -> Result<()> {
         match self {
             Self::AskUser(request) => request.deliver(channels, continuation).await,
-            Self::EscalateToHuman(request) => request.deliver(inner).await,
+            Self::EscalateToHuman(request) => request.deliver(channels, continuation).await,
         }
     }
 }
@@ -374,24 +370,26 @@ fn parse_escalation_request(args: &Value) -> Option<EscalationRequest> {
 }
 
 impl EscalationRequest {
-    async fn deliver(&self, inner: &dyn Tool) -> Result<()> {
-        let mut args = json!({
-            "summary": self.summary,
-            "urgency": self.urgency,
-            "wait_for_response": false,
-        });
+    async fn deliver(
+        &self,
+        channels: &PerToolChannelHandle,
+        continuation: Option<&TaskContinuationContext>,
+    ) -> Result<()> {
+        let continuation = continuation.context("goal has no trusted continuation route")?;
+        let channel_key = continuation
+            .channel_alias
+            .as_deref()
+            .unwrap_or(&continuation.channel);
+        let (channel_name, channel) = resolve_channel(channels, Some(channel_key))?;
+        let mut message = format!("Human escalation ({}): {}", self.urgency, self.summary);
         if let Some(context) = &self.context {
-            args["context"] = Value::String(context.clone());
+            message.push_str("\n\n");
+            message.push_str(context);
         }
-        let result = inner.execute(args).await?;
-        if result.success {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "{}",
-                result.error.unwrap_or_else(|| result.output.to_string())
-            )
-        }
+        channel
+            .send(&SendMessage::new(&message, &continuation.reply_target))
+            .await
+            .with_context(|| format!("send goal escalation to channel {channel_name}"))
     }
 }
 
@@ -833,8 +831,8 @@ mod tests {
         let principal = format!("principal-{}", uuid::Uuid::new_v4());
         let (store, goal_store, task_id, ctx) =
             create_running_goal(&agent, &route, &principal).await;
-        let (inner, calls, args) = recording_tool("escalate_to_human");
-        let (channels, _sent) = recording_channels();
+        let (inner, calls, _args) = recording_tool("escalate_to_human");
+        let (channels, sent) = recording_channels();
         let tool = GoalHumanGateTool::escalate_to_human(
             inner,
             Arc::new(SecurityPolicy::default()),
@@ -855,14 +853,14 @@ mod tests {
         .unwrap_err();
 
         assert!(err.is::<ToolLoopCancelled>(), "unexpected error: {err:#}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         {
-            let args = args.lock().unwrap();
-            assert_eq!(args.len(), 1);
-            assert_eq!(args[0]["summary"], "operator approval required");
-            assert_eq!(args[0]["context"], "deploy gate");
-            assert_eq!(args[0]["urgency"], "high");
-            assert_eq!(args[0]["wait_for_response"], false);
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].content.contains("Human escalation (high)"));
+            assert!(sent[0].content.contains("operator approval required"));
+            assert!(sent[0].content.contains("deploy gate"));
+            assert_eq!(sent[0].recipient, "room");
         }
 
         let goal = assert_paused_goal(

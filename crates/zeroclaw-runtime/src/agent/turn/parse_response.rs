@@ -163,16 +163,26 @@ pub(crate) async fn interpret_chat_response(
     // unpriced call still returns `Some(0.0)`, and the persisted cost row marks
     // `pricing_available = false` so goal cost budgets can fail closed.
     let call_cost_usd = match resp.usage.as_ref() {
-        Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
-            // Response interpretation is deliberately non-fallible because it
-            // must still surface the provider response to the turn loop. Goal
-            // evaluation re-reads its canonical ledger and pauses budgeted
-            // work when accounting is unavailable.
-            .await
-            .ok()
-            .flatten()
-            .map(|(_total_tokens, cost_usd)| cost_usd),
-        None => None,
+        Some(usage) => match record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage).await
+        {
+            Ok(Some((_total_tokens, cost_usd))) => Some(cost_usd),
+            Ok(None) | Err(_) => {
+                let _ = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(|scope| {
+                    if let Some(scope) = scope {
+                        scope.mark_goal_accounting_unavailable();
+                    }
+                });
+                None
+            }
+        },
+        None => {
+            let _ = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(|scope| {
+                if let Some(scope) = scope {
+                    scope.mark_goal_accounting_unavailable();
+                }
+            });
+            None
+        }
     };
 
     // Per-LLM-call usage event, right after the observer success event

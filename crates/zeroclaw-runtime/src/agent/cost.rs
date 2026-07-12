@@ -210,6 +210,10 @@ pub struct ToolLoopCostTrackingContext {
     /// infer goal ownership. Only a caller that entered the trusted goal
     /// admission path flips this transient marker.
     goal_attribution_enabled: Arc<AtomicBool>,
+    /// Set when a goal-owned provider response could not be durably metered.
+    /// This is transient turn evidence only; the controller persists the
+    /// resulting pause against the canonical task after the loop returns.
+    goal_accounting_unavailable: Arc<AtomicBool>,
 }
 
 impl ToolLoopCostTrackingContext {
@@ -226,6 +230,7 @@ impl ToolLoopCostTrackingContext {
             principal_id: None,
             goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
+            goal_accounting_unavailable: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -245,6 +250,7 @@ impl ToolLoopCostTrackingContext {
             principal_id: None,
             goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
+            goal_accounting_unavailable: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -307,6 +313,17 @@ impl ToolLoopCostTrackingContext {
     /// the currently active goal resolved from durable task state.
     pub fn goal_attribution_enabled(&self) -> bool {
         self.goal_attribution_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn mark_goal_accounting_unavailable(&self) {
+        if self.goal_attribution_enabled() {
+            self.goal_accounting_unavailable
+                .store(true, Ordering::Release);
+        }
+    }
+
+    pub fn goal_accounting_unavailable(&self) -> bool {
+        self.goal_accounting_unavailable.load(Ordering::Acquire)
     }
 
     /// Snapshot the per-scope usage. Wrapping code calls this after the

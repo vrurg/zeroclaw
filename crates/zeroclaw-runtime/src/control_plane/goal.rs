@@ -1657,6 +1657,31 @@ pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<
     Ok(task.status == TaskStatus::Running)
 }
 
+/// Persist a fail-closed budget pause when goal-owned provider usage could not
+/// be durably recorded. Non-budgeted goals retain their existing behavior.
+pub async fn pause_current_goal_for_accounting_unavailable(
+    ctx: &GoalAdmissionContext,
+    config: &Config,
+) -> Result<Option<GoalAdmission>> {
+    let Some(cp) = control_plane() else {
+        return Ok(None);
+    };
+    let Some(task_goal) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+        return Ok(None);
+    };
+    let Some(pause) = goal_budget_unavailable_pause(
+        task_goal.goal(),
+        GoalBudgetUnavailableCause::UsageUnavailable,
+    ) else {
+        return Ok(None);
+    };
+    let admission =
+        pause_goal_for_known_blocker(cp.goal_store.as_ref(), task_goal, Some(config), pause)
+            .await?;
+    publish_goal_state_update(&admission);
+    Ok(Some(admission))
+}
+
 async fn start_goal(
     goal_store: &dyn GoalTaskRegistry,
     boot_id: &str,
