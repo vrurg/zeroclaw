@@ -996,6 +996,27 @@ fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Stri
     Some(format!("v1:{}:{scope}{sender}", scope.len()))
 }
 
+/// Durable goal routing is an authorization identity, not a filesystem session
+/// name. Keep every component length-delimited so punctuation-normalization in
+/// `sanitize_session_key` cannot make distinct channel principals equivalent.
+fn goal_originator_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    let scope = channel_scope(msg);
+    let thread = match msg.thread_ts.as_deref() {
+        Some(_) if is_matrix_channel_name(&msg.channel) => "",
+        Some(thread) => thread,
+        None => "",
+    };
+    format!(
+        "v1:{}:{scope}:{}:{}:{}:{}:{}:{thread}",
+        scope.len(),
+        msg.reply_target.len(),
+        msg.reply_target,
+        msg.sender.len(),
+        msg.sender,
+        thread.len(),
+    )
+}
+
 fn goal_task_conversation_scope(
     scope: zeroclaw_api::channel::ChannelConversationScope,
 ) -> zeroclaw_runtime::control_plane::TaskContinuationConversationScope {
@@ -2017,12 +2038,12 @@ fn should_consolidate_message_memory(
 fn goal_admission_context_for_message(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    history_key: &str,
+    _history_key: &str,
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
-        .with_originator_route(Some(history_key.to_string()))
+        .with_originator_route(Some(goal_originator_route(msg)))
         .with_principal_id(goal_principal_id(msg))
         .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
 }
