@@ -1425,6 +1425,35 @@ fn build_channel_system_prompt_for_message(
     build_channel_system_prompt(base_prompt, &msg.channel, bot_mention.as_deref())
 }
 
+/// Build a channel prompt whose native-tool claim follows the effective
+/// per-turn tool-spec set rather than the startup provider snapshot.
+fn build_channel_system_prompt_for_message_with_signal(
+    base_prompt: &str,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    native_tool_specs_present: bool,
+) -> String {
+    let prompt = build_channel_system_prompt_for_message(base_prompt, msg, target_channel);
+    let want = if native_tool_specs_present {
+        ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING
+    } else {
+        ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING
+    };
+    if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else if prompt.contains(::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING) {
+        prompt.replace(
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+            want,
+        )
+    } else {
+        prompt
+    }
+}
+
 /// Build the cached system-prompt prefix for a channel session.
 ///
 /// **Byte-stability contract:** given identical `base_prompt`, `channel_name`,
@@ -5931,8 +5960,26 @@ async fn process_channel_message_body(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
+    let per_turn_excluded_tools: &[String] =
+        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+            &[]
+        } else {
+            ctx.non_cli_excluded_tools.as_ref()
+        };
+    let per_turn_native_tool_specs_present =
+        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            active_model_provider.as_ref(),
+            ctx.tools_registry.as_ref(),
+            per_turn_excluded_tools,
+            ctx.activated_tools.as_ref(),
+        )
+        .unwrap_or(false);
+    let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
+        &base_system_prompt,
+        &msg,
+        target_channel.as_ref(),
+        per_turn_native_tool_specs_present,
+    );
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -7833,10 +7880,21 @@ async fn run_message_dispatch_loop(
         if msg.channel != "cli"
             && let Some(goal_command_content) =
                 goal_interrupt_command_content(&msg, target_channel.as_ref())
-            && goal_command_should_interrupt_in_flight(ctx.as_ref(), &msg).await
         {
             let mut goal_command_msg = msg.clone();
             goal_command_msg.content = goal_command_content.to_string();
+            // Commit the exact pause/cancel transition before touching the
+            // in-flight worker. A bad task id, terminal task, or persistence
+            // failure must leave unrelated same-scope work running.
+            let _ = handle_runtime_command_if_needed(
+                ctx.as_ref(),
+                &goal_command_msg,
+                target_channel.as_ref(),
+            )
+            .await;
+            if goal_command_should_interrupt_in_flight(ctx.as_ref(), &goal_command_msg).await {
+                continue;
+            }
             let scope_key = interruption_scope_key(&goal_command_msg);
             let previous = {
                 let mut active = in_flight_by_sender.lock().await;
@@ -7845,12 +7903,6 @@ async fn run_message_dispatch_loop(
             if let Some(state) = previous {
                 cancel_in_flight_chain(&state);
             }
-            let _ = handle_runtime_command_if_needed(
-                ctx.as_ref(),
-                &goal_command_msg,
-                target_channel.as_ref(),
-            )
-            .await;
             continue;
         }
 
