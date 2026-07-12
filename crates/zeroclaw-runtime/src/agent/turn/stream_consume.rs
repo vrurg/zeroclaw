@@ -550,6 +550,7 @@ mod tests {
                 StreamDelta::Reasoning(text) => {
                     panic!("status mode must not emit raw reasoning: {text}")
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 

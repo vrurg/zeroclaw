@@ -2352,6 +2352,17 @@ pub async fn run(
                                 let _ = std::io::stdout().flush();
                             }
                             StreamDelta::Reasoning(_) => {}
+                            tool_event @ (StreamDelta::ToolStart { .. }
+                            | StreamDelta::ToolComplete { .. }) => {
+                                if let Some(text) = tool_event.legacy_status() {
+                                    if is_tty {
+                                        let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
+                                    } else {
+                                        eprint!("{text}");
+                                    }
+                                    let _ = std::io::stderr().flush();
+                                }
+                            }
                         }
                     }
                 });
@@ -9739,6 +9750,7 @@ This is an example, not an invocation."#;
                 StreamDelta::Reasoning(text) => {
                     !text.contains("private chain of thought") && !text.contains("<think>")
                 }
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9835,6 +9847,7 @@ This is an example, not an invocation."#;
                     visible_deltas.push_str(&text);
                 }
                 StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -9925,6 +9938,7 @@ This is an example, not an invocation."#;
                     visible_deltas.push_str(&text);
                 }
                 StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -10917,6 +10931,7 @@ This is an example, not an invocation."#;
                     visible_deltas.push_str(&text);
                 }
                 StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -11379,6 +11394,7 @@ This is an example, not an invocation."#;
                     visible_deltas.push_str(&text);
                 }
                 StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -13398,8 +13414,11 @@ Let me check the result."#;
         let all_deltas: String = deltas
             .iter()
             .map(|d| match d {
-                StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
-                StreamDelta::Reasoning(_) => "",
+                StreamDelta::Status(t) | StreamDelta::Text(t) => t.clone(),
+                StreamDelta::Reasoning(_) => String::new(),
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
+                    d.legacy_status().unwrap_or_default()
+                }
             })
             .collect();
 

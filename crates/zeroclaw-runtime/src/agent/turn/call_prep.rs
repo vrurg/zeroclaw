@@ -6,12 +6,12 @@ use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
-use super::progress::render_tool_start_progress;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
@@ -26,6 +26,8 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Per-call immutable snapshot for draft start/completion events.
+    pub(crate) stream_arguments: Vec<Option<Arc<serde_json::Value>>>,
 }
 
 fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
@@ -89,6 +91,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut executable_stream_arguments = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
@@ -247,9 +250,8 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         // ── Progress: tool start ────────────────────────────
-        if let Some(tx) = ctx.on_delta {
-            let progress =
-                render_tool_start_progress(&tool_name, &tool_args, ctx.stream_tool_arguments);
+        let stream_arguments = ctx.on_delta.map(|_| Arc::new(tool_args.clone()));
+        if let (Some(tx), Some(arguments)) = (ctx.on_delta, stream_arguments.as_ref()) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -257,10 +259,16 @@ pub(crate) async fn prepare_tool_calls(
                     .with_attrs(::serde_json::json!({"tool": tool_name})),
                 "Sending progress start to draft"
             );
-            let _ = tx.send(StreamDelta::Status(progress)).await;
+            let _ = tx
+                .send(StreamDelta::ToolStart {
+                    tool: tool_name.clone(),
+                    arguments: Arc::clone(arguments),
+                })
+                .await;
         }
 
         executable_indices.push(idx);
+        executable_stream_arguments.push(stream_arguments);
         let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
             name: tool_name.clone(),
             arguments: tool_args.clone(),
@@ -281,5 +289,6 @@ pub(crate) async fn prepare_tool_calls(
         ordered_results,
         executable_indices,
         executable_calls,
+        stream_arguments: executable_stream_arguments,
     })
 }

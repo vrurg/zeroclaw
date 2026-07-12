@@ -1544,7 +1544,11 @@ pub fn all_tools_with_runtime(
                             plugin_config,
                             plugin_limits,
                         );
-                        if wasm_plugin_name_conflicts(plugin_tool.name(), &tool_arcs) {
+                        if wasm_plugin_name_conflicts(
+                            plugin_tool.name(),
+                            &tool_arcs,
+                            root_config.pipeline.enabled,
+                        ) {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -1553,7 +1557,7 @@ pub fn all_tools_with_runtime(
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({"tool": plugin_tool.name()})),
-                                "WASM plugin tool shadows an existing tool name; skipping"
+                                "WASM plugin tool shadows an active tool name; skipping"
                             );
                             continue;
                         }
@@ -1618,9 +1622,13 @@ pub fn all_tools_with_runtime(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn wasm_plugin_name_conflicts(name: &str, registered_tools: &[Arc<dyn Tool>]) -> bool {
-    crate::agent::turn::progress::has_builtin_stream_tool_policy(name)
-        || registered_tools.iter().any(|tool| tool.name() == name)
+fn wasm_plugin_name_conflicts(
+    name: &str,
+    registered_tools: &[Arc<dyn Tool>],
+    pipeline_enabled: bool,
+) -> bool {
+    registered_tools.iter().any(|tool| tool.name() == name)
+        || (pipeline_enabled && name == PipelineTool::NAME)
 }
 
 #[cfg(test)]
@@ -1631,9 +1639,21 @@ mod tests {
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
-    fn wasm_plugin_names_cannot_shadow_disabled_builtin_stream_policies() {
-        assert!(wasm_plugin_name_conflicts("browser", &[]));
-        assert!(!wasm_plugin_name_conflicts("custom_plugin_tool", &[]));
+    fn wasm_plugin_names_conflict_only_with_active_tools() {
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(CalculatorTool::new())];
+
+        assert!(wasm_plugin_name_conflicts("calculator", &registered, false));
+        assert!(!wasm_plugin_name_conflicts("browser", &registered, false));
+        assert!(wasm_plugin_name_conflicts(
+            PipelineTool::NAME,
+            &registered,
+            true
+        ));
+        assert!(!wasm_plugin_name_conflicts(
+            PipelineTool::NAME,
+            &registered,
+            false
+        ));
     }
 
     #[tokio::test]

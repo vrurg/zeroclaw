@@ -71,8 +71,50 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// A pending tool call. Channel draft consumers decide how to render its
+    /// arguments; the runtime keeps this event structured to avoid coupling a
+    /// transport-specific disclosure policy into the agent loop.
+    ToolStart {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+    },
+    /// A completed tool call paired with its original arguments.
+    ToolComplete {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+        secs: u64,
+        success: bool,
+        error: Option<String>,
+    },
     /// Provider reasoning text. Channel surfaces must opt in before rendering.
     Reasoning(String),
+}
+
+impl StreamDelta {
+    /// Render structured tool events with the historical conservative policy.
+    /// Non-Matrix consumers must use this instead of serializing arguments.
+    #[must_use]
+    pub fn legacy_status(&self) -> Option<String> {
+        match self {
+            Self::ToolStart { tool, arguments } => {
+                Some(super::progress::render_tool_start_progress(tool, arguments))
+            }
+            Self::ToolComplete {
+                tool,
+                arguments,
+                secs,
+                success,
+                error,
+            } => Some(super::progress::render_tool_completion_progress(
+                tool,
+                arguments,
+                *secs,
+                *success,
+                error.as_deref(),
+            )),
+            Self::Text(_) | Self::Status(_) | Self::Reasoning(_) => None,
+        }
+    }
 }
 
 /// Backwards-compatible alias while callers are migrated.

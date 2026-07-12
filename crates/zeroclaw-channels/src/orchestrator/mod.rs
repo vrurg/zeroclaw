@@ -4125,21 +4125,6 @@ fn matrix_stream_reasoning(
     matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
-fn matrix_stream_tool_arguments_for_config(
-    config: &zeroclaw_config::schema::Config,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> Vec<zeroclaw_config::schema::StreamToolArgumentEntry> {
-    matrix_config_for_message(config, msg)
-        .map_or_else(Vec::new, |config| config.stream_tool_arguments.clone())
-}
-
-fn matrix_stream_tool_arguments(
-    ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> Vec<zeroclaw_config::schema::StreamToolArgumentEntry> {
-    matrix_stream_tool_arguments_for_config(ctx.prompt_config.as_ref(), msg)
-}
-
 fn matrix_draft_update_interval_ms_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -4345,6 +4330,364 @@ fn push_matrix_single_message_pending(
     trim_matrix_single_message_pending(pending, max_lines);
 }
 
+const RUNTIME_ONLY_TOOL_ARGUMENTS: &[&str] = &["approved", "__config"];
+
+/// Matrix's canonical safe-display policy for standard tools.
+///
+/// A schema-annotation alternative could mark displayable properties in each
+/// provider-facing `ToolSpec` and recursively traverse nested schemas. It is
+/// deliberately deferred: provider compatibility for custom schema keywords is
+/// not established, nested-path configuration broadens this feature, and safe
+/// mode intentionally omits composite values. A follow-up PR may introduce
+/// that general metadata model above this Matrix-local policy.
+const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (&["shell"], &["command"]),
+    (&["file_read"], &["path", "offset", "limit", "encoding"]),
+    (&["file_write"], &["path", "encoding"]),
+    (&["file_edit"], &["path"]),
+    (&["glob_search"], &["pattern"]),
+    (
+        &["content_search"],
+        &[
+            "pattern",
+            "path",
+            "output_mode",
+            "include",
+            "case_sensitive",
+            "max_results",
+        ],
+    ),
+    (&["git_operations"], &["action", "path", "branch"]),
+    (&["cron_add"], &["name", "job_type"]),
+    (&["cron_remove", "cron_run", "cron_update"], &[]),
+    (&["cron_runs"], &["limit"]),
+    (&["schedule"], &["action", "expression", "delay", "run_at"]),
+    (&["send_message_to_peer", "send_via"], &[]),
+    (&["ask_user"], &["timeout_secs"]),
+    (
+        &["escalate_to_human"],
+        &["urgency", "wait_for_response", "timeout_secs"],
+    ),
+    (&["reaction"], &["action", "emoji"]),
+    (&["poll"], &["duration_minutes", "multi_select"]),
+    (
+        &["channel_room"],
+        &["action", "name", "visibility", "encryption"],
+    ),
+    (&["sessions_list"], &["limit"]),
+    (&["sessions_history"], &["limit"]),
+    (&["sessions_send"], &[]),
+    (&["memory_store"], &["category"]),
+    (&["memory_recall"], &["query", "limit"]),
+    (&["memory_forget"], &[]),
+    (
+        &["memory_export"],
+        &["namespace", "category", "since", "until"],
+    ),
+    (&["memory_purge"], &["namespace"]),
+    (
+        &["model_routing_config"],
+        &["action", "model_provider", "model"],
+    ),
+    (&["model_switch"], &["action", "model_provider", "model"]),
+    (&["proxy_config"], &["action", "scope"]),
+    (&["browser"], &["action"]),
+    (&["http_request"], &["method"]),
+    (&["web_search_tool"], &["query"]),
+    (&["image_info"], &["path"]),
+    (&["canvas"], &["action"]),
+    (&["backup"], &[]),
+    (
+        &[
+            "cron_list",
+            "spawn_subagent",
+            "sessions_current",
+            "browser_open",
+            "web_fetch",
+            "screenshot",
+            "weather",
+            "pushover",
+            "calculator",
+        ],
+        &[],
+    ),
+];
+
+// These are configured or feature-gated standard tools. They are part of the
+// same presentation policy, but the default registry used by the drift test
+// intentionally does not construct them.
+const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (
+        &["delegate"],
+        &["action", "agent", "background", "timeout_ms"],
+    ),
+    (&["sessions_reset", "sessions_delete"], &[]),
+    (&["read_skill", "skill_view"], &["name"]),
+    (&["skills_list"], &["source"]),
+    (&["skill_manage"], &["action", "name"]),
+    (
+        &["sop_execute", "sop_advance", "sop_approve", "sop_status"],
+        &["action"],
+    ),
+    (&["sop_workshop"], &["action", "name"]),
+    (&["sop_list"], &[]),
+    (&["browser_delegate", "text_browser"], &["action"]),
+    (&["tool_search"], &["query", "max_results"]),
+    (
+        &["file_upload", "file_upload_bundle", "file_download"],
+        &["path"],
+    ),
+    (&["security_ops"], &["action"]),
+    (&["data_management"], &[]),
+    (&["image_gen"], &["model", "size", "quality"]),
+    (
+        &[
+            "cloud_ops",
+            "cloud_patterns",
+            "project_intel",
+            "report_template",
+        ],
+        &["action", "provider", "path", "name", "format"],
+    ),
+    (
+        &[
+            "notion",
+            "jira",
+            "microsoft365",
+            "google_workspace",
+            "linkedin",
+            "composio",
+        ],
+        &["action"],
+    ),
+    (&["email_search"], &["folder", "limit"]),
+    (&["email_read"], &["folder"]),
+    (&["discord_search"], &["limit"]),
+    (&["hardware_board_info"], &["board"]),
+    (
+        &["hardware_memory_map", "hardware_memory_read"],
+        &["board", "address", "length"],
+    ),
+    (&["mcp_resources", "mcp_prompts"], &["action"]),
+    (
+        &[
+            "execute_pipeline",
+            "knowledge",
+            "llm_task",
+            "vi_verify",
+            "claude_code",
+            "claude_code_runner",
+            "codex_cli",
+            "gemini_cli",
+            "opencode_cli",
+        ],
+        &[],
+    ),
+];
+
+fn matrix_safe_tool_arguments(tool: &str) -> Option<&'static [&'static str]> {
+    MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+        .iter()
+        .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+        .find_map(|(tools, arguments)| tools.contains(&tool).then_some(*arguments))
+}
+
+fn matrix_tool_progress(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    let settings = config
+        .channels
+        .matrix
+        .get(matrix_alias)
+        .map_or(&[][..], |matrix| matrix.stream_tool_arguments.as_slice());
+    match event {
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart { tool, arguments } => {
+            let subject = matrix_tool_subject(tool, arguments, settings);
+            Some(format!("\u{23f3} {subject}\n"))
+        }
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
+            tool,
+            arguments,
+            secs,
+            success,
+            error,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, settings);
+            if *success {
+                Some(format!("\u{2705} {subject} ({secs}s)\n"))
+            } else if let Some(error) = error {
+                Some(format!(
+                    "\u{274c} {subject} ({secs}s): {}\n",
+                    truncate_with_ellipsis(&matrix_scrub_display(error), 200)
+                ))
+            } else {
+                Some(format!("\u{274c} {subject} ({secs}s)\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matrix_tool_subject(
+    tool: &str,
+    arguments: &serde_json::Value,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> String {
+    matrix_tool_argument_hint(tool, arguments, settings)
+        .map_or_else(|| tool.to_string(), |hint| format!("{tool}: {hint}"))
+}
+
+fn matrix_tool_argument_hint(
+    tool: &str,
+    arguments: &serde_json::Value,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> Option<String> {
+    use zeroclaw_config::schema::{
+        DEFAULT_STREAM_TOOL_ARGUMENT_CHARS, StreamToolArgumentBase, StreamToolArgumentEntry,
+    };
+
+    let serde_json::Value::Object(map) = arguments else {
+        return None;
+    };
+    let (default_base, default_chars) = settings
+        .iter()
+        .find_map(|entry| match entry {
+            StreamToolArgumentEntry::Defaults {
+                default_base,
+                argument_chars,
+            } => Some((
+                *default_base,
+                argument_chars.unwrap_or(DEFAULT_STREAM_TOOL_ARGUMENT_CHARS),
+            )),
+            StreamToolArgumentEntry::Tool { .. } => None,
+        })
+        .unwrap_or((
+            StreamToolArgumentBase::Safe,
+            DEFAULT_STREAM_TOOL_ARGUMENT_CHARS,
+        ));
+    let rule = settings.iter().find_map(|entry| match entry {
+        StreamToolArgumentEntry::Tool {
+            tool: rule_tool,
+            base,
+            include,
+            exclude,
+            argument_chars,
+        } if rule_tool == tool => Some((base, include, exclude, argument_chars)),
+        _ => None,
+    });
+    let (base, include, exclude, max_chars) = rule.map_or(
+        (default_base, &[][..], &[][..], default_chars),
+        |(base, include, exclude, argument_chars)| {
+            (
+                base.unwrap_or(default_base),
+                include.as_slice(),
+                exclude.as_slice(),
+                argument_chars.unwrap_or(default_chars),
+            )
+        },
+    );
+    let mut keys: Vec<(&str, bool)> = match base {
+        StreamToolArgumentBase::None => Vec::new(),
+        StreamToolArgumentBase::Safe => matrix_safe_tool_arguments(tool)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|key| map.get(*key).is_some_and(matrix_is_scalar))
+            .map(|key| (key, false))
+            .collect(),
+        StreamToolArgumentBase::All => map.keys().map(|key| (key.as_str(), true)).collect(),
+    };
+    for key in include {
+        if map.contains_key(key) {
+            if let Some(existing) = keys.iter_mut().find(|(name, _)| *name == key) {
+                existing.1 = true;
+            } else {
+                keys.push((key, true));
+            }
+        }
+    }
+    keys.retain(|(key, _)| {
+        !exclude.iter().any(|excluded| excluded == key)
+            && !RUNTIME_ONLY_TOOL_ARGUMENTS.contains(key)
+    });
+    let parts: Vec<String> = keys
+        .into_iter()
+        .filter_map(|(key, explicit)| {
+            matrix_render_argument(key, map.get(key)?, max_chars, explicit)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn matrix_render_argument(
+    key: &str,
+    value: &serde_json::Value,
+    max_chars: usize,
+    explicit: bool,
+) -> Option<String> {
+    if value.is_null() || (!explicit && !matrix_is_scalar(value)) {
+        return None;
+    }
+    let rendered = if zeroclaw_runtime::approval::looks_like_secret_key(key) {
+        "[redacted]".to_string()
+    } else {
+        let rendered = match value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+            }
+            serde_json::Value::Null => return None,
+        };
+        matrix_scrub_display(&rendered)
+    };
+    if rendered.is_empty() {
+        None
+    } else if max_chars == 0 {
+        Some(format!("{key}={rendered}"))
+    } else {
+        Some(format!(
+            "{key}={}",
+            truncate_with_ellipsis(&rendered, max_chars)
+        ))
+    }
+}
+
+fn matrix_is_scalar(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+    )
+}
+
+fn matrix_scrub_display(value: &str) -> String {
+    scrub_credentials(&zeroclaw_runtime::security::scrub(value))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn matrix_progress_text(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+    match event {
+        StreamDelta::Status(text) => Some(strip_think_tags_inline(text)),
+        StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
+            matrix_tool_progress(event, config, matrix_alias)
+        }
+        StreamDelta::Reasoning(text) => Some(strip_think_tags_inline(&format!(
+            "{REASONING_FULL_PREFIX}{text}"
+        ))),
+        StreamDelta::Text(_) => None,
+    }
+}
+
 async fn run_matrix_single_message_draft_updater(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
     channel: Arc<dyn Channel>,
@@ -4353,9 +4696,9 @@ async fn run_matrix_single_message_draft_updater(
     interval_ms: u64,
     stream_draft_lines: usize,
     message_max_bytes: usize,
+    matrix_config: Arc<Config>,
+    matrix_alias: String,
 ) {
-    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
-
     let interval = Duration::from_millis(interval_ms.max(50));
     let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
     let mut ticker = tokio::time::interval(interval);
@@ -4366,21 +4709,9 @@ async fn run_matrix_single_message_draft_updater(
     let mut rx_open = true;
     let mut flush_in_flight = false;
 
-    macro_rules! progress_text {
-        ($event:expr) => {
-            match $event {
-                StreamDelta::Status(text) => Some(strip_think_tags_inline(&text)),
-                StreamDelta::Reasoning(text) => Some(strip_think_tags_inline(&format!(
-                    "{REASONING_FULL_PREFIX}{text}"
-                ))),
-                StreamDelta::Text(_) => None,
-            }
-        };
-    }
-
     macro_rules! queue_progress {
         ($event:expr) => {
-            if let Some(text) = progress_text!($event) {
+            if let Some(text) = matrix_progress_text(&$event, &matrix_config, &matrix_alias) {
                 push_matrix_single_message_pending(
                     &mut pending,
                     text,
@@ -5339,6 +5670,8 @@ async fn process_channel_message_body(
                 let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
                 let message_max_bytes = matrix_message_max_bytes(ctx.as_ref(), &msg);
+                let matrix_config = Arc::clone(&ctx.prompt_config);
+                let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
                 Some(zeroclaw_spawn::spawn!(async move {
                     run_matrix_single_message_draft_updater(
                         rx,
@@ -5348,6 +5681,8 @@ async fn process_channel_message_body(
                         interval_ms,
                         stream_draft_lines,
                         message_max_bytes,
+                        matrix_config,
+                        matrix_alias,
                     )
                     .await;
                 }))
@@ -5415,6 +5750,28 @@ async fn process_channel_message_body(
                                         ),
                                         "Draft update failed"
                                     );
+                                }
+                            }
+                            tool_event @ (StreamDelta::ToolStart { .. }
+                            | StreamDelta::ToolComplete { .. }) => {
+                                if let Some(text) = tool_event.legacy_status() {
+                                    let visible = strip_think_tags_inline(&text);
+                                    if let Err(e) = channel
+                                        .update_draft_progress(&reply_target, &draft_id, &visible)
+                                        .await
+                                    {
+                                        ::zeroclaw_log::record!(
+                                            DEBUG,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Note
+                                            )
+                                            .with_attrs(
+                                                ::serde_json::json!({"error": format!("{e}")})
+                                            ),
+                                            "Draft tool progress update failed"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -5543,7 +5900,6 @@ async fn process_channel_message_body(
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
-        loop_knobs.stream_tool_arguments = Some(matrix_stream_tool_arguments(ctx.as_ref(), &msg));
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -11494,14 +11850,178 @@ mod tests {
         assert!(!matrix_single_message_streaming_enabled_for_config(
             &config, &slack_msg
         ));
+        let single_policy = config
+            .channels
+            .matrix
+            .get("single")
+            .expect("configured Matrix alias")
+            .stream_tool_arguments
+            .as_slice();
         assert_eq!(
-            matrix_stream_tool_arguments_for_config(&config, &single_msg),
-            vec![zeroclaw_config::schema::StreamToolArgumentEntry::Defaults {
-                default_base: zeroclaw_config::schema::StreamToolArgumentBase::None,
-                argument_chars: Some(240),
-            }]
+            matrix_tool_argument_hint(
+                "delegate",
+                &serde_json::json!({"agent": "ops"}),
+                single_policy
+            ),
+            None,
+            "the configured base=none policy must be resolved only by Matrix rendering"
         );
-        assert!(matrix_stream_tool_arguments_for_config(&config, &slack_msg).is_empty());
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_safe_defaults_and_honors_explicit_opt_in() {
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({
+            "action": "start",
+            "agent": "sysadmin",
+            "background": true,
+            "task_id": "task-7",
+            "timeout_ms": 30_000,
+            "prompt": "inspect secrets",
+            "metadata": { "room": "private" },
+            "token": "should-never-leak",
+        });
+        assert_eq!(
+            matrix_tool_argument_hint("delegate", &arguments, &[]).as_deref(),
+            Some("action=start, agent=sysadmin, background=true, timeout_ms=30000"),
+        );
+
+        let policy = vec![Entry::Tool {
+            tool: "delegate".to_string(),
+            base: Some(Base::None),
+            include: vec![
+                "prompt".to_string(),
+                "metadata".to_string(),
+                "token".to_string(),
+            ],
+            exclude: Vec::new(),
+            argument_chars: Some(0),
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint("delegate", &arguments, &policy).as_deref(),
+            Some("prompt=inspect secrets, metadata={\"room\":\"private\"}, token=[redacted]"),
+        );
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_unknown_tools_name_only_by_default() {
+        let arguments = serde_json::json!({"path": "/private", "count": 3});
+        assert_eq!(
+            matrix_tool_argument_hint("mcp-private", &arguments, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let config = Arc::new(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        let registry = tools::all_tools(
+            Arc::clone(&config),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NoopMemory),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            temp.path(),
+            &HashMap::new(),
+            None,
+            config.as_ref(),
+            None,
+            false,
+            None,
+        );
+        let schemas: HashMap<String, Arc<serde_json::Value>> = registry
+            .tools
+            .iter()
+            .map(|tool| {
+                let spec = tool.spec();
+                (spec.name, spec.parameters)
+            })
+            .collect();
+        let mut checked_tools = 0;
+        let mut policy_tools = HashSet::new();
+        let mut absent_required_tools = Vec::new();
+
+        for (groups, required) in [
+            (MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS, true),
+            (MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS, false),
+        ] {
+            for (tools, fields) in groups {
+                for tool in *tools {
+                    assert!(
+                        policy_tools.insert(*tool),
+                        "Matrix safe policy lists tool {tool:?} more than once"
+                    );
+                    let Some(schema) = schemas.get(*tool) else {
+                        if required {
+                            absent_required_tools.push(*tool);
+                        }
+                        continue;
+                    };
+                    checked_tools += 1;
+                    let properties = schema
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .unwrap_or_else(|| panic!("{tool} must expose an object parameter schema"));
+                    for field in *fields {
+                        assert!(
+                            properties.contains_key(*field),
+                            "Matrix safe policy references missing field {field:?} for tool {tool:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked_tools >= 20,
+            "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
+        );
+        assert!(
+            absent_required_tools.is_empty(),
+            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"agent": "sysadmin", "prompt": "private"});
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments.clone()),
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments),
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        assert_eq!(start, "⏳ delegate: agent=sysadmin\n");
+        assert_eq!(completion, "✅ delegate: agent=sysadmin (4s)\n");
     }
 
     #[test]
@@ -11707,6 +12227,8 @@ mod tests {
             50,
             5,
             128,
+            Arc::new(Config::default()),
+            "test".to_string(),
         ));
 
         for idx in 0..20 {
