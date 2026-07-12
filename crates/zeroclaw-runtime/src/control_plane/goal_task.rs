@@ -395,6 +395,17 @@ pub trait GoalTaskRegistry: Send + Sync {
         continuation_context: Option<TaskContinuationContext>,
     ) -> anyhow::Result<()>;
 
+    /// Complete a goal only while its canonical lifecycle row is still running.
+    ///
+    /// Completion is goal-specific because the controller must not overwrite a
+    /// concurrent pause or cancellation after an asynchronous verifier call.
+    /// Returning `false` means another lifecycle transition won the race.
+    async fn complete_running_goal_task(
+        &self,
+        task_id: &str,
+        output: String,
+    ) -> anyhow::Result<bool>;
+
     /// Replace or clear the continuation delivery context for a task.
     ///
     /// The context is control-plane-owned delivery state, not lifecycle state.

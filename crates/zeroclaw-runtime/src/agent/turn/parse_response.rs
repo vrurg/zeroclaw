@@ -164,7 +164,13 @@ pub(crate) async fn interpret_chat_response(
     // `pricing_available = false` so goal cost budgets can fail closed.
     let call_cost_usd = match resp.usage.as_ref() {
         Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
+            // Response interpretation is deliberately non-fallible because it
+            // must still surface the provider response to the turn loop. Goal
+            // evaluation re-reads its canonical ledger and pauses budgeted
+            // work when accounting is unavailable.
             .await
+            .ok()
+            .flatten()
             .map(|(_total_tokens, cost_usd)| cost_usd),
         None => None,
     };
