@@ -1229,7 +1229,11 @@ pub async fn admit_goal_command(
     config: &Config,
     agent_config: Option<&AliasedAgentConfig>,
 ) -> Result<GoalAdmission> {
-    ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    // Disabling experimental goal mode prevents new work, but must not lock an
+    // operator out of inspecting or stopping an already durable goal.
+    if command.action == GoalCommandAction::Start {
+        ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    }
     if command.action == GoalCommandAction::Help {
         return Ok(GoalAdmission {
             task_id: None,
