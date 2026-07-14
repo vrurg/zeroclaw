@@ -639,6 +639,21 @@ pub struct GoalAdmissionContext {
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
     /// Exact goal task bound by trusted controller plumbing, when available.
+    /// Legacy sanitizer-derived route for this same trusted inbound message.
+    ///
+    /// This is transient compatibility evidence, not a second durable route.
+    /// It is accepted only with the exact task id, matching durable continuation
+    /// context, and matching legacy principal, then immediately rebound.
+    pub legacy_originator_route: Option<String>,
+    /// Legacy sanitizer-derived principal for this same trusted inbound message.
+    /// See [`Self::legacy_originator_route`] for the compatibility boundary.
+    pub legacy_principal_id: Option<String>,
+    /// Exact durable goal task bound to this controller turn, when one exists.
+    ///
+    /// Channel ingress leaves this unset for operator messages. The goal
+    /// controller sets it only on trusted synthetic continuations so later
+    /// admission, verifier, gate, and delegation lookups cannot drift to a
+    /// replacement goal in the same route/principal context.
     pub goal_task_id: Option<String>,
     /// Minimal durable channel context needed to resume after restart.
     ///
@@ -716,6 +731,8 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            legacy_originator_route: None,
+            legacy_principal_id: None,
             goal_task_id: None,
             continuation_context: None,
         }
@@ -742,6 +759,17 @@ impl GoalAdmissionContext {
     #[must_use]
     pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
         self.principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_legacy_identity(
+        mut self,
+        originator_route: Option<String>,
+        principal_id: Option<String>,
+    ) -> Self {
+        self.legacy_originator_route = originator_route;
+        self.legacy_principal_id = principal_id;
         self
     }
 
@@ -1247,7 +1275,9 @@ pub async fn admit_goal_command(
     config: &Config,
     agent_config: Option<&AliasedAgentConfig>,
 ) -> Result<GoalAdmission> {
-    ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    if command.action == GoalCommandAction::Start {
+        ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    }
     if command.action == GoalCommandAction::Help {
         return Ok(GoalAdmission {
             task_id: None,
@@ -1256,6 +1286,17 @@ pub async fn admit_goal_command(
             continuation_reason: None,
             continue_goal: false,
         });
+    }
+    if !config.goal.enabled
+        && !matches!(
+            command.action,
+            GoalCommandAction::Status
+                | GoalCommandAction::Pause
+                | GoalCommandAction::Resume
+                | GoalCommandAction::Cancel
+        )
+    {
+        bail!("{}", msg("goal-command-error-disabled", &[]));
     }
     let cp = control_plane()
         .with_context(|| msg("goal-command-error-control-plane-unavailable", &[]))?;
@@ -2142,8 +2183,7 @@ async fn resolve_goal_task(
             .await
             .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
             .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
-        ensure_goal_visible(&task, ctx)?;
-        return Ok(task);
+        return ensure_goal_visible_or_rebind(goal_store, task, ctx).await;
     }
 
     let task = goal_store
@@ -2203,6 +2243,74 @@ async fn latest_active_resolved_goal(
     };
     ensure_goal_visible(&task, ctx)?;
     load_goal_extension(goal_store, task).await.map(Some)
+}
+
+async fn ensure_goal_visible_or_rebind(
+    goal_store: &dyn GoalTaskRegistry,
+    task: TaskRecord,
+    ctx: &GoalAdmissionContext,
+) -> Result<TaskRecord> {
+    if ensure_goal_visible(&task, ctx).is_ok() {
+        return Ok(task);
+    }
+
+    let (
+        Some(current_route),
+        Some(current_principal),
+        Some(legacy_route),
+        Some(legacy_principal),
+        Some(expected_context),
+        Some(stored_route),
+        Some(stored_principal),
+    ) = (
+        ctx.originator_route.as_deref(),
+        ctx.principal_id.as_deref(),
+        ctx.legacy_originator_route.as_deref(),
+        ctx.legacy_principal_id.as_deref(),
+        ctx.continuation_context.as_ref(),
+        task.originator_route.as_deref(),
+        task.principal_id.as_deref(),
+    )
+    else {
+        ensure_goal_visible(&task, ctx)?;
+        return Ok(task);
+    };
+
+    if task.kind != TaskKind::Goal
+        || task.agent != ctx.agent_alias
+        || stored_route != legacy_route
+        || stored_principal != legacy_principal
+        || goal_store
+            .get_continuation_context(&task.id)
+            .await?
+            .as_ref()
+            != Some(expected_context)
+    {
+        ensure_goal_visible(&task, ctx)?;
+        return Ok(task);
+    }
+
+    let rebound = goal_store
+        .rebind_goal_task_identity(
+            &task.id,
+            stored_route,
+            stored_principal,
+            current_route,
+            current_principal,
+        )
+        .await
+        .with_context(|| msg("goal-command-error-lookup-failed", &[]))?;
+    if !rebound {
+        bail!(
+            "{}",
+            msg("goal-command-error-wrong-route", &[("task_id", &task.id)])
+        );
+    }
+
+    let mut rebound_task = task;
+    rebound_task.originator_route = Some(current_route.to_string());
+    rebound_task.principal_id = Some(current_principal.to_string());
+    Ok(rebound_task)
 }
 
 fn is_active_goal_context_conflict(error: &anyhow::Error) -> bool {
@@ -2787,10 +2895,11 @@ mod tests {
         assert!(!help.continue_goal);
 
         config.goal.enabled = false;
-        let err = admit_goal_command(ctx, command, &config, None)
+        let disabled_help = admit_goal_command(ctx, command, &config, None)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("goal.enabled = false"));
+            .unwrap();
+        assert_eq!(disabled_help.message, msg("goal-command-help", &[]));
+        assert!(!disabled_help.continue_goal);
     }
 
     #[tokio::test]
@@ -2847,6 +2956,86 @@ mod tests {
                 .contains("operator pause: maintenance window")
         );
         assert!(!status.message.contains("human escalation"));
+    }
+
+    #[tokio::test]
+    async fn disabled_goal_mode_rejects_start_but_retains_exact_lifecycle_controls() {
+        let _ = global_test_stores();
+        let config = test_config();
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let ctx = GoalAdmissionContext::new(agent)
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
+            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
+        let started = admit_goal_command(
+            ctx.clone(),
+            parse_goal_command("/goal start retain controls").unwrap(),
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.unwrap();
+        let mut disabled = config.clone();
+        disabled.goal.enabled = false;
+        assert!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command("/goal start rejected").unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal status {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal pause {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal resume {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx,
+                parse_goal_command(&format!("/goal cancel {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[test]
@@ -3848,6 +4037,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not visible to this principal"));
+    }
+
+    #[tokio::test]
+    async fn exact_legacy_goal_context_rebinds_before_pause_and_cancel() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "legacy-route-goal";
+        let continuation = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: Some("main".into()),
+            reply_target: "!room:example".into(),
+            sender: "@alice:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        let legacy_route = "matrix_main__room_example";
+        let legacy_principal = "matrix_main__alice_example";
+        let canonical_route =
+            "6:matrix|4:main|14:@alice:example|13:!room:example|0:|12:reply_target";
+        let canonical_principal = "6:matrix|4:main|14:@alice:example";
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.into(),
+                    kind: TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: TaskStatus::Running,
+                    owner_pid: 1,
+                    owner_boot_id: "boot-a".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(legacy_route.into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(legacy_principal.into()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.into(),
+                    objective: "retain existing goal controls after upgrade".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                Some(continuation.clone()),
+            )
+            .await
+            .unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some(canonical_route.into()))
+            .with_principal_id(Some(canonical_principal.into()))
+            .with_legacy_identity(Some(legacy_route.into()), Some(legacy_principal.into()))
+            .with_goal_task_id(Some(task_id.into()))
+            .with_continuation_context(Some(continuation));
+
+        let paused = pause_goal_for_blocker(
+            &store,
+            &store,
+            &ctx,
+            Some(task_id.into()),
+            Some(&test_config()),
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("operator requested pause".into()),
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+
+        let rebound = store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(rebound.originator_route.as_deref(), Some(canonical_route));
+        assert_eq!(rebound.principal_id.as_deref(), Some(canonical_principal));
+
+        let cancelled = cancel_goal(
+            &store,
+            &store,
+            &ctx,
+            Some(task_id.into()),
+            Some(&test_config()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_never_rebinds_without_exact_durable_continuation() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "legacy-route-mismatch";
+        let stored_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "!room:example".into(),
+            sender: "@alice:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.into(),
+                    kind: TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: TaskStatus::Running,
+                    owner_pid: 1,
+                    owner_boot_id: "boot-a".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("legacy-route".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("legacy-principal".into()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.into(),
+                    objective: "must not be claimed by a collision".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                Some(stored_context),
+            )
+            .await
+            .unwrap();
+        let mismatched_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "!room:example".into(),
+            sender: "@mallory:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("canonical-route".into()))
+            .with_principal_id(Some("canonical-principal".into()))
+            .with_legacy_identity(Some("legacy-route".into()), Some("legacy-principal".into()))
+            .with_goal_task_id(Some(task_id.into()))
+            .with_continuation_context(Some(mismatched_context));
+
+        let err = status_goal(&store, &store, &ctx, Some(task_id.into()), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not visible from this route"));
+        let unchanged = store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.originator_route.as_deref(), Some("legacy-route"));
+        assert_eq!(unchanged.principal_id.as_deref(), Some("legacy-principal"));
     }
 
     #[tokio::test]
