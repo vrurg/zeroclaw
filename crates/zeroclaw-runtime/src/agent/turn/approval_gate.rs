@@ -277,7 +277,7 @@ async fn apply_explicit_goal_approval_denial(
                     .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
                 "goal approval denial transition failed"
             );
-            true
+            false
         }
     }
 }
@@ -366,7 +366,7 @@ mod tests {
         )>,
         /// Test-only race injector: changes the canonical task state after the
         /// durable pre-prompt pause and before the gate attempts its resume.
-        resume_race: Option<(Arc<dyn control_plane::TaskRegistry>, String)>,
+        resume_race: Option<(Arc<dyn control_plane::GoalTaskRegistry>, String)>,
     }
 
     impl zeroclaw_api::attribution::Attributable for FixedApprovalChannel {
@@ -413,14 +413,14 @@ mod tests {
                 );
             }
             if let Some((store, task_id)) = &self.resume_race {
-                let _ = store
-                    .update_status(
-                        task_id,
-                        control_plane::TaskStatus::Cancelled,
-                        None,
-                        Some("test resume race".into()),
-                    )
-                    .await;
+                let _ = store.pause_goal_task(task_id, control_plane::GoalPauseState {
+                    reason: control_plane::GoalPauseReason::OperatorPaused,
+                    description: Some("later operator pause".into()),
+                    blockers: vec![control_plane::GoalBlocker {
+                        kind: control_plane::GoalBlockerKind::NeedsUserInput,
+                        message: "later blocker".into(), payload: None,
+                    }],
+                }).await;
             }
             Ok(self.response.clone())
         }
@@ -595,7 +595,7 @@ mod tests {
         response: Option<zeroclaw_api::channel::ChannelApprovalResponse>,
         cancel_before_resume: bool,
     ) -> (ApprovalGateOutcome, control_plane::TaskStatus, usize, bool) {
-        let (store, _goal_store, task_id, goal_ctx) = create_running_goal().await;
+        let (store, goal_store, task_id, goal_ctx) = create_running_goal().await;
         let observer = NoopObserver;
         let approval = crate::approval::ApprovalManager::for_non_interactive(&RiskProfileConfig {
             always_ask: vec!["file_write".into()],
@@ -612,7 +612,7 @@ mod tests {
                 task_id.clone(),
                 Arc::clone(&observed_paused),
             )),
-            resume_race: cancel_before_resume.then(|| (Arc::clone(&store), task_id.clone())),
+            resume_race: cancel_before_resume.then(|| (Arc::clone(&goal_store), task_id.clone())),
         };
         let ctx = TurnCtx {
             observer: &observer,
@@ -678,7 +678,7 @@ mod tests {
         .await;
 
         assert_eq!(requests, 1);
-        assert_eq!(status, control_plane::TaskStatus::Cancelled);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
     }
 
@@ -773,7 +773,31 @@ mod tests {
 
         assert_eq!(requests, 1);
         assert!(observed_paused);
-        assert_eq!(status, control_plane::TaskStatus::Cancelled);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
+        assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
+    }
+
+    #[tokio::test]
+    async fn goal_approval_success_cancels_when_later_operator_pause_wins() {
+        let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
+            zeroclaw_config::schema::GoalApprovalDenyBehavior::Pause,
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve), true,
+        ).await;
+        assert_eq!(requests, 1);
+        assert!(observed_paused);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
+        assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
+    }
+
+    #[tokio::test]
+    async fn explicit_goal_denial_resume_cancels_when_later_operator_pause_wins() {
+        let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
+            zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume,
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny), true,
+        ).await;
+        assert_eq!(requests, 1);
+        assert!(observed_paused);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
     }
 }
