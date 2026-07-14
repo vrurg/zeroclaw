@@ -333,6 +333,21 @@ pub trait GoalTaskRegistry: Send + Sync {
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<String>>;
 
+    /// Compare-and-set a legacy goal's trusted identity to its canonical form.
+    ///
+    /// This is intentionally an exact-id operation. Callers must first prove
+    /// ownership from the persisted continuation context; the store only
+    /// provides the atomic identity rebind and never performs a broad legacy
+    /// route lookup.
+    async fn rebind_goal_task_identity(
+        &self,
+        task_id: &str,
+        expected_originator_route: &str,
+        expected_principal_id: &str,
+        originator_route: &str,
+        principal_id: &str,
+    ) -> anyhow::Result<bool>;
+
     /// Load the goal extension row for a canonical task id.
     ///
     /// Absence means either the task is not a goal or the extension row is
@@ -381,6 +396,13 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// together.
     async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
 
+    /// Atomically complete exactly a running goal. A false result means a
+    /// concurrent pause/cancel/terminal transition won the lifecycle race.
+    async fn complete_running_goal_task(
+        &self,
+        task_id: &str,
+        output: String,
+    ) -> anyhow::Result<bool>;
     /// Atomically clear goal pause state, claim ownership, and mark the task running.
     ///
     /// `continuation_context` is written only when supplied by trusted ingress.

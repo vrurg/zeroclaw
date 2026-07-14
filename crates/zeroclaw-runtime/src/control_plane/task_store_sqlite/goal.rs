@@ -482,6 +482,36 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("query latest active goal id by context")
     }
 
+    async fn rebind_goal_task_identity(
+        &self,
+        task_id: &str,
+        expected_originator_route: &str,
+        expected_principal_id: &str,
+        originator_route: &str,
+        principal_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE tasks
+                    SET originator_route = ?4,
+                        principal_id = ?5
+                  WHERE id = ?1
+                    AND kind = 'goal'
+                    AND originator_route = ?2
+                    AND principal_id = ?3",
+                params![
+                    task_id,
+                    expected_originator_route,
+                    expected_principal_id,
+                    originator_route,
+                    principal_id,
+                ],
+            )
+            .context("compare-and-set rebind of goal task identity")?;
+        Ok(updated == 1)
+    }
+
     async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -562,6 +592,18 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
+    async fn complete_running_goal_task(&self, task_id: &str, output: String) -> Result<bool> {
+        let conn = self.conn.lock();
+        ensure_goal_task_row(&conn, task_id)?;
+        let updated = conn
+            .execute(
+                "UPDATE tasks SET status = 'completed', output = COALESCE(?2, output), finished_at = ?3
+             WHERE id = ?1 AND kind = 'goal' AND status = 'running'",
+                params![task_id, output, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("conditionally complete running goal task")?;
+        Ok(updated == 1)
+    }
     async fn resume_goal_task(
         &self,
         task_id: &str,
@@ -1375,5 +1417,51 @@ mod tests {
         assert!(goal.pause_reason.is_none());
         assert!(goal.pause_description.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_running_goal_task_loses_to_paused_goal_without_output_write() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-completion-cas-loses", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-completion-cas-loses".into(),
+                objective: "do not overwrite paused state".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: Some(GoalPauseReason::OperatorPaused),
+                pause_description: Some("operator won the race".into()),
+                blockers: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !s.complete_running_goal_task("goal-completion-cas-loses", "stale completion".into())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("goal-completion-cas-loses")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+        let conn = s.conn.lock();
+        let output: Option<String> = conn
+            .query_row(
+                "SELECT output FROM tasks WHERE id = ?1",
+                params!["goal-completion-cas-loses"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(output.is_none());
     }
 }
