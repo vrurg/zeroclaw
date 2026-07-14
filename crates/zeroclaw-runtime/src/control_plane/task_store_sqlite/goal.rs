@@ -646,6 +646,24 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(true)
     }
 
+    async fn cancel_approval_paused_goal_task(
+        &self,
+        task_id: &str,
+        expected_pause: GoalPauseState,
+    ) -> Result<bool> {
+        let reason = pause_reason_to_db(expected_pause.reason)?;
+        let blockers = blockers_to_db(&expected_pause.blockers)?;
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE tasks SET status = 'cancelled', finished_at = ?2
+              WHERE id = ?1 AND kind = 'goal' AND status = 'paused'
+                AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = ?1
+                    AND pause_reason = ?3 AND pause_description IS ?4 AND blockers_json = ?5)",
+            params![task_id, chrono::Utc::now().to_rfc3339(), reason, expected_pause.description, blockers],
+        ).context("conditionally cancel approval-paused goal")?;
+        Ok(changed == 1)
+    }
+
     async fn resume_approval_paused_goal_task(
         &self,
         task_id: &str,

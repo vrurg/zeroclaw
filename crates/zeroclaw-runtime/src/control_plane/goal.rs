@@ -1775,7 +1775,7 @@ pub async fn apply_current_goal_approval_denial(
         GoalApprovalDenyBehavior::Cancel => {
             if !cp
                 .goal_store
-                .cancel_paused_goal_task(&task_id, "tool approval denied".into())
+                .cancel_approval_paused_goal_task(&task_id, expected_pause)
                 .await
                 .context("cancel goal after explicit tool approval denial")?
             {

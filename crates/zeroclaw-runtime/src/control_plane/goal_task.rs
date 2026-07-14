@@ -412,6 +412,13 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// expected human-gate state was superseded and callers must fail closed.
     async fn cancel_paused_goal_task(&self, task_id: &str, error: String) -> anyhow::Result<bool>;
 
+    /// Cancel only if the durable pause still matches the approval gate.
+    async fn cancel_approval_paused_goal_task(
+        &self,
+        task_id: &str,
+        expected_pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
+
     /// Resume only if the durable pause still exactly matches the approval gate.
     async fn resume_approval_paused_goal_task(
         &self,

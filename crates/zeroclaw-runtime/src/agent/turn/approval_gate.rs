@@ -665,7 +665,7 @@ mod tests {
         .await;
 
         assert_eq!(requests, 1);
-        assert_eq!(status, control_plane::TaskStatus::Paused);
+        assert_eq!(status, control_plane::TaskStatus::Cancelled);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
     }
 
@@ -678,7 +678,7 @@ mod tests {
         .await;
 
         assert_eq!(requests, 1);
-        assert_eq!(status, control_plane::TaskStatus::Paused);
+        assert_eq!(status, control_plane::TaskStatus::Cancelled);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
     }
 
@@ -793,6 +793,18 @@ mod tests {
     async fn explicit_goal_denial_resume_cancels_when_later_operator_pause_wins() {
         let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
             zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume,
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny), true,
+        ).await;
+        assert_eq!(requests, 1);
+        assert!(observed_paused);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
+        assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
+    }
+
+    #[tokio::test]
+    async fn explicit_goal_denial_cancel_keeps_later_operator_pause() {
+        let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
+            zeroclaw_config::schema::GoalApprovalDenyBehavior::Cancel,
             Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny), true,
         ).await;
         assert_eq!(requests, 1);
