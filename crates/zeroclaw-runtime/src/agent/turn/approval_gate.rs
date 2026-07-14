@@ -7,7 +7,7 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::control_plane::{
-    GoalBlockerKind, apply_current_goal_approval_denial, current_goal_admission_context,
+    GoalBlockerKind, GoalPauseState, apply_current_goal_approval_denial, current_goal_admission_context,
     current_goal_approval_deny_behavior, current_goal_turn_evaluation_requested,
     pause_current_goal_for_human_gate, resume_current_goal_after_human_gate,
 };
@@ -39,7 +39,7 @@ pub(crate) async fn gate_tool_approval(
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
         .unwrap_or(ApprovalRequirement::NotRequired);
-    let mut goal_paused_for_approval = false;
+    let mut approval_pause = None;
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
@@ -51,10 +51,10 @@ pub(crate) async fn gate_tool_approval(
         // request. A missing controller/store must fail closed rather than
         // allowing an approval response to race tool execution.
         if current_goal_turn_evaluation_requested() {
-            if !pause_goal_for_tool_approval(ctx, &request).await {
+            let Some(pause) = pause_goal_for_tool_approval(ctx, &request).await else {
                 return ApprovalGateOutcome::Cancel;
-            }
-            goal_paused_for_approval = true;
+            };
+            approval_pause = Some(pause);
         }
         // Interactive CLI: prompt the operator.
         // Non-interactive (channels): try the channel's inline
@@ -161,7 +161,7 @@ pub(crate) async fn gate_tool_approval(
             if current_goal_turn_evaluation_requested() {
                 if explicit_deny {
                     let behavior = current_goal_approval_deny_behavior();
-                    if apply_explicit_goal_approval_denial(ctx, &request).await
+                    if apply_explicit_goal_approval_denial(ctx, &request, approval_pause.as_ref()).await
                         && behavior == zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume
                     {
                         return ApprovalGateOutcome::Deny(outcome);
@@ -174,7 +174,7 @@ pub(crate) async fn gate_tool_approval(
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
-            if !resume_goal_after_approval_if_needed(goal_paused_for_approval).await {
+            if !resume_goal_after_approval_if_needed(approval_pause.as_ref()).await {
                 return ApprovalGateOutcome::Cancel;
             }
             if let Some(tx) = ctx.on_delta {
@@ -216,7 +216,7 @@ pub(crate) async fn gate_tool_approval(
         }
     }
 
-    if !resume_goal_after_approval_if_needed(goal_paused_for_approval).await {
+    if !resume_goal_after_approval_if_needed(approval_pause.as_ref()).await {
         return ApprovalGateOutcome::Cancel;
     }
 
@@ -225,15 +225,15 @@ pub(crate) async fn gate_tool_approval(
     }
 }
 
-async fn resume_goal_after_approval_if_needed(goal_paused_for_approval: bool) -> bool {
-    if !goal_paused_for_approval {
+async fn resume_goal_after_approval_if_needed(expected_pause: Option<&GoalPauseState>) -> bool {
+    let Some(expected_pause) = expected_pause else {
         return true;
-    }
+    };
     let Some(goal_ctx) = current_goal_admission_context() else {
         return false;
     };
     matches!(
-        resume_current_goal_after_human_gate(&goal_ctx).await,
+        resume_current_goal_after_human_gate(&goal_ctx, expected_pause.clone()).await,
         Ok(true)
     )
 }
@@ -241,6 +241,7 @@ async fn resume_goal_after_approval_if_needed(goal_paused_for_approval: bool) ->
 async fn apply_explicit_goal_approval_denial(
     _ctx: &TurnCtx<'_>,
     request: &ApprovalRequest,
+    expected_pause: Option<&GoalPauseState>,
 ) -> bool {
     let Some(goal_ctx) = current_goal_admission_context() else {
         return false;
@@ -259,6 +260,10 @@ async fn apply_explicit_goal_approval_denial(
         GoalBlockerKind::NeedsUserInput,
         message,
         Some(payload),
+        match expected_pause {
+            Some(pause) => pause.clone(),
+            None => return false,
+        },
     )
     .await
     {
@@ -277,12 +282,12 @@ async fn apply_explicit_goal_approval_denial(
     }
 }
 
-async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalRequest) -> bool {
+async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalRequest) -> Option<GoalPauseState> {
     if !current_goal_turn_evaluation_requested() {
-        return false;
+        return None;
     }
     let Some(goal_ctx) = current_goal_admission_context() else {
-        return false;
+        return None;
     };
     let arguments_summary = crate::approval::summarize_args(&request.arguments);
     let message = crate::i18n::get_required_cli_string_with_args(
@@ -293,6 +298,15 @@ async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalReque
         "tool": request.tool_name.as_str(),
         "arguments_summary": arguments_summary,
     });
+    let expected_pause = GoalPauseState {
+        reason: crate::control_plane::GoalPauseReason::NeedsUserInput,
+        description: Some(message.clone()),
+        blockers: vec![crate::control_plane::GoalBlocker {
+            kind: GoalBlockerKind::NeedsUserInput,
+            message: message.clone(),
+            payload: Some(payload.clone()),
+        }],
+    };
     match pause_current_goal_for_human_gate(
         &goal_ctx,
         None,
@@ -313,9 +327,9 @@ async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalReque
                     ))
                     .await;
             }
-            true
+            Some(expected_pause)
         }
-        Ok(None) => false,
+        Ok(None) => None,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -328,7 +342,7 @@ async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalReque
                     })),
                 "goal approval blocker pause failed"
             );
-            false
+            None
         }
     }
 }

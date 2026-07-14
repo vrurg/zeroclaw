@@ -1745,6 +1745,7 @@ pub async fn apply_current_goal_approval_denial(
     kind: GoalBlockerKind,
     message: String,
     payload: Option<serde_json::Value>,
+    expected_pause: GoalPauseState,
 ) -> Result<Option<GoalAdmission>> {
     let Some(cp) = control_plane() else {
         return Ok(None);
@@ -1789,10 +1790,15 @@ pub async fn apply_current_goal_approval_denial(
             }))
         }
         GoalApprovalDenyBehavior::Resume => {
-            cp.goal_store
-                .resume_goal_task(&task_id, std::process::id(), &cp.boot_id, None)
+            if !cp.goal_store
+                .resume_approval_paused_goal_task(
+                    &task_id, expected_pause, std::process::id(), &cp.boot_id,
+                )
                 .await
-                .context("restore goal after explicit tool approval denial")?;
+                .context("restore goal after explicit tool approval denial")?
+            {
+                bail!("approval pause changed before explicit denial resume");
+            }
             Ok(Some(GoalAdmission {
                 task_id: Some(task_id),
                 status: TaskStatus::Running,
@@ -1806,7 +1812,10 @@ pub async fn apply_current_goal_approval_denial(
 
 /// Restore the exact paused goal after a synchronous approval. Failure is
 /// surfaced to the tool loop so execution cannot outrun the durable state.
-pub async fn resume_current_goal_after_human_gate(ctx: &GoalAdmissionContext) -> Result<bool> {
+pub async fn resume_current_goal_after_human_gate(
+    ctx: &GoalAdmissionContext,
+    expected_pause: GoalPauseState,
+) -> Result<bool> {
     let Some(cp) = control_plane() else {
         return Ok(false);
     };
@@ -1815,14 +1824,13 @@ pub async fn resume_current_goal_after_human_gate(ctx: &GoalAdmissionContext) ->
     else {
         return Ok(false);
     };
-    if resolved.status() != TaskStatus::Paused {
-        return Ok(false);
-    }
-    cp.goal_store
-        .resume_goal_task(resolved.task_id(), std::process::id(), &cp.boot_id, None)
+    let resumed = cp.goal_store
+        .resume_approval_paused_goal_task(
+            resolved.task_id(), expected_pause, std::process::id(), &cp.boot_id,
+        )
         .await
         .context("restore goal after tool approval")?;
-    Ok(true)
+    Ok(resumed)
 }
 
 pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<bool> {
