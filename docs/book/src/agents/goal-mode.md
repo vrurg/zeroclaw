@@ -57,6 +57,7 @@ allowed_command_surfaces = ["channel"]
 allowed_channel_types = ["discord", "irc", "matrix", "mattermost", "slack", "telegram"]
 token_budget = 50000
 cost_budget_usd = 2.50
+approval_deny_behavior = "pause"
 
 [goal.verifier]
 # Verifier checks are enabled by default. Set this to false only when an
@@ -88,6 +89,15 @@ final goal status. Direct `/goal` command replies are still sent as command
 responses. Controller-owned goal messages use a short status marker and include
 budget usage when accounting is available, so they are distinguishable from
 ordinary model-generated replies.
+
+`approval_deny_behavior` is a live global controller policy evaluated only when
+an operator explicitly denies a synchronous tool-approval request. Its default,
+`pause`, leaves the exact goal paused. `cancel` transitions the exact goal to
+cancelled. `resume` restores the exact goal to `running` and returns the
+existing failed tool result to the active model loop; it creates no duplicate
+receipt and does not retry the tool. Missing approval responses, approval-route
+delivery failures, timeouts, and restarts are fail-closed pauses, not
+deny-policy events.
 
 `restart_recovery` controls prior-boot goals that were `running` when the
 daemon stopped. The default, `last_state`, keeps the goal running and re-owns

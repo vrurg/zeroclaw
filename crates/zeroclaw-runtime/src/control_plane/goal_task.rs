@@ -396,6 +396,22 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// together.
     async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> anyhow::Result<()>;
 
+    /// Atomically pause a goal only while its canonical lifecycle is running.
+    ///
+    /// Recovery uses this compare-and-set operation after asynchronous
+    /// executor classification. A `false` result means another lifecycle
+    /// transition already won; implementations must leave the existing goal
+    /// pause payload untouched in that case.
+    async fn pause_running_goal_task(
+        &self,
+        task_id: &str,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
+
+    /// Atomically cancel exactly a paused goal. A false result means the
+    /// expected human-gate state was superseded and callers must fail closed.
+    async fn cancel_paused_goal_task(&self, task_id: &str, error: String) -> anyhow::Result<bool>;
+
     /// Atomically complete exactly a running goal. A false result means a
     /// concurrent pause/cancel/terminal transition won the lifecycle race.
     async fn complete_running_goal_task(

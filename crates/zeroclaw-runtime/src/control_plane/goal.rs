@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroclaw_commands::{BuiltinCommandId, CommandSurface, command_by_name};
 use zeroclaw_config::cost::CostTracker;
-use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, GoalApprovalDenyBehavior};
 
 use crate::agent::cost::{is_goal_accounting_failure, is_goal_accounting_pricing_failure};
 
@@ -43,6 +43,7 @@ pub struct GoalRuntimeScope {
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
     turn_evaluation_requested: Option<Arc<AtomicBool>>,
+    approval_deny_behavior: Option<Arc<dyn Fn() -> GoalApprovalDenyBehavior + Send + Sync>>,
 }
 
 impl GoalRuntimeScope {
@@ -55,7 +56,18 @@ impl GoalRuntimeScope {
             admission_context,
             state_update_sink,
             turn_evaluation_requested,
+            approval_deny_behavior: None,
         }
+    }
+
+    /// Resolve approval-denial policy from the owning runtime config at the
+    /// decision boundary. The resolver is intentionally not durable goal state.
+    pub fn with_approval_deny_behavior_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> GoalApprovalDenyBehavior + Send + Sync>,
+    ) -> Self {
+        self.approval_deny_behavior = Some(resolver);
+        self
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
@@ -860,6 +872,19 @@ pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
         .flatten()
 }
 
+pub fn current_goal_approval_deny_behavior() -> GoalApprovalDenyBehavior {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            scope
+                .approval_deny_behavior
+                .as_ref()
+                .map(|resolver| resolver())
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 fn current_goal_runtime_scope() -> GoalRuntimeScope {
     GOAL_RUNTIME_SCOPE
         .try_with(Clone::clone)
@@ -1520,6 +1545,21 @@ pub async fn evaluate_goal_turn_with_verifier(
         publish_goal_verifier_started(resolved.task_id(), &budget);
     }
 
+    // An explicit blocker is a candidate-state fact, not a verifier preference.
+    // Check it before every completion path so a permissive verifier (or the
+    // verifier-disabled fallback) cannot terminally complete blocked work.
+    if let Some(pause) = declared_blocker_pause(candidate_summary) {
+        let task_id = resolved.task_id().to_string();
+        let admission =
+            pause_goal_for_known_blocker(cp.goal_store.as_ref(), resolved, Some(config), pause)
+                .await?;
+        publish_goal_state_update(&admission);
+        return Ok(Some(GoalTurnEvaluation::Paused {
+            task_id,
+            message: admission.message,
+        }));
+    }
+
     let verifier_decision = if verifier_enabled {
         verifier
             .verify(GoalVerificationRequest {
@@ -1574,20 +1614,6 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Ok(GoalVerifierDecision::Continue { notes }) => {
             let task_id = resolved.task_id().to_string();
-            if let Some(pause) = declared_blocker_pause(candidate_summary) {
-                let admission = pause_goal_for_known_blocker(
-                    cp.goal_store.as_ref(),
-                    resolved,
-                    Some(config),
-                    pause,
-                )
-                .await?;
-                publish_goal_state_update(&admission);
-                return Ok(Some(GoalTurnEvaluation::Paused {
-                    task_id,
-                    message: admission.message,
-                }));
-            }
             let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id);
             if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
                 let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
@@ -1707,6 +1733,96 @@ pub async fn pause_current_goal_for_human_gate(
     .await?;
     publish_goal_state_update(&admission);
     Ok(Some(admission))
+}
+
+/// Commit the configured durable transition for an explicit tool-approval
+/// denial. Callers must use this only after a human actually answered `No`;
+/// unavailable routes, timeouts, and malformed delivery remain fail-closed
+/// pauses and must not consume this policy.
+pub async fn apply_current_goal_approval_denial(
+    ctx: &GoalAdmissionContext,
+    behavior: GoalApprovalDenyBehavior,
+    kind: GoalBlockerKind,
+    message: String,
+    payload: Option<serde_json::Value>,
+) -> Result<Option<GoalAdmission>> {
+    let Some(cp) = control_plane() else {
+        return Ok(None);
+    };
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
+        return Ok(None);
+    };
+    if resolved.status() != TaskStatus::Paused {
+        bail!("explicit tool approval denial requires an already-paused goal");
+    }
+    let task_id = resolved.task_id().to_string();
+    let admission = GoalAdmission {
+        task_id: Some(task_id.clone()),
+        status: TaskStatus::Paused,
+        message,
+        continuation_reason: None,
+        continue_goal: false,
+    };
+    let _ = (kind, payload); // The pre-prompt pause owns the durable blocker.
+    if behavior == GoalApprovalDenyBehavior::Pause {
+        return Ok(Some(admission));
+    }
+    match behavior {
+        GoalApprovalDenyBehavior::Pause => Ok(Some(admission)),
+        GoalApprovalDenyBehavior::Cancel => {
+            if !cp
+                .goal_store
+                .cancel_paused_goal_task(&task_id, "tool approval denied".into())
+                .await
+                .context("cancel goal after explicit tool approval denial")?
+            {
+                bail!("paused goal changed before explicit tool approval cancellation");
+            }
+            Ok(Some(GoalAdmission {
+                task_id: Some(task_id),
+                status: TaskStatus::Cancelled,
+                message: admission.message,
+                continuation_reason: None,
+                continue_goal: false,
+            }))
+        }
+        GoalApprovalDenyBehavior::Resume => {
+            cp.goal_store
+                .resume_goal_task(&task_id, std::process::id(), &cp.boot_id, None)
+                .await
+                .context("restore goal after explicit tool approval denial")?;
+            Ok(Some(GoalAdmission {
+                task_id: Some(task_id),
+                status: TaskStatus::Running,
+                message: admission.message,
+                continuation_reason: None,
+                continue_goal: false,
+            }))
+        }
+    }
+}
+
+/// Restore the exact paused goal after a synchronous approval. Failure is
+/// surfaced to the tool loop so execution cannot outrun the durable state.
+pub async fn resume_current_goal_after_human_gate(ctx: &GoalAdmissionContext) -> Result<bool> {
+    let Some(cp) = control_plane() else {
+        return Ok(false);
+    };
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
+        return Ok(false);
+    };
+    if resolved.status() != TaskStatus::Paused {
+        return Ok(false);
+    }
+    cp.goal_store
+        .resume_goal_task(resolved.task_id(), std::process::id(), &cp.boot_id, None)
+        .await
+        .context("restore goal after tool approval")?;
+    Ok(true)
 }
 
 pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<bool> {
@@ -2980,7 +3096,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_help_admission_honors_disabled_config() {
+    async fn goal_help_remains_available_when_goal_admission_is_disabled() {
         let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
         let command = GoalCommand {
             action: GoalCommandAction::Help,
@@ -3676,6 +3792,72 @@ mod tests {
         assert_eq!(
             goal.blockers[0].payload.as_ref().unwrap()["source"],
             "agent_declared_blocker"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_despite_verifier_complete() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = true;
+        let verifier = StubGoalVerifier {
+            decision: GoalVerifierDecision::Complete {
+                notes: "COMPLETE\nstub missed the blocker".into(),
+            },
+        };
+
+        let outcome = evaluate_goal_turn_with_verifier(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused { task_id, .. }) = outcome else {
+            panic!("explicit candidate blocker must override verifier completion");
+        };
+        assert_eq!(task_id, fixture.task_id);
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_when_verifier_disabled() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = false;
+
+        let outcome = evaluate_goal_turn(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+        )
+        .await
+        .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused { task_id, .. }) = outcome else {
+            panic!("explicit candidate blocker must override disabled-verifier completion");
+        };
+        assert_eq!(task_id, fixture.task_id);
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
         );
     }
 
