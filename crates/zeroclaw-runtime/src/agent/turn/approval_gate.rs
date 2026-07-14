@@ -665,7 +665,7 @@ mod tests {
         .await;
 
         assert_eq!(requests, 1);
-        assert_eq!(status, control_plane::TaskStatus::Cancelled);
+        assert_eq!(status, control_plane::TaskStatus::Paused);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
     }
 
