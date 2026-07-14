@@ -34,16 +34,26 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
-async fn active_goal_task_id_from_cost_context() -> Option<String> {
-    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String>> {
+    let Some(ctx) = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
-        .flatten()?;
+        .flatten()
+    else {
+        return Ok(None);
+    };
     if !ctx.goal_attribution_enabled() {
-        return None;
+        return Ok(None);
     }
-    let agent_alias = ctx.agent_alias.as_deref()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    if let Some(task_id) = ctx.goal_task_id {
+        return Ok(Some(task_id));
+    }
+    let Some(agent_alias) = ctx.agent_alias.as_deref() else {
+        return Ok(None);
+    };
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Err(anyhow::anyhow!("goal control plane unavailable"));
+    };
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -52,16 +62,22 @@ async fn active_goal_task_id_from_cost_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
 }
 
-async fn active_goal_task_id_from_runtime_context() -> Option<String> {
+async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
     if !crate::control_plane::current_goal_turn_evaluation_requested() {
-        return None;
+        return Ok(None);
     }
-    let ctx = crate::control_plane::current_goal_admission_context()?;
-    let control_plane = crate::control_plane::control_plane()?;
+    let Some(ctx) = crate::control_plane::current_goal_admission_context() else {
+        return Ok(None);
+    };
+    if let Some(task_id) = ctx.goal_task_id {
+        return Ok(Some(task_id));
+    }
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Err(anyhow::anyhow!("goal control plane unavailable"));
+    };
     control_plane
         .goal_store
         .latest_active_goal_id_for_context(
@@ -70,13 +86,12 @@ async fn active_goal_task_id_from_runtime_context() -> Option<String> {
             ctx.principal_id.as_deref(),
         )
         .await
-        .ok()
-        .flatten()
+        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
 }
 
-async fn active_goal_task_id_for_delegate_policy() -> Option<String> {
-    if let Some(task_id) = active_goal_task_id_from_runtime_context().await {
-        return Some(task_id);
+async fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context().await? {
+        return Ok(Some(task_id));
     }
     active_goal_task_id_from_cost_context().await
 }
@@ -324,6 +339,22 @@ impl DelegateTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
+
+    /// Bounded delegates inherit caller tools but may not mutate durable goal
+    /// lifecycle or open a goal human gate on behalf of their parent.
+    fn is_goal_control_tool(name: &str) -> bool {
+        matches!(
+            name,
+            crate::tools::GoalStartTool::NAME
+                | crate::tools::GoalObjectiveTool::NAME
+                | crate::tools::GoalResumeTool::NAME
+                | "goal_pause"
+                | "goal_cancel"
+                | "goal_status"
+                | "ask_user"
+                | "escalate_to_human"
+        )
+    }
     const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
@@ -1393,7 +1424,9 @@ impl Tool for DelegateTool {
 
         if background {
             if crate::control_plane::current_goal_start_tool_batch_requested()
-                || active_goal_task_id_for_delegate_policy().await.is_some()
+                || active_goal_task_id_for_delegate_policy()
+                    .await
+                    .map_or(true, |task| task.is_some())
             {
                 return Ok(ToolResult {
                     success: false,
@@ -1600,7 +1633,17 @@ impl DelegateTool {
         match result {
             Ok(response) => {
                 if let Some(usage) = &response.usage {
-                    record_tool_loop_cost_usage(&provider_type, &model, usage).await;
+                    if let Err(error) =
+                        record_tool_loop_cost_usage(&provider_type, &model, usage).await
+                    {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Agent '{agent_name}' accounting failed: {error:#}"
+                            )),
+                        });
+                    }
                 }
                 let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
@@ -2929,6 +2972,7 @@ impl DelegateTool {
                 parent_tools
                     .iter()
                     .filter(|tool| tool.name() != Self::NAME)
+                    .filter(|tool| !Self::is_goal_control_tool(tool.name()))
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .map(|tool| {
@@ -3156,6 +3200,26 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_delegates_exclude_all_goal_control_tools() {
+        for name in [
+            "goal_start",
+            "goal_objective",
+            "goal_resume",
+            "goal_pause",
+            "goal_cancel",
+            "goal_status",
+            "ask_user",
+            "escalate_to_human",
+        ] {
+            assert!(
+                DelegateTool::is_goal_control_tool(name),
+                "{name} must not reach bounded delegates"
+            );
+        }
+        assert!(!DelegateTool::is_goal_control_tool("shell"));
+    }
     use crate::platform::RuntimeAdapter;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
@@ -4529,7 +4593,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            active, None,
+            active.unwrap(),
+            None,
             "ordinary channel turns may carry trusted goal admission facts, \
              but must not become active goal work until the controller marks the turn"
         );
@@ -9127,6 +9192,37 @@ command = "echo hi"
         }
     }
 
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            self.0
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: self.0.into(),
+                error: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NamedTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            self.0
+        }
+    }
+
     struct MockShellTool;
     #[async_trait]
     impl Tool for MockShellTool {
@@ -9258,6 +9354,65 @@ command = "echo hi"
             "parent policy should have filtered out file_write, but got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_does_not_expose_goal_controls_or_human_gates_to_the_child() {
+        let control_tools = [
+            "goal_start",
+            "goal_objective",
+            "goal_resume",
+            "goal_pause",
+            "goal_cancel",
+            "goal_status",
+            "ask_user",
+            "escalate_to_human",
+        ];
+        let parent_security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(
+                control_tools
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("file_read"))
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            ..SecurityPolicy::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, parent_security)
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(
+                control_tools
+                    .iter()
+                    .map(|name| Arc::new(NamedTool(name)) as Arc<dyn Tool>)
+                    .chain(std::iter::once(Arc::new(FileReadTool) as Arc<dyn Tool>))
+                    .collect(),
+            )));
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &agentic_agent_config(),
+                "openrouter",
+                "model-test",
+                &ToolListInspector {
+                    forbidden_names: control_tools
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
+                },
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "bounded child saw a forbidden tool: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("done"));
     }
 
     #[tokio::test]
