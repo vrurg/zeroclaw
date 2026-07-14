@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroclaw_commands::{BuiltinCommandId, CommandSurface, command_by_name};
 use zeroclaw_config::cost::CostTracker;
-use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, GoalApprovalDenyBehavior};
+
+use crate::agent::cost::{is_goal_accounting_failure, is_goal_accounting_pricing_failure};
 
 use super::global::control_plane;
 use super::goal_task::{
@@ -41,6 +43,7 @@ pub struct GoalRuntimeScope {
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
     turn_evaluation_requested: Option<Arc<AtomicBool>>,
+    approval_deny_behavior: Option<Arc<dyn Fn() -> GoalApprovalDenyBehavior + Send + Sync>>,
 }
 
 impl GoalRuntimeScope {
@@ -53,7 +56,18 @@ impl GoalRuntimeScope {
             admission_context,
             state_update_sink,
             turn_evaluation_requested,
+            approval_deny_behavior: None,
         }
+    }
+
+    /// Resolve approval-denial policy from the owning runtime config at the
+    /// decision boundary. The resolver is intentionally not durable goal state.
+    pub fn with_approval_deny_behavior_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> GoalApprovalDenyBehavior + Send + Sync>,
+    ) -> Self {
+        self.approval_deny_behavior = Some(resolver);
+        self
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
@@ -388,11 +402,18 @@ fn goal_budget_unavailable_pause(
     if !goal_has_effective_budget(goal) {
         return None;
     }
+    Some(goal_accounting_unavailable_pause(goal, cause))
+}
+
+fn goal_accounting_unavailable_pause(
+    goal: &GoalTaskRecord,
+    cause: GoalBudgetUnavailableCause,
+) -> GoalPauseState {
     let budget = goal_budget_summary(goal, None);
     let usage_unavailable = matches!(cause, GoalBudgetUnavailableCause::UsageUnavailable);
     let cost_pricing_unavailable =
         matches!(cause, GoalBudgetUnavailableCause::CostPricingUnavailable);
-    Some(GoalPauseState {
+    GoalPauseState {
         reason: GoalPauseReason::BudgetUnavailable,
         description: Some(msg(
             "goal-command-budget-unavailable-description",
@@ -411,7 +432,7 @@ fn goal_budget_unavailable_pause(
                 "cost_limit_usd": goal.effective_cost_limit_usd,
             })),
         }],
-    })
+    }
 }
 
 fn goal_budget_gate_pause(
@@ -696,6 +717,16 @@ pub struct GoalAdmissionContext {
     pub originator_route: Option<String>,
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
+    /// Exact goal task bound by trusted controller plumbing, when available.
+    /// Legacy sanitizer-derived route for this same trusted inbound message.
+    ///
+    /// This is transient compatibility evidence, not a second durable route.
+    /// It is accepted only with the exact task id, matching durable continuation
+    /// context, and matching legacy principal, then immediately rebound.
+    pub legacy_originator_route: Option<String>,
+    /// Legacy sanitizer-derived principal for this same trusted inbound message.
+    /// See [`Self::legacy_originator_route`] for the compatibility boundary.
+    pub legacy_principal_id: Option<String>,
     /// Exact durable goal task bound to this controller turn, when one exists.
     ///
     /// Channel ingress leaves this unset for operator messages. The goal
@@ -779,6 +810,8 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            legacy_originator_route: None,
+            legacy_principal_id: None,
             goal_task_id: None,
             continuation_context: None,
         }
@@ -809,6 +842,17 @@ impl GoalAdmissionContext {
     }
 
     #[must_use]
+    pub fn with_legacy_identity(
+        mut self,
+        originator_route: Option<String>,
+        principal_id: Option<String>,
+    ) -> Self {
+        self.legacy_originator_route = originator_route;
+        self.legacy_principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
     pub fn with_goal_task_id(mut self, goal_task_id: Option<String>) -> Self {
         self.goal_task_id = goal_task_id;
         self
@@ -826,6 +870,19 @@ pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
         .try_with(|scope| scope.admission_context.clone())
         .ok()
         .flatten()
+}
+
+pub fn current_goal_approval_deny_behavior() -> GoalApprovalDenyBehavior {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            scope
+                .approval_deny_behavior
+                .as_ref()
+                .map(|resolver| resolver())
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 fn current_goal_runtime_scope() -> GoalRuntimeScope {
@@ -1310,7 +1367,9 @@ pub async fn admit_goal_command(
     config: &Config,
     agent_config: Option<&AliasedAgentConfig>,
 ) -> Result<GoalAdmission> {
-    ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    if command.action == GoalCommandAction::Start {
+        ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
+    }
     if command.action == GoalCommandAction::Help {
         return Ok(GoalAdmission {
             task_id: None,
@@ -1319,6 +1378,17 @@ pub async fn admit_goal_command(
             continuation_reason: None,
             continue_goal: false,
         });
+    }
+    if !config.goal.enabled
+        && !matches!(
+            command.action,
+            GoalCommandAction::Status
+                | GoalCommandAction::Pause
+                | GoalCommandAction::Resume
+                | GoalCommandAction::Cancel
+        )
+    {
+        bail!("{}", msg("goal-command-error-disabled", &[]));
     }
     let cp = control_plane()
         .with_context(|| msg("goal-command-error-control-plane-unavailable", &[]))?;
@@ -1477,6 +1547,21 @@ pub async fn evaluate_goal_turn_with_verifier(
         publish_goal_verifier_started(resolved.task_id(), &budget);
     }
 
+    // An explicit blocker is a candidate-state fact, not a verifier preference.
+    // Check it before every completion path so a permissive verifier (or the
+    // verifier-disabled fallback) cannot terminally complete blocked work.
+    if let Some(pause) = declared_blocker_pause(candidate_summary) {
+        let task_id = resolved.task_id().to_string();
+        let admission =
+            pause_goal_for_known_blocker(cp.goal_store.as_ref(), resolved, Some(config), pause)
+                .await?;
+        publish_goal_state_update(&admission);
+        return Ok(Some(GoalTurnEvaluation::Paused {
+            task_id,
+            message: admission.message,
+        }));
+    }
+
     let verifier_decision = if verifier_enabled {
         verifier
             .verify(GoalVerificationRequest {
@@ -1497,17 +1582,16 @@ pub async fn evaluate_goal_turn_with_verifier(
     match verifier_decision {
         Ok(GoalVerifierDecision::Complete { notes: _ }) => {
             let task_id = resolved.task_id().to_string();
-            cp.store
-                .update_status(
-                    &task_id,
-                    TaskStatus::Completed,
-                    Some(candidate_summary.to_string()),
-                    None,
-                )
+            if !cp
+                .goal_store
+                .complete_running_goal_task(&task_id, candidate_summary.to_string())
                 .await
                 .with_context(|| {
                     msg("goal-command-error-update-failed", &[("task_id", &task_id)])
-                })?;
+                })?
+            {
+                return Ok(None);
+            }
             let final_usage = if verifier_enabled {
                 goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id)
             } else {
@@ -1532,20 +1616,6 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Ok(GoalVerifierDecision::Continue { notes }) => {
             let task_id = resolved.task_id().to_string();
-            if let Some(pause) = declared_blocker_pause(candidate_summary) {
-                let admission = pause_goal_for_known_blocker(
-                    cp.goal_store.as_ref(),
-                    resolved,
-                    Some(config),
-                    pause,
-                )
-                .await?;
-                publish_goal_state_update(&admission);
-                return Ok(Some(GoalTurnEvaluation::Paused {
-                    task_id,
-                    message: admission.message,
-                }));
-            }
             let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id);
             if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
                 let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
@@ -1594,6 +1664,27 @@ pub async fn evaluate_goal_turn_with_verifier(
         }
         Err(error) => {
             let task_id = resolved.task_id().to_string();
+            if is_goal_accounting_failure(&error) {
+                let cause = if is_goal_accounting_pricing_failure(&error) {
+                    GoalBudgetUnavailableCause::CostPricingUnavailable
+                } else {
+                    GoalBudgetUnavailableCause::UsageUnavailable
+                };
+                let pause = goal_accounting_unavailable_pause(resolved.goal(), cause);
+                let budget = goal_budget_summary(resolved.goal(), None);
+                let admission = pause_goal_for_resolved_task_with_budget(
+                    cp.goal_store.as_ref(),
+                    resolved,
+                    pause,
+                    budget,
+                )
+                .await?;
+                publish_goal_state_update(&admission);
+                return Ok(Some(GoalTurnEvaluation::Paused {
+                    task_id,
+                    message: admission.message,
+                }));
+            }
             let admission = pause_goal_for_known_blocker(
                 cp.goal_store.as_ref(),
                 resolved,
@@ -1646,6 +1737,104 @@ pub async fn pause_current_goal_for_human_gate(
     .await?;
     publish_goal_state_update(&admission);
     Ok(Some(admission))
+}
+
+/// Commit the configured durable transition for an explicit tool-approval
+/// denial. Callers must use this only after a human actually answered `No`;
+/// unavailable routes, timeouts, and malformed delivery remain fail-closed
+/// pauses and must not consume this policy.
+pub async fn apply_current_goal_approval_denial(
+    ctx: &GoalAdmissionContext,
+    behavior: GoalApprovalDenyBehavior,
+    kind: GoalBlockerKind,
+    message: String,
+    payload: Option<serde_json::Value>,
+    expected_pause: GoalPauseState,
+) -> Result<Option<GoalAdmission>> {
+    let Some(cp) = control_plane() else {
+        return Ok(None);
+    };
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
+        return Ok(None);
+    };
+    if resolved.status() != TaskStatus::Paused {
+        bail!("explicit tool approval denial requires an already-paused goal");
+    }
+    let task_id = resolved.task_id().to_string();
+    let admission = GoalAdmission {
+        task_id: Some(task_id.clone()),
+        status: TaskStatus::Paused,
+        message,
+        continuation_reason: None,
+        continue_goal: false,
+    };
+    let _ = (kind, payload); // The pre-prompt pause owns the durable blocker.
+    if behavior == GoalApprovalDenyBehavior::Pause {
+        return Ok(Some(admission));
+    }
+    match behavior {
+        GoalApprovalDenyBehavior::Pause => Ok(Some(admission)),
+        GoalApprovalDenyBehavior::Cancel => {
+            if !cp
+                .goal_store
+                .cancel_approval_paused_goal_task(&task_id, expected_pause)
+                .await
+                .context("cancel goal after explicit tool approval denial")?
+            {
+                bail!("paused goal changed before explicit tool approval cancellation");
+            }
+            Ok(Some(GoalAdmission {
+                task_id: Some(task_id),
+                status: TaskStatus::Cancelled,
+                message: admission.message,
+                continuation_reason: None,
+                continue_goal: false,
+            }))
+        }
+        GoalApprovalDenyBehavior::Resume => {
+            if !cp.goal_store
+                .resume_approval_paused_goal_task(
+                    &task_id, expected_pause, std::process::id(), &cp.boot_id,
+                )
+                .await
+                .context("restore goal after explicit tool approval denial")?
+            {
+                bail!("approval pause changed before explicit denial resume");
+            }
+            Ok(Some(GoalAdmission {
+                task_id: Some(task_id),
+                status: TaskStatus::Running,
+                message: admission.message,
+                continuation_reason: None,
+                continue_goal: false,
+            }))
+        }
+    }
+}
+
+/// Restore the exact paused goal after a synchronous approval. Failure is
+/// surfaced to the tool loop so execution cannot outrun the durable state.
+pub async fn resume_current_goal_after_human_gate(
+    ctx: &GoalAdmissionContext,
+    expected_pause: GoalPauseState,
+) -> Result<bool> {
+    let Some(cp) = control_plane() else {
+        return Ok(false);
+    };
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
+        return Ok(false);
+    };
+    let resumed = cp.goal_store
+        .resume_approval_paused_goal_task(
+            resolved.task_id(), expected_pause, std::process::id(), &cp.boot_id,
+        )
+        .await
+        .context("restore goal after tool approval")?;
+    Ok(resumed)
 }
 
 pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<bool> {
@@ -2233,9 +2422,8 @@ async fn resolve_goal_task(
             .get(task_id)
             .await
             .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
-            .with_context(|| msg("goal-command-error-not-found", &[("task_id", task_id)]))?;
-        ensure_goal_visible(&task, ctx)?;
-        return Ok(task);
+            .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
+        return ensure_goal_visible_or_rebind(goal_store, task, ctx).await;
     }
 
     let task = goal_store
@@ -2299,6 +2487,74 @@ async fn resolved_goal_for_context(
     };
     ensure_goal_visible(&task, ctx)?;
     load_goal_extension(goal_store, task).await.map(Some)
+}
+
+async fn ensure_goal_visible_or_rebind(
+    goal_store: &dyn GoalTaskRegistry,
+    task: TaskRecord,
+    ctx: &GoalAdmissionContext,
+) -> Result<TaskRecord> {
+    if ensure_goal_visible(&task, ctx).is_ok() {
+        return Ok(task);
+    }
+
+    let (
+        Some(current_route),
+        Some(current_principal),
+        Some(legacy_route),
+        Some(legacy_principal),
+        Some(expected_context),
+        Some(stored_route),
+        Some(stored_principal),
+    ) = (
+        ctx.originator_route.as_deref(),
+        ctx.principal_id.as_deref(),
+        ctx.legacy_originator_route.as_deref(),
+        ctx.legacy_principal_id.as_deref(),
+        ctx.continuation_context.as_ref(),
+        task.originator_route.as_deref(),
+        task.principal_id.as_deref(),
+    )
+    else {
+        ensure_goal_visible(&task, ctx)?;
+        return Ok(task);
+    };
+
+    if task.kind != TaskKind::Goal
+        || task.agent != ctx.agent_alias
+        || stored_route != legacy_route
+        || stored_principal != legacy_principal
+        || goal_store
+            .get_continuation_context(&task.id)
+            .await?
+            .as_ref()
+            != Some(expected_context)
+    {
+        ensure_goal_visible(&task, ctx)?;
+        return Ok(task);
+    }
+
+    let rebound = goal_store
+        .rebind_goal_task_identity(
+            &task.id,
+            stored_route,
+            stored_principal,
+            current_route,
+            current_principal,
+        )
+        .await
+        .with_context(|| msg("goal-command-error-lookup-failed", &[]))?;
+    if !rebound {
+        bail!(
+            "{}",
+            msg("goal-command-error-wrong-route", &[("task_id", &task.id)])
+        );
+    }
+
+    let mut rebound_task = task;
+    rebound_task.originator_route = Some(current_route.to_string());
+    rebound_task.principal_id = Some(current_principal.to_string());
+    Ok(rebound_task)
 }
 
 fn is_active_goal_context_conflict(error: &anyhow::Error) -> bool {
@@ -2858,7 +3114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_help_admission_honors_disabled_config() {
+    async fn goal_help_remains_available_when_goal_admission_is_disabled() {
         let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
         let command = GoalCommand {
             action: GoalCommandAction::Help,
@@ -2883,10 +3139,11 @@ mod tests {
         assert!(!help.continue_goal);
 
         config.goal.enabled = false;
-        let err = admit_goal_command(ctx, command, &config, None)
+        let disabled_help = admit_goal_command(ctx, command, &config, None)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("goal.enabled = false"));
+            .unwrap();
+        assert_eq!(disabled_help.message, msg("goal-command-help", &[]));
+        assert!(!disabled_help.continue_goal);
     }
 
     #[tokio::test]
@@ -2943,6 +3200,86 @@ mod tests {
                 .contains("operator pause: maintenance window")
         );
         assert!(!status.message.contains("human escalation"));
+    }
+
+    #[tokio::test]
+    async fn disabled_goal_mode_rejects_start_but_retains_exact_lifecycle_controls() {
+        let _ = global_test_stores();
+        let config = test_config();
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let ctx = GoalAdmissionContext::new(agent)
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
+            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
+        let started = admit_goal_command(
+            ctx.clone(),
+            parse_goal_command("/goal start retain controls").unwrap(),
+            &config,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.unwrap();
+        let mut disabled = config.clone();
+        disabled.goal.enabled = false;
+        assert!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command("/goal start rejected").unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal status {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal pause {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx.clone(),
+                parse_goal_command(&format!("/goal resume {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            admit_goal_command(
+                ctx,
+                parse_goal_command(&format!("/goal cancel {task_id}")).unwrap(),
+                &disabled,
+                None,
+            )
+            .await
+            .unwrap()
+            .status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[test]
@@ -3609,6 +3946,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_despite_verifier_complete() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = true;
+        let verifier = StubGoalVerifier {
+            decision: GoalVerifierDecision::Complete {
+                notes: "COMPLETE\nstub missed the blocker".into(),
+            },
+        };
+
+        let outcome = evaluate_goal_turn_with_verifier(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused { task_id, .. }) = outcome else {
+            panic!("explicit candidate blocker must override verifier completion");
+        };
+        assert_eq!(task_id, fixture.task_id);
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_when_verifier_disabled() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = false;
+
+        let outcome = evaluate_goal_turn(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+        )
+        .await
+        .unwrap();
+
+        let Some(GoalTurnEvaluation::Paused { task_id, .. }) = outcome else {
+            panic!("explicit candidate blocker must override disabled-verifier completion");
+        };
+        assert_eq!(task_id, fixture.task_id);
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
     async fn evaluate_goal_turn_pauses_when_verifier_errors() {
         let fixture = create_running_goal_fixture("ship it").await;
         let mut config = test_config();
@@ -4130,6 +4533,165 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not visible to this principal"));
+    }
+
+    #[tokio::test]
+    async fn exact_legacy_goal_context_rebinds_before_pause_and_cancel() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "legacy-route-goal";
+        let continuation = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: Some("main".into()),
+            reply_target: "!room:example".into(),
+            sender: "@alice:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        let legacy_route = "matrix_main__room_example";
+        let legacy_principal = "matrix_main__alice_example";
+        let canonical_route =
+            "6:matrix|4:main|14:@alice:example|13:!room:example|0:|12:reply_target";
+        let canonical_principal = "6:matrix|4:main|14:@alice:example";
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.into(),
+                    kind: TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: TaskStatus::Running,
+                    owner_pid: 1,
+                    owner_boot_id: "boot-a".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(legacy_route.into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(legacy_principal.into()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.into(),
+                    objective: "retain existing goal controls after upgrade".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                Some(continuation.clone()),
+            )
+            .await
+            .unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some(canonical_route.into()))
+            .with_principal_id(Some(canonical_principal.into()))
+            .with_legacy_identity(Some(legacy_route.into()), Some(legacy_principal.into()))
+            .with_goal_task_id(Some(task_id.into()))
+            .with_continuation_context(Some(continuation));
+
+        let paused = pause_goal_for_blocker(
+            &store,
+            &store,
+            &ctx,
+            Some(task_id.into()),
+            Some(&test_config()),
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("operator requested pause".into()),
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+
+        let rebound = store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(rebound.originator_route.as_deref(), Some(canonical_route));
+        assert_eq!(rebound.principal_id.as_deref(), Some(canonical_principal));
+
+        let cancelled = cancel_goal(
+            &store,
+            &store,
+            &ctx,
+            Some(task_id.into()),
+            Some(&test_config()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_never_rebinds_without_exact_durable_continuation() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "legacy-route-mismatch";
+        let stored_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "!room:example".into(),
+            sender: "@alice:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.into(),
+                    kind: TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: TaskStatus::Running,
+                    owner_pid: 1,
+                    owner_boot_id: "boot-a".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("legacy-route".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("legacy-principal".into()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.into(),
+                    objective: "must not be claimed by a collision".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                Some(stored_context),
+            )
+            .await
+            .unwrap();
+        let mismatched_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "!room:example".into(),
+            sender: "@mallory:example".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
+        let ctx = GoalAdmissionContext::new("agent-a")
+            .with_originator_route(Some("canonical-route".into()))
+            .with_principal_id(Some("canonical-principal".into()))
+            .with_legacy_identity(Some("legacy-route".into()), Some("legacy-principal".into()))
+            .with_goal_task_id(Some(task_id.into()))
+            .with_continuation_context(Some(mismatched_context));
+
+        let err = status_goal(&store, &store, &ctx, Some(task_id.into()), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not visible from this route"));
+        let unchanged = store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.originator_route.as_deref(), Some("legacy-route"));
+        assert_eq!(unchanged.principal_id.as_deref(), Some("legacy-principal"));
     }
 
     #[tokio::test]

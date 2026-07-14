@@ -27,6 +27,28 @@ use zeroclaw_api::channel::{
 pub(crate) struct AskUserApprovalBridge {
     handles: PerToolChannelHandle,
     route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
+    goal_binding: GoalApprovalBindingState,
+}
+
+/// Immutable approval delivery identity resolved from the exact durable goal
+/// task plus its continuation row. It never falls back to mutable inbound turn
+/// routing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GoalApprovalBinding {
+    pub(crate) channel: String,
+    pub(crate) recipient: String,
+    /// Copied only after Agent validated it against the exact durable task and
+    /// the scoped goal context. The bridge has no mutable inbound principal
+    /// fallback; an empty attestation is fail-closed.
+    pub(crate) principal: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) enum GoalApprovalBindingState {
+    #[default]
+    NotGoal,
+    Bound(GoalApprovalBinding),
+    DenyOnly,
 }
 
 impl AskUserApprovalBridge {
@@ -34,7 +56,16 @@ impl AskUserApprovalBridge {
         handles: PerToolChannelHandle,
         route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     ) -> Self {
-        Self { handles, route }
+        Self {
+            handles,
+            route,
+            goal_binding: GoalApprovalBindingState::NotGoal,
+        }
+    }
+
+    pub(crate) fn with_goal_binding(mut self, binding: GoalApprovalBindingState) -> Self {
+        self.goal_binding = binding;
+        self
     }
 }
 
@@ -80,6 +111,33 @@ impl Channel for AskUserApprovalBridge {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        if matches!(self.goal_binding, GoalApprovalBindingState::DenyOnly) {
+            return Ok(None);
+        }
+        if let GoalApprovalBindingState::Bound(binding) = &self.goal_binding {
+            if binding.principal.trim().is_empty() {
+                return Ok(None);
+            }
+            let handle = self
+                .handles
+                .read()
+                .iter()
+                .find(|(name, _)| name.as_str() == binding.channel.as_str())
+                .map(|(name, channel)| (name.clone(), Arc::clone(channel)));
+            let Some((name, channel)) = handle else {
+                return Ok(None);
+            };
+            return channel
+                .request_approval(&binding.recipient, request)
+                .await
+                .map(|response| {
+                    response.map(|response| AttributedApprovalResponse {
+                        response,
+                        decided_by: Some(name),
+                    })
+                });
+        }
+
         // ── Cross-channel HITL route ───────────────────────────────────────
         // A configured `ApprovalRoute` redirects this gate to a DISTINCT
         // approver channel rather than the originating fan-out. The approver is
@@ -231,6 +289,87 @@ mod tests {
 
         assert_eq!(decided.response, ChannelApprovalResponse::Approve);
         assert_eq!(decided.decided_by.as_deref(), Some("acp"));
+    }
+
+    #[tokio::test]
+    async fn goal_binding_uses_only_its_durable_channel_and_recipient() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                approver("inbound", "inbound-recipient"),
+                approver("durable", "durable-recipient"),
+            ]),
+            None,
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable".into(),
+            recipient: "durable-recipient".into(),
+            principal: "principal-a".into(),
+        }));
+        let decided = bridge
+            .request_approval_attributed("inbound-recipient", &req())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decided.decided_by.as_deref(), Some("durable"));
+    }
+
+    #[tokio::test]
+    async fn deny_only_goal_binding_never_calls_inbound_handles() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![approver("inbound", "inbound-recipient")]),
+            None,
+        )
+        .with_goal_binding(GoalApprovalBindingState::DenyOnly);
+        assert!(
+            bridge
+                .request_approval_attributed("inbound-recipient", &req())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_durable_goal_channel_fails_closed_without_inbound_fallback() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![approver("inbound", "inbound-recipient")]),
+            None,
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable-but-unregistered".into(),
+            recipient: "durable-recipient".into(),
+            principal: "principal-a".into(),
+        }));
+
+        assert!(
+            bridge
+                .request_approval_attributed("inbound-recipient", &req())
+                .await
+                .unwrap()
+                .is_none(),
+            "a missing durable channel must not fall back to the inbound route"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_goal_principal_attestation_never_delivers() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![approver("durable", "durable-recipient")]),
+            None,
+        )
+        .with_goal_binding(GoalApprovalBindingState::Bound(GoalApprovalBinding {
+            channel: "durable".into(),
+            recipient: "durable-recipient".into(),
+            principal: String::new(),
+        }));
+
+        assert!(
+            bridge
+                .request_approval_attributed("durable-recipient", &req())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
