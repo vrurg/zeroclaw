@@ -622,6 +622,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(true)
     }
 
+    async fn cancel_paused_goal_task(&self, task_id: &str, error: String) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start conditional goal cancellation transaction")?;
+        ensure_goal_task_row(&tx, task_id)?;
+        let updated = tx
+            .execute(
+                "UPDATE tasks SET status = 'cancelled', finished_at = ?2
+             WHERE id = ?1 AND kind = 'goal' AND status = 'paused'",
+                params![task_id, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("conditionally cancel paused goal task")?;
+        if updated == 0 {
+            tx.commit()
+                .context("commit unchanged conditional goal cancellation transaction")?;
+            return Ok(false);
+        }
+        let _ = error; // terminal reason belongs to the task store's status payload API.
+        tx.commit()
+            .context("commit conditional goal cancellation transaction")?;
+        Ok(true)
+    }
+
     async fn complete_running_goal_task(&self, task_id: &str, output: String) -> Result<bool> {
         let conn = self.conn.lock();
         ensure_goal_task_row(&conn, task_id)?;

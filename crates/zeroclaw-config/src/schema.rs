@@ -3818,6 +3818,11 @@ pub struct GoalConfig {
     /// budget update time. Actual spend is derived from cost ledger rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_budget_usd: Option<f64>,
+    /// Durable-goal policy for an explicit denial of a synchronous tool
+    /// approval request. This controller policy is resolved from the live
+    /// config at the approval boundary; it is never copied into a goal row.
+    #[serde(default)]
+    pub approval_deny_behavior: GoalApprovalDenyBehavior,
     /// Completion verifier policy. The verifier is global goal-mode policy,
     /// not an agent-local provider copy.
     #[serde(default)]
@@ -3835,9 +3840,27 @@ impl Default for GoalConfig {
             allowed_channel_types: default_goal_allowed_channel_types(),
             token_budget: None,
             cost_budget_usd: None,
+            approval_deny_behavior: GoalApprovalDenyBehavior::default(),
             verifier: GoalVerifierConfig::default(),
         }
     }
+}
+
+/// Action taken after an operator explicitly denies a goal tool request.
+///
+/// `Pause` is the safe default. `Resume` deliberately returns the existing
+/// failed tool result to the active loop after restoring the exact task to
+/// `Running`; it must not synthesize a second receipt or continuation.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum GoalApprovalDenyBehavior {
+    #[default]
+    Pause,
+    Cancel,
+    Resume,
 }
 
 /// How prior-boot running goals recover after daemon restart.

@@ -408,6 +408,10 @@ pub trait GoalTaskRegistry: Send + Sync {
         pause: GoalPauseState,
     ) -> anyhow::Result<bool>;
 
+    /// Atomically cancel exactly a paused goal. A false result means the
+    /// expected human-gate state was superseded and callers must fail closed.
+    async fn cancel_paused_goal_task(&self, task_id: &str, error: String) -> anyhow::Result<bool>;
+
     /// Atomically complete exactly a running goal. A false result means a
     /// concurrent pause/cancel/terminal transition won the lifecycle race.
     async fn complete_running_goal_task(
