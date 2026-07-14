@@ -1794,9 +1794,13 @@ pub async fn apply_current_goal_approval_denial(
             }))
         }
         GoalApprovalDenyBehavior::Resume => {
-            if !cp.goal_store
+            if !cp
+                .goal_store
                 .resume_approval_paused_goal_task(
-                    &task_id, expected_pause, std::process::id(), &cp.boot_id,
+                    &task_id,
+                    expected_pause,
+                    std::process::id(),
+                    &cp.boot_id,
                 )
                 .await
                 .context("restore goal after explicit tool approval denial")?
@@ -1828,9 +1832,13 @@ pub async fn resume_current_goal_after_human_gate(
     else {
         return Ok(false);
     };
-    let resumed = cp.goal_store
+    let resumed = cp
+        .goal_store
         .resume_approval_paused_goal_task(
-            resolved.task_id(), expected_pause, std::process::id(), &cp.boot_id,
+            resolved.task_id(),
+            expected_pause,
+            std::process::id(),
+            &cp.boot_id,
         )
         .await
         .context("restore goal after tool approval")?;

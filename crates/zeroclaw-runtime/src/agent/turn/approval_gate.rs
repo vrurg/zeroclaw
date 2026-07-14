@@ -7,9 +7,10 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::control_plane::{
-    GoalBlockerKind, GoalPauseState, apply_current_goal_approval_denial, current_goal_admission_context,
-    current_goal_approval_deny_behavior, current_goal_turn_evaluation_requested,
-    pause_current_goal_for_human_gate, resume_current_goal_after_human_gate,
+    GoalBlockerKind, GoalPauseState, apply_current_goal_approval_denial,
+    current_goal_admission_context, current_goal_approval_deny_behavior,
+    current_goal_turn_evaluation_requested, pause_current_goal_for_human_gate,
+    resume_current_goal_after_human_gate,
 };
 use std::time::Duration;
 
@@ -161,7 +162,8 @@ pub(crate) async fn gate_tool_approval(
             if current_goal_turn_evaluation_requested() {
                 if explicit_deny {
                     let behavior = current_goal_approval_deny_behavior();
-                    if apply_explicit_goal_approval_denial(ctx, &request, approval_pause.as_ref()).await
+                    if apply_explicit_goal_approval_denial(ctx, &request, approval_pause.as_ref())
+                        .await
                         && behavior == zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume
                     {
                         return ApprovalGateOutcome::Deny(outcome);
@@ -282,7 +284,10 @@ async fn apply_explicit_goal_approval_denial(
     }
 }
 
-async fn pause_goal_for_tool_approval(ctx: &TurnCtx<'_>, request: &ApprovalRequest) -> Option<GoalPauseState> {
+async fn pause_goal_for_tool_approval(
+    ctx: &TurnCtx<'_>,
+    request: &ApprovalRequest,
+) -> Option<GoalPauseState> {
     if !current_goal_turn_evaluation_requested() {
         return None;
     }
@@ -413,14 +418,20 @@ mod tests {
                 );
             }
             if let Some((store, task_id)) = &self.resume_race {
-                let _ = store.pause_goal_task(task_id, control_plane::GoalPauseState {
-                    reason: control_plane::GoalPauseReason::OperatorPaused,
-                    description: Some("later operator pause".into()),
-                    blockers: vec![control_plane::GoalBlocker {
-                        kind: control_plane::GoalBlockerKind::NeedsUserInput,
-                        message: "later blocker".into(), payload: None,
-                    }],
-                }).await;
+                let _ = store
+                    .pause_goal_task(
+                        task_id,
+                        control_plane::GoalPauseState {
+                            reason: control_plane::GoalPauseReason::OperatorPaused,
+                            description: Some("later operator pause".into()),
+                            blockers: vec![control_plane::GoalBlocker {
+                                kind: control_plane::GoalBlockerKind::NeedsUserInput,
+                                message: "later blocker".into(),
+                                payload: None,
+                            }],
+                        },
+                    )
+                    .await;
             }
             Ok(self.response.clone())
         }
@@ -781,8 +792,10 @@ mod tests {
     async fn goal_approval_success_cancels_when_later_operator_pause_wins() {
         let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
             zeroclaw_config::schema::GoalApprovalDenyBehavior::Pause,
-            Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve), true,
-        ).await;
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+            true,
+        )
+        .await;
         assert_eq!(requests, 1);
         assert!(observed_paused);
         assert_eq!(status, control_plane::TaskStatus::Paused);
@@ -793,8 +806,10 @@ mod tests {
     async fn explicit_goal_denial_resume_cancels_when_later_operator_pause_wins() {
         let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
             zeroclaw_config::schema::GoalApprovalDenyBehavior::Resume,
-            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny), true,
-        ).await;
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+            true,
+        )
+        .await;
         assert_eq!(requests, 1);
         assert!(observed_paused);
         assert_eq!(status, control_plane::TaskStatus::Paused);
@@ -805,8 +820,10 @@ mod tests {
     async fn explicit_goal_denial_cancel_keeps_later_operator_pause() {
         let (outcome, status, requests, observed_paused) = goal_approval_outcome_with_resume_race(
             zeroclaw_config::schema::GoalApprovalDenyBehavior::Cancel,
-            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny), true,
-        ).await;
+            Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+            true,
+        )
+        .await;
         assert_eq!(requests, 1);
         assert!(observed_paused);
         assert_eq!(status, control_plane::TaskStatus::Paused);

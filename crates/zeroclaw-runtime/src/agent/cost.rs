@@ -541,13 +541,15 @@ pub async fn record_tool_loop_cost_usage(
                     anyhow::anyhow!("goal accounting attribution is missing agent identity")
                 })?;
                 Some(
-                active_goal_task_id_for_context(
-                    agent_alias,
-                    ctx.originator_route.as_deref(),
-                    ctx.principal_id.as_deref(),
-                )
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("goal accounting attribution has no active task"))?,
+                    active_goal_task_id_for_context(
+                        agent_alias,
+                        ctx.originator_route.as_deref(),
+                        ctx.principal_id.as_deref(),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("goal accounting attribution has no active task")
+                    })?,
                 )
             }
         } else {
