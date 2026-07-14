@@ -3493,6 +3493,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_despite_verifier_complete() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = true;
+        let verifier = StubGoalVerifier {
+            decision: GoalVerifierDecision::Complete {
+                notes: "COMPLETE\nstub missed the blocker".into(),
+            },
+        };
+
+        let outcome = evaluate_goal_turn_with_verifier(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Some(GoalTurnEvaluation::Paused { .. })));
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused,
+            "an explicit blocker must win over a verifier COMPLETE verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_goal_turn_pauses_declared_blocker_when_verifier_is_disabled() {
+        let fixture = create_running_goal_fixture("ship it").await;
+        let mut config = test_config();
+        config.goal.verifier.enabled = false;
+
+        let outcome = evaluate_goal_turn(
+            &fixture.ctx,
+            &config,
+            "BLOCKED: I cannot continue without operator approval.",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Some(GoalTurnEvaluation::Paused { .. })));
+        assert_eq!(
+            fixture
+                .store
+                .get(&fixture.task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused,
+            "a disabled verifier must not bypass an explicit blocker pause"
+        );
+    }
+
+    #[tokio::test]
     async fn evaluate_goal_turn_pauses_when_verifier_errors() {
         let fixture = create_running_goal_fixture("ship it").await;
         let mut config = test_config();

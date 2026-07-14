@@ -298,8 +298,54 @@ mod tests {
     use crate::observability::noop::NoopObserver;
     use crate::{control_plane, i18n};
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
     use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+
+    struct ApprovingChannel {
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ApprovingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "approval-gate-test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approval-gate-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
 
     fn ensure_test_control_plane() -> (
         Arc<dyn control_plane::TaskRegistry>,
@@ -484,6 +530,72 @@ mod tests {
         let goal = goal_store.get_goal_task(&task_id).await.unwrap().unwrap();
         assert!(goal.pause_reason.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approved_channel_goal_tool_records_decision_and_resumes_before_execution() {
+        let (store, goal_store, task_id, goal_ctx) = create_running_goal().await;
+        let observer = NoopObserver;
+        let approval = crate::approval::ApprovalManager::for_non_interactive_backchannel(
+            &RiskProfileConfig::default(),
+        );
+        let pacing = PacingConfig::default();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel {
+            requests: Arc::clone(&requests),
+        };
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "approval-gate-test",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&channel),
+            turn_id: "turn-test",
+            agent_alias: Some("agent"),
+        };
+        let marker = Arc::new(AtomicBool::new(true));
+        let runtime_scope =
+            control_plane::GoalRuntimeScope::new(Some(goal_ctx), None, Some(Arc::clone(&marker)));
+
+        let outcome = control_plane::scope_goal_runtime(
+            runtime_scope,
+            gate_tool_approval(
+                &ctx,
+                "file_write",
+                &serde_json::json!({"path": "/tmp/goal.txt", "content": "x"}),
+                0,
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ApprovalGateOutcome::Proceed { approved: true }
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            control_plane::TaskStatus::Running,
+            "approved execution must resume the exact paused goal"
+        );
+        let goal = goal_store.get_goal_task(&task_id).await.unwrap().unwrap();
+        assert!(goal.pause_reason.is_none());
+        assert!(goal.blockers.is_empty());
+        let audit = approval.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].tool_name, "file_write");
+        assert_eq!(audit[0].decision, ApprovalResponse::Yes);
+        assert_eq!(audit[0].channel, "approval-gate-test");
     }
 
     #[tokio::test]
