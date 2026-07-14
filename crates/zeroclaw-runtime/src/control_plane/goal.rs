@@ -625,6 +625,8 @@ pub struct GoalAdmissionContext {
     pub originator_route: Option<String>,
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
+    /// Exact goal task bound by trusted controller plumbing, when available.
+    pub goal_task_id: Option<String>,
     /// Minimal durable channel context needed to resume after restart.
     ///
     /// The context itself is persisted by the goal store. The rest of this
@@ -701,6 +703,7 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             continuation_context: None,
         }
     }
@@ -726,6 +729,12 @@ impl GoalAdmissionContext {
     #[must_use]
     pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
         self.principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_goal_task_id(mut self, goal_task_id: Option<String>) -> Self {
+        self.goal_task_id = goal_task_id;
         self
     }
 

@@ -197,6 +197,8 @@ pub struct ToolLoopCostTrackingContext {
     /// Trusted principal for this runtime turn. Used only to resolve the active
     /// goal from canonical `TaskRecord` fields at record time.
     pub principal_id: Option<String>,
+    /// Exact durable goal task when trusted controller plumbing resolved one.
+    pub goal_task_id: Option<String>,
     /// Whether this scoped turn is allowed to resolve a goal for ledger
     /// attribution.
     ///
@@ -218,6 +220,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -236,6 +239,7 @@ impl ToolLoopCostTrackingContext {
             agent_alias: None,
             originator_route: None,
             principal_id: None,
+            goal_task_id: None,
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -272,7 +276,8 @@ impl ToolLoopCostTrackingContext {
         self,
         ctx: &crate::control_plane::GoalAdmissionContext,
     ) -> Self {
-        let context = self.with_goal_admission_filters(ctx);
+        let mut context = self.with_goal_admission_filters(ctx);
+        context.goal_task_id = ctx.goal_task_id.clone();
         context.enable_goal_attribution();
         context
     }
