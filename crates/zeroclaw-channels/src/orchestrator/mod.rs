@@ -22536,6 +22536,8 @@ api_key = "test-key"
     ) -> String {
         ensure_test_control_plane().await;
         let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        // Persist the same collision-safe route the dispatcher resolves for
+        // control commands; a sanitized history key is only legacy evidence.
         let route = goal_trusted_route(msg);
         let principal = goal_principal_id(msg);
         let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
