@@ -5053,14 +5053,18 @@ fn matrix_tool_argument_hint(
     );
     let mut keys: Vec<(&str, bool)> = match base {
         StreamToolArgumentBase::None => Vec::new(),
-        StreamToolArgumentBase::Safe => matrix_safe_display_tool(tool_role)
-            .then(|| matrix_safe_tool_arguments(tool).unwrap_or_default())
-            .unwrap_or_default()
-            .iter()
-            .copied()
-            .filter(|key| map.get(*key).is_some_and(matrix_is_scalar))
-            .map(|key| (key, false))
-            .collect(),
+        StreamToolArgumentBase::Safe => {
+            if matrix_safe_display_tool(tool_role) {
+                matrix_safe_tool_arguments(tool).unwrap_or_default()
+            } else {
+                &[]
+            }
+        }
+        .iter()
+        .copied()
+        .filter(|key| map.get(*key).is_some_and(matrix_is_scalar))
+        .map(|key| (key, false))
+        .collect(),
         StreamToolArgumentBase::All => map.keys().map(|key| (key.as_str(), true)).collect(),
     };
     for key in include {
