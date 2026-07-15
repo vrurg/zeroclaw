@@ -20161,7 +20161,9 @@ BTC is currently around $65,000 based on latest tool output."#
     ) -> String {
         ensure_test_control_plane().await;
         let task_id = format!("goal-{}", uuid::Uuid::new_v4());
-        let route = conversation_history_key(msg);
+        // Persist the same collision-safe route the dispatcher resolves for
+        // control commands; a sanitized history key is only legacy evidence.
+        let route = goal_trusted_route(msg);
         let principal = goal_principal_id(msg);
         let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
         control_plane
