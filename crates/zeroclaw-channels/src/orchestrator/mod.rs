@@ -2063,6 +2063,11 @@ async fn send_goal_controller_update(
         "channel-goal-state-update",
         &[("message", message)],
     );
+    let text = redact_channel_outbound_leaks(
+        &text,
+        &config.security.leak_detection,
+        outbound_content_format_for_channel(&msg.channel),
+    );
     if let Err(err) = channel
         .send(&SendMessage::new(text, &msg.reply_target).in_thread(followup_thread_id(msg)))
         .await
@@ -2081,6 +2086,8 @@ fn spawn_goal_state_update_task(
     channel: Arc<dyn Channel>,
     reply_target: String,
     thread_ts: Option<String>,
+    leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<
         zeroclaw_runtime::control_plane::GoalStateUpdateEvent,
     >,
@@ -2093,6 +2100,8 @@ fn spawn_goal_state_update_task(
         while let Some(event) = rx.recv().await {
             match event {
                 GoalStateUpdateEvent::VerifierStarted(text) if supports_drafts => {
+                    let text =
+                        redact_channel_outbound_leaks(&text, &leak_detection, content_format);
                     match channel
                         .send_draft(
                             &SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()),
@@ -2116,6 +2125,8 @@ fn spawn_goal_state_update_task(
                 }
                 GoalStateUpdateEvent::VerifierStarted(_) => {}
                 GoalStateUpdateEvent::Status(text) => {
+                    let text =
+                        redact_channel_outbound_leaks(&text, &leak_detection, content_format);
                     if let Some(draft_id) = verifier_draft_id.take() {
                         if let Err(err) = channel
                             .finalize_draft(&reply_target, &draft_id, &text, true)
@@ -6445,6 +6456,8 @@ async fn process_channel_message_body(
                     channel,
                     reply_target,
                     thread_ts,
+                    runtime_defaults.config.security.leak_detection.clone(),
+                    outbound_content_format_for_channel(&msg.channel),
                     goal_state_rx,
                 )),
             )
@@ -23389,6 +23402,7 @@ BTC is currently around $65,000 based on latest tool output."#
     async fn recovered_goal_status_update_sends_formatted_notice() {
         let mut config = zeroclaw_config::schema::Config::default();
         config.cost.enabled = false;
+        let credential = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let msg = zeroclaw_api::channel::ChannelMessage::new(
@@ -23401,7 +23415,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let goal = zeroclaw_runtime::control_plane::GoalTaskRecord {
             task_id: "goal-1".into(),
-            objective: "finish the restart smoke".into(),
+            objective: format!("finish the restart smoke with {credential}"),
             effective_token_limit: Some(12_000),
             effective_cost_limit_usd: None,
             pause_reason: None,
@@ -23418,7 +23432,38 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent[0].contains("recovered after service restart"));
         assert!(sent[0].contains("Objective:"));
         assert!(sent[0].contains("finish the restart smoke"));
+        assert!(!sent[0].contains(&credential));
+        assert!(sent[0].contains("[REDACTED"));
         assert!(sent[0].contains("Budget:"));
+    }
+
+    #[tokio::test]
+    async fn goal_controller_error_status_redacts_before_channel_delivery() {
+        let config = zeroclaw_config::schema::Config::default();
+        let credential = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let msg = zeroclaw_api::channel::ChannelMessage::new(
+            "goal-status-error",
+            "@zeroclaw",
+            "room",
+            "hidden goal status prompt",
+            "matrix",
+            1,
+        );
+
+        send_goal_controller_update(
+            &config,
+            Some(&channel),
+            &msg,
+            &format!("controller failure: {credential}"),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].contains(&credential));
+        assert!(sent[0].contains("[REDACTED"));
     }
 
     #[tokio::test]
@@ -23426,7 +23471,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel_impl = Arc::new(GoalDraftRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = spawn_goal_state_update_task(channel, "room".into(), Some("thread".into()), rx);
+        let task = spawn_goal_state_update_task(
+            channel,
+            "room".into(),
+            Some("thread".into()),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            rx,
+        );
 
         tx.send(
             zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(
@@ -23459,7 +23511,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = spawn_goal_state_update_task(channel, "room".into(), Some("thread".into()), rx);
+        let task = spawn_goal_state_update_task(
+            channel,
+            "room".into(),
+            Some("thread".into()),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            rx,
+        );
 
         tx.send(
             zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(
@@ -23479,11 +23538,60 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn goal_state_update_task_redacts_draft_and_status_before_delivery() {
+        let credential = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();
+        let channel_impl = Arc::new(GoalDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = spawn_goal_state_update_task(
+            channel,
+            "room".into(),
+            Some("thread".into()),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            rx,
+        );
+
+        tx.send(
+            zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(format!(
+                "checking {credential}"
+            )),
+        )
+        .unwrap();
+        tx.send(
+            zeroclaw_runtime::control_plane::GoalStateUpdateEvent::Status(format!(
+                "completed {credential}"
+            )),
+        )
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let drafts = channel_impl.draft_messages.lock().await;
+        assert_eq!(drafts.len(), 1);
+        assert!(!drafts[0].contains(&credential));
+        assert!(drafts[0].contains("[REDACTED"));
+        drop(drafts);
+
+        let finalized = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized.len(), 1);
+        assert!(!finalized[0].2.contains(&credential));
+        assert!(finalized[0].2.contains("[REDACTED"));
+    }
+
+    #[tokio::test]
     async fn goal_state_update_task_cancels_unfinished_verifier_draft() {
         let channel_impl = Arc::new(GoalDraftRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = spawn_goal_state_update_task(channel, "room".into(), Some("thread".into()), rx);
+        let task = spawn_goal_state_update_task(
+            channel,
+            "room".into(),
+            Some("thread".into()),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            rx,
+        );
 
         tx.send(
             zeroclaw_runtime::control_plane::GoalStateUpdateEvent::VerifierStarted(
