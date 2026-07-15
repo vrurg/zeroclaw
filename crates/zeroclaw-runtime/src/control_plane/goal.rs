@@ -2430,7 +2430,7 @@ async fn resolve_goal_task(
             .get(task_id)
             .await
             .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
-            .with_context(|| msg("goal-command-error-not-found", &[("task_id", &task_id)]))?;
+            .with_context(|| msg("goal-command-error-not-found", &[("task_id", task_id)]))?;
         return ensure_goal_visible_or_rebind(goal_store, task, ctx).await;
     }
 
