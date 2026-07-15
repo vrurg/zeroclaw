@@ -1632,18 +1632,15 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                if let Some(usage) = &response.usage {
-                    if let Err(error) =
+                if let Some(usage) = &response.usage
+                    && let Err(error) =
                         record_tool_loop_cost_usage(&provider_type, &model, usage).await
-                    {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!(
-                                "Agent '{agent_name}' accounting failed: {error:#}"
-                            )),
-                        });
-                    }
+                {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Agent '{agent_name}' accounting failed: {error:#}")),
+                    });
                 }
                 let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
