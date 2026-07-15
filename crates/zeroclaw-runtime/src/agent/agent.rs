@@ -2814,7 +2814,7 @@ impl Agent {
         let goal_approval_binding = match crate::control_plane::current_goal_admission_context() {
             None => crate::agent::approval_bridge::GoalApprovalBindingState::NotGoal,
             Some(goal_ctx) => {
-                let binding = match (
+                match (
                     goal_ctx.goal_task_id.as_deref(),
                     crate::control_plane::control_plane(),
                 ) {
@@ -2831,8 +2831,7 @@ impl Agent {
                         _ => crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly,
                     },
                     _ => crate::agent::approval_bridge::GoalApprovalBindingState::DenyOnly,
-                };
-                binding
+                }
             }
         };
 
