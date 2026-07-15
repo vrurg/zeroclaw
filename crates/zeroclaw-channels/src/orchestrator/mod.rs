@@ -2132,7 +2132,7 @@ fn should_consolidate_message_memory(
 fn goal_admission_context_for_message(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    history_key: &str,
+    _history_key: &str,
     goal_task_id: Option<&str>,
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
@@ -20316,12 +20316,14 @@ BTC is currently around $65,000 based on latest tool output."#
             heartbeat_at: None,
             depth: 0,
             parent_id: None,
+            // Recovery verifies the legacy route against the persisted
+            // continuation message before it tests the configured channel
+            // owner. Keep this fixture valid unless an individual test
+            // deliberately replaces its continuation context.
             originator_route: Some(conversation_history_key(&continuation_message)),
             delivered: false,
             idem_key: None,
-            // Restart recovery must exercise the persisted pre-upgrade pair,
-            // not merely a legacy route with a newly formatted principal.
-            principal_id: legacy_goal_principal_id(&continuation_message),
+            principal_id: goal_principal_id(&continuation_message),
             started_at: "2020-01-01T00:00:00Z".into(),
             finished_at: None,
         };
