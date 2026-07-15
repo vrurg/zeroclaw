@@ -52,7 +52,7 @@ async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String
         return Ok(None);
     };
     let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Err(anyhow::anyhow!("goal control plane unavailable"));
+        return Err(anyhow::Error::msg("goal control plane unavailable"));
     };
     control_plane
         .goal_store
@@ -62,7 +62,7 @@ async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String
             ctx.principal_id.as_deref(),
         )
         .await
-        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
+        .map_err(|error| anyhow::Error::msg(format!("goal state lookup failed: {error}")))
 }
 
 async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
@@ -76,7 +76,7 @@ async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<Str
         return Ok(Some(task_id));
     }
     let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Err(anyhow::anyhow!("goal control plane unavailable"));
+        return Err(anyhow::Error::msg("goal control plane unavailable"));
     };
     control_plane
         .goal_store
@@ -86,7 +86,7 @@ async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<Str
             ctx.principal_id.as_deref(),
         )
         .await
-        .map_err(|error| anyhow::anyhow!("goal state lookup failed: {error}"))
+        .map_err(|error| anyhow::Error::msg(format!("goal state lookup failed: {error}")))
 }
 
 async fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
