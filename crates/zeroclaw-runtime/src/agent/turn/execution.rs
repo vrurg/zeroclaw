@@ -35,7 +35,8 @@ impl ResolvedModelAccess<'_> {
         // Record spend immediately after the call (before any caller-side output
         // validation) so a downstream failure still counts the provider usage.
         if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage);
+            crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage)
+                .await?;
         }
         Ok(resp)
     }
