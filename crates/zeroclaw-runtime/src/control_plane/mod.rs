@@ -20,9 +20,9 @@ pub use goal::{
     current_goal_admission_context, current_goal_start_tool_batch_requested,
     current_goal_turn_evaluation_marker, current_goal_turn_evaluation_requested,
     evaluate_goal_turn, evaluate_goal_turn_with_verifier, goal_recovery_status_message,
-    mark_current_goal_turn_for_evaluation, pause_current_goal_for_human_gate,
-    scope_goal_admission_context, scope_goal_runtime, scope_goal_start_tool_batch,
-    scope_goal_state_updates, scope_goal_turn_evaluation_marker,
+    has_running_goal_for_context, mark_current_goal_turn_for_evaluation,
+    pause_current_goal_for_human_gate, scope_goal_admission_context, scope_goal_runtime,
+    scope_goal_start_tool_batch, scope_goal_state_updates, scope_goal_turn_evaluation_marker,
 };
 pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
 pub use goal_task::{
