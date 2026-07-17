@@ -110,7 +110,7 @@ impl Tool for GoalResumeTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(error.to_string()),
                 });
             }
