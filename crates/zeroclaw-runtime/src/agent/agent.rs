@@ -31,10 +31,8 @@ pub fn build_session_model_provider(
     build_session_model_provider_with_options(config, model_provider_ref, model_override, |_| {})
 }
 
-/// Build a session model provider while letting narrow callers override the
-/// alias-resolved runtime options before construction. The parser, model
-/// resolution, credential lookup, routing, and resilience wiring stay here as
-/// the single provider-construction path.
+/// Build a session provider while allowing a scoped caller to override its
+/// resolved runtime options before construction.
 pub fn build_session_model_provider_with_options(
     config: &Config,
     model_provider_ref: &str,
@@ -1372,6 +1370,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             None,
+            tools::GoalAdmissionToolPolicy::Omit,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
