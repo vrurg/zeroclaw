@@ -465,6 +465,36 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("query latest active goal id by context")
     }
 
+    async fn rebind_goal_task_identity(
+        &self,
+        task_id: &str,
+        expected_originator_route: &str,
+        expected_principal_id: &str,
+        originator_route: &str,
+        principal_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE tasks
+                    SET originator_route = ?4,
+                        principal_id = ?5
+                  WHERE id = ?1
+                    AND kind = 'goal'
+                    AND originator_route = ?2
+                    AND principal_id = ?3",
+                params![
+                    task_id,
+                    expected_originator_route,
+                    expected_principal_id,
+                    originator_route,
+                    principal_id,
+                ],
+            )
+            .context("compare-and-set rebind of goal task identity")?;
+        Ok(updated == 1)
+    }
+
     async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
         let conn = self.conn.lock();
         conn.query_row(

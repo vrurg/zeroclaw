@@ -953,6 +953,18 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+fn legacy_goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return None;
+    }
+    Some(sanitize_session_key(&format!(
+        "{}_{}",
+        channel_scope(msg),
+        sender
+    )))
+}
+
 /// Collision-safe principal identity for goal ownership. This is deliberately
 /// separate from the sanitizer-backed session key because task visibility is a
 /// security boundary, not a filesystem-name convenience.
@@ -1004,30 +1016,6 @@ fn goal_continuation_context_from_message(
         interruption_scope_id: msg.interruption_scope_id.clone(),
         conversation_scope: goal_task_conversation_scope(msg.conversation_scope),
     }
-}
-
-/// Collision-safe control-plane identity. Unlike session-key sanitization this
-/// preserves every raw trusted component with explicit boundaries.
-fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    canonical_goal_identity(&[
-        msg.channel.as_str(),
-        msg.channel_alias.as_deref().unwrap_or(""),
-        msg.sender.as_str(),
-        msg.reply_target.as_str(),
-        msg.thread_ts.as_deref().unwrap_or(""),
-        match msg.conversation_scope {
-            zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
-            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
-        },
-    ])
-}
-
-fn canonical_goal_identity(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| format!("{}:{part}", part.len()))
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 /// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
@@ -1936,7 +1924,36 @@ fn goal_admission_context_for_message(
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
         .with_originator_route(Some(goal_trusted_route(msg)))
         .with_principal_id(goal_principal_id(msg))
+        .with_legacy_identity(
+            Some(conversation_history_key(msg)),
+            legacy_goal_principal_id(msg),
+        )
+        .with_goal_task_id(None)
         .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
+}
+
+/// Collision-safe control-plane identity. Unlike session-key sanitization this
+/// preserves every raw trusted component with explicit boundaries.
+fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    canonical_goal_identity(&[
+        msg.channel.as_str(),
+        msg.channel_alias.as_deref().unwrap_or(""),
+        msg.sender.as_str(),
+        msg.reply_target.as_str(),
+        msg.thread_ts.as_deref().unwrap_or(""),
+        match msg.conversation_scope {
+            zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
+            zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+        },
+    ])
+}
+
+fn canonical_goal_identity(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| format!("{}:{part}", part.len()))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn goal_cost_tracking_context_for_turn(
@@ -16113,7 +16130,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 ..Default::default()
             };
-            let route = conversation_history_key(&msg);
+            let route = goal_trusted_route(&msg);
             let principal = goal_principal_id(&msg);
             let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
             control_plane
@@ -21098,6 +21115,21 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(key, conversation_history_key(&second));
         assert!(!key.contains("$first:server"));
         assert!(!key.contains("$second:server"));
+    }
+
+    #[test]
+    fn goal_trusted_route_does_not_collide_when_history_sanitization_does() {
+        let mut first =
+            zeroclaw_api::channel::ChannelMessage::new("one", "a:b", "room", "x", "matrix", 1);
+        first.reply_target = "r-c".into();
+        let mut second = first.clone();
+        second.sender = "a b".into();
+        assert_eq!(
+            conversation_history_key(&first),
+            conversation_history_key(&second)
+        );
+        assert_ne!(goal_trusted_route(&first), goal_trusted_route(&second));
+        assert_ne!(goal_principal_id(&first), goal_principal_id(&second));
     }
 
     #[test]

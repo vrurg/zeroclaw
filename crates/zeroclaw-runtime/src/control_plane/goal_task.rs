@@ -333,6 +333,21 @@ pub trait GoalTaskRegistry: Send + Sync {
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<String>>;
 
+    /// Compare-and-set a legacy goal's trusted identity to its canonical form.
+    ///
+    /// This is intentionally an exact-id operation. Callers must first prove
+    /// ownership from the persisted continuation context; the store only
+    /// provides the atomic identity rebind and never performs a broad legacy
+    /// route lookup.
+    async fn rebind_goal_task_identity(
+        &self,
+        task_id: &str,
+        expected_originator_route: &str,
+        expected_principal_id: &str,
+        originator_route: &str,
+        principal_id: &str,
+    ) -> anyhow::Result<bool>;
+
     /// Load the goal extension row for a canonical task id.
     ///
     /// Absence means either the task is not a goal or the extension row is
