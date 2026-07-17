@@ -431,6 +431,17 @@ impl CostTracker {
         Self::resolve_global(slot, config, workspace_dir)
     }
 
+    /// Return the process-global `CostTracker` only if it already exists for
+    /// the current workspace path.
+    ///
+    /// Unlike [`Self::get_or_init_global`], this never initializes storage and
+    /// never calls the legacy migration path. Read-only status surfaces use this
+    /// to render "budget unavailable" without creating or migrating the ledger.
+    pub fn existing_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get()?;
+        Self::existing_global_in_slot(slot, config, workspace_dir)
+    }
+
     fn resolve_global(
         slot: &RwLock<Option<Arc<CostTracker>>>,
         config: CostConfig,
@@ -486,6 +497,20 @@ impl CostTracker {
                 None
             }
         }
+    }
+
+    fn existing_global_in_slot(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let storage_path = workspace_dir.join("state").join("costs.jsonl");
+        let tracker = slot.read().as_ref().cloned()?;
+        if tracker.storage_path() != storage_path {
+            return None;
+        }
+        tracker.update_config(config);
+        tracker.is_enabled().then_some(tracker)
     }
 }
 
@@ -1510,6 +1535,32 @@ mod tests {
         assert!(
             resolve_storage_path(second_tmp.path()).unwrap().exists(),
             "usage after data-dir change must land in the new canonical ledger"
+        );
+    }
+
+    #[test]
+    fn existing_global_does_not_initialize_or_migrate_storage() {
+        let tmp = TempDir::new().unwrap();
+        let legacy_dir = tmp.path().join(".zeroclaw");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("costs.db");
+        fs::write(&legacy_path, b"legacy ledger").unwrap();
+        let canonical_path = tmp.path().join("state").join("costs.jsonl");
+        let slot = RwLock::new(None);
+
+        let existing = CostTracker::existing_global_in_slot(&slot, enabled_config(), tmp.path());
+
+        assert!(
+            existing.is_none(),
+            "read-only lookup must not construct a process-global tracker"
+        );
+        assert!(
+            legacy_path.exists(),
+            "read-only lookup must not migrate legacy storage"
+        );
+        assert!(
+            !canonical_path.exists(),
+            "read-only lookup must not create the canonical ledger path"
         );
     }
 

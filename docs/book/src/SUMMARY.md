@@ -45,6 +45,7 @@
     - [ADR-009: WIT/wasmtime plugin execution](./architecture/decisions/ADR-009-wit-wasmtime-plugin-execution.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
+  - [Memory and payload lifecycle](./architecture/memory-payload-lifecycle.md)
   - [Config lifecycle](./architecture/config-lifecycle.md)
   - [RPC socket transport](./architecture/rpc-socket.md)
 - [Reference](./reference/index.md)
