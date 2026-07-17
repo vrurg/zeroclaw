@@ -1880,7 +1880,7 @@ pub async fn has_running_goal_for_context(ctx: &GoalAdmissionContext) -> Result<
     let Some(cp) = control_plane() else {
         return Ok(false);
     };
-    latest_active_resolved_goal(cp.goal_store.as_ref(), ctx)
+    latest_active_resolved_goal(cp.store.as_ref(), cp.goal_store.as_ref(), ctx)
         .await
         .map(|goal| goal.is_some_and(|goal| goal.is_running()))
 }
@@ -2405,7 +2405,9 @@ pub async fn admit_goal_autonomous_turn(
     let Some(cp) = control_plane() else {
         return Ok(None);
     };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
+    let Some(resolved) =
+        latest_active_resolved_goal(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
         return Ok(None);
     };
     if !resolved.is_running() {
@@ -2501,28 +2503,19 @@ async fn resolved_goal_for_context(
     goal_store: &dyn GoalTaskRegistry,
     ctx: &GoalAdmissionContext,
 ) -> Result<Option<TaskGoal>> {
-    if ctx.goal_task_id.is_some() {
-        return resolve_goal(store, goal_store, ctx, None).await.map(Some);
-    }
-    let Some(task) = goal_store
-        .latest_active_goal_for_context(
-            &ctx.agent_alias,
-            ctx.originator_route.as_deref(),
-            ctx.principal_id.as_deref(),
-        )
-        .await
-        .with_context(|| msg("goal-command-error-active-goal-lookup-failed", &[]))?
-    else {
-        return Ok(None);
-    };
-    ensure_goal_visible(&task, ctx)?;
-    load_goal_extension(goal_store, task).await.map(Some)
+    latest_active_resolved_goal(store, goal_store, ctx).await
 }
 
 async fn latest_active_resolved_goal(
+    store: &dyn TaskRegistry,
     goal_store: &dyn GoalTaskRegistry,
     ctx: &GoalAdmissionContext,
 ) -> Result<Option<TaskGoal>> {
+    if let Some(task_id) = ctx.goal_task_id.clone() {
+        return resolve_goal(store, goal_store, ctx, Some(task_id))
+            .await
+            .map(Some);
+    }
     let Some(task) = goal_store
         .latest_active_goal_for_context(
             &ctx.agent_alias,
@@ -3606,6 +3599,83 @@ mod tests {
                 .unwrap()
                 .pause_reason,
             Some(GoalPauseReason::NeedsUserInput)
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_turn_gate_uses_the_exact_trusted_goal_binding() {
+        let (store, goal_store) = global_test_stores();
+        let completed_task_id = format!("goal-completed-{}", uuid::Uuid::new_v4());
+        let replacement_task_id = format!("goal-replacement-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+
+        // The recovered continuation carries this exact task id through
+        // trusted dispatcher plumbing. A newer active goal in the same route
+        // must not redirect its admission decision. The durable store permits
+        // only one active goal in a context, so the predecessor is terminal.
+        let ctx = GoalAdmissionContext::new(agent.clone())
+            .with_originator_route(Some(route.clone()))
+            .with_principal_id(Some(principal.clone()))
+            .with_goal_task_id(Some(completed_task_id.clone()));
+        for (task_id, status, pause_reason) in [
+            (completed_task_id.clone(), TaskStatus::Completed, None),
+            (replacement_task_id.clone(), TaskStatus::Running, None),
+        ] {
+            goal_store
+                .create_goal(
+                    TaskRecord {
+                        id: task_id.clone(),
+                        kind: TaskKind::Goal,
+                        agent: agent.clone(),
+                        status,
+                        owner_pid: std::process::id(),
+                        owner_boot_id: "test-boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some(route.clone()),
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: Some(principal.clone()),
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id,
+                        objective: "finish recovery".into(),
+                        effective_token_limit: None,
+                        effective_cost_limit_usd: None,
+                        pause_reason,
+                        pause_description: None,
+                        blockers: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let admission = admit_goal_autonomous_turn(&ctx, &test_config())
+            .await
+            .unwrap()
+            .expect("the exact completed task must stop the recovered turn");
+
+        assert_eq!(
+            admission.task_id.as_deref(),
+            Some(completed_task_id.as_str())
+        );
+        assert_eq!(admission.status, TaskStatus::Completed);
+        assert!(!admission.continue_goal);
+        assert_eq!(
+            store
+                .get(&replacement_task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
         );
     }
 
