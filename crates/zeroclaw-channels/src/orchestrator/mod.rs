@@ -1129,18 +1129,26 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
-fn goal_interrupt_command_content<'a>(
+fn goal_command_content_and_action<'a>(
     msg: &'a zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
-) -> Option<&'a str> {
+) -> Option<(&'a str, zeroclaw_runtime::control_plane::GoalCommandAction)> {
     let content =
         strip_leading_channel_command_address(&msg.content, target_channel).unwrap_or(&msg.content);
     let Some(ChannelRuntimeCommand::Goal(command)) = parse_runtime_command(&msg.channel, content)
     else {
         return None;
     };
+    Some((content, command.action))
+}
+
+fn goal_interrupt_command_content<'a>(
+    msg: &'a zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> Option<&'a str> {
+    let (content, action) = goal_command_content_and_action(msg, target_channel)?;
     matches!(
-        command.action,
+        action,
         zeroclaw_runtime::control_plane::GoalCommandAction::Pause
             | zeroclaw_runtime::control_plane::GoalCommandAction::Cancel
     )
@@ -7431,6 +7439,7 @@ async fn process_channel_message_body(
 async fn pre_register_in_flight_before_permit(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
     task_sequence: &AtomicU64,
 ) -> InFlightPreRegistration {
@@ -7438,9 +7447,15 @@ async fn pre_register_in_flight_before_permit(
         return InFlightPreRegistration::NotNeeded;
     }
 
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    // Goal commands are control-plane commands. Generic "new message"
+    // interruption must not turn rejected or read-only commands, such as
+    // `/goal resume` on an already running goal, into `/stop`. Active-goal
+    // `/goal pause` and `/goal cancel` keep their explicit escape hatch above.
+    let is_goal_command = goal_command_content_and_action(msg, target_channel).is_some();
+    let interrupt_enabled = !is_goal_command
+        && ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(msg);
     let mut active = in_flight.lock().await;
     let predecessor = active.get(&sender_scope_key).cloned();
@@ -7896,7 +7911,11 @@ async fn run_message_dispatch_loop(
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         // Startup recovery prompts are trusted controller turns; debouncing
         // them with a real user message would merge two different authorities.
-        let msg = if msg.channel != "cli" && !is_recovered_goal_continuation_message(&msg) {
+        let msg = if msg.channel != "cli"
+            && !is_recovered_goal_continuation_message(&msg)
+            && goal_command_content_and_action(&msg, target_channel.as_ref()).is_none()
+            && ctx.debouncer.enabled()
+        {
             let debounce_key = conversation_history_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -7934,9 +7953,13 @@ async fn run_message_dispatch_loop(
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
+                        let debounce_target_channel =
+                            find_channel_for_message(&debounce_ctx.channels_by_name, &debounce_msg)
+                                .cloned();
                         let pre_registration = pre_register_in_flight_before_permit(
                             debounce_ctx.as_ref(),
                             &debounce_msg,
+                            debounce_target_channel.as_ref(),
                             debounce_in_flight.as_ref(),
                             debounce_task_seq.as_ref(),
                         )
@@ -7990,6 +8013,7 @@ async fn run_message_dispatch_loop(
         let pre_registration = pre_register_in_flight_before_permit(
             worker_ctx.as_ref(),
             &msg,
+            target_channel.as_ref(),
             in_flight.as_ref(),
             task_sequence.as_ref(),
         )
