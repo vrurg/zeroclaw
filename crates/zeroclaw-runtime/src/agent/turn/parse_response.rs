@@ -8,7 +8,7 @@ use super::protocol_detect::{
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
-use crate::agent::cost::record_tool_loop_cost_usage;
+use crate::agent::cost::record_tool_loop_cost_usage_optional;
 use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
@@ -91,9 +91,19 @@ pub(crate) fn unforwarded_narration<'a>(
     display_text: &'a str,
     streamed_visible_text: &str,
 ) -> &'a str {
+    if let Some(rest) = display_text.strip_prefix(streamed_visible_text) {
+        return rest;
+    }
+    let stream_lead_normalized = streamed_visible_text.trim_start();
+    if !stream_lead_normalized.is_empty()
+        && let Some(rest) = display_text.strip_prefix(stream_lead_normalized)
+    {
+        return rest;
+    }
+    if streamed_visible_text.trim() == display_text {
+        return "";
+    }
     display_text
-        .strip_prefix(streamed_visible_text)
-        .unwrap_or(display_text)
 }
 
 /// The interpreted Ok-arm of one provider call.
@@ -164,12 +174,10 @@ pub(crate) async fn interpret_chat_response(
     // Non-goal unpriced calls remain observable as `Some(0.0)`; a
     // goal-attributed call instead returns an accounting error before its
     // response can advance the tool loop.
-    let call_cost_usd = match resp.usage.as_ref() {
-        Some(usage) => record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage)
+    let call_cost_usd =
+        record_tool_loop_cost_usage_optional(ctx.provider_name, ctx.model, resp.usage.as_ref())
             .await?
-            .map(|(_total_tokens, cost_usd)| cost_usd),
-        None => None,
-    };
+            .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
@@ -356,6 +364,46 @@ mod tests {
         assert_eq!(
             unforwarded_narration("final visible text", "diverged live text"),
             "final visible text"
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_trailing_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "Checking the data.\n\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_leading_whitespace() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data."),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_streamed_text_has_whitespace_on_both_ends() {
+        assert_eq!(
+            unforwarded_narration("Checking the data.", "\n\nChecking the data.\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_suffix_past_the_whitespace_trimmed_streamed_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to"),
+            " check."
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_prefix_space_when_only_the_leading_edge_diverges() {
+        assert_eq!(
+            unforwarded_narration("About to check.", "\nAbout to "),
+            "check."
         );
     }
 }

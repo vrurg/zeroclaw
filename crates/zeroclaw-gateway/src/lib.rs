@@ -1794,6 +1794,10 @@ pub async fn run_gateway(
             "/api/channels/bind",
             post(api_config::handle_api_channel_bind),
         )
+        .route(
+            "/api/channels/{channel}/relink",
+            post(api::handle_api_channel_relink),
+        )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(api::handle_api_sessions_list))
@@ -2947,9 +2951,10 @@ async fn process_whatsapp_message(
         // Route approval replies to pending approval requests before dispatching to agent
         if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         {
-            let mut map = wa.pending_approvals().lock().await;
-            if let Some(sender) = map.remove(&token) {
-                let _ = sender.send(response);
+            if wa
+                .resolve_pending_approval(&token, &msg.sender, response)
+                .await
+            {
                 continue;
             }
         }
