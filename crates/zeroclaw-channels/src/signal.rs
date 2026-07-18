@@ -33,7 +33,7 @@ struct ReactionTarget {
 }
 
 /// One outstanding prompt, including an optional identity constraint for a
-/// goal-owned approval. This request-scoped entry is the sole source of truth
+/// goal-owned approval. This request-scoped entry is the authoritative record
 /// until the reply, timeout, or send failure removes it.
 struct PendingApproval {
     sender: oneshot::Sender<ChannelApprovalResponse>,
