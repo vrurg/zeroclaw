@@ -38,7 +38,12 @@ tokio::task_local! {
 #[derive(Clone, Default)]
 pub struct GoalRuntimeScope {
     /// Trusted admission facts attached by channel ingress.
-    admission_context: Option<GoalAdmissionContext>,
+    ///
+    /// The inner context is shared by the tools in this one live turn so a
+    /// successful exact goal admission can bind its returned task id before a
+    /// later approval request. This remains transient trust plumbing; the
+    /// canonical task and continuation rows remain authoritative.
+    admission_context: Arc<parking_lot::RwLock<Option<GoalAdmissionContext>>>,
     /// Optional live channel sink for controller/verifier progress messages.
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
@@ -52,14 +57,14 @@ impl GoalRuntimeScope {
         turn_evaluation_requested: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
-            admission_context,
+            admission_context: Arc::new(parking_lot::RwLock::new(admission_context)),
             state_update_sink,
             turn_evaluation_requested,
         }
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
-        self.admission_context = admission_context;
+        self.admission_context = Arc::new(parking_lot::RwLock::new(admission_context));
         self
     }
 
@@ -751,9 +756,36 @@ impl GoalAdmissionContext {
 
 pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
     GOAL_RUNTIME_SCOPE
-        .try_with(|scope| scope.admission_context.clone())
+        .try_with(|scope| scope.admission_context.read().clone())
         .ok()
         .flatten()
+}
+
+/// Bind a just-admitted exact goal task to the current live turn.
+///
+/// This does not persist lifecycle state or resolve a goal by route: callers
+/// may supply an id only after a successful controller transition returned it.
+/// It lets later tools in the same turn use the durable continuation route
+/// without falling back to mutable inbound delivery facts.
+pub fn bind_current_goal_task(task_id: &str) -> bool {
+    if task_id.trim().is_empty() {
+        return false;
+    }
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            let mut admission = scope.admission_context.write();
+            let Some(admission) = admission.as_mut() else {
+                return false;
+            };
+            match admission.goal_task_id.as_deref() {
+                Some(existing) => existing == task_id,
+                None => {
+                    admission.goal_task_id = Some(task_id.to_string());
+                    true
+                }
+            }
+        })
+        .unwrap_or(false)
 }
 
 fn current_goal_runtime_scope() -> GoalRuntimeScope {

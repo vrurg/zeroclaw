@@ -118,6 +118,12 @@ impl Tool for GoalStartTool {
         )
         .await?;
         if admission.continue_goal {
+            let task_id = admission.task_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("continuing goal admission returned no exact task id")
+            })?;
+            if !crate::control_plane::bind_current_goal_task(task_id) {
+                anyhow::bail!("goal admission could not bind its exact live task");
+            }
             crate::agent::cost::enable_current_tool_loop_goal_attribution();
             crate::control_plane::mark_current_goal_turn_for_evaluation();
         }
