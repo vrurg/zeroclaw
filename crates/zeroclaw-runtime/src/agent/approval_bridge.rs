@@ -14,6 +14,7 @@ pub(crate) struct AskUserApprovalBridge {
     handles: PerToolChannelHandle,
     route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     goal_binding: GoalApprovalBindingState,
+    resolve_goal_binding_from_scope: bool,
 }
 
 /// Immutable approval delivery identity resolved from the exact durable goal
@@ -46,13 +47,56 @@ impl AskUserApprovalBridge {
             handles,
             route,
             goal_binding: GoalApprovalBindingState::NotGoal,
+            resolve_goal_binding_from_scope: false,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_goal_binding(mut self, binding: GoalApprovalBindingState) -> Self {
         self.goal_binding = binding;
         self
     }
+
+    /// Resolve goal delivery at approval time so a `goal_start` or
+    /// `goal_resume` in this same tool loop can bind its exact durable task
+    /// before a later approval request.
+    pub(crate) fn with_goal_scope_binding(mut self) -> Self {
+        self.resolve_goal_binding_from_scope = true;
+        self
+    }
+}
+
+/// Resolve the delivery identity for an approval requested during goal work.
+///
+/// The controller admits this context only after binding it to the canonical
+/// goal task and its persisted continuation row.  A goal turn may therefore
+/// use that immutable route, but must never fall back to the current inbound
+/// recipient when the continuation facts are absent or incomplete.
+pub(crate) fn goal_approval_binding_from_admission(
+    admission: &crate::control_plane::GoalAdmissionContext,
+) -> GoalApprovalBindingState {
+    if admission.goal_task_id.is_none() {
+        return GoalApprovalBindingState::NotGoal;
+    }
+
+    let Some(context) = admission.continuation_context.as_ref() else {
+        return GoalApprovalBindingState::DenyOnly;
+    };
+    let channel = match context.channel_alias.as_deref().map(str::trim) {
+        Some(alias) if !alias.is_empty() => format!("{}.{}", context.channel.trim(), alias),
+        _ => context.channel.trim().to_string(),
+    };
+    let recipient = context.reply_target.trim();
+    let principal = admission.principal_id.as_deref().unwrap_or("").trim();
+    if channel.is_empty() || recipient.is_empty() || principal.is_empty() {
+        return GoalApprovalBindingState::DenyOnly;
+    }
+
+    GoalApprovalBindingState::Bound(GoalApprovalBinding {
+        channel,
+        recipient: recipient.to_string(),
+        principal: principal.to_string(),
+    })
 }
 
 impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
@@ -97,10 +141,17 @@ impl Channel for AskUserApprovalBridge {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
-        if matches!(self.goal_binding, GoalApprovalBindingState::DenyOnly) {
+        let goal_binding = if self.resolve_goal_binding_from_scope {
+            crate::control_plane::current_goal_admission_context()
+                .map(|admission| goal_approval_binding_from_admission(&admission))
+                .unwrap_or_default()
+        } else {
+            self.goal_binding.clone()
+        };
+        if matches!(goal_binding, GoalApprovalBindingState::DenyOnly) {
             return Ok(None);
         }
-        if let GoalApprovalBindingState::Bound(binding) = &self.goal_binding {
+        if let GoalApprovalBindingState::Bound(binding) = &goal_binding {
             if binding.principal.trim().is_empty() {
                 return Ok(None);
             }
@@ -114,7 +165,7 @@ impl Channel for AskUserApprovalBridge {
                 return Ok(None);
             };
             return channel
-                .request_approval(&binding.recipient, request)
+                .request_approval_for_principal(&binding.recipient, &binding.principal, request)
                 .await
                 .map(|response| {
                     response.map(|response| AttributedApprovalResponse {
@@ -232,6 +283,17 @@ mod tests {
                 Ok(None)
             }
         }
+        async fn request_approval_for_principal(
+            &self,
+            recipient: &str,
+            principal: &str,
+            request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            if principal.is_empty() {
+                return Ok(None);
+            }
+            self.request_approval(recipient, request).await
+        }
     }
 
     fn approver(name: &str, approves_recipient: &str) -> Arc<dyn Channel> {
@@ -297,6 +359,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decided.decided_by.as_deref(), Some("durable"));
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_binding_uses_task_admitted_later_in_the_turn() {
+        let continuation = crate::control_plane::TaskContinuationContext {
+            channel: "durable".into(),
+            channel_alias: None,
+            reply_target: "durable-recipient".into(),
+            sender: "original-sender".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope:
+                crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+        };
+        let admission = crate::control_plane::GoalAdmissionContext::new("agent")
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation));
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                approver("inbound", "inbound-recipient"),
+                approver("durable", "durable-recipient"),
+            ]),
+            None,
+        )
+        .with_goal_scope_binding();
+
+        let decided = crate::control_plane::scope_goal_admission_context(Some(admission), async {
+            assert!(crate::control_plane::bind_current_goal_task("goal-1"));
+            bridge
+                .request_approval_attributed("inbound-recipient", &req())
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(decided.decided_by.as_deref(), Some("durable"));
+    }
+
+    #[test]
+    fn goal_binding_requires_exact_continuation_delivery_context() {
+        let admission = crate::control_plane::GoalAdmissionContext::new("agent")
+            .with_goal_task_id(Some("goal-1".into()))
+            .with_principal_id(Some("principal-a".into()));
+        assert_eq!(
+            goal_approval_binding_from_admission(&admission),
+            GoalApprovalBindingState::DenyOnly,
+            "a goal without its durable continuation route must not fan out to inbound handles"
+        );
+    }
+
+    #[test]
+    fn goal_binding_uses_durable_alias_and_reply_target_not_live_route() {
+        let continuation = crate::control_plane::TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: Some("primary".into()),
+            reply_target: "durable-room".into(),
+            sender: "original-sender".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope:
+                crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+        };
+        let admission = crate::control_plane::GoalAdmissionContext::new("agent")
+            .with_goal_task_id(Some("goal-1".into()))
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation));
+        assert_eq!(
+            goal_approval_binding_from_admission(&admission),
+            GoalApprovalBindingState::Bound(GoalApprovalBinding {
+                channel: "matrix.primary".into(),
+                recipient: "durable-room".into(),
+                principal: "principal-a".into(),
+            })
+        );
     }
 
     #[tokio::test]

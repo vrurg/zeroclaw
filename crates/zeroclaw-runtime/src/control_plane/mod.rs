@@ -16,7 +16,7 @@ pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
 pub use goal::{
     GoalAdmission, GoalAdmissionContext, GoalCommand, GoalCommandAction, GoalRuntimeScope,
-    GoalTurnEvaluation, admit_goal_autonomous_turn, admit_goal_command,
+    GoalTurnEvaluation, admit_goal_autonomous_turn, admit_goal_command, bind_current_goal_task,
     current_goal_admission_context, current_goal_start_tool_batch_requested,
     current_goal_turn_evaluation_marker, current_goal_turn_evaluation_requested,
     evaluate_goal_turn, evaluate_goal_turn_with_verifier, goal_recovery_status_message,
