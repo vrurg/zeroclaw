@@ -11095,6 +11095,26 @@ mod tests {
     use zeroclaw_providers::{ChatMessage, ModelProvider};
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    fn run_channel_dispatch_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-channel-dispatch-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build channel dispatch test runtime");
+                runtime.block_on(future);
+            })
+            .expect("spawn channel dispatch test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
@@ -16069,8 +16089,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_persists_model_switch_with_route_credential() {
+    async fn assert_model_switch_persists_route_credential() {
         // Serialize on the process-wide model-switch state so this test
         // doesn't race other tests that also touch the same static.
         let _guard = model_switch_test_guard().lock().await;
@@ -16329,6 +16348,11 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Clean up shared global state so we don't leak into other tests.
         clear_model_switch_request();
+    }
+
+    #[test]
+    fn process_channel_message_persists_model_switch_with_route_credential() {
+        run_channel_dispatch_test(Box::pin(assert_model_switch_persists_route_credential()));
     }
 
     #[tokio::test]
@@ -20583,8 +20607,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn process_channel_message_restores_per_sender_history_on_follow_ups() {
+    async fn assert_process_channel_message_restores_per_sender_history_on_follow_ups() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -20731,8 +20754,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][3].1.contains("follow up"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_refreshes_available_skills_after_new_session() {
+    async fn assert_process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
@@ -20976,6 +20998,20 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+    }
+
+    #[test]
+    fn process_channel_message_restores_per_sender_history_on_follow_ups() {
+        run_channel_dispatch_test(Box::pin(
+            assert_process_channel_message_restores_per_sender_history_on_follow_ups(),
+        ));
+    }
+
+    #[test]
+    fn process_channel_message_refreshes_available_skills_after_new_session() {
+        run_channel_dispatch_test(Box::pin(
+            assert_process_channel_message_refreshes_available_skills_after_new_session(),
+        ));
     }
 
     #[tokio::test]
@@ -21262,8 +21298,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
     }
 
-    #[tokio::test]
-    async fn process_channel_message_telegram_system_prompt_is_byte_stable_across_turns() {
+    async fn assert_process_channel_message_telegram_system_prompt_is_byte_stable_across_turns() {
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let runtime_ctx = cache_stability_test_context(provider_impl.clone(), Arc::new(NoopMemory));
 
@@ -21291,6 +21326,13 @@ BTC is currently around $65,000 based on latest tool output."#
             calls[0][0].1, calls[1][0].1,
             "system prompt must be byte-identical across consecutive turns (prompt cache hit)"
         );
+    }
+
+    #[test]
+    fn process_channel_message_telegram_system_prompt_is_byte_stable_across_turns() {
+        run_channel_dispatch_test(Box::pin(
+            assert_process_channel_message_telegram_system_prompt_is_byte_stable_across_turns(),
+        ));
     }
 
     #[tokio::test]
@@ -21486,25 +21528,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn process_channel_message_memory_recall_difference_keeps_system_byte_identical() {
-        std::thread::Builder::new()
-            .name("memory-recall-cache-stability".to_string())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("memory-recall cache stability runtime should build")
-                    .block_on(Box::pin(
-                        assert_memory_recall_difference_keeps_system_byte_identical(),
-                    ));
-            })
-            .expect("memory-recall cache stability test thread should start")
-            .join()
-            .expect("memory-recall cache stability test thread should complete");
+        run_channel_dispatch_test(Box::pin(
+            assert_memory_recall_difference_keeps_system_byte_identical(),
+        ));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_user_message_accumulates_no_preamble_in_cached_history() {
+    async fn assert_process_channel_message_user_message_accumulates_no_preamble_in_cached_history()
+    {
         // The cached conversation history (ctx.conversation_histories)
         // must not accumulate the runtime preamble across turns —
         // otherwise the conversation prefix cache hits would still
@@ -21571,6 +21601,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 turn.content
             );
         }
+    }
+
+    #[test]
+    fn process_channel_message_user_message_accumulates_no_preamble_in_cached_history() {
+        run_channel_dispatch_test(Box::pin(
+            assert_process_channel_message_user_message_accumulates_no_preamble_in_cached_history(),
+        ));
     }
 
     #[tokio::test]
