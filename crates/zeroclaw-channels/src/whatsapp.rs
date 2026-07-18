@@ -8,7 +8,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
-/// One outstanding prompt. This process-wide map is the sole source of truth
+/// One outstanding prompt. This process-wide map is the authoritative record
 /// for an approval request until its reply, timeout, send failure, or caller
 /// cancellation removes it.
 struct PendingApproval {
