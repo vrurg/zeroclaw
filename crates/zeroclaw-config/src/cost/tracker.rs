@@ -248,7 +248,7 @@ impl CostTracker {
 
         {
             let mut storage = self.lock_storage();
-            storage.add_record(record)?;
+            storage.add_record(record, enabled)?;
         }
 
         {
@@ -326,9 +326,15 @@ impl CostTracker {
     pub fn get_usage_totals_for_task_with_pricing(
         &self,
         task_id: &str,
-    ) -> Result<(u64, f64, bool)> {
+    ) -> Result<(u64, f64, bool, bool)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task_with_pricing(task_id)
+    }
+
+    /// Verify that the canonical ledger can be opened for an append before a
+    /// controller admits goal work that must retain attributed usage.
+    pub fn ensure_storage_ready(&self) -> Result<()> {
+        self.lock_storage().ensure_appendable()
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -431,6 +437,19 @@ impl CostTracker {
         Self::resolve_global(slot, config, workspace_dir)
     }
 
+    /// Return the shared canonical usage ledger for goal-owned calls.
+    ///
+    /// Goal mode retains provider usage even when ordinary cost tracking is
+    /// disabled. The supplied disabled policy remains in force, so unscoped
+    /// callers stay untracked while scoped goal writes persist task usage.
+    pub fn get_or_init_global_goal_usage_ledger(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::resolve_global_with_policy(slot, config, workspace_dir, true)
+    }
+
     /// Return the process-global `CostTracker` only if it already exists for
     /// the current workspace path.
     ///
@@ -442,10 +461,29 @@ impl CostTracker {
         Self::existing_global_in_slot(slot, config, workspace_dir)
     }
 
+    /// Return the existing canonical usage ledger even when cost calculation is
+    /// disabled, without initializing storage for a read-only status request.
+    pub fn existing_global_goal_usage_ledger(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get()?;
+        Self::existing_global_in_slot_with_policy(slot, config, workspace_dir, true)
+    }
+
     fn resolve_global(
         slot: &RwLock<Option<Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        Self::resolve_global_with_policy(slot, config, workspace_dir, false)
+    }
+
+    fn resolve_global_with_policy(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+        initialize_when_disabled: bool,
     ) -> Option<Arc<Self>> {
         let storage_path = match resolve_storage_path(workspace_dir) {
             Ok(path) => path,
@@ -462,19 +500,19 @@ impl CostTracker {
         };
 
         if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
         }
 
-        if !config.enabled {
+        if !config.enabled && !initialize_when_disabled {
             return None;
         }
 
         let mut guard = slot.write();
         if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
@@ -504,13 +542,22 @@ impl CostTracker {
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Option<Arc<Self>> {
+        Self::existing_global_in_slot_with_policy(slot, config, workspace_dir, false)
+    }
+
+    fn existing_global_in_slot_with_policy(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+        include_disabled: bool,
+    ) -> Option<Arc<Self>> {
         let storage_path = workspace_dir.join("state").join("costs.jsonl");
         let tracker = slot.read().as_ref().cloned()?;
         if tracker.storage_path() != storage_path {
             return None;
         }
         tracker.update_config(config);
-        tracker.is_enabled().then_some(tracker)
+        (include_disabled || tracker.is_enabled()).then_some(tracker)
     }
 }
 
@@ -710,6 +757,15 @@ impl CostStorage {
         })
     }
 
+    fn ensure_appendable(&self) -> Result<()> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("open cost storage for append at {}", self.path.display()))?;
+        Ok(())
+    }
+
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
     where
         F: FnMut(CostRecord),
@@ -822,8 +878,15 @@ impl CostStorage {
     }
 
     /// Add a new record.
-    fn add_record(&mut self, record: CostRecord) -> Result<()> {
-        self.ensure_period_cache_current()?;
+    fn add_record(&mut self, record: CostRecord, update_cost_aggregates: bool) -> Result<()> {
+        if update_cost_aggregates {
+            self.ensure_period_cache_current()?;
+        } else {
+            // Goal-only token recording intentionally persists without cost
+            // aggregation while cost tracking is disabled. Mark the cache
+            // stale so a later config reload rebuilds it from every ledger row.
+            self.aggregates_current = false;
+        }
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -851,12 +914,14 @@ impl CostStorage {
             )
         })?;
 
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
-            self.daily_cost_usd += record.usage.cost_usd;
-        }
-        if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
-            self.monthly_cost_usd += record.usage.cost_usd;
+        if update_cost_aggregates {
+            let timestamp = record.usage.timestamp.naive_utc();
+            if timestamp.date() == self.cached_day {
+                self.daily_cost_usd += record.usage.cost_usd;
+            }
+            if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
+                self.monthly_cost_usd += record.usage.cost_usd;
+            }
         }
         Ok(())
     }
@@ -914,15 +979,19 @@ impl CostStorage {
     }
 
     fn usage_totals_for_task(&mut self, task_id: &str) -> Result<(u64, f64)> {
-        let (total_tokens, cost_usd, _pricing_available) =
+        let (total_tokens, cost_usd, _pricing_available, _usage_available) =
             self.usage_totals_for_task_with_pricing(task_id)?;
         Ok((total_tokens, cost_usd))
     }
 
-    fn usage_totals_for_task_with_pricing(&mut self, task_id: &str) -> Result<(u64, f64, bool)> {
+    fn usage_totals_for_task_with_pricing(
+        &mut self,
+        task_id: &str,
+    ) -> Result<(u64, f64, bool, bool)> {
         let mut total_tokens = 0_u64;
         let mut cost_usd = 0.0_f64;
         let mut pricing_available = true;
+        let mut usage_available = true;
         self.for_each_record(|record| {
             if record.task_id.as_deref() == Some(task_id) {
                 total_tokens = total_tokens.saturating_add(record.usage.total_tokens);
@@ -930,9 +999,12 @@ impl CostStorage {
                 if !record.usage.pricing_available {
                     pricing_available = false;
                 }
+                if !record.usage.usage_available {
+                    usage_available = false;
+                }
             }
         })?;
-        Ok((total_tokens, cost_usd, pricing_available))
+        Ok((total_tokens, cost_usd, pricing_available, usage_available))
     }
 
     /// Get cost for a specific date.
@@ -1112,13 +1184,36 @@ mod tests {
             )
             .unwrap();
 
-        let (tokens, cost, pricing_available) = tracker
+        let (tokens, cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
 
         assert_eq!(tokens, 2_250);
         assert!(cost > 0.0);
         assert!(!pricing_available);
+        assert!(usage_available);
+    }
+
+    #[test]
+    fn task_usage_totals_distinguish_unknown_usage_from_zero_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        tracker
+            .record_usage_with_task_attribution(
+                TokenUsage::unavailable("test/unknown"),
+                Some("agent-a"),
+                Some("goal-a"),
+            )
+            .unwrap();
+
+        let (tokens, cost, pricing_available, usage_available) = tracker
+            .get_usage_totals_for_task_with_pricing("goal-a")
+            .unwrap();
+        assert_eq!(tokens, 0);
+        assert_eq!(cost, 0.0);
+        assert!(!pricing_available);
+        assert!(!usage_available);
     }
 
     #[test]
@@ -1136,12 +1231,13 @@ mod tests {
                 Some("goal-a"),
             )
             .unwrap();
-        let (tokens, cost, pricing_available) = tracker
+        let (tokens, cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
         assert_eq!(tokens, 1_500);
         assert!(cost > 0.0);
         assert!(pricing_available);
+        assert!(usage_available);
 
         let mut unpriced = TokenUsage::new("test/unpriced", 500, 250, 0, 0.0, 0.0, 0.0);
         unpriced.pricing_available = false;
@@ -1159,7 +1255,7 @@ mod tests {
                 .map(|stats| stats.request_count),
             Some(2)
         );
-        let (tokens, _cost, pricing_available) = tracker
+        let (tokens, _cost, pricing_available, usage_available) = tracker
             .get_usage_totals_for_task_with_pricing("goal-a")
             .unwrap();
         assert_eq!(tokens, 2_250);
@@ -1167,6 +1263,7 @@ mod tests {
             !pricing_available,
             "one unpriced row must make task cost-budget enforcement fail closed"
         );
+        assert!(usage_available);
     }
 
     #[test]
@@ -1454,6 +1551,16 @@ mod tests {
                 .map(|stats| stats.request_count),
             Some(1)
         );
+
+        tracker.update_config(CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            ..Default::default()
+        });
+        let after_reenable = tracker.get_summary().unwrap();
+        assert_eq!(after_reenable.request_count, 1);
+        assert_eq!(after_reenable.total_tokens, 2_500);
+        assert!(after_reenable.daily_cost_usd > 0.0);
     }
 
     #[test]

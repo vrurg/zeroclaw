@@ -232,6 +232,58 @@ mod run_model_query_tests {
         }
     }
 
+    async fn create_budgeted_test_goal(task_id: String) {
+        if crate::control_plane::control_plane().is_none() {
+            let sqlite_store = Arc::new(
+                crate::control_plane::SqliteTaskStore::new_in_memory().expect("test goal store"),
+            );
+            let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+            let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+            let _ = crate::control_plane::init_control_plane(
+                crate::control_plane::ControlPlaneHandle {
+                    store,
+                    goal_store,
+                    boot_id: "test-boot".into(),
+                    recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    data_dir_lock: None,
+                },
+            );
+        }
+        let goal_store = Arc::clone(&crate::control_plane::control_plane().unwrap().goal_store);
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: "agent-a".into(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: "2026-07-20T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id,
+                    objective: "test goal".into(),
+                    effective_token_limit: Some(1_000),
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("create budgeted goal");
+    }
+
     // Unscoped: no cost-tracking context on the task. Budget-gate allows (no-op),
     // usage recording is skipped, and the call still returns the provider's
     // response. This is the tests / CLI-without-cost shape.
@@ -286,8 +338,10 @@ mod run_model_query_tests {
         // budget without a durable ledger record.
         let provider = UsageProvider::with_usage(None);
         let messages = [ChatMessage::user("hi")];
+        let task_id = format!("goal-summary-usage-{}", uuid::Uuid::new_v4());
+        create_budgeted_test_goal(task_id.clone()).await;
         let goal = crate::control_plane::GoalAdmissionContext::new("agent-a")
-            .with_goal_task_id(Some("goal-summary-usage".into()));
+            .with_goal_task_id(Some(task_id));
         let workspace = tempfile::tempdir().unwrap();
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), workspace.path()).unwrap());
         let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(Default::default()))

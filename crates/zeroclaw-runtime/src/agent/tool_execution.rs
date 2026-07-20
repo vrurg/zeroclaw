@@ -380,6 +380,7 @@ pub(crate) async fn execute_one_tool(
                 }
             }
             Err(e) if is_tool_loop_cancelled(&e) => Err(e),
+            Err(e) if crate::agent::cost::is_goal_accounting_failure(&e) => Err(e),
             Err(e) => {
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(

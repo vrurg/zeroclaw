@@ -2455,9 +2455,19 @@ fn goal_cost_tracking_context_for_turn(
     context: zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext,
     goal_admission_context: Option<&zeroclaw_runtime::control_plane::GoalAdmissionContext>,
     goal_controller_continuation: bool,
+    config: &zeroclaw_config::schema::Config,
 ) -> zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext {
     match goal_admission_context {
         Some(goal_ctx) if goal_controller_continuation => {
+            if let Err(error) = context.ensure_goal_usage_ledger(config) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                    "goal continuation usage ledger unavailable"
+                );
+            }
             context.with_goal_admission_context(goal_ctx)
         }
         Some(goal_ctx) => context.with_goal_admission_filters(goal_ctx),
@@ -6847,18 +6857,41 @@ async fn process_channel_message_body(
         recovered_goal_task_id().as_deref(),
     ));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
-    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+    let goal_runtime_scope = zeroclaw_runtime::control_plane::GoalRuntimeScope::new(
+        goal_admission_context.clone(),
+        goal_state_update_scope.clone(),
+        Some(Arc::clone(&goal_turn_evaluation_requested)),
+    )
+    .with_approval_deny_behavior_resolver(goal_approval_deny_behavior_resolver(Arc::clone(&ctx)));
+    let cost_tracking_context = if let Some(state) = ctx.cost_tracking.clone() {
         let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
             state.tracker,
             state.model_provider_pricing,
         )
         .with_agent_alias(state.agent_alias.as_str());
-        goal_cost_tracking_context_for_turn(
+        Some(goal_cost_tracking_context_for_turn(
             context,
             goal_admission_context.as_ref(),
             goal_controller_continuation,
-        )
-    });
+            runtime_defaults.config.as_ref(),
+        ))
+    } else if goal_controller_continuation || runtime_defaults.config.goal.enabled {
+        // A normal channel turn can become goal-owned when its model calls
+        // `goal_start` or `goal_resume`. Keep a dormant, usage-only context
+        // for goal-capable turns so that exact admission can promote the
+        // current loop to the canonical goal ledger. Until that promotion it
+        // records neither ordinary-channel usage nor cost.
+        let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+            .with_agent_alias(ctx.agent_alias.as_ref().as_str());
+        Some(goal_cost_tracking_context_for_turn(
+            context,
+            goal_admission_context.as_ref(),
+            goal_controller_continuation,
+            runtime_defaults.config.as_ref(),
+        ))
+    } else {
+        None
+    };
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -6988,16 +7021,10 @@ async fn process_channel_message_body(
                 .scope(receipt_scope.clone(), tool_loop);
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
-            let goal_runtime_scope = zeroclaw_runtime::control_plane::GoalRuntimeScope::new(
-                goal_admission_context.clone(),
-                goal_state_update_scope.clone(),
-                Some(Arc::clone(&goal_turn_evaluation_requested)),
-            )
-            .with_approval_deny_behavior_resolver(
-                goal_approval_deny_behavior_resolver(Arc::clone(&ctx)),
+            let tool_loop = zeroclaw_runtime::control_plane::scope_goal_runtime(
+                goal_runtime_scope.clone(),
+                tool_loop,
             );
-            let tool_loop =
-                zeroclaw_runtime::control_plane::scope_goal_runtime(goal_runtime_scope, tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             // This future captures the full channel turn, provider dispatch,
@@ -7579,9 +7606,14 @@ async fn process_channel_message_body(
                 }
             }
 
+            // A start/resume tool call can bind this turn to a goal that did
+            // not exist at admission. Read the shared scope here rather than
+            // the pre-loop context so post-turn evaluation cannot fall back to
+            // a later goal for the same route/principal.
+            let bound_goal_admission_context = goal_runtime_scope.admission_context();
             if !cancellation_token.is_cancelled()
                 && goal_turn_evaluation_requested.load(Ordering::Acquire)
-                && let Some(goal_ctx) = goal_admission_context.as_ref()
+                && let Some(goal_ctx) = bound_goal_admission_context.as_ref()
             {
                 let evaluation = zeroclaw_runtime::control_plane::scope_goal_state_updates(
                     goal_state_update_scope.clone(),
@@ -7716,6 +7748,27 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
+                let bound_goal_admission_context = goal_runtime_scope.admission_context();
+                if zeroclaw_runtime::agent::cost::is_goal_accounting_failure(&e)
+                    && let Some(goal_ctx) = bound_goal_admission_context.as_ref()
+                    && let Err(error) = zeroclaw_runtime::control_plane::scope_goal_state_updates(
+                        goal_state_update_scope.clone(),
+                        zeroclaw_runtime::control_plane::pause_current_goal_for_accounting_failure(
+                            goal_ctx,
+                            runtime_defaults.config.as_ref(),
+                            &e,
+                        ),
+                    )
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                        "failed to durably pause goal after accounting failure"
+                    );
+                }
                 eprintln!(
                     "  ❌ LLM error after {}ms: {e}",
                     started_at.elapsed().as_millis()
@@ -7846,6 +7899,11 @@ async fn process_channel_message_body(
         }
     }
 
+    // The shared runtime scope retains the status sender so it can expose an
+    // in-turn exact goal binding to failed-loop handling. Release it before
+    // waiting for the receiver task, otherwise that task can never observe
+    // channel closure.
+    drop(goal_runtime_scope);
     drop(goal_state_update_scope);
     if let Some(handle) = goal_state_update_task {
         let _ = handle.await;
@@ -24017,7 +24075,12 @@ BTC is currently around $65,000 based on latest tool output."#
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
-        let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
+        let cost_ctx = goal_cost_tracking_context_for_turn(
+            cost_ctx,
+            Some(&goal_ctx),
+            false,
+            &zeroclaw_config::schema::Config::default(),
+        );
 
         assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
         assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
@@ -24041,7 +24104,12 @@ BTC is currently around $65,000 based on latest tool output."#
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
-        let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true);
+        let cost_ctx = goal_cost_tracking_context_for_turn(
+            cost_ctx,
+            Some(&goal_ctx),
+            true,
+            &zeroclaw_config::schema::Config::default(),
+        );
 
         assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
         assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));

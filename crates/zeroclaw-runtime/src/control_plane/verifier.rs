@@ -111,8 +111,10 @@ pub async fn verify_goal_completion(
             goal_context,
             goal,
             candidate_summary,
-            cost_tracker: CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-                .filter(|tracker| tracker.is_enabled()),
+            cost_tracker: CostTracker::get_or_init_global_goal_usage_ledger(
+                config.cost.clone(),
+                &config.data_dir,
+            ),
         })
         .await
 }
@@ -180,10 +182,9 @@ async fn verify_goal_completion_with_llm(
     };
 
     let tracker = cost_tracker.or_else(|| {
-        CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-            .filter(|tracker| tracker.is_enabled())
+        CostTracker::get_or_init_global_goal_usage_ledger(config.cost.clone(), &config.data_dir)
     });
-    let ctx = verifier_cost_tracking_context(config, agent_alias, tracker, goal_context);
+    let ctx = verifier_cost_tracking_context(config, agent_alias, tracker, goal_context, goal);
     let text = TOOL_LOOP_COST_TRACKING_CONTEXT
         .scope(Some(ctx), verifier_call)
         .await?;
@@ -191,17 +192,18 @@ async fn verify_goal_completion_with_llm(
     Ok(parse_verifier_decision(&text))
 }
 
-/// Build verifier accounting scope even when cost collection is disabled.
+/// Build verifier accounting scope even when USD cost collection is disabled.
 ///
-/// The tracker can be unavailable for an unlimited goal, but the verifier is
-/// still a goal-owned spend. A usage-only scope carries that ownership to the
-/// shared preflight, which rejects the unaccountable call before provider
-/// dispatch rather than mistaking it for ordinary best-effort traffic.
+/// Every verifier call remains goal-owned: a disabled cost subsystem uses the
+/// canonical ledger in token-only mode. If that ledger cannot be opened, the
+/// shared preflight rejects the call before provider dispatch so the
+/// controller can durably pause the exact goal rather than lose attribution.
 fn verifier_cost_tracking_context(
     config: &Config,
     agent_alias: &str,
     tracker: Option<std::sync::Arc<CostTracker>>,
     goal_context: &GoalAdmissionContext,
+    _goal: &GoalTaskRecord,
 ) -> crate::agent::cost::ToolLoopCostTrackingContext {
     let context = tracker
         .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
@@ -407,21 +409,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_without_cost_tracker_fails_before_provider_dispatch() {
-        // Unlimited goals can run with cost tracking disabled. Their verifier
-        // calls still need a goal-owned scope so the shared preflight rejects
-        // the unaccountable call before any provider dispatch can happen.
+    async fn unlimited_goal_verifier_uses_usage_ledger_without_cost_tracking() {
+        // Unlimited verifier calls still retain exact-task attribution. A
+        // disabled cost policy writes token usage through the same ledger.
         let config = Config::default();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = std::sync::Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
         let goal_context = GoalAdmissionContext::new("agent-a")
             .with_goal_task_id(Some("goal-disabled-cost".into()));
-        let context = verifier_cost_tracking_context(&config, "agent-a", None, &goal_context);
+        let goal = GoalTaskRecord {
+            task_id: "goal-disabled-cost".into(),
+            objective: "finish the task".into(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+        let context =
+            verifier_cost_tracking_context(&config, "agent-a", Some(tracker), &goal_context, &goal);
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                crate::agent::cost::ensure_goal_accounting_preflight()
+            })
+            .await
+            .expect("unlimited verifier must retain its usage ledger");
+    }
+
+    #[tokio::test]
+    async fn budgeted_goal_verifier_requires_cost_tracker() {
+        let config = Config::default();
+        let goal_context =
+            GoalAdmissionContext::new("agent-a").with_goal_task_id(Some("goal-with-budget".into()));
+        let goal = GoalTaskRecord {
+            task_id: "goal-with-budget".into(),
+            objective: "finish the task".into(),
+            effective_token_limit: Some(100),
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+        let context =
+            verifier_cost_tracking_context(&config, "agent-a", None, &goal_context, &goal);
 
         let error = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(context), async {
                 crate::agent::cost::ensure_goal_accounting_preflight()
             })
             .await
-            .expect_err("trackerless goal verifier must fail before dispatch");
+            .expect_err("budgeted verifier must fail before unaccountable dispatch");
         assert!(format!("{error:#}").contains("goal accounting tracker unavailable"));
     }
 
@@ -490,9 +537,9 @@ mod tests {
         );
         let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
             .expect("tracker");
-        let store: std::sync::Arc<dyn crate::control_plane::TaskRegistry> =
+        let goal_store: std::sync::Arc<dyn crate::control_plane::GoalTaskRegistry> =
             match crate::control_plane::control_plane() {
-                Some(control_plane) => std::sync::Arc::clone(&control_plane.store),
+                Some(control_plane) => std::sync::Arc::clone(&control_plane.goal_store),
                 None => {
                     let sqlite_store = std::sync::Arc::new(
                         crate::control_plane::SqliteTaskStore::new_in_memory().unwrap(),
@@ -512,47 +559,73 @@ mod tests {
                             data_dir_lock: None,
                         },
                     );
-                    std::sync::Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                    std::sync::Arc::clone(
+                        &crate::control_plane::control_plane().unwrap().goal_store,
+                    )
                 }
             };
-        store
-            .create(crate::control_plane::TaskRecord {
-                id: goal_id.clone(),
-                kind: crate::control_plane::TaskKind::Goal,
-                agent: agent_alias.clone(),
-                status: crate::control_plane::TaskStatus::Running,
-                owner_pid: std::process::id(),
-                owner_boot_id: "test-boot".into(),
-                heartbeat_at: None,
-                depth: 0,
-                parent_id: None,
-                originator_route: Some("route-a".into()),
-                delivered: false,
-                idem_key: None,
-                principal_id: Some("principal-a".into()),
-                started_at: "2026-06-18T00:00:00Z".into(),
-                finished_at: None,
-            })
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent_alias.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("route-a".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("principal-a".into()),
+                    started_at: "2026-06-18T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id: goal_id.clone(),
+                    objective: "goal a".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
             .await
             .unwrap();
-        store
-            .create(crate::control_plane::TaskRecord {
-                id: other_goal_id.clone(),
-                kind: crate::control_plane::TaskKind::Goal,
-                agent: agent_alias.clone(),
-                status: crate::control_plane::TaskStatus::Running,
-                owner_pid: std::process::id(),
-                owner_boot_id: "test-boot".into(),
-                heartbeat_at: None,
-                depth: 0,
-                parent_id: None,
-                originator_route: Some("route-b".into()),
-                delivered: false,
-                idem_key: None,
-                principal_id: Some("principal-a".into()),
-                started_at: "2026-06-19T00:00:00Z".into(),
-                finished_at: None,
-            })
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: other_goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent_alias.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some("route-b".into()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some("principal-a".into()),
+                    started_at: "2026-06-19T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id: other_goal_id.clone(),
+                    objective: "goal b".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
             .await
             .unwrap();
         let ctx =

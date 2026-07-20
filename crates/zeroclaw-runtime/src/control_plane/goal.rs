@@ -65,6 +65,13 @@ impl GoalRuntimeScope {
         }
     }
 
+    /// Snapshot the trusted admission context after tools in this live turn
+    /// may have bound an exact task. This remains transient turn plumbing;
+    /// durable state is still resolved from the task and goal-extension rows.
+    pub fn admission_context(&self) -> Option<GoalAdmissionContext> {
+        self.admission_context.read().clone()
+    }
+
     /// Resolve approval-denial policy from the owning runtime config at the
     /// decision boundary. The resolver is intentionally not durable goal state.
     pub fn with_approval_deny_behavior_resolver(
@@ -200,6 +207,14 @@ struct GoalUsageTotals {
     /// Token totals remain usable when this is false, but an active cost limit
     /// must pause because unknown cost cannot be treated as free.
     cost_pricing_available: bool,
+    /// Whether this ledger is configured to calculate USD amounts at all.
+    ///
+    /// A token-only goal ledger deliberately keeps this false. That is
+    /// different from an enabled cost tracker which lacks a price for one
+    /// particular model or token dimension.
+    cost_tracking_available: bool,
+    /// Whether every goal-owned provider call supplied usable token counts.
+    usage_available: bool,
 }
 
 /// Why the controller cannot produce trustworthy budget accounting.
@@ -221,12 +236,14 @@ impl Default for GoalUsageTotals {
             total_tokens: 0,
             cost_usd: 0.0,
             cost_pricing_available: true,
+            cost_tracking_available: true,
+            usage_available: true,
         }
     }
 }
 
 fn goal_usage_totals(config: Option<&Config>, task_id: &str) -> Option<GoalUsageTotals> {
-    let tracker = enabled_cost_tracker(config)?;
+    let tracker = goal_usage_ledger(config)?;
     goal_usage_totals_from_tracker(Some(tracker.as_ref()), task_id)
 }
 
@@ -234,7 +251,7 @@ fn goal_usage_totals_if_tracker_ready(
     config: Option<&Config>,
     task_id: &str,
 ) -> Option<GoalUsageTotals> {
-    let tracker = existing_cost_tracker(config)?;
+    let tracker = existing_goal_usage_ledger(config)?;
     goal_usage_totals_from_tracker(Some(tracker.as_ref()), task_id)
 }
 
@@ -244,11 +261,15 @@ fn goal_usage_totals_from_tracker(
 ) -> Option<GoalUsageTotals> {
     let tracker = tracker?;
     match tracker.get_usage_totals_for_task_with_pricing(task_id) {
-        Ok((total_tokens, cost_usd, cost_pricing_available)) => Some(GoalUsageTotals {
-            total_tokens,
-            cost_usd,
-            cost_pricing_available,
-        }),
+        Ok((total_tokens, cost_usd, cost_pricing_available, usage_available)) => {
+            Some(GoalUsageTotals {
+                total_tokens,
+                cost_usd,
+                cost_pricing_available,
+                cost_tracking_available: tracker.is_enabled(),
+                usage_available,
+            })
+        }
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -269,26 +290,37 @@ fn initial_goal_usage_totals(config: Option<&Config>) -> Option<GoalUsageTotals>
     if config.is_none() {
         return Some(GoalUsageTotals::default());
     }
-    enabled_cost_tracker(config).map(|_| GoalUsageTotals::default())
+    let tracker = goal_usage_ledger(config)?;
+    tracker.ensure_storage_ready().ok()?;
+    Some(GoalUsageTotals {
+        cost_tracking_available: tracker.is_enabled(),
+        ..GoalUsageTotals::default()
+    })
 }
 
-fn enabled_cost_tracker(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
+fn goal_usage_ledger(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
     let config = config?;
-    let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)?;
-    tracker.is_enabled().then_some(tracker)
+    CostTracker::get_or_init_global_goal_usage_ledger(config.cost.clone(), &config.data_dir)
 }
 
-fn existing_cost_tracker(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
+fn existing_goal_usage_ledger(config: Option<&Config>) -> Option<std::sync::Arc<CostTracker>> {
     let config = config?;
-    CostTracker::existing_global(config.cost.clone(), &config.data_dir)
+    CostTracker::existing_global_goal_usage_ledger(config.cost.clone(), &config.data_dir)
 }
 
 fn goal_budget_summary(goal: &GoalTaskRecord, usage: Option<&GoalUsageTotals>) -> String {
     let token_limit = token_limit_label(goal.effective_token_limit);
-    let cost_limit = cost_limit_label(goal.effective_cost_limit_usd);
-    if let Some(usage) = usage {
+    if let Some(usage) = usage.filter(|usage| usage.usage_available) {
+        if !usage.cost_tracking_available || !usage.cost_pricing_available {
+            let tokens_used = usage.total_tokens.to_string();
+            return msg(
+                "goal-budget-summary-cost-unavailable",
+                &[("tokens_used", &tokens_used), ("token_limit", &token_limit)],
+            );
+        }
         let tokens_used = usage.total_tokens.to_string();
         let cost_used = formatted_cost(usage.cost_usd);
+        let cost_limit = cost_limit_label(goal.effective_cost_limit_usd);
         msg(
             "goal-budget-summary",
             &[
@@ -299,6 +331,7 @@ fn goal_budget_summary(goal: &GoalTaskRecord, usage: Option<&GoalUsageTotals>) -
             ],
         )
     } else {
+        let cost_limit = cost_limit_label(goal.effective_cost_limit_usd);
         msg(
             "goal-budget-summary-unavailable",
             &[("token_limit", &token_limit), ("cost_limit", &cost_limit)],
@@ -359,12 +392,39 @@ fn goal_has_effective_budget(goal: &GoalTaskRecord) -> bool {
     goal.effective_token_limit.is_some() || goal.effective_cost_limit_usd.is_some()
 }
 
+/// Reject a cost budget before it is written when the service that owns the
+/// canonical cost ledger is disabled or cannot be initialized. A goal without
+/// a cost limit remains valid without cost tracking.
+fn ensure_cost_budget_tracking_available(
+    config: Option<&Config>,
+    cost_limit_usd: Option<f64>,
+) -> Result<()> {
+    if cost_limit_usd.is_none() {
+        return Ok(());
+    }
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if !config.cost.enabled
+        || CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+            .is_none_or(|tracker| !tracker.is_enabled() || tracker.ensure_storage_ready().is_err())
+    {
+        bail!("{}", msg("goal-command-error-cost-tracking-required", &[]));
+    }
+    Ok(())
+}
+
 fn goal_budget_pause(
     goal: &GoalTaskRecord,
     usage: Option<&GoalUsageTotals>,
 ) -> Option<GoalPauseState> {
     let usage = usage?;
-    if goal.effective_cost_limit_usd.is_some() && !usage.cost_pricing_available {
+    if !usage.usage_available {
+        return goal_budget_unavailable_pause(goal, GoalBudgetUnavailableCause::UsageUnavailable);
+    }
+    if goal.effective_cost_limit_usd.is_some()
+        && (!usage.cost_tracking_available || !usage.cost_pricing_available)
+    {
         return goal_budget_unavailable_pause(
             goal,
             GoalBudgetUnavailableCause::CostPricingUnavailable,
@@ -448,6 +508,19 @@ fn goal_budget_gate_pause(
         Some(usage) => goal_budget_pause(goal, Some(usage)),
         None => goal_budget_unavailable_pause(goal, GoalBudgetUnavailableCause::UsageUnavailable),
     }
+}
+
+/// A missing ledger snapshot is an infrastructure failure, unlike a persisted
+/// provider-usage-unavailable observation. Goal work cannot retain its
+/// canonical attribution when the ledger itself is unavailable, even if no
+/// budget limit is configured.
+fn goal_usage_ledger_gate_pause(
+    goal: &GoalTaskRecord,
+    usage: Option<&GoalUsageTotals>,
+) -> Option<GoalPauseState> {
+    usage.is_none().then(|| {
+        goal_accounting_unavailable_pause(goal, GoalBudgetUnavailableCause::UsageUnavailable)
+    })
 }
 
 fn declared_blocker_pause(candidate_summary: &str) -> Option<GoalPauseState> {
@@ -1554,8 +1627,24 @@ pub async fn evaluate_goal_turn_with_verifier(
         return Ok(None);
     }
 
-    let cost_tracker = enabled_cost_tracker(Some(config));
+    let cost_tracker = goal_usage_ledger(Some(config));
     let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), resolved.task_id());
+    if let Some(pause) = goal_usage_ledger_gate_pause(resolved.goal(), usage.as_ref()) {
+        let task_id = resolved.task_id().to_string();
+        let budget = goal_budget_summary(resolved.goal(), None);
+        let admission = pause_goal_for_resolved_task_with_budget(
+            cp.goal_store.as_ref(),
+            resolved,
+            pause,
+            budget,
+        )
+        .await?;
+        publish_goal_state_update(&admission);
+        return Ok(Some(GoalTurnEvaluation::Paused {
+            task_id,
+            message: admission.message,
+        }));
+    }
     if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
         let task_id = resolved.task_id().to_string();
         let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
@@ -1649,6 +1738,21 @@ pub async fn evaluate_goal_turn_with_verifier(
         Ok(GoalVerifierDecision::Continue { notes }) => {
             let task_id = resolved.task_id().to_string();
             let usage = goal_usage_totals_from_tracker(cost_tracker.as_deref(), &task_id);
+            if let Some(pause) = goal_usage_ledger_gate_pause(resolved.goal(), usage.as_ref()) {
+                let budget = goal_budget_summary(resolved.goal(), None);
+                let admission = pause_goal_for_resolved_task_with_budget(
+                    cp.goal_store.as_ref(),
+                    resolved,
+                    pause,
+                    budget,
+                )
+                .await?;
+                publish_goal_state_update(&admission);
+                return Ok(Some(GoalTurnEvaluation::Paused {
+                    task_id,
+                    message: admission.message,
+                }));
+            }
             if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
                 let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
                 let admission = pause_goal_for_resolved_task_with_budget(
@@ -1767,6 +1871,58 @@ pub async fn pause_current_goal_for_human_gate(
         },
     )
     .await?;
+    publish_goal_state_update(&admission);
+    Ok(Some(admission))
+}
+
+/// Fail closed after a goal-owned provider boundary cannot retain trustworthy
+/// accounting. The `Running -> Paused` transition is exact and conditional so
+/// a concurrent operator or terminal transition is never overwritten.
+pub async fn pause_current_goal_for_accounting_failure(
+    ctx: &GoalAdmissionContext,
+    config: &Config,
+    error: &anyhow::Error,
+) -> Result<Option<GoalAdmission>> {
+    if !is_goal_accounting_failure(error) {
+        return Ok(None);
+    }
+    let Some(cp) = control_plane() else {
+        return Ok(None);
+    };
+    let Some(resolved) =
+        resolved_goal_for_context(cp.store.as_ref(), cp.goal_store.as_ref(), ctx).await?
+    else {
+        return Ok(None);
+    };
+    if resolved.status() != TaskStatus::Running {
+        return Ok(None);
+    }
+    let cause = if is_goal_accounting_pricing_failure(error) {
+        GoalBudgetUnavailableCause::CostPricingUnavailable
+    } else {
+        GoalBudgetUnavailableCause::UsageUnavailable
+    };
+    let task_id = resolved.task_id().to_string();
+    let budget = task_goal_budget_summary(&resolved, Some(config));
+    let pause = goal_accounting_unavailable_pause(resolved.goal(), cause);
+    if !cp
+        .goal_store
+        .pause_running_goal_task(&task_id, pause)
+        .await
+        .with_context(|| msg("goal-command-error-pause-failed", &[("task_id", &task_id)]))?
+    {
+        return Ok(None);
+    }
+    let admission = GoalAdmission {
+        task_id: Some(task_id.clone()),
+        status: TaskStatus::Paused,
+        message: msg(
+            "goal-command-budget-unavailable",
+            &[("task_id", &task_id), ("budget", &budget)],
+        ),
+        continuation_reason: None,
+        continue_goal: false,
+    };
     publish_goal_state_update(&admission);
     Ok(Some(admission))
 }
@@ -1926,6 +2082,7 @@ async fn start_goal(
     cost_limit_usd: Option<f64>,
     config: Option<&Config>,
 ) -> Result<GoalAdmission> {
+    ensure_cost_budget_tracking_available(config, cost_limit_usd)?;
     let continuation_context = ctx.continuation_context.clone();
     if let Some(active) = goal_store
         .latest_active_goal_for_context(
@@ -1956,7 +2113,10 @@ async fn start_goal(
         blockers: Vec::new(),
     };
     let initial_usage = initial_goal_usage_totals(config);
-    let initial_pause = config.and_then(|_| goal_budget_gate_pause(&goal, initial_usage.as_ref()));
+    let initial_pause = config.and_then(|_| {
+        goal_usage_ledger_gate_pause(&goal, initial_usage.as_ref())
+            .or_else(|| goal_budget_gate_pause(&goal, initial_usage.as_ref()))
+    });
     let (status, continue_goal, message_key) = if let Some(pause) = initial_pause {
         goal.pause_reason = Some(pause.reason);
         goal.pause_description = pause.description;
@@ -2070,6 +2230,7 @@ async fn update_goal_budget(
         GoalBudgetValue::Unlimited => None,
         GoalBudgetValue::Limited(value) => Some(value),
     };
+    ensure_cost_budget_tracking_available(config, cost_limit_usd)?;
     let task_id = current.task_id().to_string();
     goal_store
         .update_goal_limits(&task_id, token_limit, cost_limit_usd)
@@ -2502,10 +2663,21 @@ pub async fn admit_goal_autonomous_turn(
             continue_goal: false,
         }));
     }
+    let usage = goal_usage_totals(Some(config), resolved.task_id());
+    if let Some(pause) = goal_usage_ledger_gate_pause(resolved.goal(), usage.as_ref()) {
+        let budget = goal_budget_summary(resolved.goal(), None);
+        return pause_goal_for_resolved_task_with_budget(
+            cp.goal_store.as_ref(),
+            resolved,
+            pause,
+            budget,
+        )
+        .await
+        .map(Some);
+    }
     if !goal_has_effective_budget(resolved.goal()) {
         return Ok(None);
     }
-    let usage = goal_usage_totals(Some(config), resolved.task_id());
     let budget = goal_budget_summary(resolved.goal(), usage.as_ref());
     if let Some(pause) = goal_budget_gate_pause(resolved.goal(), usage.as_ref()) {
         return pause_goal_for_resolved_task_with_budget(
@@ -3125,6 +3297,8 @@ mod tests {
             cost_usd: 0.75,
             total_tokens: 1_000,
             cost_pricing_available: true,
+            cost_tracking_available: true,
+            usage_available: true,
         };
 
         let pause = goal_budget_pause(&goal, Some(&usage)).unwrap();
@@ -3136,6 +3310,31 @@ mod tests {
         assert_eq!(payload["tokens"]["exhausted"], true);
         assert_eq!(payload["cost"]["exhausted"], true);
         assert!(pause.blockers[0].message.contains("Budget:"));
+    }
+
+    #[test]
+    fn goal_budget_summary_omits_unknown_cost_in_token_only_mode() {
+        let goal = GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship it".into(),
+            effective_token_limit: Some(1_000),
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+        let usage = GoalUsageTotals {
+            total_tokens: 250,
+            cost_usd: 0.0,
+            cost_pricing_available: false,
+            cost_tracking_available: false,
+            usage_available: true,
+        };
+
+        let summary = goal_budget_summary(&goal, Some(&usage));
+        assert!(summary.contains("tokens 250/1000"));
+        assert!(summary.contains("cost unavailable"));
+        assert!(!summary.contains("$0.00"));
     }
 
     #[test]
@@ -3180,6 +3379,8 @@ mod tests {
             total_tokens: 250,
             cost_usd: 0.0,
             cost_pricing_available: false,
+            cost_tracking_available: true,
+            usage_available: true,
         };
 
         let pause = goal_budget_gate_pause(&goal, Some(&usage)).unwrap();
@@ -3200,6 +3401,51 @@ mod tests {
             goal_budget_gate_pause(&goal, Some(&usage)).is_none(),
             "unpriced cost must not block a token-only budget"
         );
+    }
+
+    #[test]
+    fn unlimited_goal_keeps_provider_usage_unavailable_as_status_data() {
+        let goal = GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship it".into(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+        let usage = GoalUsageTotals {
+            total_tokens: 0,
+            cost_usd: 0.0,
+            cost_pricing_available: false,
+            cost_tracking_available: false,
+            usage_available: false,
+        };
+
+        assert!(goal_budget_gate_pause(&goal, Some(&usage)).is_none());
+        assert!(goal_budget_summary(&goal, Some(&usage)).contains("usage unavailable"));
+    }
+
+    #[test]
+    fn token_limited_goal_accepts_unpriced_token_only_usage() {
+        let goal = GoalTaskRecord {
+            task_id: "goal-1".into(),
+            objective: "ship it".into(),
+            effective_token_limit: Some(1_000),
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+        };
+        let usage = GoalUsageTotals {
+            total_tokens: 250,
+            cost_usd: 0.0,
+            cost_pricing_available: false,
+            cost_tracking_available: false,
+            usage_available: true,
+        };
+
+        assert!(goal_budget_gate_pause(&goal, Some(&usage)).is_none());
     }
 
     #[test]
@@ -3423,6 +3669,21 @@ mod tests {
             .unwrap()
             .status,
             TaskStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn runtime_scope_retains_exact_in_turn_goal_binding_after_scope_exits() {
+        let scope = GoalRuntimeScope::new(Some(GoalAdmissionContext::new("agent-a")), None, None);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            scope_goal_runtime(scope.clone(), async {
+                assert!(bind_current_goal_task("goal-exact"));
+            })
+            .await;
+        });
+        assert_eq!(
+            scope.admission_context().and_then(|ctx| ctx.goal_task_id),
+            Some("goal-exact".into())
         );
     }
 
@@ -4265,6 +4526,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accounting_failure_pauses_only_the_exact_running_goal() {
+        let (store, goal_store) = global_test_stores();
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let ctx = GoalAdmissionContext::new(agent.clone())
+            .with_goal_task_id(Some(task_id.clone()))
+            .with_originator_route(Some(route.clone()))
+            .with_principal_id(Some(principal.clone()));
+        goal_store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.clone(),
+                    kind: TaskKind::Goal,
+                    agent,
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "retain accounting".into(),
+                    effective_token_limit: Some(10),
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let error = anyhow::anyhow!("goal accounting usage unavailable");
+        let admission = pause_current_goal_for_accounting_failure(&ctx, &test_config(), &error)
+            .await
+            .unwrap()
+            .expect("exact running goal pauses");
+        assert_eq!(admission.task_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            goal_store
+                .get_goal_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(GoalPauseReason::BudgetUnavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn evaluate_goal_turn_pauses_when_verifier_usage_is_unpriced_under_cost_budget() {
         let _cost_guard = goal_cost_tracker_test_lock().await;
         use wiremock::matchers::{method, path};
@@ -4418,7 +4743,10 @@ mod tests {
     async fn goal_start_with_budget_pauses_when_usage_ledger_unavailable() {
         let store = SqliteTaskStore::new_in_memory().unwrap();
         let ctx = GoalAdmissionContext::new("agent-a");
-        let config = test_config();
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.data_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(config.data_dir.join("state").join("costs.jsonl")).unwrap();
 
         let started = start_goal(
             &store,
@@ -4443,6 +4771,153 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Paused);
         assert_eq!(goal.pause_reason, Some(GoalPauseReason::BudgetUnavailable));
         assert_eq!(goal.blockers[0].kind, GoalBlockerKind::Budget);
+    }
+
+    #[tokio::test]
+    async fn goal_start_rejects_cost_budget_when_cost_tracking_is_disabled() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let config = test_config();
+
+        let error = start_goal(
+            &store,
+            "boot-a",
+            GoalAdmissionContext::new("agent-a"),
+            "ship it".into(),
+            None,
+            Some(2.50),
+            Some(&config),
+        )
+        .await
+        .expect_err("cost-budget admission must require enabled cost tracking");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cost budgets require enabled cost tracking")
+        );
+        assert!(
+            store
+                .latest_active_goal_for_agent("agent-a")
+                .await
+                .unwrap()
+                .is_none(),
+            "rejected cost budget must not create a goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_budget_update_rejects_cost_limit_before_mutating_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let started = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "ship it".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.unwrap();
+
+        let error = update_goal_budget(
+            &store,
+            &store,
+            "boot-a",
+            &ctx,
+            GoalBudgetOverrides {
+                token_limit: GoalBudgetValue::Default,
+                cost_limit_usd: GoalBudgetValue::Limited(2.50),
+            },
+            Some(&test_config()),
+        )
+        .await
+        .expect_err("cost-budget update must require enabled cost tracking");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cost budgets require enabled cost tracking")
+        );
+        let goal = store.get_goal_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(goal.effective_cost_limit_usd, None);
+    }
+
+    #[tokio::test]
+    async fn cost_budget_rejects_unappendable_ledger_before_goal_or_limit_mutation() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let ctx = GoalAdmissionContext::new("agent-a");
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.cost.enabled = true;
+        config.data_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(config.data_dir.join("state").join("costs.jsonl")).unwrap();
+
+        let error = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "ship it".into(),
+            None,
+            Some(2.50),
+            Some(&config),
+        )
+        .await
+        .expect_err("an unappendable cost ledger must reject admission");
+        assert!(
+            error
+                .to_string()
+                .contains("cost budgets require enabled cost tracking")
+        );
+        assert!(
+            store
+                .latest_active_goal_for_agent("agent-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let started = start_goal(
+            &store,
+            "boot-a",
+            ctx.clone(),
+            "token-only".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let task_id = started.task_id.unwrap();
+        let update_error = update_goal_budget(
+            &store,
+            &store,
+            "boot-a",
+            &ctx,
+            GoalBudgetOverrides {
+                token_limit: GoalBudgetValue::Default,
+                cost_limit_usd: GoalBudgetValue::Limited(2.50),
+            },
+            Some(&config),
+        )
+        .await
+        .expect_err("an unappendable cost ledger must reject a limit update");
+        assert!(
+            update_error
+                .to_string()
+                .contains("cost budgets require enabled cost tracking")
+        );
+        assert_eq!(
+            store
+                .get_goal_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .effective_cost_limit_usd,
+            None
+        );
     }
 
     #[test]

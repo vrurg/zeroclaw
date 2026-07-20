@@ -104,7 +104,7 @@ impl Tool for GoalStartTool {
             });
         }
 
-        let admission = admit_goal_command(
+        let admission = match admit_goal_command(
             ctx,
             GoalCommand {
                 action: GoalCommandAction::Start,
@@ -116,7 +116,17 @@ impl Tool for GoalStartTool {
             self.config.as_ref(),
             self.config.agent(&self.agent_alias),
         )
-        .await?;
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new().into(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
         if admission.continue_goal {
             let task_id = admission.task_id.as_deref().ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -130,7 +140,7 @@ impl Tool for GoalStartTool {
             if !crate::control_plane::bind_current_goal_task(task_id) {
                 anyhow::bail!("goal admission could not bind its exact live task");
             }
-            crate::agent::cost::enable_current_tool_loop_goal_attribution();
+            crate::agent::cost::enable_current_tool_loop_goal_attribution(self.config.as_ref());
             crate::control_plane::mark_current_goal_turn_for_evaluation();
         }
         let output = goal_start_tool_output(&admission);
@@ -263,6 +273,49 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not visible from this route"));
+    }
+
+    #[tokio::test]
+    async fn tool_reports_cost_budget_admission_error_to_model() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        if control_plane().is_none() {
+            let sqlite_store =
+                Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+            let store: Arc<dyn TaskRegistry> = sqlite_store.clone();
+            let goal_store: Arc<dyn GoalTaskRegistry> = sqlite_store;
+            let _ = init_control_plane(crate::control_plane::ControlPlaneHandle {
+                store,
+                goal_store,
+                boot_id: "test-boot".into(),
+                recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                data_dir_lock: None,
+            });
+        }
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.cost_budget_usd = Some(2.50);
+        config.cost.enabled = false;
+        let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config));
+        let ctx = GoalAdmissionContext::new(agent)
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some("channel:route-a".into()))
+            .with_principal_id(Some("principal-a".into()));
+
+        let result = scope_goal_admission_context(
+            Some(ctx),
+            tool.execute(serde_json::json!({"objective": "ship it"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("cost budgets require enabled cost tracking")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

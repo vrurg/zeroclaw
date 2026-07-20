@@ -1,4 +1,7 @@
-use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, record_tool_loop_cost_usage};
+use crate::agent::cost::{
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ensure_goal_accounting_preflight,
+    record_tool_loop_cost_usage_optional,
+};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, is_tool_loop_cancelled,
@@ -1434,6 +1437,9 @@ impl DelegateTool {
             messages.push(ChatMessage::system(system_prompt.to_string()));
         }
         messages.push(ChatMessage::user(full_prompt.clone()));
+        // This direct provider boundary bypasses `ResolvedModelAccess`, so it
+        // must enforce the same goal-owned accounting contract before spending.
+        ensure_goal_accounting_preflight()?;
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
             dispatcher.chat(
@@ -1463,16 +1469,12 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                if let Some(usage) = &response.usage
-                    && let Err(error) =
-                        record_tool_loop_cost_usage(&provider_type, &model, usage).await
-                {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Agent '{agent_name}' accounting failed: {error:#}")),
-                    });
-                }
+                record_tool_loop_cost_usage_optional(
+                    &provider_type,
+                    &model,
+                    response.usage.as_ref(),
+                )
+                .await?;
                 let mut rendered = response.text.unwrap_or_default();
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
@@ -4462,9 +4464,9 @@ mod tests {
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone());
 
-        let store: Arc<dyn crate::control_plane::TaskRegistry> =
+        let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> =
             match crate::control_plane::control_plane() {
-                Some(control_plane) => Arc::clone(&control_plane.store),
+                Some(control_plane) => Arc::clone(&control_plane.goal_store),
                 None => {
                     let sqlite_store =
                         Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
@@ -4479,27 +4481,39 @@ mod tests {
                             data_dir_lock: None,
                         },
                     );
-                    Arc::clone(&crate::control_plane::control_plane().unwrap().store)
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().goal_store)
                 }
             };
-        store
-            .create(crate::control_plane::TaskRecord {
-                id: goal_id.clone(),
-                kind: crate::control_plane::TaskKind::Goal,
-                agent: caller_alias.clone(),
-                status: crate::control_plane::TaskStatus::Running,
-                owner_pid: std::process::id(),
-                owner_boot_id: "test-boot".into(),
-                heartbeat_at: None,
-                depth: 0,
-                parent_id: None,
-                originator_route: Some(route.clone()),
-                delivered: false,
-                idem_key: None,
-                principal_id: Some(principal.clone()),
-                started_at: chrono::Utc::now().to_rfc3339(),
-                finished_at: None,
-            })
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: goal_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: caller_alias.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route.clone()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal.clone()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id: goal_id.clone(),
+                    objective: "foreground delegation".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
             .await
             .unwrap();
 

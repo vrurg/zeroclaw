@@ -115,6 +115,18 @@ still derived from the usage ledger. If a budget-paused goal becomes eligible
 after a budget update, the controller resumes it through the same trusted
 continuation path instead of only flipping its lifecycle state.
 
+Goal-owned worker, verifier, continuation, and foreground-delegate calls keep
+their exact task attribution even when `[cost].enabled = false`. In that mode
+the canonical ledger records provider token usage but does not calculate or
+display a dollar amount. A finite cost budget is rejected before a goal or
+budget update is written unless cost tracking is enabled. Missing provider
+usage is recorded as unavailable rather than zero: it pauses a goal with an
+effective limit, while an unlimited goal can continue and reports usage as
+unavailable. This budget-gating rule covers missing provider usage and missing
+cost pricing. A ledger that cannot be opened or written is different: because
+the system cannot retain any exact task-attributed usage record, it pauses the
+exact goal even when that goal is unlimited.
+
 The model-facing `goal_start`, `goal_objective`, and `goal_resume` tools are
 registered only for tool loops that have trusted goal admission context.
 General CLI, gateway, and tool-listing registries do not advertise them yet. If
