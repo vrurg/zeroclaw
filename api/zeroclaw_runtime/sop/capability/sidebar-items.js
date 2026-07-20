@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["CapabilityContext","CapabilityInfo","CapabilityResult","SopCapabilityRegistry"],"trait":["SopCapability"]};

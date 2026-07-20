@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="`ScopedToolRegistry` - the one gated seam that mints the per-agent tool set."><title>zeroclaw::tools::scoped - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.0 (2d8144b78 2026-07-07)" data-channel="1.97.0" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module scoped</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.8.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module scoped</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>tools</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">tools</a></div><h1>Module <span>scoped</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p><code>ScopedToolRegistry</code> - the one gated seam that mints the per-agent tool set.</p>
+<p>Epic A of the agent-policy enforcement-unification program (see the contributing
+page <code>agent-policy-parity-harness.md</code>). The per-agent tool registry has
+historically been assembled by hand at six construction sites (channels
+orchestrator, runtime <code>run</code> / <code>process_message</code>, <code>Agent::from_config</code>, the
+gateway, and the delegate independent-target builder), each re-applying the
+policy itself. That is why the built-in filter and the MCP scoping had to be
+patched per-site (#7064, #6960, #8120) and why the gateway’s <code>/api/tools</code>
+listings misreported the tool set a real turn receives (its live chat resolves
+through <code>process_message</code>, which filters; its listing registries never did).</p>
+<p><a href="struct.ScopedToolRegistry.html#method.assemble" title="associated function zeroclaw::tools::scoped::ScopedToolRegistry::assemble"><code>ScopedToolRegistry::assemble</code></a> is the seam that ends the copying: it applies,
+in order, peripherals, the built-in <code>allowed_tools</code>/<code>excluded_tools</code> filter, the
+ACP memory strip, per-agent MCP server scoping (<code>mcp_bundles</code>, omission is not a
+grant) with per-tool gating plus the MCP capability tools and pinned-resources
+section, and skill registration under the same <code>SecurityPolicy</code>.</p>
+<p>Cut-over status: the gateway’s two registry builders are the first consumers;
+the remaining sites migrate one PR at a time, after which the engine’s tools
+field seals to this newtype and handing it an unfiltered registry becomes a
+compile error instead of a review-checklist item. Until that seal lands, the
+guarantee is that every path routed through <code>assemble</code> shares one
+implementation; paths not yet routed remain hand-rolled by convention.</p>
+<p>Per-site variation is expressed as DATA, never as “skip a security step”: the
+knobs are documented divergences - a per-run caller allowlist that only narrows,
+<code>connect_mcp</code> (ACP fast-boot), <code>connect_peripherals</code> (listing-only surfaces must
+not open hardware), the ACP memory-tool strip, and <code>emit_assembly_logs</code> (only
+execution paths emit the assembly audit records; listing surfaces stay quiet).
+With <code>process_message</code> now routed through <code>assemble</code>, every construction path
+shares one built-in filter: the plain <code>allowed_tools</code>/<code>excluded_tools</code> policy
+filter that <code>run</code> and the orchestrator already used. This retired the former
+<code>filter_channel_builtin_tools</code>, which admitted the canonical read-only defaults
+past <code>allowed_tools</code> at non-Full autonomy on the gateway live-chat and
+peer-delegation paths - a narrowing, since no construction path now bypasses
+<code>allowed_tools</code>.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.ScopedAssembled.html" title="struct zeroclaw::tools::scoped::ScopedAssembled">Scoped<wbr>Assembled</a></dt><dd>Output of <a href="struct.ScopedToolRegistry.html#method.assemble" title="associated function zeroclaw::tools::scoped::ScopedToolRegistry::assemble"><code>ScopedToolRegistry::assemble</code></a>: the scoped registry plus the
+side-channel handles + the deferred-MCP prompt section the callers thread on.</dd><dt><a class="struct" href="struct.ScopedAssembly.html" title="struct zeroclaw::tools::scoped::ScopedAssembly">Scoped<wbr>Assembly</a></dt><dd>Inputs to <a href="struct.ScopedToolRegistry.html#method.assemble" title="associated function zeroclaw::tools::scoped::ScopedToolRegistry::assemble"><code>ScopedToolRegistry::assemble</code></a>. The eager built-ins arrive already
+built (<code>built</code>); <code>assemble</code> does the policy-bearing steps the sites used to repeat.</dd><dt><a class="struct" href="struct.ScopedToolRegistry.html" title="struct zeroclaw::tools::scoped::ScopedToolRegistry">Scoped<wbr>Tool<wbr>Registry</a></dt><dd>A per-agent tool registry that has been scoped and gated. The inner field is
+private and production code can only mint one through
+<a href="struct.ScopedToolRegistry.html#method.assemble" title="associated function zeroclaw::tools::scoped::ScopedToolRegistry::assemble"><code>ScopedToolRegistry::assemble</code></a>. Today (the unsealed P1 phase) the engine still
+takes <code>&amp;[Box&lt;dyn Tool&gt;]</code>, so callers dissolve the type via <a href="https://doc.rust-lang.org/1.97.0/core/ops/deref/trait.Deref.html" title="trait core::ops::deref::Deref"><code>std::ops::Deref</code></a> or
+<a href="struct.ScopedToolRegistry.html#method.into_inner" title="method zeroclaw::tools::scoped::ScopedToolRegistry::into_inner"><code>Self::into_inner</code></a> at the boundary; once every construction site is cut over,
+the engine’s tools field seals to this type and handing it an unfiltered
+registry becomes a compile error instead of a review-checklist item.</dd></dl></section></div></main></body></html>
