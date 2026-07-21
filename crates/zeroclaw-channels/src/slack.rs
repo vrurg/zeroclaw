@@ -1260,6 +1260,9 @@ impl SlackChannel {
         block
     }
 
+    /// Applies the same authorization boundary to historical thread context as
+    /// to live messages. Only the bot's own replies bypass the user allowlist;
+    /// unsupported, unattributed, and unauthorized messages are omitted.
     fn filter_backfill_messages<'a>(
         messages: &'a [serde_json::Value],
         trigger_ts: &str,
