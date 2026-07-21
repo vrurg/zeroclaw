@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -29,6 +29,24 @@ impl ResolvedModelAccess<'_> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget().await?;
+        // This one-shot seam does NOT run `prepare_messages_for_provider` (the
+        // main iteration path does that upstream), so a tool-result
+        // `[AUDIO:/path]` in the history — e.g. the max-iteration graceful
+        // summary sends the accumulated history verbatim — would otherwise
+        // reach the provider as a raw filesystem path and be hallucinated
+        // over. Strip loadable audio markers here so every direct
+        // `run_model_query` caller is covered. Borrows untouched when clean.
+        let ChatRequest {
+            messages,
+            tools,
+            thinking,
+        } = request;
+        let sanitized = multimodal::sanitize_audio_markers(messages);
+        let request = ChatRequest {
+            messages: &sanitized,
+            tools,
+            thinking,
+        };
         let resp = ProviderDispatch::from_ref(self.model_provider)
             .chat(request, self.model, self.temperature)
             .await?;
@@ -64,6 +82,11 @@ pub struct ResolvedAgentExecution<'a> {
     pub approval: Option<&'a ApprovalManager>,
     /// Vision-model routing config.
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config, for resolving the configured `vision_model_provider`'s
+    /// alias-specific runtime options (the `vision` override, endpoint URI,
+    /// credentials) on the vision route. `None` on configless (test) paths,
+    /// where the route falls back to the legacy factory.
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     /// Agentic loop iteration cap.
     pub max_tool_iterations: usize,
     /// Lifecycle hooks; `None` when unconfigured.
@@ -102,6 +125,9 @@ pub struct ResolvedIo<'a> {
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
     pub multimodal_config: &'a MultimodalConfig,
+    /// Full config for vision-route provider-alias resolution; `None` on
+    /// configless (test) paths. See [`ResolvedAgentExecution::config`].
+    pub config: Option<&'a zeroclaw_config::schema::Config>,
     pub hooks: Option<&'a HookRunner>,
     pub activated_tools: Option<&'a Arc<Mutex<ActivatedToolSet>>>,
     pub model_switch_callback: Option<ModelSwitchCallback>,
@@ -136,6 +162,7 @@ impl<'a> ResolvedAgentExecution<'a> {
             silent: io.silent,
             approval: io.approval,
             multimodal_config: io.multimodal_config,
+            config: io.config,
             max_tool_iterations: runtime.max_tool_iterations,
             hooks: io.hooks,
             excluded_tools: runtime.excluded_tools,
@@ -171,14 +198,14 @@ mod run_model_query_tests {
     /// accounting seam can prove both normal recording and fail-closed goals.
     struct UsageProvider {
         usage: Option<TokenUsage>,
-        calls: Arc<AtomicUsize>,
+        calls: AtomicUsize,
     }
 
     impl UsageProvider {
         fn with_usage(usage: Option<TokenUsage>) -> Self {
             Self {
                 usage,
-                calls: Arc::new(AtomicUsize::new(0)),
+                calls: AtomicUsize::new(0),
             }
         }
 
@@ -189,6 +216,64 @@ mod run_model_query_tests {
                 cached_input_tokens: None,
             }))
         }
+    }
+
+    async fn create_test_goal(task_id: String, agent: &str, token_limit: Option<u64>) {
+        let control_plane = match crate::control_plane::control_plane() {
+            Some(control_plane) => control_plane,
+            None => {
+                let sqlite_store = Arc::new(
+                    crate::control_plane::SqliteTaskStore::new_in_memory()
+                        .expect("test control-plane store"),
+                );
+                let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                let _ = crate::control_plane::init_control_plane(
+                    crate::control_plane::ControlPlaneHandle {
+                        store,
+                        goal_store,
+                        boot_id: "test-boot".into(),
+                        recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                        data_dir_lock: None,
+                    },
+                );
+                crate::control_plane::control_plane().expect("test control plane initialized")
+            }
+        };
+
+        control_plane
+            .goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent.into(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: "2026-07-21T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id,
+                    objective: "test goal".into(),
+                    effective_token_limit: token_limit,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("test goal created");
     }
 
     #[async_trait]
@@ -293,8 +378,10 @@ mod run_model_query_tests {
         // budget without a durable ledger record.
         let provider = UsageProvider::with_usage(None);
         let messages = [ChatMessage::user("hi")];
+        let task_id = format!("goal-summary-usage-{}", uuid::Uuid::new_v4());
+        create_test_goal(task_id.clone(), "agent-a", Some(1)).await;
         let goal = crate::control_plane::GoalAdmissionContext::new("agent-a")
-            .with_goal_task_id(Some("goal-summary-usage".into()));
+            .with_goal_task_id(Some(task_id));
         let workspace = tempfile::tempdir().unwrap();
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), workspace.path()).unwrap());
         let context = ToolLoopCostTrackingContext::new(tracker, Arc::new(Default::default()))
