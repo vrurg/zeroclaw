@@ -118,7 +118,11 @@ pub fn relink(
 #[cfg(test)]
 mod tests {
     #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
-    use super::*;
+    use super::{RelinkOutcome, relink};
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use crate::listing::QrPairingChannel;
+    #[cfg(any(feature = "channel-wechat", feature = "whatsapp-web"))]
+    use zeroclaw_config::schema::Config;
 
     #[test]
     fn channels_without_a_relink_hook_resolve_to_no_qr_pairing_key() {
