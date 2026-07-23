@@ -162,12 +162,11 @@ impl Channel for AskUserApprovalBridge {
         if matches!(goal_binding, GoalApprovalBindingState::DenyOnly) {
             return Ok(None);
         }
-        if let GoalApprovalBindingState::Bound(binding) = &goal_binding {
-            if binding.canonical_principal.trim().is_empty()
-                || binding.transport_principal.trim().is_empty()
-            {
-                return Ok(None);
-            }
+        if let GoalApprovalBindingState::Bound(binding) = &goal_binding
+            && (binding.canonical_principal.trim().is_empty()
+                || binding.transport_principal.trim().is_empty())
+        {
+            return Ok(None);
         }
 
         // ── Cross-channel HITL route ───────────────────────────────────────
