@@ -64,49 +64,68 @@ static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// that merely contain a sensitive word (e.g. `access_token`), so this walks the
 /// value instead. Same rendering-boundary contract as [`scrub_credentials`].
 pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
+    scrub_credentials_value_with(value, &scrub_credentials)
+}
+
+pub(crate) fn scrub_credentials_value_with_config(
+    value: serde_json::Value,
+    config: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> serde_json::Value {
+    scrub_credentials_value_with(value, &|text| {
+        crate::security::scrub_with_config(&scrub_credentials(text), config)
+    })
+}
+
+fn scrub_credentials_value_with(
+    mut value: serde_json::Value,
+    scrub_string: &impl Fn(&str) -> String,
+) -> serde_json::Value {
+    scrub_credentials_value_in_place(&mut value, scrub_string);
+    value
+}
+
+fn scrub_credentials_value_in_place(
+    value: &mut serde_json::Value,
+    scrub_string: &impl Fn(&str) -> String,
+) {
     match value {
         serde_json::Value::Object(map) => {
-            let scrubbed = map
-                .into_iter()
-                .map(|(key, val)| {
-                    if SENSITIVE_KEY_REGEX.is_match(&key) {
-                        (key, redact_credential_leaf(val))
-                    } else {
-                        (key, scrub_credentials_value(val))
-                    }
-                })
-                .collect();
-            serde_json::Value::Object(scrubbed)
+            for (key, nested) in map {
+                if SENSITIVE_KEY_REGEX.is_match(key)
+                    && let serde_json::Value::String(secret) = nested
+                {
+                    let redacted = redact_credential_string(secret);
+                    *secret = scrub_string(&redacted);
+                } else {
+                    scrub_credentials_value_in_place(nested, scrub_string);
+                }
+            }
         }
         serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(scrub_credentials_value).collect())
+            for nested in items {
+                scrub_credentials_value_in_place(nested, scrub_string);
+            }
         }
-        serde_json::Value::String(s) => serde_json::Value::String(scrub_credentials(&s)),
-        other => other,
+        serde_json::Value::String(text) => *text = scrub_string(text),
+        _ => {}
     }
 }
 
-/// Redact a value sitting under a credential-named key. String values keep a
-/// short prefix for context; non-strings recurse so nested secret objects are
-/// still walked.
-fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => {
-            let prefix = s
-                .char_indices()
-                .nth(4)
-                .map(|(byte_idx, _)| &s[..byte_idx])
-                .filter(|_| s.chars().count() > 4)
-                .unwrap_or("");
-            serde_json::Value::String(format!("{prefix}*[REDACTED]"))
-        }
-        nested => scrub_credentials_value(nested),
-    }
+/// Redact a string sitting under a credential-named key while retaining a
+/// short prefix for operator context.
+fn redact_credential_string(secret: &str) -> String {
+    let prefix = secret
+        .char_indices()
+        .nth(4)
+        .map(|(byte_idx, _)| &secret[..byte_idx])
+        .unwrap_or("");
+    format!("{prefix}*[REDACTED]")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{scrub_credentials, scrub_credentials_value};
+    use super::{scrub_credentials, scrub_credentials_value, scrub_credentials_value_with};
+    use std::cell::Cell;
 
     #[test]
     fn scrub_credentials_value_redacts_nested_secret_and_keeps_key() {
@@ -143,6 +162,18 @@ mod tests {
         assert!(set_cookie.contains("[REDACTED]"));
         assert!(!set_cookie.contains("9f8e7d6c5b4a3210feed"));
         assert_eq!(out["body"]["status"], "ok");
+    }
+
+    #[test]
+    fn structured_secret_leaf_still_runs_the_followup_scrubber() {
+        let calls = Cell::new(0);
+        let out = scrub_credentials_value_with(serde_json::json!({"token": "abcdefgh"}), &|text| {
+            calls.set(calls.get() + 1);
+            format!("{text}|configured")
+        });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out["token"], "abcd*[REDACTED]|configured");
     }
 
     #[test]

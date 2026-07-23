@@ -124,7 +124,10 @@ impl Tool for GoalStartTool {
             if !crate::control_plane::bind_current_goal_task(task_id) {
                 anyhow::bail!("goal admission could not bind its exact live task");
             }
-            crate::agent::cost::enable_current_tool_loop_goal_attribution(self.config.as_ref());
+            crate::agent::cost::enable_current_tool_loop_goal_attribution(
+                self.config.as_ref(),
+                task_id,
+            )?;
             crate::control_plane::mark_current_goal_turn_for_evaluation();
         }
         let output = goal_start_tool_output(&admission);
@@ -213,12 +216,18 @@ mod tests {
             .with_principal_id(Some("principal-a".into()))
             .with_continuation_context(Some(continuation_context.clone()));
 
-        let result = scope_goal_admission_context(
-            Some(owner.clone()),
-            tool.execute(serde_json::json!({"objective": "ship trusted goal"})),
-        )
-        .await
-        .unwrap();
+        let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only()
+            .with_agent_alias(agent.clone());
+        let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(accounting),
+                scope_goal_admission_context(
+                    Some(owner.clone()),
+                    tool.execute(serde_json::json!({"objective": "ship trusted goal"})),
+                ),
+            )
+            .await
+            .unwrap();
         assert!(result.success, "{result:?}");
         assert!(
             result
@@ -283,16 +292,21 @@ mod tests {
             .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
             .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
         let marker = Arc::new(AtomicBool::new(false));
+        let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
 
-        let result = scope_goal_turn_evaluation_marker(
-            Some(Arc::clone(&marker)),
-            scope_goal_admission_context(
-                Some(owner),
-                tool.execute(serde_json::json!({"objective": "ship trusted goal"})),
-            ),
-        )
-        .await
-        .unwrap();
+        let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(accounting),
+                scope_goal_turn_evaluation_marker(
+                    Some(Arc::clone(&marker)),
+                    scope_goal_admission_context(
+                        Some(owner),
+                        tool.execute(serde_json::json!({"objective": "ship trusted goal"})),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
 
         assert!(result.success, "{result:?}");
         assert!(

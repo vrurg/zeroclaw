@@ -534,6 +534,7 @@ mod cost_usd_regression_tests {
         .with_goal_admission_context(&goal);
 
         let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
         let dedup_exempt_tools = Vec::new();
         let ctx = TurnCtx {
             parent_agent_alias: None,
@@ -551,6 +552,7 @@ mod cost_usd_regression_tests {
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
             strict_tool_parsing: false,
+            leak_detection: &leak_detection,
             channel: None,
             agent_alias: Some(&agent),
             turn_id: "turn-goal-accounting-regression",
@@ -716,6 +718,7 @@ mod cost_usd_regression_tests {
         // TurnCtx with event_tx wired; everything else empty/None.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
         let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
             parent_agent_alias: None,
@@ -733,6 +736,7 @@ mod cost_usd_regression_tests {
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
             strict_tool_parsing: false,
+            leak_detection: &leak_detection,
             channel: None,
             agent_alias: None,
             turn_id: "turn-cost-regression",

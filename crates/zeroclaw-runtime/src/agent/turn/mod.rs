@@ -225,6 +225,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         receipt_generator,
         knobs,
     } = exec;
+    let default_leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+    let leak_detection = config
+        .map(|config| &config.security.leak_detection)
+        .unwrap_or(&default_leak_detection);
 
     let ingress_policy_cfg = IngressPolicy::default();
     let p1_text = history
@@ -332,6 +336,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         dedup_exempt_tools,
         pacing,
         strict_tool_parsing,
+        leak_detection,
         channel,
         turn_id,
         agent_alias,
@@ -897,6 +902,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        leak_detection: Some(ctx.leak_detection),
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -914,6 +920,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        leak_detection: Some(ctx.leak_detection),
                     };
                     execute_tools_sequential(
                         &executable_calls,

@@ -306,10 +306,14 @@ mod payload_capture_tests {
     use super::announce_llm_request;
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
+    use std::sync::LazyLock;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_log::LogConfig;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    static TEST_LEAK_DETECTION: LazyLock<zeroclaw_config::schema::LeakDetectionConfig> =
+        LazyLock::new(zeroclaw_config::schema::LeakDetectionConfig::default);
 
     /// Minimal provider stub. Only `chat_with_system` is required by
     /// `ModelProvider`; `announce_llm_request` never calls it (it only opens
@@ -355,6 +359,7 @@ mod payload_capture_tests {
             dedup_exempt_tools: &[],
             pacing,
             strict_tool_parsing: false,
+            leak_detection: &TEST_LEAK_DETECTION,
             channel: None,
             agent_alias: None,
             turn_id: "trace-req-test",

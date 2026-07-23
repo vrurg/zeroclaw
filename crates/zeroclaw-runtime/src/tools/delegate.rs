@@ -1,10 +1,14 @@
-use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, record_tool_loop_cost_usage};
+use crate::agent::cost::{
+    TOOL_LOOP_COST_TRACKING_CONTEXT, is_goal_accounting_failure,
+    record_tool_loop_cost_usage_optional,
+};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, is_tool_loop_cancelled,
     run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::turn::ToolLoopCancelled;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -34,7 +38,7 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
-async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String>> {
+fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String>> {
     let Some(ctx) = TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(Clone::clone)
         .ok()
@@ -45,55 +49,74 @@ async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String
     if !ctx.goal_attribution_enabled() {
         return Ok(None);
     }
-    if let Some(task_id) = ctx.goal_task_id {
-        return Ok(Some(task_id));
-    }
-    let Some(agent_alias) = ctx.agent_alias.as_deref() else {
-        return Ok(None);
-    };
-    let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Err(anyhow::Error::msg("goal control plane unavailable"));
-    };
-    control_plane
-        .goal_store
-        .latest_active_goal_id_for_context(
-            agent_alias,
-            ctx.originator_route.as_deref(),
-            ctx.principal_id.as_deref(),
-        )
-        .await
-        .map_err(|error| anyhow::Error::msg(format!("goal state lookup failed: {error}")))
+    ctx.exact_goal_task_id()
+        .map(Some)
+        .ok_or_else(|| anyhow::Error::msg("goal state has no exact durable task binding"))
 }
 
-async fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
+fn active_goal_task_id_from_runtime_context() -> anyhow::Result<Option<String>> {
     if !crate::control_plane::current_goal_turn_evaluation_requested() {
         return Ok(None);
     }
-    let Some(ctx) = crate::control_plane::current_goal_admission_context() else {
-        return Ok(None);
-    };
-    if let Some(task_id) = ctx.goal_task_id {
-        return Ok(Some(task_id));
-    }
-    let Some(control_plane) = crate::control_plane::control_plane() else {
-        return Err(anyhow::Error::msg("goal control plane unavailable"));
-    };
-    control_plane
-        .goal_store
-        .latest_active_goal_id_for_context(
-            ctx.agent_alias.as_str(),
-            ctx.originator_route.as_deref(),
-            ctx.principal_id.as_deref(),
-        )
-        .await
-        .map_err(|error| anyhow::Error::msg(format!("goal state lookup failed: {error}")))
+    let ctx = crate::control_plane::current_goal_admission_context()
+        .ok_or_else(|| anyhow::Error::msg("goal state has no durable admission context"))?;
+    ctx.goal_task_id
+        .map(Some)
+        .ok_or_else(|| anyhow::Error::msg("goal state has no exact durable task binding"))
 }
 
-async fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
-    if let Some(task_id) = active_goal_task_id_from_runtime_context().await? {
+fn active_goal_task_id_for_delegate_policy() -> anyhow::Result<Option<String>> {
+    if let Some(task_id) = active_goal_task_id_from_runtime_context()? {
         return Ok(Some(task_id));
     }
-    active_goal_task_id_from_cost_context().await
+    active_goal_task_id_from_cost_context()
+}
+
+fn background_delegate_conflicts_with_goal_state(
+    goal_start_batch: bool,
+    active_goal: anyhow::Result<Option<String>>,
+) -> bool {
+    goal_start_batch || active_goal.map_or(true, |task_id| task_id.is_some())
+}
+
+async fn record_synchronous_delegate_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+) -> anyhow::Result<()> {
+    match record_tool_loop_cost_usage_optional(model_provider_name, model, usage).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_goal_accounting_failure(&error) => {
+            Err(cancel_after_delegate_accounting_failure("synchronous", &error).await)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn cancel_after_delegate_accounting_failure(
+    mode: &str,
+    error: &anyhow::Error,
+) -> anyhow::Error {
+    if let Some(task_id) = crate::agent::cost::current_exact_goal_task_id()
+        && let Err(pause_error) =
+            crate::control_plane::pause_goal_for_accounting_failure(&task_id, error).await
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "task_id": task_id,
+                    "mode": mode,
+                    "accounting_error": format!("{error:#}"),
+                    "pause_error": format!("{pause_error:#}"),
+                })),
+            "delegate accounting failed and the exact goal could not be paused"
+        );
+    }
+    anyhow::Error::new(ToolLoopCancelled)
+        .context(format!("{mode} delegate accounting failed: {error:#}"))
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -1266,11 +1289,13 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
-            if crate::control_plane::current_goal_start_tool_batch_requested()
-                || active_goal_task_id_for_delegate_policy()
-                    .await
-                    .map_or(true, |task| task.is_some())
-            {
+            let goal_start_batch = crate::control_plane::current_goal_start_tool_batch_requested();
+            let active_goal = if goal_start_batch {
+                Ok(None)
+            } else {
+                active_goal_task_id_for_delegate_policy()
+            };
+            if background_delegate_conflicts_with_goal_state(goal_start_batch, active_goal) {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new().into(),
@@ -1469,10 +1494,16 @@ impl DelegateTool {
 
         match result {
             Ok(response) => {
-                if let Some(usage) = &response.usage
-                    && let Err(error) =
-                        record_tool_loop_cost_usage(&provider_type, &model, usage).await
+                if let Err(error) = record_synchronous_delegate_usage(
+                    &provider_type,
+                    &model,
+                    response.usage.as_ref(),
+                )
+                .await
                 {
+                    if is_tool_loop_cancelled(&error) {
+                        return Err(error);
+                    }
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
@@ -2891,6 +2922,9 @@ impl DelegateTool {
                 })
             }
             Ok(Err(e)) if is_tool_loop_cancelled(&e) => Err(e),
+            Ok(Err(e)) if is_goal_accounting_failure(&e) => {
+                Err(cancel_after_delegate_accounting_failure("agentic", &e).await)
+            }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -3174,6 +3208,92 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    async fn create_delegate_goal_for_accounting(
+        token_limit: Option<u64>,
+    ) -> (
+        Arc<dyn crate::control_plane::GoalTaskRegistry>,
+        String,
+        String,
+        crate::control_plane::GoalAdmissionContext,
+    ) {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> =
+            match crate::control_plane::control_plane() {
+                Some(control_plane) => Arc::clone(&control_plane.goal_store),
+                None => {
+                    let sqlite_store =
+                        Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                    let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                    let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                    let _ = crate::control_plane::init_control_plane(
+                        crate::control_plane::ControlPlaneHandle {
+                            store,
+                            goal_store,
+                            boot_id: "test-boot".into(),
+                            recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                            data_dir_lock: None,
+                        },
+                    );
+                    Arc::clone(&crate::control_plane::control_plane().unwrap().goal_store)
+                }
+            };
+        goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent.clone(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "verify delegate accounting boundary".into(),
+                    effective_token_limit: token_limit,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let ctx = crate::control_plane::GoalAdmissionContext::new(agent.clone())
+            .with_goal_task_id(Some(task_id.clone()));
+        (goal_store, task_id, agent, ctx)
+    }
+
+    async fn assert_delegate_accounting_pause(
+        goal_store: &dyn crate::control_plane::GoalTaskRegistry,
+        task_id: &str,
+    ) {
+        let task = crate::control_plane::control_plane()
+            .unwrap()
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, crate::control_plane::TaskStatus::Paused);
+        let goal = goal_store.get_goal_task(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            goal.pause_reason,
+            Some(crate::control_plane::GoalPauseReason::BudgetUnavailable)
+        );
     }
 
     fn security_allowing() -> Arc<SecurityPolicy> {
@@ -4170,6 +4290,22 @@ mod tests {
         assert_eq!(schema["properties"]["prompt"]["minLength"], json!(1));
     }
 
+    #[test]
+    fn background_delegation_fails_closed_when_goal_lookup_is_unavailable() {
+        assert!(background_delegate_conflicts_with_goal_state(
+            false,
+            Err(anyhow::Error::msg("synthetic goal lookup failure"))
+        ));
+        assert!(background_delegate_conflicts_with_goal_state(
+            true,
+            Ok(None)
+        ));
+        assert!(!background_delegate_conflicts_with_goal_state(
+            false,
+            Ok(None)
+        ));
+    }
+
     #[tokio::test]
     async fn background_delegation_rejected_when_goal_context_active() {
         let agent = format!("agent-{}", uuid::Uuid::new_v4());
@@ -4311,6 +4447,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_delegation_rejected_when_goal_marker_has_no_binding_context() {
+        let workspace = TempDir::new().unwrap();
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.path().to_path_buf());
+        let marker = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let result = crate::control_plane::scope_goal_turn_evaluation_marker(
+            Some(marker),
+            tool.execute(json!({
+                "agent": "researcher",
+                "prompt": "do detached work",
+                "background": true
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Background delegation is disabled")
+        );
+        assert!(
+            !workspace.path().join("delegate_results").exists(),
+            "a rejected marker-only goal delegate must not create detached result state"
+        );
+    }
+
+    #[tokio::test]
     async fn ordinary_admission_context_does_not_activate_goal_delegate_policy() {
         let agent = format!("agent-{}", uuid::Uuid::new_v4());
         let route = format!("route-{}", uuid::Uuid::new_v4());
@@ -4358,11 +4526,11 @@ mod tests {
         let goal_context = crate::control_plane::GoalAdmissionContext::new(agent)
             .with_originator_route(Some(route))
             .with_principal_id(Some(principal));
-        let active = crate::control_plane::scope_goal_admission_context(
-            Some(goal_context),
-            active_goal_task_id_for_delegate_policy(),
-        )
-        .await;
+        let active =
+            crate::control_plane::scope_goal_admission_context(Some(goal_context), async {
+                active_goal_task_id_for_delegate_policy()
+            })
+            .await;
 
         assert_eq!(
             active.unwrap(),
@@ -4537,7 +4705,8 @@ mod tests {
         let tracker = Arc::new(crate::cost::CostTracker::new(cost_config, tmp.path()).unwrap());
         let goal_ctx = crate::control_plane::GoalAdmissionContext::new(caller_alias.clone())
             .with_originator_route(Some(route))
-            .with_principal_id(Some(principal));
+            .with_principal_id(Some(principal))
+            .with_goal_task_id(Some(goal_id.clone()));
         let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::new(
             Arc::clone(&tracker),
             Arc::new(HashMap::from([(
@@ -4574,6 +4743,79 @@ mod tests {
                 .map(|stats| stats.request_count),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn synchronous_delegate_missing_or_empty_usage_pauses_and_cancels_goal_work() {
+        for (token_limit, usage) in [
+            (None, None),
+            (
+                Some(100),
+                Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cached_input_tokens: Some(0),
+                }),
+            ),
+        ] {
+            let workspace = TempDir::new().unwrap();
+            let (goal_store, task_id, agent, goal_ctx) =
+                create_delegate_goal_for_accounting(token_limit).await;
+            let tracker = Arc::new(
+                crate::cost::CostTracker::new(
+                    zeroclaw_config::schema::CostConfig::default(),
+                    workspace.path(),
+                )
+                .unwrap(),
+            );
+            let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker,
+                Arc::new(HashMap::new()),
+            )
+            .with_agent_alias(agent)
+            .with_goal_admission_context(&goal_ctx);
+
+            let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(cost_ctx), async {
+                    record_synchronous_delegate_usage("test-provider", "test-model", usage.as_ref())
+                        .await
+                })
+                .await
+                .expect_err("goal delegate accounting failure must cancel the active loop");
+
+            assert!(
+                is_tool_loop_cancelled(&error),
+                "unexpected error: {error:#}"
+            );
+            assert_delegate_accounting_pause(goal_store.as_ref(), &task_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_delegate_unavailable_ledger_pauses_and_cancels_goal_work() {
+        let (goal_store, task_id, agent, goal_ctx) =
+            create_delegate_goal_for_accounting(None).await;
+        let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::usage_only()
+            .with_agent_alias(agent)
+            .with_goal_admission_context(&goal_ctx);
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_input_tokens: Some(0),
+        };
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(cost_ctx), async {
+                record_synchronous_delegate_usage("test-provider", "test-model", Some(&usage)).await
+            })
+            .await
+            .expect_err("missing goal ledger must cancel the active loop");
+
+        assert!(
+            is_tool_loop_cancelled(&error),
+            "unexpected error: {error:#}"
+        );
+        assert_delegate_accounting_pause(goal_store.as_ref(), &task_id).await;
     }
 
     #[test]
@@ -5246,6 +5488,50 @@ mod tests {
             .expect_err("ToolLoopCancelled should propagate out of agentic delegate");
 
         assert!(is_tool_loop_cancelled(&err), "unexpected error: {err:#}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_accounting_failure_pauses_and_cancels_parent_goal_loop() {
+        let workspace = TempDir::new().unwrap();
+        let (goal_store, task_id, agent, goal_ctx) =
+            create_delegate_goal_for_accounting(None).await;
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let cost_ctx =
+            crate::agent::cost::ToolLoopCostTrackingContext::new(tracker, Arc::new(HashMap::new()))
+                .with_agent_alias(agent)
+                .with_goal_admission_context(&goal_ctx);
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()));
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                tool.execute_agentic(
+                    "agentic",
+                    &config,
+                    "openrouter",
+                    "model-test",
+                    &FinalOnlyModelProvider,
+                    "run",
+                    Some(0.2),
+                ),
+            )
+            .await
+            .expect_err("nested accounting failure must cancel the parent goal loop");
+
+        assert!(
+            is_tool_loop_cancelled(&error),
+            "unexpected error: {error:#}"
+        );
+        assert_delegate_accounting_pause(goal_store.as_ref(), &task_id).await;
     }
 
     #[tokio::test]

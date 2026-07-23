@@ -64,8 +64,10 @@ impl ChannelSopTopic {
 pub struct ChannelApprovalRequest {
     pub tool_name: String,
     pub arguments_summary: String,
-    /// Raw tool arguments for channels (e.g. ACP) that can render structured
-    /// diffs instead of a plain summary string.
+    /// Structured presentation arguments for channels (e.g. ACP) that can
+    /// render diffs instead of a plain summary string. The approval boundary
+    /// must scrub this copy before it leaves the runtime; execution retains its
+    /// separate raw argument value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
 }

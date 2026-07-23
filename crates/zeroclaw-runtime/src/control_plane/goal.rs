@@ -1865,17 +1865,24 @@ pub async fn pause_current_goal_for_human_gate(
     kind: GoalBlockerKind,
     message: String,
     payload: Option<serde_json::Value>,
-) -> Result<Option<GoalAdmission>> {
+) -> Result<GoalAdmission> {
     match kind {
         GoalBlockerKind::NeedsUserInput | GoalBlockerKind::HumanEscalation => {}
         _ => bail!("human gate pause requires a human-gate blocker kind"),
     }
-    let Some(cp) = control_plane() else {
-        return Ok(None);
-    };
-    let Some(resolved) = latest_active_resolved_goal(cp.goal_store.as_ref(), ctx).await? else {
-        return Ok(None);
-    };
+    let cp = control_plane().context("goal control plane unavailable during human gate")?;
+    let task_id = ctx
+        .goal_task_id
+        .as_deref()
+        .filter(|task_id| !task_id.trim().is_empty())
+        .context("goal human gate has no exact durable task binding")?;
+    let resolved = resolve_goal(
+        cp.store.as_ref(),
+        cp.goal_store.as_ref(),
+        ctx,
+        Some(task_id.to_string()),
+    )
+    .await?;
     let admission = pause_goal_for_known_blocker(
         cp.goal_store.as_ref(),
         resolved,
@@ -1892,7 +1899,7 @@ pub async fn pause_current_goal_for_human_gate(
     )
     .await?;
     publish_goal_state_update(&admission);
-    Ok(Some(admission))
+    Ok(admission)
 }
 
 async fn start_goal(
@@ -5224,6 +5231,7 @@ mod tests {
         .await
         .unwrap();
         let task_id = started.task_id.unwrap();
+        let ctx = ctx.with_goal_task_id(Some(task_id.clone()));
 
         let admission = pause_current_goal_for_human_gate(
             &ctx,
@@ -5233,8 +5241,7 @@ mod tests {
             Some(serde_json::json!({"tool": "ask_user", "question": "continue?"})),
         )
         .await
-        .unwrap()
-        .expect("active scoped goal should be paused");
+        .unwrap();
 
         assert_eq!(admission.task_id.as_deref(), Some(task_id.as_str()));
         assert_eq!(admission.status, TaskStatus::Paused);
