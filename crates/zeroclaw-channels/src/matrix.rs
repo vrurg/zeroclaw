@@ -145,18 +145,24 @@ mod mention {
         // a runtime slash command; normal conversational mentions stay intact.
         // Matrix has several user-visible address forms, while `Channel`
         // exposes only one canonical address for cross-channel callers.
-        let mut addresses = vec![bot_user_id.to_string()];
-        let localpart = format!("@{}", bot_user_id.localpart());
-        addresses.push(localpart);
-        if let Some(display_name) = bot_display_name
+        let full_user_id = bot_user_id.as_str();
+        let localpart = full_user_id
+            .split_once(':')
+            .map_or(full_user_id, |(localpart, _)| localpart);
+        let display_name = bot_display_name
             .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            addresses.push(display_name.to_string());
-            if !display_name.starts_with('@') {
-                addresses.push(format!("@{display_name}"));
-            }
-        }
+            .filter(|name| !name.is_empty());
+        let prefixed_display_name = display_name
+            .filter(|name| !name.starts_with('@'))
+            .map(|name| format!("@{name}"));
+        let addresses = [
+            Some(full_user_id),
+            Some(localpart),
+            display_name,
+            prefixed_display_name.as_deref(),
+        ]
+        .into_iter()
+        .flatten();
 
         crate::addressed_command::strip_leading_addressed_command(body, addresses)
     }
@@ -1710,8 +1716,9 @@ mod inbound {
             return Ok(());
         }
 
-        let display_name = ctx.bot_display_name.read().await.clone();
-        if ctx.config.mention_only && is_group_room(&room).await {
+        let mention_required = ctx.config.mention_only && is_group_room(&room).await;
+        let display_name = ctx.bot_display_name.read().await;
+        if mention_required {
             let mention_user_ids = extract_mentions_user_ids(&raw);
             if !mention::is_mentioned(
                 &ctx.bot_user_id,
@@ -1737,6 +1744,7 @@ mod inbound {
         )
         .unwrap_or(&body)
         .to_string();
+        drop(display_name);
         if ctx_mod::should_prepend_thread_preamble(&content)
             && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
@@ -4251,6 +4259,10 @@ mod tests {
                     Some("Task Orchestrator"),
                     "Task Orchestrator: /goal status"
                 ),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Кіготь"), "@Кіготь /goal status"),
                 Some("/goal status")
             );
         }

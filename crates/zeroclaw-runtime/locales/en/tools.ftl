@@ -105,6 +105,7 @@ tool-goal-start-success-paused =
 tool-goal-start-error-empty-objective = goal_start requires a non-empty objective
 tool-goal-start-error-missing-context = goal_start is unavailable because trusted runtime admission context was not supplied.
 tool-goal-start-error-agent-context-mismatch = goal_start is unavailable because trusted runtime admission context does not match this agent.
+tool-goal-human-gate-error-channel-override = Goal-mode ask_user cannot override its channel. The notification route is bound to the exact goal's durable continuation context.
 
 tool-goal-objective = Amend the current durable goal objective. The replacement objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
 tool-goal-objective-objective-description = Replacement objective text for the current durable goal. Use when new evidence changes the goal scope without requiring cancellation.

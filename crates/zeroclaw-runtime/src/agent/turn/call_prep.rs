@@ -7,7 +7,7 @@ use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, scrub_tool_arguments_for_presentation};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -24,6 +24,30 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     let canonical_args = canonicalize_json_for_tool_signature(tool_args);
     let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
     (tool_name.trim().to_ascii_lowercase(), args_json)
+}
+
+fn tool_start_progress(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> String {
+    let hint = {
+        let value = match tool_name {
+            "shell" => arguments.get("command").and_then(|value| value.as_str()),
+            "file_read" | "file_write" => arguments.get("path").and_then(|value| value.as_str()),
+            _ => arguments
+                .get("action")
+                .and_then(|value| value.as_str())
+                .or_else(|| arguments.get("query").and_then(|value| value.as_str())),
+        };
+        value.map_or_else(String::new, |text| truncate_with_ellipsis(text, 60))
+    };
+    let progress = if hint.is_empty() {
+        format!("\u{23f3} {tool_name}\n")
+    } else {
+        format!("\u{23f3} {tool_name}: {hint}\n")
+    };
+    crate::security::scrub_with_config(&scrub_credentials(&progress), leak_detection)
 }
 
 async fn record_duplicate_tool_call(
@@ -43,7 +67,10 @@ async fn record_duplicate_tool_call(
                 "model": ctx.model,
                 "iteration": iteration + 1,
                 "tool": tool_name,
-                "arguments": scrub_credentials(&tool_args.to_string()),
+                "arguments": scrub_tool_arguments_for_presentation(
+                    tool_args,
+                    ctx.leak_detection
+                ).to_string(),
                 "result": duplicate,
                 "deduplicated": true,
                 "trace_id": ctx.turn_id,
@@ -105,7 +132,10 @@ pub(crate) async fn prepare_tool_calls(
                                 "model": ctx.model,
                                 "iteration": iteration + 1,
                                 "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
+                                "arguments": scrub_tool_arguments_for_presentation(
+                                    &tool_args,
+                                    ctx.leak_detection
+                                ).to_string(),
                                 "result": cancelled,
                                 "trace_id": ctx.turn_id,
                             })),
@@ -132,7 +162,7 @@ pub(crate) async fn prepare_tool_calls(
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
                     // as the direct execution path always emitted.
                     if let Some(tx) = ctx.event_tx {
-                        emit_tool_call_pair(tx, call, &outcome).await;
+                        emit_tool_call_pair(tx, call, &outcome, ctx.leak_detection).await;
                     }
                     ordered_results[idx] =
                         Some((call.name.clone(), call.tool_call_id.clone(), outcome));
@@ -181,7 +211,10 @@ pub(crate) async fn prepare_tool_calls(
                             "model": ctx.model,
                             "iteration": iteration + 1,
                             "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
+                            "arguments": scrub_tool_arguments_for_presentation(
+                                &tool_args,
+                                ctx.leak_detection
+                            ).to_string(),
                             "result": repeated,
                             "trace_id": ctx.turn_id,
                         })),
@@ -207,7 +240,7 @@ pub(crate) async fn prepare_tool_calls(
                 // synthesized result (e.g. a DenyWithEdit replacement) as a
                 // ToolCall/ToolResult pair, as the direct path always did.
                 if let Some(tx) = ctx.event_tx {
-                    emit_tool_call_pair(tx, call, &outcome).await;
+                    emit_tool_call_pair(tx, call, &outcome, ctx.leak_detection).await;
                 }
                 ordered_results[idx] =
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
@@ -226,6 +259,8 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
+        let presentation_arguments =
+            scrub_tool_arguments_for_presentation(&tool_args, ctx.leak_detection);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -234,7 +269,7 @@ pub(crate) async fn prepare_tool_calls(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "arguments": presentation_arguments.to_string(),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_start"
@@ -242,25 +277,8 @@ pub(crate) async fn prepare_tool_calls(
 
         // ── Progress: tool start ────────────────────────────
         if let Some(tx) = ctx.on_delta {
-            let hint = {
-                let raw = match tool_name.as_str() {
-                    "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-                    "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
-                    _ => tool_args
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| tool_args.get("query").and_then(|v| v.as_str())),
-                };
-                match raw {
-                    Some(s) => truncate_with_ellipsis(s, 60),
-                    None => String::new(),
-                }
-            };
-            let progress = if hint.is_empty() {
-                format!("\u{23f3} {}\n", tool_name)
-            } else {
-                format!("\u{23f3} {}: {hint}\n", tool_name)
-            };
+            let progress =
+                tool_start_progress(&tool_name, &presentation_arguments, ctx.leak_detection);
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -293,4 +311,30 @@ pub(crate) async fn prepare_tool_calls(
         executable_indices,
         executable_calls,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_start_progress;
+    use crate::agent::tool_execution::scrub_tool_arguments_for_presentation;
+    use zeroclaw_config::schema::LeakDetectionConfig;
+
+    #[test]
+    fn tool_start_progress_scrubs_arguments_before_truncation_and_final_display() {
+        let configured_credential = "AKIAIOSFODNN7EXAMPLE";
+        let legacy_credential = "token=abcdefghijklmnop";
+        let raw = serde_json::json!({
+            "command": format!("{configured_credential} {legacy_credential}"),
+        });
+
+        let config = LeakDetectionConfig::default();
+        let arguments = scrub_tool_arguments_for_presentation(&raw, &config);
+        let progress = tool_start_progress("shell", &arguments, &config);
+
+        for output in [arguments.to_string(), progress] {
+            assert!(!output.contains(configured_credential));
+            assert!(!output.contains("abcdefghijklmnop"));
+            assert!(output.contains("[REDACTED"));
+        }
+    }
 }

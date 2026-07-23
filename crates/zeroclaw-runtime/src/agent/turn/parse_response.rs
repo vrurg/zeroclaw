@@ -455,7 +455,219 @@ mod cost_usd_regression_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use zeroclaw_config::cost::CostTracker;
+    use zeroclaw_config::schema::CostConfig;
     use zeroclaw_providers::traits::TokenUsage;
+
+    async fn create_running_goal(task_id: String, agent: &str) {
+        let control_plane = match crate::control_plane::control_plane() {
+            Some(control_plane) => control_plane,
+            None => {
+                let sqlite_store = Arc::new(
+                    crate::control_plane::SqliteTaskStore::new_in_memory()
+                        .expect("test control-plane store"),
+                );
+                let store: Arc<dyn crate::control_plane::TaskRegistry> = sqlite_store.clone();
+                let goal_store: Arc<dyn crate::control_plane::GoalTaskRegistry> = sqlite_store;
+                let _ = crate::control_plane::init_control_plane(
+                    crate::control_plane::ControlPlaneHandle {
+                        store,
+                        goal_store,
+                        boot_id: "test-boot".into(),
+                        recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                        data_dir_lock: None,
+                    },
+                );
+                crate::control_plane::control_plane().expect("test control plane initialized")
+            }
+        };
+
+        control_plane
+            .goal_store
+            .create_goal(
+                crate::control_plane::TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent.into(),
+                    status: crate::control_plane::TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: None,
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: None,
+                    started_at: "2026-07-23T00:00:00Z".into(),
+                    finished_at: None,
+                },
+                crate::control_plane::GoalTaskRecord {
+                    task_id,
+                    objective: "test iterative worker accounting".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("test goal created");
+    }
+
+    async fn assert_iterative_goal_usage_failure_pauses(usage: Option<TokenUsage>) {
+        let task_id = format!("goal-worker-usage-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        create_running_goal(task_id.clone(), &agent).await;
+
+        let workspace = tempfile::TempDir::new().expect("test workspace");
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), workspace.path()).unwrap());
+        let goal = crate::control_plane::GoalAdmissionContext::new(agent.clone())
+            .with_goal_task_id(Some(task_id.clone()));
+        let cost_ctx = crate::agent::cost::ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::new()),
+        )
+        .with_agent_alias(agent.clone())
+        .with_goal_admission_context(&goal);
+
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            leak_detection: &leak_detection,
+            channel: None,
+            agent_alias: Some(&agent),
+            turn_id: "turn-goal-accounting-regression",
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: Vec::new(),
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+        let response = ChatResponse {
+            text: Some("candidate completion".into()),
+            tool_calls: Vec::new(),
+            usage,
+            reasoning_content: None,
+        };
+        let prior_usage = TokenUsage {
+            input_tokens: Some(20),
+            output_tokens: Some(5),
+            cached_input_tokens: Some(0),
+        };
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = crate::control_plane::scope_goal_state_updates(
+            Some(crate::control_plane::GoalStateUpdateSink::new(status_tx)),
+            async {
+                crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(Some(cost_ctx), async {
+                        crate::agent::cost::record_tool_loop_cost_usage(
+                            "test-provider",
+                            "test-model",
+                            &prior_usage,
+                        )
+                        .await
+                        .expect("known usage is recorded before the missing observation");
+                        interpret_chat_response(
+                            &ctx,
+                            response,
+                            &[],
+                            &specs,
+                            false,
+                            Instant::now(),
+                            0,
+                            false,
+                        )
+                        .await
+                    })
+                    .await
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unmetered goal worker response must not advance"),
+        };
+        assert!(
+            format!("{error:#}").contains("goal accounting usage unavailable"),
+            "unexpected worker accounting error: {error:#}"
+        );
+        let status = status_rx
+            .try_recv()
+            .expect("accounting pause publishes its committed status");
+        let crate::control_plane::GoalStateUpdateEvent::Status(message) = status else {
+            panic!("accounting pause must publish a status event");
+        };
+        assert!(
+            message.contains("at least 25/unlimited tokens recorded; usage incomplete"),
+            "pause status lost known token totals: {message}"
+        );
+        assert!(
+            message.contains("cost unavailable"),
+            "unpriced usage must not be displayed as zero cost: {message}"
+        );
+
+        let control_plane = crate::control_plane::control_plane().expect("control plane");
+        let task = control_plane
+            .store
+            .get(&task_id)
+            .await
+            .unwrap()
+            .expect("goal task remains durable");
+        assert_eq!(task.status, crate::control_plane::TaskStatus::Paused);
+        let goal = control_plane
+            .goal_store
+            .get_goal_task(&task_id)
+            .await
+            .unwrap()
+            .expect("goal extension remains durable");
+        assert_eq!(
+            goal.pause_reason,
+            Some(crate::control_plane::GoalPauseReason::BudgetUnavailable)
+        );
+
+        let (tokens, cost, pricing_available, usage_available) = tracker
+            .get_usage_totals_for_task_with_pricing(&task_id)
+            .expect("exact-task unavailable observation");
+        assert_eq!(tokens, 25);
+        assert_eq!(cost, 0.0);
+        assert!(!pricing_available);
+        assert!(!usage_available);
+    }
+
+    #[tokio::test]
+    async fn iterative_goal_worker_pauses_when_provider_omits_usage() {
+        assert_iterative_goal_usage_failure_pauses(None).await;
+    }
+
+    #[tokio::test]
+    async fn iterative_goal_worker_pauses_when_provider_reports_empty_usage() {
+        assert_iterative_goal_usage_failure_pauses(Some(TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(0),
+        }))
+        .await;
+    }
 
     /// Regression guard for the per-call USD that
     /// `record_tool_loop_cost_usage` returns and `interpret_chat_response`
@@ -506,6 +718,7 @@ mod cost_usd_regression_tests {
         // TurnCtx with event_tx wired; everything else empty/None.
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
         let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
         let dedup_exempt_tools: Vec<String> = Vec::new();
         let ctx = TurnCtx {
             parent_agent_alias: None,
@@ -523,6 +736,7 @@ mod cost_usd_regression_tests {
             dedup_exempt_tools: &dedup_exempt_tools,
             pacing: &pacing,
             strict_tool_parsing: false,
+            leak_detection: &leak_detection,
             channel: None,
             agent_alias: None,
             turn_id: "turn-cost-regression",

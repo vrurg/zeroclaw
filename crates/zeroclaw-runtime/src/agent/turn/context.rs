@@ -8,7 +8,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_config::schema::PacingConfig;
+use zeroclaw_config::schema::{LeakDetectionConfig, PacingConfig};
 
 pub(crate) struct TurnCtx<'a> {
     pub(crate) observer: &'a dyn Observer,
@@ -25,6 +25,7 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) dedup_exempt_tools: &'a [String],
     pub(crate) pacing: &'a PacingConfig,
     pub(crate) strict_tool_parsing: bool,
+    pub(crate) leak_detection: &'a LeakDetectionConfig,
     pub(crate) channel: Option<&'a dyn Channel>,
     pub(crate) turn_id: &'a str,
     pub(crate) agent_alias: Option<&'a str>,

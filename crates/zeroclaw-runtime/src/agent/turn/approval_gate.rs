@@ -4,7 +4,7 @@
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, scrub_tool_arguments_for_presentation};
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
 
@@ -12,6 +12,29 @@ pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
+}
+
+fn approval_request_for_presentation(
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        tool_name: tool_name.to_string(),
+        arguments: scrub_tool_arguments_for_presentation(tool_args, leak_detection),
+    }
+}
+
+fn approval_decision_for_audit(
+    decision: &ApprovalResponse,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> ApprovalResponse {
+    match decision {
+        ApprovalResponse::ReplaceWith(replacement) => ApprovalResponse::ReplaceWith(
+            crate::security::scrub_with_config(&scrub_credentials(replacement), leak_detection),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -31,10 +54,7 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
-        let request = ApprovalRequest {
-            tool_name: tool_name.to_string(),
-            arguments: tool_args.clone(),
-        };
+        let request = approval_request_for_presentation(tool_name, tool_args, ctx.leak_detection);
 
         // Interactive CLI: prompt the operator.
         // Non-interactive (channels): try the channel's inline
@@ -93,7 +113,13 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        let audit_decision = approval_decision_for_audit(&decision, ctx.leak_detection);
+        mgr.record_decision(
+            tool_name,
+            &request.arguments,
+            &audit_decision,
+            &decision_channel,
+        );
 
         if decision == ApprovalResponse::No {
             let denied = "Denied by user.".to_string();
@@ -106,7 +132,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": request.arguments,
                         "result": denied,
                         "trace_id": ctx.turn_id,
                     })),
@@ -131,6 +157,9 @@ pub(crate) async fn gate_tool_approval(
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
+            let ApprovalResponse::ReplaceWith(audit_replacement) = &audit_decision else {
+                unreachable!("audit decision must preserve the response variant");
+            };
             if let Some(tx) = ctx.on_delta {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
@@ -148,9 +177,9 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": request.arguments,
                         "replaced": true,
-                        "output": scrub_credentials(replacement),
+                        "output": audit_replacement,
                         "trace_id": ctx.turn_id,
                     })),
                 "tool_call_result"
@@ -172,5 +201,62 @@ pub(crate) async fn gate_tool_approval(
 
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{approval_decision_for_audit, approval_request_for_presentation};
+    use crate::approval::{ApprovalManager, ApprovalResponse};
+    use crate::security::AutonomyLevel;
+    use zeroclaw_config::schema::{LeakDetectionConfig, RiskProfileConfig};
+
+    #[test]
+    fn approval_presentation_scrubs_configured_patterns_before_audit_or_delivery() {
+        let credential = "AKIAIOSFODNN7EXAMPLE";
+        let request = approval_request_for_presentation(
+            "shell",
+            &serde_json::json!({
+                "command": format!("echo {credential}"),
+                "content": credential,
+            }),
+            &LeakDetectionConfig::default(),
+        );
+        let serialized = request.arguments.to_string();
+        assert!(!serialized.contains(credential));
+        assert!(serialized.contains("[REDACTED"));
+
+        let manager = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            ..RiskProfileConfig::default()
+        });
+        manager.record_decision(
+            &request.tool_name,
+            &request.arguments,
+            &ApprovalResponse::No,
+            "test",
+        );
+        let audit = manager.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].arguments_summary.contains(credential));
+        assert!(audit[0].arguments_summary.contains("[REDACT"));
+    }
+
+    #[test]
+    fn replacement_decision_is_scrubbed_for_audit_without_changing_execution_copy() {
+        let credential = "AKIAIOSFODNN7EXAMPLE";
+        let decision = ApprovalResponse::ReplaceWith(format!("denied: {credential}"));
+        let audit_decision =
+            approval_decision_for_audit(&decision, &LeakDetectionConfig::default());
+
+        let ApprovalResponse::ReplaceWith(audit_text) = audit_decision else {
+            panic!("replacement decision changed variant");
+        };
+        assert!(!audit_text.contains(credential));
+        assert!(audit_text.contains("[REDACTED"));
+        assert_eq!(
+            decision,
+            ApprovalResponse::ReplaceWith(format!("denied: {credential}"))
+        );
     }
 }

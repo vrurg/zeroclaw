@@ -1823,11 +1823,13 @@ fn goal_continuation_message_with_prompt(
     task_id: &str,
     prompt: &GoalContinuationPrompt,
 ) -> zeroclaw_api::channel::ChannelMessage {
-    synthetic_goal_message_from(
+    let mut next = synthetic_goal_message_from(
         msg,
         format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4()),
         goal_continuation_prompt(task_id, prompt),
-    )
+    );
+    next.internal_goal_task_id = Some(task_id.to_string());
+    next
 }
 
 fn synthetic_goal_message_from(
@@ -1849,6 +1851,8 @@ fn synthetic_goal_message_from(
     next.subject = msg.subject.clone();
     next.conversation_scope = msg.conversation_scope;
     next.passive_context = false;
+    next.internal_goal_task_id
+        .clone_from(&msg.internal_goal_task_id);
     next
 }
 
@@ -1876,15 +1880,16 @@ fn recovered_goal_continuation_message(
     msg.interruption_scope_id = context.interruption_scope_id;
     msg.conversation_scope = goal_channel_conversation_scope(context.conversation_scope);
     msg.passive_context = false;
+    msg.internal_goal_task_id = Some(task_id.to_string());
     msg
 }
 
 fn is_recovered_goal_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
-    msg.id.starts_with("goal-restart:")
+    msg.internal_goal_task_id.is_some() && msg.id.starts_with("goal-restart:")
 }
 
 fn is_goal_controller_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
-    msg.id.contains(":goal:") || is_recovered_goal_continuation_message(msg)
+    msg.internal_goal_task_id.is_some()
 }
 
 fn should_enrich_message_links(
@@ -1926,18 +1931,15 @@ fn should_consolidate_message_memory(
 fn goal_admission_context_for_message(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    _history_key: &str,
+    history_key: &str,
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
         .with_originator_route(Some(goal_trusted_route(msg)))
         .with_principal_id(goal_principal_id(msg))
-        .with_legacy_identity(
-            Some(conversation_history_key(msg)),
-            legacy_goal_principal_id(msg),
-        )
-        .with_goal_task_id(None)
+        .with_legacy_identity(Some(history_key.to_string()), legacy_goal_principal_id(msg))
+        .with_goal_task_id(msg.internal_goal_task_id.clone())
         .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
 }
 
@@ -1958,11 +1960,16 @@ fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 }
 
 fn canonical_goal_identity(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| format!("{}:{part}", part.len()))
-        .collect::<Vec<_>>()
-        .join("|")
+    let capacity = parts.iter().map(|part| part.len() + 4).sum();
+    let mut identity = String::with_capacity(capacity);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            identity.push('|');
+        }
+        write!(&mut identity, "{}:{part}", part.len())
+            .expect("writing canonical identity into String cannot fail");
+    }
+    identity
 }
 
 fn goal_cost_tracking_context_for_turn(
@@ -1974,8 +1981,7 @@ fn goal_cost_tracking_context_for_turn(
         Some(goal_ctx) if goal_controller_continuation => {
             context.with_goal_admission_context(goal_ctx)
         }
-        Some(goal_ctx) => context.with_goal_admission_filters(goal_ctx),
-        None => context,
+        _ => context,
     }
 }
 
@@ -3580,7 +3586,6 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
-    let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -3831,9 +3836,9 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::Goal(command) => {
             let action = command.action;
             let command_objective = command.objective.clone();
-            let defaults_snapshot = runtime_defaults_snapshot(ctx);
+            let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
             match zeroclaw_runtime::control_plane::admit_goal_command(
-                goal_admission_context.clone(),
+                goal_admission_context,
                 command,
                 defaults_snapshot.config.as_ref(),
                 Some(ctx.agent_cfg.as_ref()),
@@ -3841,19 +3846,23 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => {
-                    if admission.continue_goal
-                        && let Some(task_id) = admission.task_id.clone()
-                    {
+                    let zeroclaw_runtime::control_plane::GoalAdmission {
+                        task_id,
+                        status: _,
+                        message,
+                        continuation_reason,
+                        continue_goal,
+                    } = admission;
+                    if continue_goal && let Some(task_id) = task_id {
                         let prompt = match action {
                             zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
                                 command_objective
-                                    .clone()
                                     .map(|objective| GoalContinuationPrompt::Start { objective })
                             }
                             zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
                                 Some(GoalContinuationPrompt::Resume {
                                     objective: goal_objective_for_prompt(&task_id).await,
-                                    resume_reason: admission.continuation_reason.clone(),
+                                    resume_reason: continuation_reason,
                                 })
                             }
                             zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
@@ -3867,7 +3876,7 @@ async fn handle_runtime_command_if_needed(
                             outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
                         }
                     }
-                    admission.message
+                    message
                 }
                 Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-command-failed",
@@ -5599,6 +5608,7 @@ async fn process_channel_message_body(
             msg.content = goal_continuation_prompt(&task_id, &prompt);
             msg.attachments.clear();
             msg.passive_context = false;
+            msg.internal_goal_task_id = Some(task_id);
             command_requested_goal_continuation = true;
         }
     }
@@ -5676,6 +5686,7 @@ async fn process_channel_message_body(
         }
     }
 
+    let mut controller_goal_context = None;
     if goal_controller_continuation {
         let goal_ctx = goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key);
         match zeroclaw_runtime::control_plane::admit_goal_autonomous_turn(
@@ -5702,7 +5713,7 @@ async fn process_channel_message_body(
                 .await;
                 return ChannelProcessOutcome::Done;
             }
-            Ok(None) => {}
+            Ok(None) => controller_goal_context = Some(goal_ctx),
             Err(error) => {
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-controller-failed",
@@ -6340,11 +6351,10 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
-    let goal_admission_context = Some(goal_admission_context_for_message(
-        ctx.as_ref(),
-        &msg,
-        &history_key,
-    ));
+    let goal_admission_context =
+        Some(controller_goal_context.unwrap_or_else(|| {
+            goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key)
+        }));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
@@ -22595,6 +22605,14 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn canonical_goal_identity_preserves_exact_byte_length_framing() {
+        assert_eq!(
+            canonical_goal_identity(&["matrix", "бот", "", "room|thread"]),
+            "6:matrix|6:бот|0:|11:room|thread"
+        );
+    }
+
+    #[test]
     fn matrix_self_anchored_root_history_key_omits_event_id() {
         let first = zeroclaw_api::channel::ChannelMessage {
             id: "$first:server".into(),
@@ -23463,8 +23481,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert!(cost_ctx.exact_goal_task_id().is_none());
         assert!(!cost_ctx.goal_attribution_enabled());
     }
 
@@ -23481,14 +23498,14 @@ BTC is currently around $65,000 based on latest tool output."#
     fn controller_goal_turn_enables_goal_attribution() {
         let goal_ctx = zeroclaw_runtime::control_plane::GoalAdmissionContext::new("agent-a")
             .with_originator_route(Some("route-a".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_goal_task_id(Some("goal-a".into()));
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert_eq!(cost_ctx.exact_goal_task_id().as_deref(), Some("goal-a"));
         assert!(cost_ctx.goal_attribution_enabled());
     }
 
@@ -23599,7 +23616,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn synthetic_goal_messages_are_preflighted_before_model_turn() {
-        let original = zeroclaw_api::channel::ChannelMessage::new(
+        let mut original = zeroclaw_api::channel::ChannelMessage::new(
             "msg-1",
             "@operator:example.org",
             "!room:example.org",
@@ -23617,6 +23634,11 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(is_goal_controller_continuation_message(&next));
+        assert!(!is_goal_controller_continuation_message(&original));
+        assert_eq!(next.internal_goal_task_id.as_deref(), Some("goal-1"));
+
+        original.id = "goal-restart:spoofed:message".into();
+        assert!(!is_recovered_goal_continuation_message(&original));
         assert!(!is_goal_controller_continuation_message(&original));
     }
 
@@ -23687,6 +23709,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(is_recovered_goal_continuation_message(&msg));
         assert!(is_goal_controller_continuation_message(&msg));
+        assert_eq!(msg.internal_goal_task_id.as_deref(), Some("goal-1"));
         assert_eq!(msg.channel, context.channel);
         assert_eq!(msg.channel_alias, context.channel_alias);
         assert_eq!(msg.reply_target, context.reply_target);
@@ -25813,6 +25836,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )
@@ -27573,6 +27597,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )

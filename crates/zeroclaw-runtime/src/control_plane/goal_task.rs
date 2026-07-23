@@ -272,6 +272,26 @@ pub struct TaskContinuationContext {
     pub conversation_scope: TaskContinuationConversationScope,
 }
 
+impl TaskContinuationContext {
+    /// Return the exact key used by the live channel registry.
+    ///
+    /// Goal continuations, approval prompts, and human-gate notifications must
+    /// all resolve the same durable channel identity. Keeping the composite-key
+    /// rule here prevents those egress paths from inventing independent alias
+    /// precedence or falling back to an arbitrary registered channel.
+    #[must_use]
+    pub fn channel_key(&self) -> Option<String> {
+        let channel = self.channel.trim();
+        if channel.is_empty() {
+            return None;
+        }
+        match self.channel_alias.as_deref().map(str::trim) {
+            Some(alias) if !alias.is_empty() => Some(format!("{channel}.{alias}")),
+            _ => Some(channel.to_string()),
+        }
+    }
+}
+
 /// Durable representation of the channel history scope for a continuation
 /// prompt. Kept local to the control plane so the store does not depend on
 /// channel transport structs.

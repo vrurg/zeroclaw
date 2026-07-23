@@ -82,13 +82,12 @@ pub(crate) fn goal_approval_binding_from_admission(
     let Some(context) = admission.continuation_context.as_ref() else {
         return GoalApprovalBindingState::DenyOnly;
     };
-    let channel = match context.channel_alias.as_deref().map(str::trim) {
-        Some(alias) if !alias.is_empty() => format!("{}.{}", context.channel.trim(), alias),
-        _ => context.channel.trim().to_string(),
+    let Some(channel) = context.channel_key() else {
+        return GoalApprovalBindingState::DenyOnly;
     };
     let recipient = context.reply_target.trim();
     let principal = admission.principal_id.as_deref().unwrap_or("").trim();
-    if channel.is_empty() || recipient.is_empty() || principal.is_empty() {
+    if recipient.is_empty() || principal.is_empty() {
         return GoalApprovalBindingState::DenyOnly;
     }
 
