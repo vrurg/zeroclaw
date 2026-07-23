@@ -992,6 +992,8 @@ goal-budget-limit-unlimited = unlimited
 goal-budget-cost-value = ${$amount}
 goal-budget-summary = Budget: tokens {$tokens_used}/{$token_limit}; cost {$cost_used}/{$cost_limit}.
 goal-budget-summary-cost-unavailable = Budget: tokens {$tokens_used}/{$token_limit}; cost unavailable.
+goal-budget-summary-incomplete = Budget: at least {$tokens_used}/{$token_limit} tokens and {$cost_used}/{$cost_limit} cost recorded; usage incomplete.
+goal-budget-summary-incomplete-cost-unavailable = Budget: at least {$tokens_used}/{$token_limit} tokens recorded; usage incomplete; cost unavailable.
 goal-budget-summary-unavailable = Budget: usage unavailable; limits tokens {$token_limit}, cost {$cost_limit}.
 goal-command-started =
     🎯 Goal `{$task_id}` started.
