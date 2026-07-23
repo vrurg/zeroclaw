@@ -154,11 +154,11 @@ controller instead of separate surface-specific start paths.
 
 ## Usage Attribution
 
-When a turn runs under goal context, model usage is attributed to the active
-goal by resolving the canonical task record at recording time. Synchronous
-delegation and verifier calls inherit that attribution. Background delegation
-is rejected while a goal is active until parent-linked completion and usage
-reporting exist.
+Before a goal-owned provider call starts, the controller binds the turn to the
+exact admitted durable task and validates that task against canonical storage.
+Synchronous delegation and verifier calls inherit that exact-task binding.
+Background delegation is rejected while a goal is active until parent-linked
+completion and usage reporting exist.
 
 Goal usage summaries are derived from task-attributed cost ledger rows whose
 task attribution key matches the canonical goal task id. The JSONL

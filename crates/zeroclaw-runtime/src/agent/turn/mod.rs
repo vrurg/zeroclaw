@@ -64,7 +64,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
+    should_execute_prepared_tools_in_parallel,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::util::truncate_with_ellipsis;
@@ -225,6 +225,10 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         receipt_generator,
         knobs,
     } = exec;
+    let default_leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+    let leak_detection = config
+        .map(|config| &config.security.leak_detection)
+        .unwrap_or(&default_leak_detection);
 
     let ingress_policy_cfg = IngressPolicy::default();
     let p1_text = history
@@ -338,6 +342,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         dedup_exempt_tools,
         pacing,
         strict_tool_parsing,
+        leak_detection,
         channel,
         turn_id,
         agent_alias,
@@ -891,8 +896,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // raw model calls. `before_tool_call` hooks may rewrite the tool name;
         // policy-sensitive goal admission tools must be seen under their
         // executable names before a batch is allowed to run concurrently.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
+        let allow_parallel_execution = parallel_tools
+            && should_execute_prepared_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
@@ -903,6 +908,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        leak_detection: Some(ctx.leak_detection),
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -920,6 +926,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
+                        leak_detection: Some(ctx.leak_detection),
                     };
                     execute_tools_sequential(
                         &executable_calls,
@@ -944,27 +951,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
 
-        let mut executed_completed_indices: Vec<usize> = Vec::new();
-        let mut executed_completed_calls = Vec::new();
-        let mut executed_completed_outcomes = Vec::new();
-        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
-            executable_indices
-                .iter()
-                .copied()
-                .zip(executable_calls.iter()),
-        ) {
-            if let Some(outcome) = slot {
-                executed_completed_indices.push(call_idx);
-                executed_completed_calls.push(call.clone());
-                executed_completed_outcomes.push(outcome);
-            }
-        }
-
-        record_executed_outcomes(
+        let executed_completed_indices = record_executed_outcomes(
             &ctx,
-            &executed_completed_indices,
-            &executed_completed_calls,
-            executed_completed_outcomes,
+            &executable_indices,
+            &executable_calls,
+            executed_slots,
             &mut ordered_results,
             iteration,
         )
@@ -999,6 +990,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     if completed.contains(call_idx) {
                         continue;
                     }
+                    let call = call.call();
                     let call_id = events::resolve_tool_call_id(call);
                     let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
                         output: crate::i18n::get_required_cli_string(

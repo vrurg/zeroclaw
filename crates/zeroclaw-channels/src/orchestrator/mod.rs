@@ -827,6 +827,36 @@ fn in_flight_worker_is_bound_to_goal(state: &InFlightSenderTaskState, task_id: &
         == Some(task_id)
 }
 
+fn find_in_flight_worker_bound_to_goal(
+    head: &InFlightSenderTaskState,
+    task_id: &str,
+) -> Option<InFlightSenderTaskState> {
+    let mut current = Some(head.clone());
+    while let Some(state) = current {
+        if in_flight_worker_is_bound_to_goal(&state, task_id) {
+            return Some(state);
+        }
+        current = state.predecessor.as_deref().cloned();
+    }
+    None
+}
+
+async fn interrupt_in_flight_goal_worker(
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    sender_scope_key: &str,
+    task_id: &str,
+) -> bool {
+    let head = in_flight.lock().await.get(sender_scope_key).cloned();
+    let Some(worker) = head
+        .as_ref()
+        .and_then(|head| find_in_flight_worker_bound_to_goal(head, task_id))
+    else {
+        return false;
+    };
+    worker.cancellation.cancel();
+    true
+}
+
 #[cfg(test)]
 #[test]
 fn in_flight_worker_binding_requires_the_exact_goal_task() {
@@ -1936,11 +1966,13 @@ fn goal_continuation_message_with_prompt(
     task_id: &str,
     prompt: &GoalContinuationPrompt,
 ) -> zeroclaw_api::channel::ChannelMessage {
-    synthetic_goal_message_from(
+    let mut next = synthetic_goal_message_from(
         msg,
         format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4()),
         goal_continuation_prompt(task_id, prompt),
-    )
+    );
+    next.internal_goal_task_id = Some(task_id.to_string());
+    next
 }
 
 fn synthetic_goal_message_from(
@@ -1962,6 +1994,8 @@ fn synthetic_goal_message_from(
     next.subject = msg.subject.clone();
     next.conversation_scope = msg.conversation_scope;
     next.passive_context = false;
+    next.internal_goal_task_id
+        .clone_from(&msg.internal_goal_task_id);
     next
 }
 
@@ -1989,15 +2023,16 @@ fn recovered_goal_continuation_message(
     msg.interruption_scope_id = context.interruption_scope_id;
     msg.conversation_scope = goal_channel_conversation_scope(context.conversation_scope);
     msg.passive_context = false;
+    msg.internal_goal_task_id = Some(task_id.to_string());
     msg
 }
 
 fn is_recovered_goal_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
-    msg.id.starts_with("goal-restart:")
+    msg.internal_goal_task_id.is_some() && msg.id.starts_with("goal-restart:")
 }
 
 fn is_goal_controller_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
-    msg.id.contains(":goal:") || is_recovered_goal_continuation_message(msg)
+    msg.internal_goal_task_id.is_some()
 }
 
 fn should_enrich_message_links(
@@ -2039,18 +2074,19 @@ fn should_consolidate_message_memory(
 fn goal_admission_context_for_message(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    _history_key: &str,
+    history_key: &str,
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
         .with_originator_route(Some(goal_trusted_route(msg)))
         .with_principal_id(goal_principal_id(msg))
-        .with_legacy_identity(
-            Some(conversation_history_key(msg)),
-            legacy_goal_principal_id(msg),
+        .with_legacy_identity(Some(history_key.to_string()), legacy_goal_principal_id(msg))
+        .with_goal_task_id(
+            msg.internal_goal_task_id
+                .clone()
+                .or_else(current_in_flight_goal_task),
         )
-        .with_goal_task_id(current_in_flight_goal_task())
         .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
 }
 
@@ -2071,11 +2107,16 @@ fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 }
 
 fn canonical_goal_identity(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| format!("{}:{part}", part.len()))
-        .collect::<Vec<_>>()
-        .join("|")
+    let capacity = parts.iter().map(|part| part.len() + 4).sum();
+    let mut identity = String::with_capacity(capacity);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            identity.push('|');
+        }
+        write!(&mut identity, "{}:{part}", part.len())
+            .expect("writing canonical identity into String cannot fail");
+    }
+    identity
 }
 
 fn goal_cost_tracking_context_for_turn(
@@ -2087,8 +2128,7 @@ fn goal_cost_tracking_context_for_turn(
         Some(goal_ctx) if goal_controller_continuation => {
             context.with_goal_admission_context(goal_ctx)
         }
-        Some(goal_ctx) => context.with_goal_admission_filters(goal_ctx),
-        None => context,
+        _ => context,
     }
 }
 
@@ -3698,6 +3738,7 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
+    goal_workers: Option<&tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
 ) -> RuntimeCommandOutcome {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return RuntimeCommandOutcome::NotCommand;
@@ -3708,7 +3749,6 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
-    let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -3959,9 +3999,9 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::Goal(command) => {
             let action = command.action;
             let command_objective = command.objective.clone();
-            let defaults_snapshot = runtime_defaults_snapshot(ctx);
+            let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
             match zeroclaw_runtime::control_plane::admit_goal_command(
-                goal_admission_context.clone(),
+                goal_admission_context,
                 command,
                 defaults_snapshot.config.as_ref(),
                 Some(ctx.agent_cfg.as_ref()),
@@ -3969,20 +4009,24 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => {
-                    let admitted_task_id = admission.task_id.clone();
-                    if admission.continue_goal
-                        && let Some(task_id) = admission.task_id.clone()
-                    {
+                    let zeroclaw_runtime::control_plane::GoalAdmission {
+                        task_id,
+                        status: _,
+                        message,
+                        continuation_reason,
+                        continue_goal,
+                    } = admission;
+                    let admitted_task_id = task_id.clone();
+                    if continue_goal && let Some(task_id) = task_id {
                         let prompt = match action {
                             zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
                                 command_objective
-                                    .clone()
                                     .map(|objective| GoalContinuationPrompt::Start { objective })
                             }
                             zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
                                 Some(GoalContinuationPrompt::Resume {
                                     objective: goal_objective_for_prompt(&task_id).await,
-                                    resume_reason: admission.continuation_reason.clone(),
+                                    resume_reason: continuation_reason,
                                 })
                             }
                             zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
@@ -4001,7 +4045,7 @@ async fn handle_runtime_command_if_needed(
                             task_id: admitted_task_id,
                         };
                     }
-                    admission.message
+                    message
                 }
                 Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-command-failed",
@@ -4022,6 +4066,25 @@ async fn handle_runtime_command_if_needed(
         &defaults_snapshot.config.security.leak_detection,
         outbound_content_format_for_channel(&msg.channel),
     );
+
+    finish_runtime_command(outcome, response, msg, channel, goal_workers).await
+}
+
+async fn finish_runtime_command(
+    outcome: RuntimeCommandOutcome,
+    response: String,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel: &Arc<dyn Channel>,
+    goal_workers: Option<&tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+) -> RuntimeCommandOutcome {
+    if let RuntimeCommandOutcome::HandledGoal {
+        task_id: Some(task_id),
+    } = &outcome
+        && let Some(goal_workers) = goal_workers
+    {
+        let sender_scope_key = interruption_scope_key(msg);
+        interrupt_in_flight_goal_worker(goal_workers, &sender_scope_key, task_id).await;
+    }
 
     if let Err(err) = channel
         .send(&{
@@ -5649,7 +5712,8 @@ async fn process_channel_message_body(
     // mutate the leading command token. Otherwise `/goal start ... https://...`
     // can become `[Link: ...]\n/goal ...` and leak into the model as prompt text.
     let mut command_requested_goal_continuation = false;
-    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref(), None).await
+    {
         RuntimeCommandOutcome::NotCommand => {}
         RuntimeCommandOutcome::Handled | RuntimeCommandOutcome::HandledGoal { .. } => {
             reconcile_early_ack(
@@ -5668,6 +5732,7 @@ async fn process_channel_message_body(
             msg.content = goal_continuation_prompt(&task_id, &prompt);
             msg.attachments.clear();
             msg.passive_context = false;
+            msg.internal_goal_task_id = Some(task_id);
             command_requested_goal_continuation = true;
         }
     }
@@ -5745,6 +5810,7 @@ async fn process_channel_message_body(
         }
     }
 
+    let mut controller_goal_context = None;
     if goal_controller_continuation {
         let goal_ctx = goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key);
         match zeroclaw_runtime::control_plane::admit_goal_autonomous_turn(
@@ -5771,7 +5837,7 @@ async fn process_channel_message_body(
                 .await;
                 return ChannelProcessOutcome::Done;
             }
-            Ok(None) => {}
+            Ok(None) => controller_goal_context = Some(goal_ctx),
             Err(error) => {
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-controller-failed",
@@ -6409,11 +6475,10 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
-    let goal_admission_context = Some(goal_admission_context_for_message(
-        ctx.as_ref(),
-        &msg,
-        &history_key,
-    ));
+    let goal_admission_context =
+        Some(controller_goal_context.unwrap_or_else(|| {
+            goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key)
+        }));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
@@ -8327,28 +8392,13 @@ async fn run_message_dispatch_loop(
         {
             let mut goal_command_msg = msg.clone();
             goal_command_msg.content = goal_command_content.to_string();
-            let outcome = handle_runtime_command_if_needed(
+            handle_runtime_command_if_needed(
                 ctx.as_ref(),
                 &goal_command_msg,
                 target_channel.as_ref(),
+                Some(in_flight_by_sender.as_ref()),
             )
             .await;
-            if let RuntimeCommandOutcome::HandledGoal {
-                task_id: Some(task_id),
-            } = outcome
-            {
-                let scope_key = interruption_scope_key(&goal_command_msg);
-                let bound_worker = {
-                    let mut active = in_flight_by_sender.lock().await;
-                    let matches_task = active
-                        .get(&scope_key)
-                        .is_some_and(|state| in_flight_worker_is_bound_to_goal(state, &task_id));
-                    matches_task.then(|| active.remove(&scope_key)).flatten()
-                };
-                if let Some(state) = bound_worker {
-                    cancel_in_flight_chain(&state);
-                }
-            }
             // Pause/cancel admission has committed (or failed) before this
             // point. It is never folded into debounce or an active model turn.
             continue;
@@ -15454,6 +15504,12 @@ api_key = "anthropic-key"
         send_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct PendingSendChannel {
+        send_started: tokio::sync::Notify,
+        release_send: tokio::sync::Notify,
+    }
+
     struct DraftRecordingChannel {
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
@@ -15639,6 +15695,18 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for PendingSendChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "pending-send-test"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for DraftRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -15659,6 +15727,26 @@ api_key = "anthropic-key"
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             self.send_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("send boom")
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PendingSendChannel {
+        fn name(&self) -> &str {
+            "pending-send-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_started.notify_one();
+            self.release_send.notified().await;
+            Ok(())
         }
 
         async fn listen(
@@ -22784,6 +22872,29 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn goal_trusted_route_does_not_collide_when_history_sanitization_does() {
+        let mut first =
+            zeroclaw_api::channel::ChannelMessage::new("one", "a:b", "room", "x", "matrix", 1);
+        first.reply_target = "r-c".into();
+        let mut second = first.clone();
+        second.sender = "a b".into();
+        assert_eq!(
+            conversation_history_key(&first),
+            conversation_history_key(&second)
+        );
+        assert_ne!(goal_trusted_route(&first), goal_trusted_route(&second));
+        assert_ne!(goal_principal_id(&first), goal_principal_id(&second));
+    }
+
+    #[test]
+    fn canonical_goal_identity_preserves_exact_byte_length_framing() {
+        assert_eq!(
+            canonical_goal_identity(&["matrix", "бот", "", "room|thread"]),
+            "6:matrix|6:бот|0:|11:room|thread"
+        );
+    }
+
+    #[test]
     fn matrix_self_anchored_root_history_key_omits_event_id() {
         let first = zeroclaw_api::channel::ChannelMessage {
             id: "$first:server".into(),
@@ -23466,6 +23577,79 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn goal_command_interrupts_bound_predecessor_before_response_delivery() {
+        let goal_cancellation = CancellationToken::new();
+        let goal_worker = InFlightSenderTaskState {
+            task_id: 1,
+            cancellation: goal_cancellation.clone(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            goal_task_id: Arc::new(std::sync::Mutex::new(Some("goal-a".into()))),
+            predecessor: None,
+        };
+        let ordinary_cancellation = CancellationToken::new();
+        let ordinary_worker = InFlightSenderTaskState {
+            task_id: 2,
+            cancellation: ordinary_cancellation.clone(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            goal_task_id: Arc::new(std::sync::Mutex::new(None)),
+            predecessor: Some(Arc::new(goal_worker)),
+        };
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "pause-goal-a".into(),
+            sender: "alice".into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            content: "/goal pause wait".into(),
+            ..Default::default()
+        };
+        let scope_key = interruption_scope_key(&msg);
+        let workers = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            scope_key,
+            ordinary_worker,
+        )])));
+        let pending_channel = Arc::new(PendingSendChannel::default());
+        let channel: Arc<dyn Channel> = pending_channel.clone();
+        let task = {
+            let workers = Arc::clone(&workers);
+            zeroclaw_spawn::spawn!(async move {
+                finish_runtime_command(
+                    RuntimeCommandOutcome::HandledGoal {
+                        task_id: Some("goal-a".into()),
+                    },
+                    "Goal paused".into(),
+                    &msg,
+                    &channel,
+                    Some(workers.as_ref()),
+                )
+                .await
+            })
+        };
+
+        pending_channel.send_started.notified().await;
+        assert!(
+            goal_cancellation.is_cancelled(),
+            "the exact goal worker must be interrupted before response delivery"
+        );
+        assert!(
+            !ordinary_cancellation.is_cancelled(),
+            "an unrelated queued successor must remain registered"
+        );
+        assert!(
+            !task.is_finished(),
+            "the response transport should still be pending during the ordering assertion"
+        );
+
+        pending_channel.release_send.notify_one();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeCommandOutcome::HandledGoal {
+                task_id: Some("goal-a".into())
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_agent_scope_writes_override_for_admin_sender() {
         // Authorized sender: dispatch must reach the SetModelScoped(Agent)
         // accept branch and write a scope override.
@@ -23482,6 +23666,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("alice"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -23515,6 +23700,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("mallory"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -23546,6 +23732,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_user_msg("mallory"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -23576,6 +23763,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("alice"),
             Some(&target),
+            None,
         )
         .await;
         assert!(!matches!(handled, RuntimeCommandOutcome::NotCommand));
@@ -23652,8 +23840,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert!(cost_ctx.exact_goal_task_id().is_none());
         assert!(!cost_ctx.goal_attribution_enabled());
     }
 
@@ -23670,14 +23857,14 @@ BTC is currently around $65,000 based on latest tool output."#
     fn controller_goal_turn_enables_goal_attribution() {
         let goal_ctx = zeroclaw_runtime::control_plane::GoalAdmissionContext::new("agent-a")
             .with_originator_route(Some("route-a".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_goal_task_id(Some("goal-a".into()));
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert_eq!(cost_ctx.exact_goal_task_id().as_deref(), Some("goal-a"));
         assert!(cost_ctx.goal_attribution_enabled());
     }
 
@@ -23788,7 +23975,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn synthetic_goal_messages_are_preflighted_before_model_turn() {
-        let original = zeroclaw_api::channel::ChannelMessage::new(
+        let mut original = zeroclaw_api::channel::ChannelMessage::new(
             "msg-1",
             "@operator:example.org",
             "!room:example.org",
@@ -23806,6 +23993,11 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(is_goal_controller_continuation_message(&next));
+        assert!(!is_goal_controller_continuation_message(&original));
+        assert_eq!(next.internal_goal_task_id.as_deref(), Some("goal-1"));
+
+        original.id = "goal-restart:spoofed:message".into();
+        assert!(!is_recovered_goal_continuation_message(&original));
         assert!(!is_goal_controller_continuation_message(&original));
     }
 
@@ -23876,6 +24068,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(is_recovered_goal_continuation_message(&msg));
         assert!(is_goal_controller_continuation_message(&msg));
+        assert_eq!(msg.internal_goal_task_id.as_deref(), Some("goal-1"));
         assert_eq!(msg.channel, context.channel);
         assert_eq!(msg.channel_alias, context.channel_alias);
         assert_eq!(msg.reply_target, context.reply_target);
@@ -26008,6 +26201,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )
@@ -27768,6 +27962,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )

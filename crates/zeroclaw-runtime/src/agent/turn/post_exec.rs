@@ -4,9 +4,8 @@
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{PreparedToolCall, ToolExecutionOutcome};
 use crate::util::truncate_with_ellipsis;
-use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
 /// post-execution section): one `tool_call_result` log line, the
@@ -15,16 +14,22 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
-    executable_calls: &[ParsedToolCall],
-    executed_outcomes: Vec<ToolExecutionOutcome>,
+    executable_calls: &[PreparedToolCall],
+    executed_slots: Vec<Option<ToolExecutionOutcome>>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
-) {
+) -> Vec<usize> {
+    let mut completed_indices = Vec::new();
     for ((idx, call), outcome) in executable_indices
         .iter()
         .zip(executable_calls.iter())
-        .zip(executed_outcomes)
+        .zip(executed_slots)
     {
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        completed_indices.push(*idx);
+        let call = call.call();
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
@@ -97,6 +102,7 @@ pub(crate) async fn record_executed_outcomes(
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
     }
+    completed_indices
 }
 
 /// Build the CLI completion-progress line. Failure text is scrubbed here

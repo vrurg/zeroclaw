@@ -67,8 +67,10 @@ pub struct ChannelApprovalRequest {
     /// Human-readable argument summary for channels that cannot render a
     /// structured approval view.
     pub arguments_summary: String,
-    /// Raw tool arguments for channels (e.g. ACP) that can render structured
-    /// diffs instead of a plain summary string.
+    /// Structured presentation arguments for channels (e.g. ACP) that can
+    /// render diffs instead of a plain summary string. The approval boundary
+    /// must scrub this copy before it leaves the runtime; execution retains its
+    /// separate raw argument value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
 }
@@ -261,7 +263,6 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<MediaAttachment>,
-    /// Email subject for reply threading.
     /// Email-style subject for transports that use subject-based threading.
     pub subject: Option<String>,
     /// Internal SOP-ingress marker carrying the event topic, set ONLY by the
@@ -270,6 +271,15 @@ pub struct ChannelMessage {
     /// never be driven by user-controlled fields like `subject` or `content`.
     /// Never round-trips through serde.
     pub internal_sop_event: Option<String>,
+    /// Exact durable goal task carried only by runtime-authored continuation
+    /// messages.
+    ///
+    /// This is transient controller plumbing across the channel dispatch
+    /// boundary, not lifecycle state or an authorization lookup key. Channel
+    /// adapters must leave it as `None`; the orchestrator validates the
+    /// referenced task against the canonical goal store before provider work.
+    /// Never round-trips through serde.
+    pub internal_goal_task_id: Option<String>,
     /// When true, the orchestrator records this as context only and must not
     /// start an agent turn or emit visible channel side effects.
     pub passive_context: bool,

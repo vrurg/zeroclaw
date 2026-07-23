@@ -9,10 +9,11 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_config::schema::LeakDetectionConfig;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
-use super::turn::TurnMeta;
+use super::turn::{TurnMeta, redact::scrub_credentials_value_with_config};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -51,6 +52,45 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     /// Tool names removed from this specific turn before model/tool execution.
     pub excluded_tools: &'a [String],
+    /// Configured rendering policy for copies emitted to logs and UI events.
+    ///
+    /// Raw tool arguments remain untouched for execution, receipts, and
+    /// model-loop history. `None` is reserved for configless test/subturn
+    /// callers and uses the secure default policy.
+    #[allow(dead_code)] // Used by the secure direct-dispatch fallback.
+    pub leak_detection: Option<&'a LeakDetectionConfig>,
+}
+
+pub(crate) fn scrub_tool_arguments_for_presentation(
+    value: &serde_json::Value,
+    leak_detection: &LeakDetectionConfig,
+) -> serde_json::Value {
+    scrub_credentials_value_with_config(value.clone(), leak_detection)
+}
+
+/// One executable tool call with separate data- and presentation-path
+/// arguments.
+///
+/// Preparation owns all argument mutations (hooks, delivery defaults, approval
+/// markers), then creates the scrubbed copy exactly once. Execution must use
+/// `call.arguments`; logs, observers, progress, and pending-call events must use
+/// `presentation_arguments`.
+pub(crate) struct PreparedToolCall {
+    call: ParsedToolCall,
+    presentation_arguments: serde_json::Value,
+}
+
+impl PreparedToolCall {
+    pub(crate) fn new(call: ParsedToolCall, presentation_arguments: serde_json::Value) -> Self {
+        Self {
+            call,
+            presentation_arguments,
+        }
+    }
+
+    pub(crate) fn call(&self) -> &ParsedToolCall {
+        &self.call
+    }
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -63,7 +103,7 @@ fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
 fn unavailable_tool_outcome(
     call_name: &str,
     tool_call_id_owned: Option<String>,
-    full_args: &str,
+    full_args: String,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     duration: Duration,
@@ -74,7 +114,7 @@ fn unavailable_tool_outcome(
         tool_call_id: tool_call_id_owned,
         duration,
         success: false,
-        arguments: Some(full_args.to_string()),
+        arguments: Some(full_args),
         result: Some(scrub_credentials(&reason)),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -98,12 +138,6 @@ fn is_goal_admission_tool_call(name: &str) -> bool {
             | crate::tools::GoalObjectiveTool::NAME
             | crate::tools::GoalResumeTool::NAME
     )
-}
-
-fn contains_goal_admission_tool_call(tool_calls: &[ParsedToolCall]) -> bool {
-    tool_calls
-        .iter()
-        .any(|call| is_goal_admission_tool_call(&call.name))
 }
 
 // ── Outcome ──────────────────────────────────────────────────────────────
@@ -135,6 +169,7 @@ pub struct ToolExecutionOutcome {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
+#[allow(dead_code)] // Retained as the secure fallback for callers without preparation.
 pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -146,7 +181,39 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
-    let full_args = call_arguments.to_string();
+    let default_leak_detection = LeakDetectionConfig::default();
+    let leak_detection = dispatch.leak_detection.unwrap_or(&default_leak_detection);
+    let presentation_arguments =
+        scrub_tool_arguments_for_presentation(&call_arguments, leak_detection);
+    execute_one_tool_with_presentation(
+        call_name,
+        &call_arguments,
+        &presentation_arguments,
+        tool_call_id,
+        dispatch,
+        meta,
+        observer,
+        cancellation_token,
+        receipt_generator,
+        event_tx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_one_tool_with_presentation(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+    presentation_arguments: &serde_json::Value,
+    tool_call_id: Option<&str>,
+    dispatch: ToolDispatchContext<'_>,
+    meta: &TurnMeta<'_>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+    receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
+    event_tx: Option<&Sender<TurnEvent>>,
+) -> Result<ToolExecutionOutcome> {
+    let full_args = presentation_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -163,7 +230,7 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            full_args,
             meta,
             observer,
             start.elapsed(),
@@ -206,10 +273,10 @@ pub(crate) async fn execute_one_tool(
         let duration = start.elapsed();
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
-            tool_call_id: tool_call_id_owned.clone(),
+            tool_call_id: tool_call_id_owned,
             duration,
             success: false,
-            arguments: Some(full_args.clone()),
+            arguments: Some(full_args),
             result: Some(scrub_credentials(&reason)),
             channel: Some(meta.channel_name.to_string()),
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -230,7 +297,7 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            full_args,
             meta,
             observer,
             start.elapsed(),
@@ -255,7 +322,7 @@ pub(crate) async fn execute_one_tool(
             .with_attrs(::serde_json::json!({
                 "tool": call_name,
                 "tool_call_id": tool_call_id,
-                "input": call_arguments,
+                "input": presentation_arguments,
             })),
         format!("tool call: {call_name}")
     );
@@ -274,7 +341,7 @@ pub(crate) async fn execute_one_tool(
             .send(TurnEvent::ToolCall {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
-                args: call_arguments.clone(),
+                args: presentation_arguments.clone(),
             })
             .await;
     }
@@ -309,7 +376,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
+                            "input": presentation_arguments,
                             "output": r.output,
                         })),
                         format!("tool result: {call_name}")
@@ -324,7 +391,7 @@ pub(crate) async fn execute_one_tool(
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,
                                 "tool_call_id": tool_call_id,
-                                "input": call_arguments,
+                                "input": presentation_arguments,
                                 "error": r.error.clone().unwrap_or_default(),
                                 "output": r.output,
                             })),
@@ -338,14 +405,14 @@ pub(crate) async fn execute_one_tool(
                         &r.output
                     };
                     let receipt = receipt_generator.map(|receipt_gen| {
-                        receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
+                        receipt_gen.generate_now(call_name, call_arguments, normalized_output)
                     });
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
-                        tool_call_id: tool_call_id_owned.clone(),
+                        tool_call_id: tool_call_id_owned,
                         duration,
                         success: true,
-                        arguments: Some(full_args.clone()),
+                        arguments: Some(full_args),
                         result: Some(scrub_credentials(normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -364,10 +431,10 @@ pub(crate) async fn execute_one_tool(
                     let reason = r.error.unwrap_or_else(|| r.output.into_string());
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
-                        tool_call_id: tool_call_id_owned.clone(),
+                        tool_call_id: tool_call_id_owned,
                         duration,
                         success: false,
-                        arguments: Some(full_args.clone()),
+                        arguments: Some(full_args),
                         result: Some(scrub_credentials(&reason)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -396,7 +463,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
+                            "input": presentation_arguments,
                             "error": format!("{e:?}"),
                         })),
                     format!("tool error: {call_name}")
@@ -404,10 +471,10 @@ pub(crate) async fn execute_one_tool(
                 let reason = format!("Error executing {call_name}: {e}");
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
-                    tool_call_id: tool_call_id_owned.clone(),
+                    tool_call_id: tool_call_id_owned,
                     duration,
                     success: false,
-                    arguments: Some(full_args.clone()),
+                    arguments: Some(full_args),
                     result: Some(scrub_credentials(&reason)),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -431,7 +498,7 @@ pub(crate) async fn execute_one_tool(
     {
         let _ = tx
             .send(TurnEvent::ToolResult {
-                id: event_call_id.clone(),
+                id: event_call_id,
                 name: call_name.to_string(),
                 output: scrub_credentials(&out.output),
             })
@@ -443,7 +510,7 @@ pub(crate) async fn execute_one_tool(
     // swallowed (the ToolResult already conveyed success/failure).
     if let Some(tx) = event_tx
         && let Ok(out) = &outcome
-        && let Some(plan_event) = maybe_plan_event(call_name, out.success, &call_arguments)
+        && let Some(plan_event) = maybe_plan_event(call_name, out.success, call_arguments)
     {
         let _ = tx.send(plan_event).await;
     }
@@ -457,6 +524,21 @@ pub fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
 ) -> bool {
+    should_execute_tools_in_parallel_by(tool_calls, approval, |call| call)
+}
+
+pub(crate) fn should_execute_prepared_tools_in_parallel(
+    tool_calls: &[PreparedToolCall],
+    approval: Option<&ApprovalManager>,
+) -> bool {
+    should_execute_tools_in_parallel_by(tool_calls, approval, PreparedToolCall::call)
+}
+
+fn should_execute_tools_in_parallel_by<T>(
+    tool_calls: &[T],
+    approval: Option<&ApprovalManager>,
+    call: impl Fn(&T) -> &ParsedToolCall,
+) -> bool {
     if tool_calls.len() <= 1 {
         return false;
     }
@@ -465,11 +547,17 @@ pub fn should_execute_tools_in_parallel(
     // Running tool_search in parallel with the tools it activates causes a
     // race condition where the tool lookup happens before activation completes.
     // Force sequential execution whenever tool_search is in the batch.
-    if tool_calls.iter().any(|call| call.name == "tool_search") {
+    if tool_calls
+        .iter()
+        .any(|prepared| call(prepared).name == "tool_search")
+    {
         return false;
     }
 
-    if contains_goal_admission_tool_call(tool_calls) {
+    if tool_calls
+        .iter()
+        .any(|prepared| is_goal_admission_tool_call(&call(prepared).name))
+    {
         // Goal admission/control tools mutate task-local goal policy after
         // trusted admission. Keep the whole batch serial and separately marked
         // so sibling tools cannot race goal state before admission finishes.
@@ -477,7 +565,9 @@ pub fn should_execute_tools_in_parallel(
     }
 
     if let Some(mgr) = approval
-        && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
+        && tool_calls
+            .iter()
+            .any(|prepared| mgr.needs_approval(&call(prepared).name))
     {
         // Approval-gated calls must keep sequential handling so the caller can
         // enforce CLI prompt/deny policy consistently.
@@ -490,7 +580,7 @@ pub fn should_execute_tools_in_parallel(
 // ── Parallel execution ───────────────────────────────────────────────────
 
 pub(crate) async fn execute_tools_parallel(
-    tool_calls: &[ParsedToolCall],
+    tool_calls: &[PreparedToolCall],
     dispatch: ToolDispatchContext<'_>,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
@@ -499,15 +589,18 @@ pub(crate) async fn execute_tools_parallel(
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<ToolExecutionOutcome>>> {
     crate::control_plane::scope_goal_start_tool_batch(
-        contains_goal_admission_tool_call(tool_calls),
+        tool_calls
+            .iter()
+            .any(|call| is_goal_admission_tool_call(&call.call.name)),
         async {
             let futures: Vec<_> = tool_calls
                 .iter()
                 .map(|call| {
-                    execute_one_tool(
-                        &call.name,
-                        call.arguments.clone(),
-                        call.tool_call_id.as_deref(),
+                    execute_one_tool_with_presentation(
+                        &call.call.name,
+                        &call.call.arguments,
+                        &call.presentation_arguments,
+                        call.call.tool_call_id.as_deref(),
                         dispatch,
                         meta,
                         observer,
@@ -536,7 +629,7 @@ pub(crate) async fn execute_tools_parallel(
 // ── Sequential execution ─────────────────────────────────────────────────
 
 pub(crate) async fn execute_tools_sequential(
-    tool_calls: &[ParsedToolCall],
+    tool_calls: &[PreparedToolCall],
     dispatch: ToolDispatchContext<'_>,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
@@ -545,7 +638,9 @@ pub(crate) async fn execute_tools_sequential(
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<Vec<Option<ToolExecutionOutcome>>> {
     crate::control_plane::scope_goal_start_tool_batch(
-        contains_goal_admission_tool_call(tool_calls),
+        tool_calls
+            .iter()
+            .any(|call| is_goal_admission_tool_call(&call.call.name)),
         async {
             let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
 
@@ -553,10 +648,11 @@ pub(crate) async fn execute_tools_sequential(
                 if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
                     break;
                 }
-                let outcome = match execute_one_tool(
-                    &call.name,
-                    call.arguments.clone(),
-                    call.tool_call_id.as_deref(),
+                let outcome = match execute_one_tool_with_presentation(
+                    &call.call.name,
+                    &call.call.arguments,
+                    &call.presentation_arguments,
+                    call.call.tool_call_id.as_deref(),
                     dispatch,
                     meta,
                     observer,
@@ -582,12 +678,15 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool, execute_tools_sequential};
+    use super::{
+        PreparedToolCall, ToolDispatchContext, execute_one_tool, execute_tools_sequential,
+    };
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use zeroclaw_api::agent::TurnEvent;
     use zeroclaw_api::tool::Tool;
 
     /// Minimal tool that records invocations. Used to verify that the
@@ -596,6 +695,10 @@ mod tests {
     struct CountingTool {
         name: String,
         invocations: Arc<AtomicUsize>,
+    }
+
+    struct RawArgumentRecordingTool {
+        received: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
     impl CountingTool {
@@ -613,6 +716,43 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "test-counting-tool"
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RawArgumentRecordingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-raw-argument-recording-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RawArgumentRecordingTool {
+        fn name(&self) -> &str {
+            "escalate_to_human"
+        }
+
+        fn description(&self) -> &str {
+            "Records the raw execution arguments"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.received.lock().unwrap() = Some(args);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "delivered".into(),
+                error: None,
+            })
         }
     }
 
@@ -745,10 +885,18 @@ mod tests {
                 Arc::clone(&goal_start_invocations),
             )),
         ];
-        let calls = vec![
+        let calls = [
             parsed_tool_call("goal_start_batch_probe"),
             parsed_tool_call(crate::tools::GoalStartTool::NAME),
         ];
+        let prepared_calls: Vec<_> = calls
+            .iter()
+            .cloned()
+            .map(|call| {
+                let presentation_arguments = call.arguments.clone();
+                PreparedToolCall::new(call, presentation_arguments)
+            })
+            .collect();
         let meta = crate::agent::turn::TurnMeta {
             agent_alias: None,
             parent_agent_alias: None,
@@ -757,11 +905,12 @@ mod tests {
         };
 
         let results = execute_tools_sequential(
-            &calls,
+            &prepared_calls,
             ToolDispatchContext {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
+                leak_detection: None,
             },
             &meta,
             &NoopObserver,
@@ -791,6 +940,7 @@ mod tests {
             tools_registry: &tools,
             activated_tools: None,
             excluded_tools: &[],
+            leak_detection: None,
         };
         let meta = super::super::turn::TurnMeta {
             channel_name: "test",
@@ -817,6 +967,122 @@ mod tests {
         };
 
         assert!(crate::agent::turn::is_tool_loop_cancelled(&error));
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_scrubs_presentation_arguments_but_preserves_execution_input() {
+        let received = Arc::new(Mutex::new(None));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RawArgumentRecordingTool {
+            received: Arc::clone(&received),
+        })];
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let raw_arguments = serde_json::json!({
+            "summary": "operator approval requires sk_test_1234567890abcdefghijklmnop",
+            "context": "password=longsecretvalue"
+        });
+        let meta = super::super::turn::TurnMeta {
+            channel_name: "test",
+            agent_alias: Some("agent"),
+            parent_agent_alias: None,
+            turn_id: "turn-secret-boundary",
+        };
+
+        let outcome = execute_one_tool(
+            "escalate_to_human",
+            raw_arguments.clone(),
+            Some("call-secret-boundary"),
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                leak_detection: Some(&leak_detection),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            Some(&event_tx),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.success);
+        assert_eq!(
+            received.lock().unwrap().as_ref(),
+            Some(&raw_arguments),
+            "the tool and receipt data path must retain the original arguments"
+        );
+        let event = event_rx.recv().await.unwrap();
+        let TurnEvent::ToolCall { args, .. } = event else {
+            panic!("expected pending tool-call event");
+        };
+        let rendered = args.to_string();
+        assert!(!rendered.contains("sk_test_"));
+        assert!(!rendered.contains("longsecretvalue"));
+        assert!(rendered.contains("REDACTED"));
+    }
+
+    #[tokio::test]
+    async fn prepared_tool_call_preserves_raw_input_and_reuses_scrubbed_presentation() {
+        let received = Arc::new(Mutex::new(None));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RawArgumentRecordingTool {
+            received: Arc::clone(&received),
+        })];
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let raw_arguments = serde_json::json!({
+            "summary": "operator approval requires sk_test_1234567890abcdefghijklmnop",
+            "context": "password=longsecretvalue"
+        });
+        let presentation_arguments =
+            super::scrub_tool_arguments_for_presentation(&raw_arguments, &leak_detection);
+        let prepared = PreparedToolCall::new(
+            ParsedToolCall {
+                name: "escalate_to_human".to_string(),
+                arguments: raw_arguments.clone(),
+                tool_call_id: Some("call-prepared-secret-boundary".to_string()),
+            },
+            presentation_arguments,
+        );
+        let meta = super::super::turn::TurnMeta {
+            channel_name: "test",
+            agent_alias: Some("agent"),
+            parent_agent_alias: None,
+            turn_id: "turn-prepared-secret-boundary",
+        };
+
+        let outcomes = execute_tools_sequential(
+            &[prepared],
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                leak_detection: Some(&leak_detection),
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            Some(&event_tx),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcomes[0].as_ref().is_some_and(|outcome| outcome.success));
+        assert_eq!(
+            received.lock().unwrap().as_ref(),
+            Some(&raw_arguments),
+            "prepared execution must retain the original arguments"
+        );
+        let event = event_rx.recv().await.unwrap();
+        let TurnEvent::ToolCall { args, .. } = event else {
+            panic!("expected pending tool-call event");
+        };
+        let rendered = args.to_string();
+        assert!(!rendered.contains("sk_test_"));
+        assert!(!rendered.contains("longsecretvalue"));
+        assert!(rendered.contains("REDACTED"));
     }
 
     /// Regression: execute_one_tool must recover a poisoned
@@ -865,6 +1131,7 @@ mod tests {
                 tools_registry: &[], // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
+                leak_detection: None,
             },
             &meta,
             &NoopObserver,
@@ -920,6 +1187,7 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
+                leak_detection: None,
             },
             &meta,
             &NoopObserver,

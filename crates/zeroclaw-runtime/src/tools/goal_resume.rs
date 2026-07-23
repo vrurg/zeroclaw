@@ -128,7 +128,10 @@ impl Tool for GoalResumeTool {
             if !crate::control_plane::bind_current_goal_task(task_id) {
                 anyhow::bail!("goal admission could not bind its exact live task");
             }
-            crate::agent::cost::enable_current_tool_loop_goal_attribution(self.config.as_ref());
+            crate::agent::cost::enable_current_tool_loop_goal_attribution(
+                self.config.as_ref(),
+                task_id,
+            )?;
             crate::control_plane::mark_current_goal_turn_for_evaluation();
         }
         let output = goal_resume_tool_output(&admission);
@@ -234,18 +237,23 @@ mod tests {
             .with_originator_route(Some(route))
             .with_principal_id(Some(principal));
         let marker = Arc::new(AtomicBool::new(false));
+        let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
 
-        let result = scope_goal_turn_evaluation_marker(
-            Some(Arc::clone(&marker)),
-            scope_goal_admission_context(
-                Some(owner),
-                tool.execute(serde_json::json!({
-                    "reason": "The external blocker is fixed; retry the blocked action."
-                })),
-            ),
-        )
-        .await
-        .unwrap();
+        let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(accounting),
+                scope_goal_turn_evaluation_marker(
+                    Some(Arc::clone(&marker)),
+                    scope_goal_admission_context(
+                        Some(owner),
+                        tool.execute(serde_json::json!({
+                            "reason": "The external blocker is fixed; retry the blocked action."
+                        })),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
 
         assert!(result.success, "{result:?}");
         assert!(

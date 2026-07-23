@@ -4,7 +4,7 @@
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, scrub_tool_arguments_for_presentation};
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use crate::control_plane::{
     GoalBlockerKind, GoalPauseState, apply_current_goal_approval_denial,
@@ -19,6 +19,29 @@ pub(crate) enum ApprovalGateOutcome {
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
     Cancel,
+}
+
+fn approval_request_for_presentation(
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        tool_name: tool_name.to_string(),
+        arguments: scrub_tool_arguments_for_presentation(tool_args, leak_detection),
+    }
+}
+
+fn approval_decision_for_audit(
+    decision: &ApprovalResponse,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> ApprovalResponse {
+    match decision {
+        ApprovalResponse::ReplaceWith(replacement) => ApprovalResponse::ReplaceWith(
+            crate::security::scrub_with_config(&scrub_credentials(replacement), leak_detection),
+        ),
+        other => other.clone(),
+    }
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -39,10 +62,7 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
-        let request = ApprovalRequest {
-            tool_name: tool_name.to_string(),
-            arguments: tool_args.clone(),
-        };
+        let request = approval_request_for_presentation(tool_name, tool_args, ctx.leak_detection);
         // Goal tools stop at a durable human gate before the synchronous
         // request. A missing controller/store must fail closed rather than
         // allowing an approval response to race tool execution.
@@ -112,7 +132,13 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        let audit_decision = approval_decision_for_audit(&decision, ctx.leak_detection);
+        mgr.record_decision(
+            tool_name,
+            &request.arguments,
+            &audit_decision,
+            &decision_channel,
+        );
 
         if decision == ApprovalResponse::No {
             let denied = "Denied by user.".to_string();
@@ -125,7 +151,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": request.arguments,
                         "result": denied,
                         "trace_id": ctx.turn_id,
                     })),
@@ -172,6 +198,9 @@ pub(crate) async fn gate_tool_approval(
             if !resume_goal_after_approval_if_needed(approval_pause.as_ref()).await {
                 return ApprovalGateOutcome::Cancel;
             }
+            let ApprovalResponse::ReplaceWith(audit_replacement) = &audit_decision else {
+                unreachable!("audit decision must preserve the response variant");
+            };
             if let Some(tx) = ctx.on_delta {
                 let _ = tx
                     .send(StreamDelta::Status(format!(
@@ -189,9 +218,9 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": request.arguments,
                         "replaced": true,
-                        "output": scrub_credentials(replacement),
+                        "output": audit_replacement,
                         "trace_id": ctx.turn_id,
                     })),
                 "tool_call_result"
@@ -313,7 +342,7 @@ async fn pause_goal_for_tool_approval(
     )
     .await
     {
-        Ok(Some(_)) => {
+        Ok(_) => {
             if let Some(tx) = ctx.on_delta {
                 let _ = tx
                     .send(StreamDelta::Status(
@@ -326,7 +355,6 @@ async fn pause_goal_for_tool_approval(
             }
             Some(expected_pause)
         }
-        Ok(None) => None,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -347,11 +375,13 @@ async fn pause_goal_for_tool_approval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalManager;
     use crate::observability::noop::NoopObserver;
+    use crate::security::AutonomyLevel;
     use crate::{control_plane, i18n};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+    use zeroclaw_config::schema::{LeakDetectionConfig, PacingConfig, RiskProfileConfig};
 
     struct FixedApprovalChannel {
         response: Option<zeroclaw_api::channel::ChannelApprovalResponse>,
@@ -473,7 +503,8 @@ mod tests {
         let ctx = control_plane::GoalAdmissionContext::new(agent.clone())
             .with_channel_type(Some("matrix".into()))
             .with_originator_route(Some(route.clone()))
-            .with_principal_id(Some(principal.clone()));
+            .with_principal_id(Some(principal.clone()))
+            .with_goal_task_id(Some(task_id.clone()));
         goal_store
             .create_goal(
                 control_plane::TaskRecord {
@@ -516,6 +547,7 @@ mod tests {
         let approval =
             crate::approval::ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
         let pacing = PacingConfig::default();
+        let leak_detection = LeakDetectionConfig::default();
         let ctx = TurnCtx {
             observer: &observer,
             provider_name: "test-provider",
@@ -535,6 +567,7 @@ mod tests {
             turn_id: "turn-test",
             agent_alias: Some("agent"),
             parent_agent_alias: None,
+            leak_detection: &leak_detection,
         };
         let marker = Arc::new(AtomicBool::new(true));
         let runtime_scope =
@@ -607,6 +640,7 @@ mod tests {
             ..RiskProfileConfig::default()
         });
         let pacing = PacingConfig::default();
+        let leak_detection = LeakDetectionConfig::default();
         let requests = Arc::new(AtomicUsize::new(0));
         let observed_paused = Arc::new(AtomicBool::new(false));
         let channel = FixedApprovalChannel {
@@ -638,6 +672,7 @@ mod tests {
             turn_id: "turn-test",
             agent_alias: Some("agent"),
             parent_agent_alias: None,
+            leak_detection: &leak_detection,
         };
         let marker = Arc::new(AtomicBool::new(true));
         let runtime_scope =
@@ -823,5 +858,54 @@ mod tests {
         assert!(observed_paused);
         assert_eq!(status, control_plane::TaskStatus::Paused);
         assert!(matches!(outcome, ApprovalGateOutcome::Cancel));
+    }
+
+    #[test]
+    fn approval_presentation_scrubs_configured_patterns_before_audit_or_delivery() {
+        let credential = "AKIAIOSFODNN7EXAMPLE";
+        let request = approval_request_for_presentation(
+            "shell",
+            &serde_json::json!({
+                "command": format!("echo {credential}"),
+                "content": credential,
+            }),
+            &LeakDetectionConfig::default(),
+        );
+        let serialized = request.arguments.to_string();
+        assert!(!serialized.contains(credential));
+        assert!(serialized.contains("[REDACTED"));
+
+        let manager = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            ..RiskProfileConfig::default()
+        });
+        manager.record_decision(
+            &request.tool_name,
+            &request.arguments,
+            &ApprovalResponse::No,
+            "test",
+        );
+        let audit = manager.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].arguments_summary.contains(credential));
+        assert!(audit[0].arguments_summary.contains("[REDACT"));
+    }
+
+    #[test]
+    fn replacement_decision_is_scrubbed_for_audit_without_changing_execution_copy() {
+        let credential = "AKIAIOSFODNN7EXAMPLE";
+        let decision = ApprovalResponse::ReplaceWith(format!("denied: {credential}"));
+        let audit_decision =
+            approval_decision_for_audit(&decision, &LeakDetectionConfig::default());
+
+        let ApprovalResponse::ReplaceWith(audit_text) = audit_decision else {
+            panic!("replacement decision changed variant");
+        };
+        assert!(!audit_text.contains(credential));
+        assert!(audit_text.contains("[REDACTED"));
+        assert_eq!(
+            decision,
+            ApprovalResponse::ReplaceWith(format!("denied: {credential}"))
+        );
     }
 }

@@ -13,8 +13,8 @@ use zeroclaw_tools::escalate::is_valid_urgency_level;
 
 use crate::agent::turn::ToolLoopCancelled;
 use crate::control_plane::{
-    GoalBlockerKind, current_goal_admission_context, current_goal_turn_evaluation_requested,
-    pause_current_goal_for_human_gate,
+    GoalBlockerKind, TaskContinuationContext, control_plane, current_goal_admission_context,
+    current_goal_turn_evaluation_requested, pause_current_goal_for_human_gate,
 };
 
 use super::PerToolChannelHandle;
@@ -83,13 +83,22 @@ impl GoalHumanGateTool {
         }
     }
 
-    async fn execute_goal_gate(&self, args: Value) -> Result<Option<ToolResult>> {
+    async fn execute_goal_gate(&self, args: &Value) -> Result<Option<ToolResult>> {
         if !current_goal_turn_evaluation_requested() {
             return Ok(None);
         }
-        let Some(ctx) = current_goal_admission_context() else {
-            return Ok(None);
-        };
+        let ctx = current_goal_admission_context().ok_or_else(|| {
+            anyhow::Error::new(ToolLoopCancelled)
+                .context("goal human gate has no durable admission context")
+        })?;
+        if ctx
+            .goal_task_id
+            .as_deref()
+            .is_none_or(|task_id| task_id.trim().is_empty())
+        {
+            return Err(anyhow::Error::new(ToolLoopCancelled)
+                .context("goal human gate has no exact durable task binding"));
+        }
         if let Err(error) = self
             .security
             .enforce_tool_operation(ToolOperation::Act, self.inner.name())
@@ -101,46 +110,103 @@ impl GoalHumanGateTool {
             }));
         }
 
+        if self.kind == HumanGateKind::AskUser
+            && args
+                .get("channel")
+                .and_then(Value::as_str)
+                .is_some_and(|channel| !channel.trim().is_empty())
+        {
+            return Ok(Some(ToolResult {
+                success: false,
+                output: String::new().into(),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-goal-human-gate-error-channel-override",
+                )),
+            }));
+        }
+
         let gate = match self.kind {
-            HumanGateKind::AskUser => match parse_ask_user_request(&args) {
+            HumanGateKind::AskUser => match parse_ask_user_request(args) {
                 Some(request) => HumanGatePause::AskUser(request),
                 None => return Ok(None),
             },
-            HumanGateKind::EscalateToHuman => match parse_escalation_request(&args) {
-                Some(request) => HumanGatePause::EscalateToHuman(request),
+            HumanGateKind::EscalateToHuman => match parse_escalation_request(args) {
+                Some(request) => HumanGatePause::EscalateToHuman(
+                    request.scrubbed(&self.config.security.leak_detection),
+                ),
                 None => return Ok(None),
             },
         };
 
-        let (kind, message, payload) = gate.pause_packet(self.inner.name());
-        let Some(_admission) = pause_current_goal_for_human_gate(
+        let (kind, message, payload) =
+            gate.pause_packet(self.inner.name(), &self.config.security.leak_detection);
+        let admission = pause_current_goal_for_human_gate(
             &ctx,
             Some(&self.config),
             kind,
             message,
             Some(payload),
         )
-        .await?
-        else {
-            return Ok(None);
+        .await?;
+
+        let continuation = match (&gate, admission.task_id.as_deref()) {
+            (HumanGatePause::AskUser(_), Some(task_id)) => match control_plane() {
+                Some(control_plane) => control_plane
+                    .goal_store
+                    .get_continuation_context(task_id)
+                    .await
+                    .with_context(|| {
+                        format!("load durable continuation context for goal human gate {task_id}")
+                    }),
+                None => Err(anyhow::Error::msg(
+                    "goal control plane unavailable after human-gate pause",
+                )),
+            },
+            _ => Ok(None),
         };
-
-        if let Err(error) = gate.deliver(&self.channels, self.inner.as_ref()).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "tool": self.inner.name(),
-                        "error": format!("{error:#}"),
-                    })),
-                "goal human gate delivery failed after durable pause"
-            );
-        }
-
-        Err(ToolLoopCancelled.into())
+        finish_goal_human_gate_after_pause(
+            &gate,
+            &self.channels,
+            self.inner.as_ref(),
+            continuation,
+            &self.config.security.leak_detection,
+        )
+        .await
     }
+}
+
+async fn finish_goal_human_gate_after_pause(
+    gate: &HumanGatePause,
+    channels: &PerToolChannelHandle,
+    inner: &dyn Tool,
+    continuation: Result<Option<TaskContinuationContext>>,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+) -> Result<Option<ToolResult>> {
+    // Once the pause commits, notification is best effort. Preparation or
+    // transport failure must not escape as an ordinary tool error because the
+    // executor could otherwise continue past the durable human gate.
+    let delivery = match continuation {
+        Ok(continuation) => {
+            gate.deliver(channels, inner, continuation.as_ref(), leak_detection)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = delivery {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "tool": inner.name(),
+                    "error": format!("{error:#}"),
+                })),
+            "goal human gate notification failed; the durable blocker remains recoverable through goal status and resume"
+        );
+    }
+
+    Err(ToolLoopCancelled.into())
 }
 
 impl Attributable for GoalHumanGateTool {
@@ -168,7 +234,7 @@ impl Tool for GoalHumanGateTool {
     }
 
     async fn execute(&self, args: Value) -> Result<ToolResult> {
-        match self.execute_goal_gate(args.clone()).await {
+        match self.execute_goal_gate(&args).await {
             Ok(Some(result)) => Ok(result),
             Ok(None) => self.inner.execute(args).await,
             Err(error) => Err(error),
@@ -190,18 +256,35 @@ enum HumanGatePause {
 }
 
 impl HumanGatePause {
-    fn pause_packet(&self, tool_name: &str) -> (GoalBlockerKind, String, Value) {
+    fn pause_packet(
+        &self,
+        tool_name: &str,
+        leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    ) -> (GoalBlockerKind, String, Value) {
         match self {
-            Self::AskUser(request) => (
-                GoalBlockerKind::NeedsUserInput,
-                request.question.clone(),
-                json!({
-                    "tool": tool_name,
-                    "question": request.question,
-                    "choices": request.choices,
-                    "channel": request.channel,
-                }),
-            ),
+            Self::AskUser(request) => {
+                let question =
+                    crate::security::scrub_with_config(&request.question, leak_detection);
+                let choices = request.choices.as_ref().map(|choices| {
+                    choices
+                        .iter()
+                        .map(|choice| crate::security::scrub_with_config(choice, leak_detection))
+                        .collect::<Vec<_>>()
+                });
+                (
+                    GoalBlockerKind::NeedsUserInput,
+                    question.clone(),
+                    json!({
+                        "tool": tool_name,
+                        "question": question,
+                        "choices": choices,
+                        "delivery": {
+                            "route": "durable_goal_continuation",
+                            "notification": "best_effort"
+                        },
+                    }),
+                )
+            }
             Self::EscalateToHuman(request) => (
                 GoalBlockerKind::HumanEscalation,
                 request.summary.clone(),
@@ -216,9 +299,25 @@ impl HumanGatePause {
         }
     }
 
-    async fn deliver(&self, channels: &PerToolChannelHandle, inner: &dyn Tool) -> Result<()> {
+    async fn deliver(
+        &self,
+        channels: &PerToolChannelHandle,
+        inner: &dyn Tool,
+        continuation: Option<&TaskContinuationContext>,
+        leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    ) -> Result<()> {
         match self {
-            Self::AskUser(request) => request.deliver(channels).await,
+            Self::AskUser(request) => {
+                request
+                    .deliver(
+                        channels,
+                        continuation.context(
+                            "goal ask_user has no durable continuation delivery context",
+                        )?,
+                        leak_detection,
+                    )
+                    .await
+            }
             Self::EscalateToHuman(request) => request.deliver(inner).await,
         }
     }
@@ -236,8 +335,6 @@ struct AskUserRequest {
     question: String,
     /// Optional model-supplied answer choices.
     choices: Option<Vec<String>>,
-    /// Optional requested channel override supported by the underlying tool.
-    channel: Option<String>,
 }
 
 fn parse_ask_user_request(args: &Value) -> Option<AskUserRequest> {
@@ -257,25 +354,27 @@ fn parse_ask_user_request(args: &Value) -> Option<AskUserRequest> {
                 .collect::<Vec<_>>()
         })
     });
-    let channel = args
-        .get("channel")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    Some(AskUserRequest {
-        question,
-        choices,
-        channel,
-    })
+    Some(AskUserRequest { question, choices })
 }
 
 impl AskUserRequest {
-    async fn deliver(&self, channels: &PerToolChannelHandle) -> Result<()> {
-        let (channel_name, channel) = resolve_channel(channels, self.channel.as_deref())?;
-        let message = format_question(&self.question, self.choices.as_deref());
+    async fn deliver(
+        &self,
+        channels: &PerToolChannelHandle,
+        continuation: &TaskContinuationContext,
+        leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    ) -> Result<()> {
+        let (channel_name, channel) = resolve_trusted_channel(channels, continuation)?;
+        let message = crate::security::scrub_with_config(
+            &format_question(&self.question, self.choices.as_deref()),
+            leak_detection,
+        );
+        let recipient = continuation.reply_target.trim();
+        if recipient.is_empty() {
+            anyhow::bail!("goal ask_user durable reply target is empty");
+        }
         channel
-            .send(&SendMessage::new(&message, ""))
+            .send(&SendMessage::new(message, recipient).in_thread(continuation.thread_ts.clone()))
             .await
             .with_context(|| format!("send goal ask_user prompt to channel {channel_name}"))
     }
@@ -333,6 +432,15 @@ fn parse_escalation_request(args: &Value) -> Option<EscalationRequest> {
 }
 
 impl EscalationRequest {
+    fn scrubbed(mut self, leak_detection: &zeroclaw_config::schema::LeakDetectionConfig) -> Self {
+        self.summary = crate::security::scrub_with_config(&self.summary, leak_detection);
+        self.context = self
+            .context
+            .as_deref()
+            .map(|value| crate::security::scrub_with_config(value, leak_detection));
+        self
+    }
+
     async fn deliver(&self, inner: &dyn Tool) -> Result<()> {
         let mut args = json!({
             "summary": self.summary,
@@ -354,27 +462,19 @@ impl EscalationRequest {
     }
 }
 
-fn resolve_channel(
+fn resolve_trusted_channel(
     channels: &PerToolChannelHandle,
-    requested: Option<&str>,
+    continuation: &TaskContinuationContext,
 ) -> Result<(String, Arc<dyn Channel>)> {
+    let channel_name = continuation
+        .channel_key()
+        .context("goal ask_user durable channel identity is empty")?;
     let channels = channels.read();
-    if channels.is_empty() {
-        anyhow::bail!("no channels available yet");
-    }
-    if let Some(requested) = requested {
-        let channel = channels
-            .get(requested)
-            .cloned()
-            .with_context(|| format!("channel {requested:?} not found"))?;
-        return Ok((requested.to_string(), channel));
-    }
-    let (name, channel) = channels
-        .iter()
-        .next()
-        .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
-        .context("no channels available yet")?;
-    Ok((name, channel))
+    let channel = channels
+        .get(channel_name.as_str())
+        .cloned()
+        .with_context(|| format!("durable goal channel {channel_name:?} is unavailable"))?;
+    Ok((channel_name, channel))
 }
 
 #[cfg(test)]
@@ -437,6 +537,8 @@ mod tests {
     struct RecordingChannel {
         /// Messages sent through the channel by the wrapper.
         sent: Arc<Mutex<Vec<SendMessage>>>,
+        /// Whether delivery should fail after recording the attempt.
+        fail: bool,
     }
 
     impl Attributable for RecordingChannel {
@@ -457,6 +559,9 @@ mod tests {
 
         async fn send(&self, message: &SendMessage) -> Result<()> {
             self.sent.lock().unwrap().push(message.clone());
+            if self.fail {
+                anyhow::bail!("synthetic channel delivery failure");
+            }
             Ok(())
         }
 
@@ -489,6 +594,7 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let channel: Arc<dyn Channel> = Arc::new(RecordingChannel {
             sent: Arc::clone(&sent),
+            fail: false,
         });
         let mut channels = HashMap::new();
         channels.insert("matrix".to_string(), channel);
@@ -538,10 +644,22 @@ mod tests {
     ) {
         let (store, goal_store) = ensure_test_control_plane();
         let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let continuation = crate::control_plane::TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: route.to_string(),
+            sender: principal.to_string(),
+            thread_ts: Some("thread-a".into()),
+            interruption_scope_id: None,
+            conversation_scope:
+                crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+        };
         let ctx = crate::control_plane::GoalAdmissionContext::new(agent.to_string())
             .with_channel_type(Some("matrix".into()))
             .with_originator_route(Some(route.to_string()))
-            .with_principal_id(Some(principal.to_string()));
+            .with_principal_id(Some(principal.to_string()))
+            .with_goal_task_id(Some(task_id.clone()))
+            .with_continuation_context(Some(continuation.clone()));
         goal_store
             .create_goal(
                 crate::control_plane::TaskRecord {
@@ -570,7 +688,7 @@ mod tests {
                     pause_description: None,
                     blockers: Vec::new(),
                 },
-                None,
+                Some(continuation),
             )
             .await
             .unwrap();
@@ -624,6 +742,23 @@ mod tests {
     }
 
     #[test]
+    fn human_gate_pause_packet_scrubs_sensitive_presentation_content() {
+        let request = parse_ask_user_request(&json!({
+            "question": "Use sk_test_1234567890abcdefghijklmnop?",
+            "choices": ["yes", "password=longsecretvalue"]
+        }))
+        .unwrap();
+        let (_kind, message, payload) = HumanGatePause::AskUser(request).pause_packet(
+            "ask_user",
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        );
+
+        assert!(!message.contains("sk_test_"));
+        assert!(!payload.to_string().contains("longsecretvalue"));
+        assert!(payload.to_string().contains("REDACTED"));
+    }
+
+    #[test]
     fn escalation_delivery_forces_nonblocking_inner_call() {
         let request = parse_escalation_request(&json!({
             "summary": "help",
@@ -632,8 +767,10 @@ mod tests {
         }))
         .unwrap();
         assert!(request.wait_for_response);
-        let (_kind, _message, payload) =
-            HumanGatePause::EscalateToHuman(request).pause_packet("escalate_to_human");
+        let (_kind, _message, payload) = HumanGatePause::EscalateToHuman(request).pause_packet(
+            "escalate_to_human",
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        );
         assert_eq!(payload["wait_for_response_requested"], true);
     }
 
@@ -678,6 +815,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_goal_marker_without_binding_context_cancels_without_delivery() {
+        let config = Arc::new(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let (channels, sent) = recording_channels();
+        let tool = GoalHumanGateTool::ask_user(inner, security, channels, config);
+
+        let err = crate::control_plane::scope_goal_turn_evaluation_marker(
+            Some(Arc::new(AtomicBool::new(true))),
+            tool.execute(json!({"question": "continue?"})),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is::<ToolLoopCancelled>(), "unexpected error: {err:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn ask_user_wrapper_pauses_active_goal_and_cancels_tool_loop() {
         let agent = format!("agent-{}", uuid::Uuid::new_v4());
         let route = format!("route-{}", uuid::Uuid::new_v4());
@@ -697,8 +854,7 @@ mod tests {
             ctx,
             tool.execute(json!({
                 "question": "continue?",
-                "choices": ["yes", "no"],
-                "channel": "matrix"
+                "choices": ["yes", "no"]
             })),
         )
         .await
@@ -715,6 +871,8 @@ mod tests {
             assert_eq!(sent.len(), 1);
             assert!(sent[0].content.contains("continue?"));
             assert!(sent[0].content.contains("1. yes"));
+            assert_eq!(sent[0].recipient, route);
+            assert_eq!(sent[0].thread_ts.as_deref(), Some("thread-a"));
         }
 
         let goal = assert_paused_goal(
@@ -729,7 +887,213 @@ mod tests {
         let payload = goal.blockers[0].payload.as_ref().unwrap();
         assert_eq!(payload["question"], "continue?");
         assert_eq!(payload["choices"], json!(["yes", "no"]));
-        assert_eq!(payload["channel"], "matrix");
+        assert!(payload.get("channel").is_none());
+        assert_eq!(payload["delivery"]["route"], "durable_goal_continuation");
+    }
+
+    #[tokio::test]
+    async fn goal_ask_user_rejects_model_channel_override_before_pause() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let (store, _goal_store, task_id, ctx) =
+            create_running_goal(&agent, &route, &principal).await;
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let (channels, sent) = recording_channels();
+        let tool = GoalHumanGateTool::ask_user(
+            inner,
+            Arc::new(SecurityPolicy::default()),
+            channels,
+            Arc::new(Config::default()),
+        );
+
+        let result = scope_active_goal_work(
+            ctx,
+            tool.execute(json!({
+                "question": "send this elsewhere",
+                "channel": "attacker-controlled"
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cannot override its channel")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            crate::control_plane::TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_ask_user_missing_continuation_stays_paused_without_delivery() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let (store, goal_store, task_id, ctx) =
+            create_running_goal(&agent, &route, &principal).await;
+        goal_store
+            .set_continuation_context(&task_id, None)
+            .await
+            .unwrap();
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let (channels, sent) = recording_channels();
+        let tool = GoalHumanGateTool::ask_user(
+            inner,
+            Arc::new(SecurityPolicy::default()),
+            channels,
+            Arc::new(Config::default()),
+        );
+
+        let err = scope_active_goal_work(ctx, tool.execute(json!({"question": "continue?"})))
+            .await
+            .unwrap_err();
+
+        assert!(err.is::<ToolLoopCancelled>(), "unexpected error: {err:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
+        let goal = assert_paused_goal(
+            store.as_ref(),
+            goal_store.as_ref(),
+            &task_id,
+            crate::control_plane::GoalPauseReason::NeedsUserInput,
+            crate::control_plane::GoalBlockerKind::NeedsUserInput,
+            "ask_user",
+        )
+        .await;
+        assert_eq!(goal.blockers[0].message, "continue?");
+    }
+
+    #[tokio::test]
+    async fn continuation_lookup_failure_after_pause_still_cancels_tool_loop() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let (store, goal_store, task_id, ctx) =
+            create_running_goal(&agent, &route, &principal).await;
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let (channels, sent) = recording_channels();
+        let gate = HumanGatePause::AskUser(
+            parse_ask_user_request(&json!({"question": "continue?"})).unwrap(),
+        );
+        let config = Config::default();
+        let (kind, message, payload) =
+            gate.pause_packet("ask_user", &config.security.leak_detection);
+        pause_current_goal_for_human_gate(&ctx, Some(&config), kind, message, Some(payload))
+            .await
+            .unwrap();
+
+        let err = finish_goal_human_gate_after_pause(
+            &gate,
+            &channels,
+            inner.as_ref(),
+            Err(anyhow::Error::msg("synthetic continuation lookup failure")),
+            &config.security.leak_detection,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.is::<ToolLoopCancelled>(), "unexpected error: {err:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
+        let goal = assert_paused_goal(
+            store.as_ref(),
+            goal_store.as_ref(),
+            &task_id,
+            crate::control_plane::GoalPauseReason::NeedsUserInput,
+            crate::control_plane::GoalBlockerKind::NeedsUserInput,
+            "ask_user",
+        )
+        .await;
+        assert_eq!(goal.blockers[0].message, "continue?");
+    }
+
+    #[tokio::test]
+    async fn goal_human_gate_route_mismatch_does_not_pause_or_deliver() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let (store, _goal_store, task_id, ctx) =
+            create_running_goal(&agent, &route, &principal).await;
+        let wrong_route_ctx = ctx.with_originator_route(Some("wrong-route".into()));
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let (channels, sent) = recording_channels();
+        let tool = GoalHumanGateTool::ask_user(
+            inner,
+            Arc::new(SecurityPolicy::default()),
+            channels,
+            Arc::new(Config::default()),
+        );
+
+        let err = scope_active_goal_work(
+            wrong_route_ctx,
+            tool.execute(json!({"question": "continue?"})),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("route"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(
+            store.get(&task_id).await.unwrap().unwrap().status,
+            crate::control_plane::TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_ask_user_delivery_failure_leaves_recoverable_durable_blocker() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        let (store, goal_store, task_id, ctx) =
+            create_running_goal(&agent, &route, &principal).await;
+        let (inner, calls, _args) = recording_tool("ask_user");
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel {
+            sent: Arc::clone(&sent),
+            fail: true,
+        });
+        let channels = Arc::new(parking_lot::RwLock::new(HashMap::from([(
+            "matrix".to_string(),
+            channel,
+        )])));
+        let tool = GoalHumanGateTool::ask_user(
+            inner,
+            Arc::new(SecurityPolicy::default()),
+            channels,
+            Arc::new(Config::default()),
+        );
+
+        let err = scope_active_goal_work(ctx, tool.execute(json!({"question": "continue?"})))
+            .await
+            .unwrap_err();
+
+        assert!(err.is::<ToolLoopCancelled>(), "unexpected error: {err:#}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let goal = assert_paused_goal(
+            store.as_ref(),
+            goal_store.as_ref(),
+            &task_id,
+            crate::control_plane::GoalPauseReason::NeedsUserInput,
+            crate::control_plane::GoalBlockerKind::NeedsUserInput,
+            "ask_user",
+        )
+        .await;
+        assert_eq!(goal.blockers[0].message, "continue?");
+        assert_eq!(
+            goal.blockers[0].payload.as_ref().unwrap()["delivery"]["notification"],
+            "best_effort"
+        );
     }
 
     #[tokio::test]
@@ -795,8 +1159,8 @@ mod tests {
         let err = scope_active_goal_work(
             ctx,
             tool.execute(json!({
-                "summary": "operator approval required",
-                "context": "deploy gate",
+                "summary": "operator approval requires sk_test_1234567890abcdefghijklmnop",
+                "context": "password=longsecretvalue",
                 "urgency": "high",
                 "wait_for_response": true
             })),
@@ -809,8 +1173,9 @@ mod tests {
         {
             let args = args.lock().unwrap();
             assert_eq!(args.len(), 1);
-            assert_eq!(args[0]["summary"], "operator approval required");
-            assert_eq!(args[0]["context"], "deploy gate");
+            assert!(!args[0].to_string().contains("sk_test_"));
+            assert!(!args[0].to_string().contains("longsecretvalue"));
+            assert!(args[0].to_string().contains("REDACTED"));
             assert_eq!(args[0]["urgency"], "high");
             assert_eq!(args[0]["wait_for_response"], false);
         }
@@ -825,8 +1190,9 @@ mod tests {
         )
         .await;
         let payload = goal.blockers[0].payload.as_ref().unwrap();
-        assert_eq!(payload["summary"], "operator approval required");
-        assert_eq!(payload["context"], "deploy gate");
+        assert!(!payload.to_string().contains("sk_test_"));
+        assert!(!payload.to_string().contains("longsecretvalue"));
+        assert!(payload.to_string().contains("REDACTED"));
         assert_eq!(payload["urgency"], "high");
         assert_eq!(payload["wait_for_response_requested"], true);
     }
