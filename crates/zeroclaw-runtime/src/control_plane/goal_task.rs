@@ -272,6 +272,19 @@ pub struct TaskContinuationContext {
     pub conversation_scope: TaskContinuationConversationScope,
 }
 
+/// Durable facts needed to reconcile a live goal-policy revocation.
+///
+/// This is a read projection, not another registry or lifecycle authority.
+/// The canonical task row remains authoritative for status and agent identity;
+/// the optional continuation row supplies the currently supported channel
+/// control-surface binding.
+#[derive(Debug, Clone)]
+pub struct ActiveGoalControlBinding {
+    pub task_id: String,
+    pub agent: String,
+    pub continuation_context: Option<TaskContinuationContext>,
+}
+
 impl TaskContinuationContext {
     /// Return the exact key used by the live channel registry.
     ///
@@ -352,6 +365,27 @@ pub trait GoalTaskRegistry: Send + Sync {
         originator_route: Option<&str>,
         principal_id: Option<&str>,
     ) -> anyhow::Result<Option<String>>;
+
+    /// List every nonterminal goal with its durable control-surface binding.
+    ///
+    /// Live configuration reconciliation uses this projection to identify
+    /// goals whose global, agent, surface, or channel authorization was
+    /// revoked. Missing continuation context is preserved as `None` so policy
+    /// can fail closed instead of guessing a channel.
+    async fn list_active_goal_control_bindings(
+        &self,
+    ) -> anyhow::Result<Vec<ActiveGoalControlBinding>>;
+
+    /// Atomically cancel the supplied exact nonterminal goals for policy
+    /// revocation and return the ids actually transitioned.
+    ///
+    /// Terminal races are left untouched. Any storage error rolls back the
+    /// whole batch so callers never publish a partially applied config update.
+    async fn cancel_active_goals_for_policy_revocation(
+        &self,
+        task_ids: &[String],
+        error: &str,
+    ) -> anyhow::Result<Vec<String>>;
 
     /// Compare-and-set a legacy goal's trusted identity to its canonical form.
     ///

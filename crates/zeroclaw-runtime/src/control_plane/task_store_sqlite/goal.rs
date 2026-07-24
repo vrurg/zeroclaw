@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::control_plane::goal_task::{
-    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    TaskContinuationContext,
+    ActiveGoalControlBinding, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+    GoalTaskRegistry, TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -465,6 +465,81 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("query latest active goal id by context")
     }
 
+    async fn list_active_goal_control_bindings(&self) -> Result<Vec<ActiveGoalControlBinding>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT tasks.id,
+                        tasks.agent,
+                        task_continuation_contexts.context_json AS continuation_context_json
+                   FROM tasks
+                   JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+              LEFT JOIN task_continuation_contexts
+                     ON task_continuation_contexts.task_id = tasks.id
+                  WHERE tasks.kind = 'goal'
+                    AND tasks.status IN ('running','paused')
+               ORDER BY tasks.started_at, tasks.rowid",
+            )
+            .context("prepare active goal control bindings")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let continuation_context = row
+                    .get::<_, Option<String>>("continuation_context_json")?
+                    .map(continuation_context_from_db)
+                    .transpose()?;
+                Ok(ActiveGoalControlBinding {
+                    task_id: row.get("id")?,
+                    agent: row.get("agent")?,
+                    continuation_context,
+                })
+            })
+            .context("query active goal control bindings")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("decode active goal control bindings")
+    }
+
+    async fn cancel_active_goals_for_policy_revocation(
+        &self,
+        task_ids: &[String],
+        error: &str,
+    ) -> Result<Vec<String>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start goal policy revocation transaction")?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let mut cancelled = Vec::with_capacity(task_ids.len());
+        let mut stmt = tx
+            .prepare(
+                "UPDATE tasks
+                    SET status = 'cancelled',
+                        error = ?2,
+                        finished_at = ?3
+                  WHERE id = ?1
+                    AND kind = 'goal'
+                    AND status IN ('running','paused')
+                    AND EXISTS (
+                        SELECT 1 FROM goal_tasks WHERE task_id = ?1
+                    )",
+            )
+            .context("prepare goal policy revocation update")?;
+        for task_id in task_ids {
+            let updated = stmt
+                .execute(params![task_id, error, finished_at])
+                .with_context(|| format!("cancel goal {task_id} for live policy revocation"))?;
+            if updated == 1 {
+                cancelled.push(task_id.clone());
+            }
+        }
+        drop(stmt);
+        tx.commit()
+            .context("commit goal policy revocation transaction")?;
+        Ok(cancelled)
+    }
+
     async fn rebind_goal_task_identity(
         &self,
         task_id: &str,
@@ -914,6 +989,122 @@ mod tests {
             conversation_scope:
                 crate::control_plane::goal_task::TaskContinuationConversationScope::Sender,
         }
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_lists_bindings_and_cancels_exact_active_goals_atomically() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        for (task_id, status, context) in [
+            (
+                "running-goal",
+                TaskStatus::Running,
+                Some(continuation_context()),
+            ),
+            ("paused-goal", TaskStatus::Paused, None),
+            (
+                "completed-goal",
+                TaskStatus::Completed,
+                Some(continuation_context()),
+            ),
+        ] {
+            let agent = if task_id == "paused-goal" {
+                "secondary"
+            } else {
+                "main"
+            };
+            let mut task = rec(task_id, agent, 1, "boot-1");
+            task.kind = TaskKind::Goal;
+            task.status = status;
+            s.create_goal(task, goal_record(task_id, task_id), context)
+                .await
+                .unwrap();
+        }
+
+        let bindings = s.list_active_goal_control_bindings().await.unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.task_id == "running-goal"
+                    && binding.continuation_context.is_some())
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.task_id == "paused-goal"
+                    && binding.continuation_context.is_none())
+        );
+
+        let cancelled = s
+            .cancel_active_goals_for_policy_revocation(
+                &[
+                    "running-goal".into(),
+                    "paused-goal".into(),
+                    "completed-goal".into(),
+                ],
+                "policy revoked",
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled, vec!["running-goal", "paused-goal"]);
+        assert_eq!(
+            s.get("running-goal").await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            s.get("paused-goal").await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            s.get("completed-goal").await.unwrap().unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_rolls_back_every_goal_on_injected_sqlite_failure() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        for (task_id, agent) in [("goal-a", "agent-a"), ("goal-b", "agent-b")] {
+            let mut task = rec(task_id, agent, 1, "boot-1");
+            task.kind = TaskKind::Goal;
+            s.create_goal(
+                task,
+                goal_record(task_id, task_id),
+                Some(continuation_context()),
+            )
+            .await
+            .unwrap();
+        }
+        s.conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_policy_revocation
+                 BEFORE UPDATE OF status ON tasks
+                 WHEN NEW.status = 'cancelled' AND NEW.id = 'goal-b'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected policy revocation failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = s
+            .cancel_active_goals_for_policy_revocation(
+                &["goal-a".into(), "goal-b".into()],
+                "policy revoked",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("goal-b"));
+        assert_eq!(
+            s.get("goal-a").await.unwrap().unwrap().status,
+            TaskStatus::Running,
+            "the first update must roll back when the later SQLite write fails"
+        );
+        assert_eq!(
+            s.get("goal-b").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
     }
 
     #[tokio::test]

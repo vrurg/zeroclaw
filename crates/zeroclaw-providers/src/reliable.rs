@@ -716,6 +716,7 @@ pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
+    warmup_target: bool,
 }
 
 impl ReliableModelProviderEntry {
@@ -728,6 +729,7 @@ impl ReliableModelProviderEntry {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
+            warmup_target: true,
         }
     }
 
@@ -751,7 +753,17 @@ impl ReliableModelProviderEntry {
                     .inner(inner)
                     .build(),
             ),
+            warmup_target: true,
         }
+    }
+
+    /// Keep this chat/failover entry while excluding it from wrapper warmup.
+    ///
+    /// Production model pins for one alias share a single inner provider, so
+    /// only the first pin should perform model-independent connection setup.
+    pub(crate) fn without_warmup(mut self) -> Self {
+        self.warmup_target = false;
+        self
     }
 
     /// Model this entry serves for `requested_model`: the pinned model when
@@ -765,10 +777,8 @@ impl ReliableModelProviderEntry {
     }
 }
 
-/// ModelProvider wrapper with retry + auth-key rotation. The model_provider Vec exists
-/// for tests to exercise multi-provider failover; production wiring always
-/// passes a single primary. Per-model failover chains are also test-only —
-/// the schema no longer surfaces them.
+/// ModelProvider wrapper with retry, configured provider/model failover, and
+/// auth-key rotation.
 pub struct ReliableModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
@@ -976,29 +986,42 @@ impl ReliableModelProvider {
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
-        for entry in &self.model_providers {
-            let provider_name = entry.display_name.as_str();
+        let mut failures = Vec::new();
+        for entry in self
+            .model_providers
+            .iter()
+            .filter(|entry| entry.warmup_target)
+        {
+            let provider_ref = entry.cooldown_key.as_str();
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"model_provider": provider_name})),
+                    .with_attrs(::serde_json::json!({"model_provider": provider_ref})),
                 "Warming up model_provider connection pool"
             );
-            if ProviderDispatch::from_ref(entry.provider())
-                .warmup()
-                .await
-                .is_err()
-            {
+            if let Err(err) = ProviderDispatch::from_ref(entry.provider()).warmup().await {
+                let safe_err = super::format_error_chain(err.as_ref());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"model_provider": provider_name})),
-                    "Warmup failed (non-fatal)"
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": provider_ref,
+                            "error": safe_err,
+                        })),
+                    "Model provider warmup failed"
                 );
+                failures.push(format!("{provider_ref}: {safe_err}"));
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::Error::msg(format!(
+                "one or more model provider warmups failed: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     async fn chat_with_system(
@@ -2198,6 +2221,46 @@ mod tests {
         }
     }
 
+    struct WarmupMock {
+        calls: Arc<AtomicUsize>,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmupMock {
+        async fn warmup(&self) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.error {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for WarmupMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "WarmupMock"
+        }
+    }
+
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
@@ -2237,6 +2300,103 @@ mod tests {
     }
 
     // ── Existing tests (preserved) ──
+
+    #[tokio::test]
+    async fn warmup_attempts_every_provider_and_propagates_failure() {
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let healthy_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(WarmupMock {
+                        calls: Arc::clone(&failed_calls),
+                        error: Some("503 Service Unavailable"),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(WarmupMock {
+                        calls: Arc::clone(&healthy_calls),
+                        error: None,
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .warmup()
+            .await
+            .expect_err("an inner warmup failure must reach the caller");
+        assert!(error.to_string().contains("503 Service Unavailable"));
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            healthy_calls.load(Ordering::SeqCst),
+            1,
+            "warmup should still probe configured fallbacks"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn warmup_sanitizes_provider_errors_before_logging_or_propagation() {
+        const SECRET: &str = "sk-ant-zeroclaw_warmup_test_credential";
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(WarmupMock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    error: Some(SECRET),
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .warmup()
+            .await
+            .expect_err("the sanitized inner warmup failure must reach the caller");
+        let propagated = error.to_string();
+        assert!(propagated.contains("[REDACTED]"));
+        assert!(!propagated.contains(SECRET));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "warmup failure event was not emitted");
+            match tokio::time::timeout(remaining.min(Duration::from_millis(50)), rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(serde_json::Value::as_str)
+                        == Some("Model provider warmup failed") =>
+                {
+                    break value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("log broadcast closed before the warmup failure event")
+                }
+                Err(_elapsed) => {}
+            }
+        };
+
+        let logged = event["attributes"]["error"]
+            .as_str()
+            .expect("warmup failure event must retain sanitized error detail");
+        assert!(logged.contains("[REDACTED]"));
+        assert!(!logged.contains(SECRET));
+        zeroclaw_log::clear_broadcast_hook();
+    }
 
     #[tokio::test]
     async fn succeeds_without_retry() {

@@ -3727,9 +3727,11 @@ impl Channel for TelegramChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
-        if self.mention_only {
-            let _ = self.get_bot_username().await;
-        }
+        // The trusted bot username is required not only for mention gating but
+        // also for validating Telegram's `/command@botname` target. Fetch it
+        // for every listener so a suffixed command can never be accepted merely
+        // because `mention_only` is disabled.
+        let _ = self.get_bot_username().await;
 
         ::zeroclaw_log::record!(
             INFO,
@@ -3830,11 +3832,9 @@ impl Channel for TelegramChannel {
         self.register_bot_commands().await;
 
         loop {
-            if self.mention_only {
-                let missing_username = self.bot_username.lock().is_none();
-                if missing_username {
-                    let _ = self.get_bot_username().await;
-                }
+            let missing_username = self.bot_username.lock().is_none();
+            if missing_username {
+                let _ = self.get_bot_username().await;
             }
 
             let url = self.api_url("getUpdates");

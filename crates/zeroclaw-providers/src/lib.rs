@@ -1344,13 +1344,16 @@ fn push_pinned_entries(
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push(ReliableModelProviderEntry::new_pinned(
-            family,
-            cooldown_key.clone(),
-            alias,
-            model,
-            Box::new(std::sync::Arc::clone(&built)),
-        ));
+        out.push(
+            ReliableModelProviderEntry::new_pinned(
+                family,
+                cooldown_key.clone(),
+                alias,
+                model,
+                Box::new(std::sync::Arc::clone(&built)),
+            )
+            .without_warmup(),
+        );
     }
 }
 
@@ -4075,6 +4078,122 @@ mod tests {
             "multi-alias fallback chain must build: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn resilient_alias_warms_each_constructed_provider_once() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+        use serde_json::{Value, json};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        type WarmupState = (Arc<AtomicUsize>, StatusCode);
+
+        async fn warmup_response(
+            State((calls, status)): State<WarmupState>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (status, Json(json!({"data": []})))
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary warmup server");
+        let primary_addr = primary_listener
+            .local_addr()
+            .expect("primary warmup server addr");
+        let primary_app = Router::new()
+            .route("/v1/models", get(warmup_response))
+            .with_state((Arc::clone(&primary_calls), StatusCode::OK));
+        let primary_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(primary_listener, primary_app)
+                .await
+                .expect("serve primary warmup server");
+        });
+
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backup warmup server");
+        let backup_addr = backup_listener
+            .local_addr()
+            .expect("backup warmup server addr");
+        let backup_app = Router::new()
+            .route("/v1/models", get(warmup_response))
+            .with_state((Arc::clone(&backup_calls), StatusCode::SERVICE_UNAVAILABLE));
+        let backup_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(backup_listener, backup_app)
+                .await
+                .expect("serve backup warmup server");
+        });
+
+        let primary_uri = format!("http://{primary_addr}/v1");
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    uri: Some(primary_uri.clone()),
+                    fallback_models: vec!["gpt-4o-mini".to_string(), "gpt-4.1-mini".to_string()],
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    api_key: Some("backup-key".to_string()),
+                    uri: Some(format!("http://{backup_addr}/v1")),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let model_provider = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            Some(&primary_uri),
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("production fallback chain must build");
+        let error = ProviderDispatch::from_ref(&*model_provider)
+            .warmup()
+            .await
+            .expect_err("the failing backup warmup must reach the caller");
+
+        let error = error.to_string();
+        assert!(error.contains("openai.backup"));
+        assert!(error.contains("503 Service Unavailable"));
+        assert!(
+            !error.contains("openai.primary"),
+            "a healthy primary alias must not be blamed for fallback warmup failure: {error}"
+        );
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "fallback models share one provider-level warmup"
+        );
+        assert_eq!(
+            backup_calls.load(Ordering::SeqCst),
+            1,
+            "a distinct fallback provider must still be warmed"
+        );
+        primary_server.abort();
+        backup_server.abort();
     }
 
     #[test]

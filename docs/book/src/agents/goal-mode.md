@@ -81,6 +81,14 @@ channel types such as `matrix` or `telegram`, not aliases like
 `matrix.default`. The default includes in-tree channels that expose a canonical
 self-addressed mention for the transitional shared command-ingress path.
 
+These gates are live revocation boundaries, not start-only admission hints.
+Applying a configuration that disables goal mode globally, disables it for an
+agent, removes the `channel` surface, or removes a channel type durably cancels
+every affected nonterminal goal before that configuration generation becomes
+active. It also revokes live and queued continuation ownership. While the scope
+is disabled, every `/goal` command is rejected; re-enabling the scope can start
+new goals but cannot revive the cancelled records.
+
 `channel_status_updates` controls extra in-channel goal state/status messages
 emitted by goal admission inside an agent turn, such as a model-initiated
 `goal_start`, controller transitions, and verifier progress. When the channel

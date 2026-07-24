@@ -136,8 +136,9 @@ fn goal_objective_tool_output(admission: &GoalAdmission) -> String {
 mod tests {
     use super::*;
     use crate::control_plane::{
-        GoalAdmissionContext, GoalTaskRecord, GoalTaskRegistry, TaskRecord, TaskRegistry,
-        TaskStatus, control_plane, init_control_plane, scope_goal_admission_context,
+        GoalAdmissionContext, GoalTaskRecord, GoalTaskRegistry, TaskContinuationContext,
+        TaskContinuationConversationScope, TaskRecord, TaskRegistry, TaskStatus, control_plane,
+        init_control_plane, scope_goal_admission_context,
     };
     use std::sync::Arc;
 
@@ -196,12 +197,37 @@ mod tests {
 
         let mut config = zeroclaw_config::schema::Config::default();
         config.goal.enabled = true;
-        config.goal.allowed_channel_types = vec!["test-channel".into()];
+        config.goal.allowed_channel_types = vec!["matrix".into()];
+        config.channels.matrix.insert(
+            "default".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MatrixConfig::default()
+            },
+        );
+        config.agents.insert(
+            agent.clone(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "matrix.default",
+                )],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
         let tool = GoalObjectiveTool::new(agent.clone(), std::sync::Arc::new(config));
         let owner = GoalAdmissionContext::new(agent)
-            .with_channel_type(Some("test-channel".into()))
+            .with_channel_type(Some("matrix".into()))
             .with_originator_route(Some(route))
-            .with_principal_id(Some(principal));
+            .with_principal_id(Some(principal))
+            .with_continuation_context(Some(TaskContinuationContext {
+                channel: "matrix".into(),
+                channel_alias: Some("default".into()),
+                reply_target: "room-a".into(),
+                sender: "operator-a".into(),
+                thread_ts: None,
+                interruption_scope_id: None,
+                conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+            }));
 
         let result = scope_goal_admission_context(
             Some(owner),
