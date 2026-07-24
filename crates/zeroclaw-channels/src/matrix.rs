@@ -164,7 +164,26 @@ mod mention {
         .into_iter()
         .flatten();
 
-        crate::addressed_command::strip_leading_addressed_command(body, addresses)
+        let command = crate::addressed_command::strip_leading_addressed_command(body, addresses)?;
+        let token = command.split_whitespace().next()?;
+        match zeroclaw_commands::classify_command_token(
+            token,
+            zeroclaw_commands::CommandSurface::Channel,
+        ) {
+            zeroclaw_commands::CommandTokenClassification::Valid(parsed)
+                if parsed.command.is_runtime_owned() =>
+            {
+                Some(command)
+            }
+            zeroclaw_commands::CommandTokenClassification::MalformedTarget(spec)
+                if spec.is_runtime_owned() =>
+            {
+                Some(command)
+            }
+            zeroclaw_commands::CommandTokenClassification::Unknown
+            | zeroclaw_commands::CommandTokenClassification::Valid(_)
+            | zeroclaw_commands::CommandTokenClassification::MalformedTarget(_) => None,
+        }
     }
 
     pub(super) fn is_mentioned(
@@ -4338,6 +4357,10 @@ mod tests {
                 strip_leading_command_address(bot, None, "@zc-architect: /goal start ship it"),
                 Some("/goal start ship it")
             );
+            assert_eq!(
+                strip_leading_command_address(bot, None, "@zc-architect: /goal@ status"),
+                Some("/goal@ status")
+            );
         }
 
         #[test]
@@ -4386,6 +4409,18 @@ mod tests {
             );
             assert_eq!(
                 strip_leading_command_address(bot, Some("Architect"), "@other: /goal status"),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("Architect"),
+                    "@zc-architect /weather today"
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("Architect"), "@zc-architect /help"),
                 None
             );
         }

@@ -175,7 +175,26 @@ pub(crate) async fn gate_tool_approval(
             };
             if current_goal_turn_evaluation_requested() {
                 if explicit_deny {
-                    let behavior = current_goal_approval_deny_behavior();
+                    let behavior = match current_goal_approval_deny_behavior().await {
+                        Ok(behavior) => behavior,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "tool": tool_name,
+                                    "error": error.to_string(),
+                                })),
+                                "Goal approval denial policy refresh failed"
+                            );
+                            return ApprovalGateOutcome::Cancel;
+                        }
+                    };
                     if apply_explicit_goal_approval_denial(
                         ctx,
                         &request,
@@ -677,7 +696,9 @@ mod tests {
         let marker = Arc::new(AtomicBool::new(true));
         let runtime_scope =
             control_plane::GoalRuntimeScope::new(Some(goal_ctx), None, Some(Arc::clone(&marker)))
-                .with_approval_deny_behavior_resolver(Arc::new(move || behavior));
+                .with_approval_deny_behavior_resolver(Arc::new(move || {
+                    Box::pin(async move { Ok(behavior) })
+                }));
         let outcome = control_plane::scope_goal_runtime(
             runtime_scope,
             gate_tool_approval(

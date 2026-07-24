@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, RoomCreationOptions,
-    SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelCommandMenuEntry,
+    ChannelMessage, RoomCreationOptions, SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -327,6 +327,12 @@ impl Channel for PacedChannel {
         self.inner.name()
     }
 
+    async fn refresh_command_menu(&self, commands: &[ChannelCommandMenuEntry]) -> Result<()> {
+        // Command-menu synchronization is control-plane metadata, not an
+        // outbound peer reply, so it bypasses per-recipient pacing.
+        self.inner.refresh_command_menu(commands).await
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         self.paced_dispatch(PacedOp::Send(message.clone())).await
     }
@@ -509,6 +515,12 @@ mod tests {
         finalize_drafts: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct CommandMenuChannel {
+        refreshes: AtomicUsize,
+        menus: tokio::sync::Mutex<Vec<Vec<ChannelCommandMenuEntry>>>,
+    }
+
     impl Attributable for CountingChannel {
         fn role(&self) -> Role {
             // Reuse an existing channel kind for testing only.
@@ -542,6 +554,37 @@ mod tests {
             _suppress_voice: bool,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Attributable for CommandMenuChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Telegram)
+        }
+
+        fn alias(&self) -> &str {
+            "command-menu"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for CommandMenuChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn refresh_command_menu(&self, commands: &[ChannelCommandMenuEntry]) -> Result<()> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            self.menus.lock().await.push(commands.to_vec());
+            Ok(())
+        }
+
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
             Ok(())
         }
     }
@@ -634,6 +677,33 @@ mod tests {
         // wrapper allocated, no atomic overhead, the default config pays
         // nothing for pacing it never asked for.
         assert!(Arc::ptr_eq(&wrapped, &(inner as Arc<dyn Channel>)));
+    }
+
+    #[tokio::test]
+    async fn command_menu_refresh_bypasses_reply_pacing_and_reaches_inner_channel() {
+        let channel = Arc::new(CommandMenuChannel::default());
+        let inner: Arc<dyn Channel> = channel.clone();
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 1,
+            },
+        );
+        let commands = vec![ChannelCommandMenuEntry {
+            name: "goal".into(),
+            description: "Manage a durable goal".into(),
+        }];
+
+        paced.refresh_command_menu(&commands).await.unwrap();
+        paced.refresh_command_menu(&[]).await.unwrap();
+
+        assert_eq!(channel.refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            channel.menus.lock().await.as_slice(),
+            [commands, Vec::new()],
+            "control-plane menu updates must not be delayed or dropped by reply pacing"
+        );
     }
 
     #[tokio::test]

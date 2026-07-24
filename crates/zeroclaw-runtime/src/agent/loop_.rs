@@ -1014,6 +1014,25 @@ pub fn build_tool_instructions_for_names(
     )
 }
 
+/// Build only the per-tool entries for an existing text-tool protocol block.
+///
+/// Channel runtimes use this to append live-policy tools to a static protocol
+/// without duplicating its invocation instructions on every turn.
+pub fn build_tool_entries_for_names(
+    tools_registry: &[Box<dyn Tool>],
+    effective_tool_names: &HashSet<&str>,
+) -> String {
+    let mut entries = String::new();
+    write_tool_entries(
+        &mut entries,
+        tools_registry
+            .iter()
+            .map(|tool| tool.as_ref())
+            .filter(|tool| effective_tool_names.contains(tool.name())),
+    );
+    entries
+}
+
 fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
     let tools: Vec<&dyn Tool> = tools.into_iter().collect();
     if tools.is_empty() {
@@ -1034,6 +1053,14 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
         .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
     instructions.push_str("### Available Tools\n\n");
 
+    write_tool_entries(&mut instructions, tools);
+    instructions
+}
+
+fn write_tool_entries<'a>(
+    instructions: &mut String,
+    tools: impl IntoIterator<Item = &'a dyn Tool>,
+) {
     for tool in tools {
         let desc = tool.description();
         let _ = writeln!(
@@ -1044,8 +1071,6 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
             tool.parameters_schema()
         );
     }
-
-    instructions
 }
 
 fn retain_registered_tool_descriptions(
@@ -12107,6 +12132,22 @@ This is an example, not an invocation."#;
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn build_tool_entries_appends_only_live_policy_tools_without_a_second_protocol() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new("shell", Arc::clone(&invocations))),
+            Box::new(CountingTool::new("goal_start", Arc::clone(&invocations))),
+        ];
+        let names = HashSet::from(["goal_start"]);
+
+        let entries = build_tool_entries_for_names(&tools, &names);
+
+        assert!(entries.contains("goal_start"));
+        assert!(!entries.contains("**shell**"));
+        assert!(!entries.contains("## Tool Use Protocol"));
     }
 
     #[test]

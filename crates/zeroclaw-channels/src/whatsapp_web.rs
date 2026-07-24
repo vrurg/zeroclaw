@@ -906,6 +906,7 @@ impl WhatsAppWebChannel {
                 attachments,
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
                 passive_context,
                 explicitly_addressed: false,
                 conversation_scope,

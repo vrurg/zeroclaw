@@ -1,12 +1,13 @@
 //! Performance benchmarks for ZeroClaw hot paths.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
 use zeroclaw::agent::agent::Agent;
 use zeroclaw::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
-use zeroclaw::config::MemoryConfig;
+use zeroclaw::config::providers::ChannelRef;
+use zeroclaw::config::{AliasedAgentConfig, Config, MemoryConfig, TelegramConfig};
 use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
@@ -328,11 +329,80 @@ fn bench_agent_turn(c: &mut Criterion) {
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Benchmark: live goal-policy projection
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn goal_policy_config(channel_count: usize) -> Config {
+    let mut config = Config::default();
+    config.goal.enabled = true;
+    config.goal.allowed_command_surfaces = vec!["channel".into()];
+    config.goal.allowed_channel_types = vec!["telegram".into()];
+    let mut agent = AliasedAgentConfig::default();
+    agent.goal.enabled = true;
+    for index in 0..channel_count {
+        let alias = format!("channel-{index}");
+        agent
+            .channels
+            .push(ChannelRef::new(format!("telegram.{alias}")));
+        config.channels.telegram.insert(
+            alias,
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+    }
+    config.agents.insert("bench-agent".into(), agent);
+    config
+}
+
+fn bench_goal_policy_projection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("goal_policy_projection");
+    for channel_count in [1_usize, 16, 64] {
+        let enabled = goal_policy_config(channel_count);
+        let mut disabled = enabled.clone();
+        disabled.goal.enabled = false;
+        let target = format!("channel-{}", channel_count - 1);
+
+        group.bench_with_input(
+            BenchmarkId::new("enabled_exact_binding", channel_count),
+            &channel_count,
+            |b, _| {
+                b.iter(|| {
+                    zeroclaw_runtime::control_plane::goal_commands_available_on_channel(
+                        black_box(&enabled),
+                        black_box("bench-agent"),
+                        black_box("telegram"),
+                        black_box(&target),
+                    )
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("disabled_early_exit", channel_count),
+            &channel_count,
+            |b, _| {
+                b.iter(|| {
+                    zeroclaw_runtime::control_plane::goal_commands_available_on_channel(
+                        black_box(&disabled),
+                        black_box("bench-agent"),
+                        black_box("telegram"),
+                        black_box(&target),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_xml_parsing,
     bench_native_parsing,
     bench_memory_operations,
     bench_agent_turn,
+    bench_goal_policy_projection,
 );
 criterion_main!(benches);

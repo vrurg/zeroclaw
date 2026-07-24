@@ -525,6 +525,19 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// One runtime-owned command that a channel may advertise in its native menu.
+///
+/// Admission and visibility policy are resolved before this transport-neutral
+/// projection reaches a channel adapter. A channel must not infer runtime
+/// authorization from this display record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCommandMenuEntry {
+    /// Transport command name without a leading slash.
+    pub name: String,
+    /// Localized operator-facing description.
+    pub description: String,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -544,6 +557,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Refresh the runtime-owned entries in a channel's native command menu.
+    ///
+    /// Most channels do not expose a remotely registered command catalogue and
+    /// therefore keep the no-op default. Adapters that do expose one must treat
+    /// this as discoverability only: runtime admission remains authoritative
+    /// when a remote API update is delayed or fails.
+    async fn refresh_command_menu(
+        &self,
+        _commands: &[ChannelCommandMenuEntry],
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Send a discrete-choice prompt with options.

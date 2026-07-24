@@ -78,6 +78,14 @@ impl CommandSpec {
     pub fn token_matches(self, token: &str) -> bool {
         self.name == token || self.aliases.contains(&token)
     }
+
+    /// Whether the shared runtime, rather than a client surface, owns execution.
+    pub fn is_runtime_owned(self) -> bool {
+        matches!(
+            self.execution,
+            CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
+        )
+    }
 }
 
 impl CommandSurface {
@@ -92,10 +100,48 @@ impl CommandSurface {
 }
 
 /// Parsed command token before surface-specific argument handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCommandToken {
     /// Catalogue entry matched by the leading slash token.
     pub command: CommandSpec,
+    /// Explicit bot target following `@`, without the leading marker.
+    ///
+    /// Ingress must validate this against its trusted channel identity before
+    /// executing the command. Keeping it here prevents shared parsing from
+    /// silently turning `/goal@other_bot` into an unaddressed `/goal`.
+    pub target: Option<String>,
+}
+
+/// Shared classification for a leading command token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandTokenClassification {
+    /// No catalogue command exists for this token on the requested surface.
+    Unknown,
+    /// A catalogue command was recognized, but its explicit target is invalid.
+    MalformedTarget(CommandSpec),
+    /// A valid catalogue command with its optional explicit target preserved.
+    Valid(ParsedCommandToken),
+}
+
+impl ParsedCommandToken {
+    /// Whether this command is bare or explicitly addressed to `self_handle`.
+    ///
+    /// A suffixed command fails closed when the channel cannot provide a
+    /// trusted self handle. Channel adapters own identity discovery; the
+    /// catalogue owns only normalization and comparison.
+    pub fn targets(&self, self_handle: Option<&str>) -> bool {
+        let Some(target) = self.target.as_deref() else {
+            return true;
+        };
+        let Some(self_handle) = self_handle else {
+            return false;
+        };
+        let self_target = self_handle
+            .trim()
+            .strip_prefix('@')
+            .unwrap_or(self_handle.trim());
+        !self_target.is_empty() && self_target.eq_ignore_ascii_case(target)
+    }
 }
 
 const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel];
@@ -197,8 +243,23 @@ pub fn commands_for_surface(
         .filter(move |spec| spec.supports(surface))
 }
 
+/// Runtime-owned commands that a surface may advertise for the current policy.
+///
+/// Parsing remains independent from advertisement so a stale remote menu or a
+/// hand-written command still reaches the authoritative runtime admission
+/// check. Goal admission is the only policy-conditional command class today.
+pub fn advertised_runtime_commands(
+    surface: CommandSurface,
+    goal_admission_visible: bool,
+) -> impl Iterator<Item = CommandSpec> + 'static {
+    commands_for_surface(surface).filter(move |spec| {
+        matches!(spec.execution, CommandExecution::RuntimeCommand)
+            || (goal_admission_visible && matches!(spec.execution, CommandExecution::GoalAdmission))
+    })
+}
+
 pub fn command_by_name(name: &str) -> Option<CommandSpec> {
-    let normalized = normalize_command_name(name)?;
+    let (normalized, _) = parse_command_name(name)?;
     BUILTIN_COMMANDS
         .iter()
         .copied()
@@ -206,21 +267,65 @@ pub fn command_by_name(name: &str) -> Option<CommandSpec> {
 }
 
 pub fn parse_command_token(token: &str, surface: CommandSurface) -> Option<ParsedCommandToken> {
-    let command = command_by_name(token)?;
-    command
-        .supports(surface)
-        .then_some(ParsedCommandToken { command })
+    match classify_command_token(token, surface) {
+        CommandTokenClassification::Valid(parsed) => Some(parsed),
+        CommandTokenClassification::Unknown | CommandTokenClassification::MalformedTarget(_) => {
+            None
+        }
+    }
+}
+
+pub fn classify_command_token(token: &str, surface: CommandSurface) -> CommandTokenClassification {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return CommandTokenClassification::Unknown;
+    }
+    let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
+    let (name, raw_target) = without_slash
+        .split_once('@')
+        .map_or((without_slash, None), |(name, target)| (name, Some(target)));
+    let normalized = name.trim().to_ascii_lowercase();
+    let command = BUILTIN_COMMANDS
+        .iter()
+        .copied()
+        .find(|spec| spec.token_matches(&normalized) && spec.supports(surface));
+    let Some(command) = command else {
+        return CommandTokenClassification::Unknown;
+    };
+    let target = match raw_target {
+        Some(target) => match normalize_explicit_command_target(target) {
+            Some(target) => Some(target),
+            None => return CommandTokenClassification::MalformedTarget(command),
+        },
+        None => None,
+    };
+    CommandTokenClassification::Valid(ParsedCommandToken { command, target })
 }
 
 pub fn normalize_command_name(token: &str) -> Option<String> {
+    parse_command_name(token).map(|(name, _target)| name)
+}
+
+fn parse_command_name(token: &str) -> Option<(String, Option<String>)> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return None;
     }
     let without_slash = trimmed.strip_prefix('/').unwrap_or(trimmed);
-    let without_bot_suffix = without_slash.split('@').next().unwrap_or(without_slash);
-    let normalized = without_bot_suffix.trim().to_ascii_lowercase();
-    (!normalized.is_empty()).then_some(normalized)
+    let (name, target) = match without_slash.split_once('@') {
+        Some((name, target)) => (name, Some(normalize_explicit_command_target(target)?)),
+        None => (without_slash, None),
+    };
+    let normalized = name.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some((normalized, target))
+}
+
+fn normalize_explicit_command_target(target: &str) -> Option<String> {
+    let normalized = target.trim();
+    if normalized.is_empty() || normalized.contains('@') {
+        return None;
+    }
+    Some(normalized.to_ascii_lowercase())
 }
 
 pub fn usage_for_surface(surface: CommandSurface) -> Vec<&'static str> {
@@ -264,6 +369,27 @@ mod tests {
                 .map(|parsed| parsed.command.id),
             Some(BuiltinCommandId::New)
         );
+        let parsed = parse_command_token("/goal@ZeroClaw_Bot", CommandSurface::Channel).unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("zeroclaw_bot"));
+        assert!(parsed.targets(Some("@ZEROCLAW_BOT")));
+        assert!(!parsed.targets(Some("other_bot")));
+        assert!(!parsed.targets(None));
+        assert!(
+            parse_command_token("/goal", CommandSurface::Channel)
+                .unwrap()
+                .targets(None)
+        );
+        assert!(parse_command_token("/goal@", CommandSurface::Channel).is_none());
+        assert!(parse_command_token("/goal@@other", CommandSurface::Channel).is_none());
+        assert!(matches!(
+            classify_command_token("/goal@", CommandSurface::Channel),
+            CommandTokenClassification::MalformedTarget(spec)
+                if spec.id == BuiltinCommandId::Goal
+        ));
+        assert!(matches!(
+            classify_command_token("/unknown@", CommandSurface::Channel),
+            CommandTokenClassification::Unknown
+        ));
     }
 
     #[test]
@@ -309,5 +435,20 @@ mod tests {
             goal.usage.contains("objective <objective>"),
             "goal command usage must advertise objective amendment syntax"
         );
+    }
+
+    #[test]
+    fn runtime_advertisement_hides_goal_without_hiding_runtime_commands() {
+        let hidden: Vec<_> = advertised_runtime_commands(CommandSurface::Channel, false).collect();
+        assert!(
+            hidden
+                .iter()
+                .all(|spec| spec.execution == CommandExecution::RuntimeCommand)
+        );
+        assert!(hidden.iter().any(|spec| spec.id == BuiltinCommandId::Clear));
+        assert!(hidden.iter().all(|spec| spec.id != BuiltinCommandId::Goal));
+
+        let visible: Vec<_> = advertised_runtime_commands(CommandSurface::Channel, true).collect();
+        assert!(visible.iter().any(|spec| spec.id == BuiltinCommandId::Goal));
     }
 }

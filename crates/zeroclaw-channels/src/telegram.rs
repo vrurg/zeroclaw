@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_commands::{CommandExecution, CommandSurface, commands_for_surface};
+use zeroclaw_api::channel::{Channel, ChannelCommandMenuEntry, ChannelMessage, SendMessage};
+use zeroclaw_commands::{CommandSurface, advertised_runtime_commands};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
@@ -85,21 +85,19 @@ fn truncate_telegram_command_description(raw: &str) -> String {
     truncated
 }
 
-fn telegram_builtin_command_values() -> Vec<serde_json::Value> {
-    commands_for_surface(CommandSurface::Channel)
-        .filter(|spec| {
-            matches!(
-                spec.execution,
-                CommandExecution::RuntimeCommand | CommandExecution::GoalAdmission
-            )
-        })
-        .map(|spec| {
-            serde_json::json!({
-                "command": spec.name,
-                "description": zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
-            })
+fn telegram_builtin_command_entries(goal_commands_visible: bool) -> Vec<ChannelCommandMenuEntry> {
+    advertised_runtime_commands(CommandSurface::Channel, goal_commands_visible)
+        .map(|spec| ChannelCommandMenuEntry {
+            name: spec.name.to_string(),
+            description: zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
         })
         .collect()
+}
+
+struct RegisteredCommandMenu {
+    /// Runtime-owned catalogue projection used to avoid rebuilding an
+    /// unchanged menu on every inbound message.
+    builtin_commands: Vec<ChannelCommandMenuEntry>,
 }
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -589,6 +587,12 @@ pub struct TelegramChannel {
     proxy_url: Option<String>,
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
+    /// Last command-menu payload accepted by Telegram.
+    ///
+    /// Runtime policy retries a failed refresh on later ingress, while equal
+    /// successful payloads remain local no-ops instead of one API call per
+    /// message.
+    registered_command_menu: Mutex<Option<RegisteredCommandMenu>>,
     /// Pending approval requests: callback_data key → request-local responder
     /// constraint and oneshot sender. `listen()` resolves only the matching
     /// authenticated callback principal for a goal-bound request.
@@ -717,6 +721,7 @@ impl TelegramChannel {
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
+            registered_command_menu: Mutex::new(None),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
         }
@@ -1040,12 +1045,64 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    fn initial_command_menu_entries(&self) -> Vec<ChannelCommandMenuEntry> {
+        let goal_commands_visible = self.persist.as_ref().is_some_and(|config| {
+            let config = config.read();
+            let channel_ref = format!("telegram.{}", self.alias);
+            config.agent_for_channel(&channel_ref).is_some_and(|agent| {
+                zeroclaw_runtime::control_plane::goal_commands_available_on_channel(
+                    &config,
+                    agent,
+                    "telegram",
+                    &self.alias,
+                )
+            })
+        });
+        telegram_builtin_command_entries(goal_commands_visible)
+    }
+
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
-    /// Called once at startup so that users see a command menu when pressing `/`.
-    /// Includes built-in runtime commands, user-installed skill commands, and
-    /// enabled tool commands from the configuration.
+    ///
+    /// Startup derives visibility from the canonical persisted config handle.
+    /// Later live generations arrive through [`Channel::refresh_command_menu`]
+    /// so Telegram remains a display adapter rather than a policy authority.
     async fn register_bot_commands(&self) {
-        let mut commands = telegram_builtin_command_values();
+        let commands = self.initial_command_menu_entries();
+        if let Err(error) = self.register_bot_commands_with_entries(&commands).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": zeroclaw_runtime::security::scrub(&error.to_string())
+                    })),
+                "Failed to register Telegram bot commands"
+            );
+        }
+    }
+
+    async fn register_bot_commands_with_entries(
+        &self,
+        builtin_commands: &[ChannelCommandMenuEntry],
+    ) -> anyhow::Result<()> {
+        if self
+            .registered_command_menu
+            .lock()
+            .as_ref()
+            .is_some_and(|registered| registered.builtin_commands == builtin_commands)
+        {
+            return Ok(());
+        }
+
+        let mut commands: Vec<serde_json::Value> = builtin_commands
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "command": entry.name,
+                    "description": entry.description,
+                })
+            })
+            .collect();
 
         // Track registered names to deduplicate across skills and tools.
         let mut used_names: std::collections::HashSet<String> = commands
@@ -1116,41 +1173,24 @@ impl TelegramChannel {
 
         let url = self.api_url("setMyCommands");
         let body = serde_json::json!({ "commands": commands });
-
-        match self.http_client().post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    &format!(
-                        "Telegram bot commands registered successfully ({} commands)",
-                        commands.len()
-                    )
-                );
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"status": status.to_string(), "text": text})
-                        ),
-                    "Failed to register Telegram bot commands:"
-                );
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                    "Failed to register Telegram bot commands"
-                );
-            }
+        let response = self.http_client().post(&url).json(&body).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMyCommands failed with {status}: {text}");
         }
+        *self.registered_command_menu.lock() = Some(RegisteredCommandMenu {
+            builtin_commands: builtin_commands.to_vec(),
+        });
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Telegram bot commands registered successfully ({} commands)",
+                commands.len()
+            )
+        );
+        Ok(())
     }
 
     fn is_voice_chat(&self, recipient: &str) -> bool {
@@ -1420,6 +1460,92 @@ impl TelegramChannel {
                     "Failed to fetch bot username"
                 );
                 None
+            }
+        }
+    }
+
+    async fn claim_startup_polling_slot(&self, offset: &mut i64) {
+        loop {
+            let url = self.api_url("getUpdates");
+            let probe = serde_json::json!({
+                "offset": *offset,
+                "timeout": 0,
+                "allowed_updates": ["message", "callback_query"]
+            });
+            match self.http_client().post(&url).json(&probe).send().await {
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
+                        "startup probe error; retrying in 5s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                                "startup probe parse error: ; retrying in 5s"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                        Ok(data) => {
+                            let ok = data
+                                .get("ok")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            if ok {
+                                // Slot claimed — advance offset past any queued updates.
+                                if let Some(results) =
+                                    data.get("result").and_then(serde_json::Value::as_array)
+                                {
+                                    for update in results {
+                                        if let Some(uid) = update
+                                            .get("update_id")
+                                            .and_then(serde_json::Value::as_i64)
+                                        {
+                                            *offset = uid + 1;
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+
+                            let error_code = data
+                                .get("error_code")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or_default();
+                            if error_code == 409 {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    ),
+                                    "Startup probe: slot busy (409), retrying in 5s"
+                                );
+                            } else {
+                                let desc = data
+                                    .get("description")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error_code": error_code, "desc": desc})), "Startup probe: API error : ; retrying in 5s");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -3289,6 +3415,13 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    async fn refresh_command_menu(
+        &self,
+        commands: &[ChannelCommandMenuEntry],
+    ) -> anyhow::Result<()> {
+        self.register_bot_commands_with_entries(commands).await
+    }
+
     fn self_handle(&self) -> Option<String> {
         self.bot_username.lock().clone()
     }
@@ -3727,99 +3860,20 @@ impl Channel for TelegramChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
-        if self.mention_only {
-            let _ = self.get_bot_username().await;
-        }
-
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "channel listening for messages..."
         );
 
-        loop {
-            let url = self.api_url("getUpdates");
-            let probe = serde_json::json!({
-                "offset": offset,
-                "timeout": 0,
-                "allowed_updates": ["message", "callback_query"]
-            });
-            match self.http_client().post(&url).json(&probe).send().await {
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
-                            ),
-                        "startup probe error; retrying in 5s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                                "startup probe parse error: ; retrying in 5s"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                        Ok(data) => {
-                            let ok = data
-                                .get("ok")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false);
-                            if ok {
-                                // Slot claimed — advance offset past any queued updates.
-                                if let Some(results) =
-                                    data.get("result").and_then(serde_json::Value::as_array)
-                                {
-                                    for update in results {
-                                        if let Some(uid) = update
-                                            .get("update_id")
-                                            .and_then(serde_json::Value::as_i64)
-                                        {
-                                            offset = uid + 1;
-                                        }
-                                    }
-                                }
-                                break; // Probe succeeded; enter the long-poll loop.
-                            }
-
-                            let error_code = data
-                                .get("error_code")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or_default();
-                            if error_code == 409 {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    ),
-                                    "Startup probe: slot busy (409), retrying in 5s"
-                                );
-                            } else {
-                                let desc = data
-                                    .get("description")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown");
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error_code": error_code, "desc": desc})), "Startup probe: API error : ; retrying in 5s");
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                    }
-                }
-            }
-        }
+        // Telegram identity and polling-slot acquisition are independent API
+        // calls. Overlap them, but do not enter message dispatch until both
+        // finish: targeted `/command@botname` input remains fail-closed unless
+        // `getMe` supplied the trusted self username.
+        let _ = tokio::join!(
+            self.get_bot_username(),
+            self.claim_startup_polling_slot(&mut offset)
+        );
 
         ::zeroclaw_log::record!(
             DEBUG,
@@ -3830,11 +3884,9 @@ impl Channel for TelegramChannel {
         self.register_bot_commands().await;
 
         loop {
-            if self.mention_only {
-                let missing_username = self.bot_username.lock().is_none();
-                if missing_username {
-                    let _ = self.get_bot_username().await;
-                }
+            let missing_username = self.bot_username.lock().is_none();
+            if missing_username {
+                let _ = self.get_bot_username().await;
             }
 
             let url = self.api_url("getUpdates");
@@ -7738,10 +7790,144 @@ mod tests {
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 
-    fn expected_bot_commands_body(extra_commands: Vec<serde_json::Value>) -> serde_json::Value {
-        let mut commands = telegram_builtin_command_values();
+    fn expected_bot_commands_body(
+        goal_commands_visible: bool,
+        extra_commands: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut commands: Vec<serde_json::Value> =
+            telegram_builtin_command_entries(goal_commands_visible)
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "command": entry.name,
+                        "description": entry.description,
+                    })
+                })
+                .collect();
         commands.extend(extra_commands);
         serde_json::json!({ "commands": commands })
+    }
+
+    fn telegram_goal_config(goal_enabled: bool) -> Arc<RwLock<Config>> {
+        let mut config = Config::default();
+        config.goal.enabled = goal_enabled;
+        config.goal.allowed_command_surfaces = vec!["channel".into()];
+        config.goal.allowed_channel_types = vec!["telegram".into()];
+        config.agents.insert(
+            "agent-a".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "telegram.telegram_test_alias",
+                )],
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "telegram_test_alias".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        Arc::new(RwLock::new(config))
+    }
+
+    #[tokio::test]
+    async fn telegram_identity_fetch_overlaps_startup_probe() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "id": 42,
+                            "username": "trusted_test_bot"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 0,
+                "allowed_updates": ["message", "callback_query"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = mock_server
+                    .received_requests()
+                    .await
+                    .expect("mock server should retain startup requests");
+                let saw_identity = requests
+                    .iter()
+                    .any(|request| request.url.path().ends_with("/getMe"));
+                let saw_probe = requests
+                    .iter()
+                    .any(|request| request.url.path().ends_with("/getUpdates"));
+                if saw_identity && saw_probe {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("identity fetch and startup probe must become in-flight together");
+
+        assert_eq!(
+            channel.self_handle().as_deref(),
+            None,
+            "the delayed identity response must not publish an untrusted self handle"
+        );
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should retain startup requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/setMyCommands")),
+            "message dispatch and command registration must wait for trusted identity"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no inbound message may be dispatched while trusted identity is unresolved"
+        );
+
+        listener.abort();
+        let _ = listener.await;
     }
 
     #[tokio::test]
@@ -7750,7 +7936,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-        let expected_body = expected_bot_commands_body(Vec::new());
+        let expected_body = expected_bot_commands_body(false, Vec::new());
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7775,6 +7961,111 @@ mod tests {
         ch.register_bot_commands().await;
 
         // Mock expectation assert happens on MockServer drop
+    }
+
+    #[tokio::test]
+    async fn register_bot_commands_includes_goal_only_when_live_policy_allows_it() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .and(body_json(expected_bot_commands_body(true, Vec::new())))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence(telegram_goal_config(true))
+        .with_api_base(mock_server.uri());
+
+        channel.register_bot_commands().await;
+    }
+
+    #[tokio::test]
+    async fn live_command_menu_refresh_removes_goal_and_deduplicates_equal_policy() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        for (goal_visible, expected_body) in [
+            (true, expected_bot_commands_body(true, Vec::new())),
+            (false, expected_bot_commands_body(false, Vec::new())),
+        ] {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+                .and(body_json(expected_body))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": true })),
+                )
+                .expect(1)
+                .named(format!("goal_visible={goal_visible}"))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+        let visible = telegram_builtin_command_entries(true);
+        let hidden = telegram_builtin_command_entries(false);
+
+        channel.refresh_command_menu(&visible).await.unwrap();
+        channel.refresh_command_menu(&hidden).await.unwrap();
+        channel.refresh_command_menu(&hidden).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_command_menu_refresh_retries_until_remote_accepts_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = Arc::clone(&attempts);
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": true }))
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+        let hidden = telegram_builtin_command_entries(false);
+
+        assert!(channel.refresh_command_menu(&hidden).await.is_err());
+        channel.refresh_command_menu(&hidden).await.unwrap();
+        channel.refresh_command_menu(&hidden).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -7896,10 +8187,13 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
-            "command": "weather",
-            "description": "Check the weather forecast",
-        })]);
+        let expected_body = expected_bot_commands_body(
+            false,
+            vec![serde_json::json!({
+                "command": "weather",
+                "description": "Check the weather forecast",
+            })],
+        );
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))
@@ -7932,10 +8226,13 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let expected_body = expected_bot_commands_body(vec![serde_json::json!({
-            "command": "test_tool",
-            "description": "A test tool",
-        })]);
+        let expected_body = expected_bot_commands_body(
+            false,
+            vec![serde_json::json!({
+                "command": "test_tool",
+                "description": "A test tool",
+            })],
+        );
 
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/setMyCommands$"))

@@ -159,6 +159,17 @@ pub use verifiable_intent::VerifiableIntentTool;
 /// repeat. Unioned with config-provided exemptions in the tool-call loop.
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
+/// Model-callable goal tools whose visibility follows live goal policy.
+///
+/// Channel runtimes keep these tools in their capability reservoir so a later
+/// config generation can re-enable them without rebuilding the daemon. Every
+/// actual turn still filters their schemas and execution by this exact set.
+pub const GOAL_ADMISSION_TOOL_NAMES: [&str; 3] = [
+    GoalObjectiveTool::NAME,
+    GoalResumeTool::NAME,
+    GoalStartTool::NAME,
+];
+
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
