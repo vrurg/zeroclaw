@@ -890,29 +890,23 @@ impl WhatsAppWebChannel {
         passive_context: bool,
         conversation_scope: ChannelConversationScope,
     ) {
-        if let Err(e) = tx
-            .send(ChannelMessage {
-                id: uuid::Uuid::new_v4().to_string(),
-                channel: "whatsapp".to_string(),
-                channel_alias: Some(alias.to_string()),
-                sender: sender.to_string(),
+        let message = ChannelMessage {
+            channel_alias: Some(alias.to_string()),
+            attachments,
+            passive_context,
+            conversation_scope,
+            ..ChannelMessage::new(
+                uuid::Uuid::new_v4().to_string(),
+                sender,
                 // Reply to the originating chat JID (DM or group), passed
                 // through unchanged (library handles LID addressing internally).
                 reply_target,
                 content,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments,
-                subject: None,
-                internal_sop_event: None,
-                internal_goal_task_id: None,
-                passive_context,
-                explicitly_addressed: false,
-                conversation_scope,
-            })
-            .await
-        {
+                "whatsapp",
+                chrono::Utc::now().timestamp() as u64,
+            )
+        };
+        if let Err(e) = tx.send(message).await {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
