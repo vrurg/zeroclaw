@@ -15,8 +15,10 @@ use zeroclaw_api::channel::{
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
 enum PacedOp {
-    /// A final outbound message. Dispatches to `inner.send`.
+    /// An ordinary outbound message. Dispatches to `inner.send`.
     Send(SendMessage),
+    /// A completed assistant response. Dispatches to `inner.send_final`.
+    SendFinal(SendMessage),
     /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
     /// channel edits the existing draft rather than posting a new message.
     FinalizeDraft {
@@ -31,7 +33,7 @@ impl PacedOp {
     /// The recipient key this op paces against.
     fn recipient(&self) -> &str {
         match self {
-            Self::Send(message) => &message.recipient,
+            Self::Send(message) | Self::SendFinal(message) => &message.recipient,
             Self::FinalizeDraft { recipient, .. } => recipient,
         }
     }
@@ -39,7 +41,7 @@ impl PacedOp {
     /// Character count of the payload, for the overflow-drop log.
     fn payload_chars(&self) -> usize {
         match self {
-            Self::Send(message) => message.content.chars().count(),
+            Self::Send(message) | Self::SendFinal(message) => message.content.chars().count(),
             Self::FinalizeDraft { text, .. } => text.chars().count(),
         }
     }
@@ -48,6 +50,7 @@ impl PacedOp {
     async fn dispatch(self, inner: &Arc<dyn Channel>) -> Result<()> {
         match self {
             Self::Send(message) => inner.send(&message).await,
+            Self::SendFinal(message) => inner.send_final(&message).await,
             Self::FinalizeDraft {
                 recipient,
                 message_id,
@@ -331,6 +334,11 @@ impl Channel for PacedChannel {
         self.paced_dispatch(PacedOp::Send(message.clone())).await
     }
 
+    async fn send_final(&self, message: &SendMessage) -> Result<()> {
+        self.paced_dispatch(PacedOp::SendFinal(message.clone()))
+            .await
+    }
+
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         self.inner.listen(tx).await
     }
@@ -495,6 +503,7 @@ mod tests {
 
     struct CountingChannel {
         sends: AtomicUsize,
+        final_sends: AtomicUsize,
         finalize_drafts: AtomicUsize,
     }
 
@@ -515,6 +524,10 @@ mod tests {
         }
         async fn send(&self, _message: &SendMessage) -> Result<()> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn send_final(&self, _message: &SendMessage) -> Result<()> {
+            self.final_sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -577,6 +590,7 @@ mod tests {
     async fn zero_interval_is_passthrough() {
         let inner = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let cfg = PacingFixture {
@@ -594,6 +608,7 @@ mod tests {
     async fn first_send_records_recipient_state() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
@@ -621,6 +636,7 @@ mod tests {
     async fn different_recipients_track_state_independently() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
@@ -650,6 +666,7 @@ mod tests {
     async fn small_interval_sleeps_long_enough_between_repeats() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
@@ -679,6 +696,7 @@ mod tests {
     async fn queue_overflow_drops_newest_and_warns() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
@@ -734,6 +752,7 @@ mod tests {
     async fn finalize_draft_dispatches_to_inner_finalize_not_send() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();
@@ -763,9 +782,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_response_dispatches_to_inner_send_final_not_send() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        paced
+            .send_final(&SendMessage::new("final text", "alice"))
+            .await
+            .unwrap();
+
+        assert_eq!(counting.final_sends.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            counting.sends.load(Ordering::SeqCst),
+            0,
+            "final response policy must survive the pacing wrapper"
+        );
+    }
+
+    #[tokio::test]
     async fn queued_finalize_draft_preserves_op_through_worker() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
         });
         let inner: Arc<dyn Channel> = counting.clone();

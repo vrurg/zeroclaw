@@ -498,6 +498,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
+    /// Send the completed assistant response for a turn.
+    ///
+    /// Most channels use the ordinary send path. Channels with delivery
+    /// policy that applies only to final responses can override this without
+    /// changing the shared message shape or affecting system and approval
+    /// sends.
+    async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.send(message).await
+    }
+
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 

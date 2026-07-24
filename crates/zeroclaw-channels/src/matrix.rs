@@ -2712,8 +2712,8 @@ mod outbound {
         EmptyError,
     }
 
-    /// Apply the Matrix single-message response budget at the common send
-    /// boundary so direct sends and `finalize_draft` fallbacks share one rule.
+    /// Apply an explicitly selected Matrix response budget after markers and
+    /// attachments have been processed.
     pub(super) fn bounded_body(text: &str, message_max_bytes: Option<usize>) -> String {
         message_max_bytes.map_or_else(
             || text.to_string(),
@@ -3736,9 +3736,15 @@ impl MatrixChannel {
             reaction_log: &self.reaction_log,
             reply_in_thread: self.config.reply_in_thread,
             workspace_dir: self.workspace_dir.as_deref().map(|p| p.as_path()),
-            message_max_bytes: (self.config.stream_mode == MatrixStreamMode::SingleMessage)
-                .then_some(self.config.message_max_bytes.max(1)),
+            message_max_bytes: None,
         }
+    }
+
+    fn final_outbox<'a>(&'a self, client: &'a Client) -> outbound::Outbox<'a> {
+        let mut outbox = self.outbox(client);
+        outbox.message_max_bytes = (self.config.stream_mode == MatrixStreamMode::SingleMessage)
+            .then_some(self.config.effective_message_max_bytes());
+        outbox
     }
 
     /// Edit-in-place draft update. Rate-limited per the configured interval.
@@ -3776,7 +3782,7 @@ impl MatrixChannel {
         text: &str,
     ) -> Result<()> {
         let key = streaming_key(recipient, message_id)?;
-        let max_body_bytes = self.config.message_max_bytes.max(1);
+        let max_body_bytes = self.config.effective_message_max_bytes();
         let update = {
             let mut state = self.streaming_state.write().await;
             let Some(draft) = streaming::single_for_update(&mut state, &key) else {
@@ -3825,7 +3831,7 @@ impl MatrixChannel {
             return Ok(());
         }
         let key = streaming_key(recipient, message_id)?;
-        let max_body_bytes = self.config.message_max_bytes.max(1);
+        let max_body_bytes = self.config.effective_message_max_bytes();
         let update = {
             let mut state = self.streaming_state.write().await;
             let Some(draft) = streaming::single_for_update(&mut state, &key) else {
@@ -3956,6 +3962,12 @@ impl Channel for MatrixChannel {
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.ensure_client().await?;
         let _ = outbound::send(&self.outbox(client), message).await?;
+        Ok(())
+    }
+
+    async fn send_final(&self, message: &SendMessage) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let _ = outbound::send(&self.final_outbox(client), message).await?;
         Ok(())
     }
 
@@ -4306,7 +4318,7 @@ impl Channel for MatrixChannel {
                 {
                     match streaming::single_retained_draft_action(
                         draft,
-                        self.config.message_max_bytes.max(1),
+                        self.config.effective_message_max_bytes(),
                     ) {
                         streaming::SingleRetainedDraftAction::DeletePlaceholder => {
                             Self::redact_single_draft_before_final(
@@ -4349,7 +4361,7 @@ impl Channel for MatrixChannel {
                         .as_ref()
                         .and_then(|draft| draft.thread_anchor.as_ref())
                         .map(|e| e.to_string());
-                    outbound::send(&self.outbox(client), &msg).await?;
+                    outbound::send(&self.final_outbox(client), &msg).await?;
                 }
                 Ok(())
             }
@@ -4949,7 +4961,7 @@ mod tests {
             Mock, MockServer, ResponseTemplate,
             matchers::{body_partial_json, method, path_regex},
         };
-        use zeroclaw_api::channel::Channel;
+        use zeroclaw_api::channel::{Channel, SendMessage};
         use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
         use zeroclaw_runtime::agent::loop_::{
             DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
@@ -4974,9 +4986,19 @@ mod tests {
         }
 
         #[test]
-        fn single_message_common_send_boundary_is_utf8_budgeted() {
+        fn single_message_final_budget_is_utf8_safe_and_non_empty() {
             assert_eq!(outbound::bounded_body("😀😀", Some(5)), "😀");
             assert_eq!(outbound::bounded_body("😀😀", None), "😀😀");
+            for message_max_bytes in 0..4 {
+                let config = MatrixConfig {
+                    message_max_bytes,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    outbound::bounded_body("😀😀", Some(config.effective_message_max_bytes())),
+                    "😀"
+                );
+            }
         }
 
         fn single_draft(event_id: OwnedEventId) -> SingleDraft {
@@ -5795,6 +5817,22 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "event_id": "$final:server"
                 })))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let approval_prompt =
+                "Approval required: reply approve or deny with token approval-12345";
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": approval_prompt
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$approval:server"
+                })))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -5849,6 +5887,15 @@ mod tests {
                     panic!("mock sync timed out; received paths: {paths:?}");
                 }
             }
+
+            channel
+                .send(&SendMessage::new(approval_prompt, room_id))
+                .await
+                .expect("ordinary approval-style send remains unbounded");
+            channel
+                .send_final(&SendMessage::new("😀😀", room_id))
+                .await
+                .expect("no-draft final uses the single-message budget");
 
             let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
             {

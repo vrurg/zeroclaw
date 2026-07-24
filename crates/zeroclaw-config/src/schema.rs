@@ -13505,6 +13505,7 @@ fn default_matrix_stream_draft_lines() -> usize {
 }
 
 pub const DEFAULT_STREAM_TOOL_ARGUMENT_CHARS: usize = 60;
+pub const MATRIX_MIN_MESSAGE_MAX_BYTES: usize = 4;
 
 fn default_matrix_message_max_bytes() -> usize {
     48_000
@@ -14307,7 +14308,8 @@ pub struct MatrixConfig {
     /// single-message streaming draft edits and the separate final response.
     /// The Matrix protocol caps event/request size; keep this below that cap
     /// to leave room for JSON event overhead. Bodies are UTF-8-safely
-    /// truncated to this limit.
+    /// truncated to this limit. Values below 4 use the four-byte minimum so a
+    /// leading Unicode scalar cannot be truncated into an empty final body.
     #[tab(Behavior)]
     #[serde(default = "default_matrix_message_max_bytes")]
     pub message_max_bytes: usize,
@@ -14441,6 +14443,15 @@ fn validate_stream_tool_argument_names<'a>(
 }
 
 impl MatrixConfig {
+    /// Effective UTF-8 body budget for Matrix single-message streaming.
+    ///
+    /// Four bytes is the largest encoded width of one Unicode scalar. Keeping
+    /// at least that much space prevents a non-empty final response from
+    /// becoming empty solely because its first scalar is multibyte.
+    pub fn effective_message_max_bytes(&self) -> usize {
+        self.message_max_bytes.max(MATRIX_MIN_MESSAGE_MAX_BYTES)
+    }
+
     /// Validate the order-independent tool argument display policy.
     pub fn validate_stream_tool_arguments(&self) -> Result<()> {
         let mut saw_defaults = false;
@@ -31907,6 +31918,29 @@ stream_tool_arguments = [
             }
         );
         assert!(matrix.validate_stream_tool_arguments().is_ok());
+    }
+
+    #[::core::prelude::v1::test]
+    fn matrix_message_budget_clamps_values_below_one_unicode_scalar() {
+        for message_max_bytes in 0..MATRIX_MIN_MESSAGE_MAX_BYTES {
+            let matrix = MatrixConfig {
+                message_max_bytes,
+                ..Default::default()
+            };
+            assert_eq!(
+                matrix.effective_message_max_bytes(),
+                MATRIX_MIN_MESSAGE_MAX_BYTES
+            );
+        }
+
+        let matrix = MatrixConfig {
+            message_max_bytes: MATRIX_MIN_MESSAGE_MAX_BYTES + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            matrix.effective_message_max_bytes(),
+            MATRIX_MIN_MESSAGE_MAX_BYTES + 1
+        );
     }
 
     #[test]

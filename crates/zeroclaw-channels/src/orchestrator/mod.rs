@@ -236,6 +236,15 @@ const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+// matrix-sdk typing notices expire after four seconds and suppress resends for
+// the first three seconds. Refresh between those boundaries while the
+// single-message draft is still not visible.
+const MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS: u64 = 3_500;
+const _: () = assert!(
+    MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS > 3_000
+        && MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS < 4_000,
+    "Matrix typing refresh must clear matrix-sdk's resend gate before notice expiry"
+);
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -4339,28 +4348,81 @@ fn spawn_scoped_typing_task(
 /// A proper general lifecycle still requires event-subsystem ownership.
 struct MatrixSingleMessageTypingScope {
     cancellation: CancellationToken,
-    started: tokio::sync::oneshot::Receiver<()>,
-    handle: tokio::task::JoinHandle<()>,
+    started: Option<tokio::sync::oneshot::Receiver<()>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MatrixSingleMessageTypingScope {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 fn start_matrix_single_message_typing_scope(
     channel: Arc<dyn Channel>,
     recipient: String,
 ) -> MatrixSingleMessageTypingScope {
+    start_matrix_single_message_typing_scope_with_interval(
+        channel,
+        recipient,
+        Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS),
+    )
+}
+
+fn start_matrix_single_message_typing_scope_with_interval(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+    refresh_interval: Duration,
+) -> MatrixSingleMessageTypingScope {
     let cancellation = CancellationToken::new();
     let stop_signal = cancellation.clone();
     let (started_tx, started) = tokio::sync::oneshot::channel();
     let handle = zeroclaw_spawn::spawn!(async move {
-        if let Err(e) = channel.start_typing(&recipient).await {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
-                "failed to start typing"
-            );
-        }
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let cancelled_before_start = tokio::select! {
+            () = stop_signal.cancelled() => true,
+            result = channel.start_typing(&recipient) => {
+                if let Err(e) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({
+                            "error": scrub_typing_error(&e)
+                        })),
+                        "failed to start typing"
+                    );
+                }
+                false
+            }
+        };
         let _ = started_tx.send(());
-        stop_signal.cancelled().await;
+        if !cancelled_before_start {
+            loop {
+                tokio::select! {
+                    () = stop_signal.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = channel.start_typing(&recipient).await {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "error": scrub_typing_error(&e)
+                                })),
+                                "failed to refresh typing"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = channel.stop_typing(&recipient).await {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -4372,15 +4434,19 @@ fn start_matrix_single_message_typing_scope(
     });
     MatrixSingleMessageTypingScope {
         cancellation,
-        started,
-        handle,
+        started: Some(started),
+        handle: Some(handle),
     }
 }
 
-async fn stop_matrix_single_message_typing_scope(scope: MatrixSingleMessageTypingScope) {
-    let _ = scope.started.await;
+async fn stop_matrix_single_message_typing_scope(mut scope: MatrixSingleMessageTypingScope) {
+    if let Some(started) = scope.started.take() {
+        let _ = started.await;
+    }
     scope.cancellation.cancel();
-    log_worker_join_result(scope.handle.await);
+    if let Some(handle) = scope.handle.take() {
+        log_worker_join_result(handle.await);
+    }
 }
 
 async fn process_channel_message(
@@ -4498,11 +4564,10 @@ fn matrix_message_max_bytes_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> usize {
-    let default_bytes = zeroclaw_config::schema::MatrixConfig::default()
-        .message_max_bytes
-        .max(1);
+    let default_bytes =
+        zeroclaw_config::schema::MatrixConfig::default().effective_message_max_bytes();
     matrix_config_for_message(config, msg)
-        .map_or(default_bytes, |config| config.message_max_bytes.max(1))
+        .map_or(default_bytes, |config| config.effective_message_max_bytes())
 }
 
 fn matrix_message_max_bytes(
@@ -5027,6 +5092,12 @@ fn matrix_scrub_display(value: &str) -> String {
         .join(" ")
 }
 
+fn matrix_scrub_progress_text(value: &str) -> String {
+    scrub_credentials(&zeroclaw_runtime::security::scrub(
+        &strip_think_tags_inline(value),
+    ))
+}
+
 fn matrix_progress_text(
     event: &zeroclaw_runtime::agent::loop_::StreamDelta,
     config: &Config,
@@ -5035,11 +5106,11 @@ fn matrix_progress_text(
     use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
 
     match event {
-        StreamDelta::Status(text) => Some(strip_think_tags_inline(text)),
+        StreamDelta::Status(text) => Some(matrix_scrub_progress_text(text)),
         StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
             matrix_tool_progress(event, config, matrix_alias)
         }
-        StreamDelta::Reasoning(text) => Some(strip_think_tags_inline(&format!(
+        StreamDelta::Reasoning(text) => Some(matrix_scrub_progress_text(&format!(
             "{REASONING_FULL_PREFIX}{text}"
         ))),
         StreamDelta::Text(_) => None,
@@ -6816,16 +6887,16 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    channel.send(&send_msg).await.is_ok()
+                    channel.send_final(&send_msg).await.is_ok()
                 } else if let Some(ref draft_id) = draft_message_id {
                     // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send() so force_voice
+                    // draft placeholder and deliver via send_final() so force_voice
                     // reaches the channel's voice path (finalize_draft has no
                     // force_voice concept).
                     if force_voice_override {
                         let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
-                            .send(
+                            .send_final(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
                                     .force_voice()
                                     .in_thread(msg.thread_ts.clone()),
@@ -6859,7 +6930,7 @@ async fn process_channel_message_body(
                                 if suppress {
                                     fallback = fallback.suppress_voice();
                                 }
-                                channel.send(&fallback).await.is_ok()
+                                channel.send_final(&fallback).await.is_ok()
                             }
                         }
                     }
@@ -6873,7 +6944,7 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    match channel.send(&send_msg).await {
+                    match channel.send_final(&send_msg).await {
                         Ok(()) => true,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -12881,6 +12952,22 @@ mod tests {
     }
 
     #[test]
+    fn matrix_status_progress_scrubs_standalone_secret_patterns() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let progress = matrix_progress_text(
+            &StreamDelta::Status(format!("Cancelled by hook: {token}")),
+            &Config::default(),
+            "missing",
+        )
+        .expect("status renders");
+
+        assert!(!progress.contains(token));
+        assert!(progress.contains("[REDACTED"));
+    }
+
+    #[test]
     fn matrix_single_message_pending_splits_reasoning_after_tool_progress() {
         use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
 
@@ -15013,6 +15100,7 @@ api_key = "anthropic-key"
     #[derive(Default)]
     struct RecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
+        final_send_calls: AtomicUsize,
         start_typing_calls: AtomicUsize,
         stop_typing_calls: AtomicUsize,
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
@@ -15030,10 +15118,20 @@ api_key = "anthropic-key"
         supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
+        final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
         delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
+    }
+
+    struct ExpiringTypingChannel {
+        expiry: Duration,
+        start_delay: Duration,
+        expires_at: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+        start_calls: AtomicUsize,
+        lapsed_refreshes: AtomicUsize,
+        stop_calls: AtomicUsize,
     }
 
     impl DraftRecordingChannel {
@@ -15043,6 +15141,7 @@ api_key = "anthropic-key"
                 supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
+                final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
@@ -15236,6 +15335,55 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for ExpiringTypingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "expiring-typing"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ExpiringTypingChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            let now = tokio::time::Instant::now();
+            let mut expires_at = self.expires_at.lock().await;
+            if expires_at.is_some_and(|deadline| deadline <= now) {
+                self.lapsed_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            *expires_at = Some(now + self.expiry);
+            drop(expires_at);
+            tokio::time::sleep(self.start_delay).await;
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            *self.expires_at.lock().await = None;
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for FailingSendChannel {
         fn name(&self) -> &str {
@@ -15270,6 +15418,11 @@ api_key = "anthropic-key"
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(())
+        }
+
+        async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.final_send_calls.fetch_add(1, Ordering::SeqCst);
+            self.send(message).await
         }
 
         async fn listen(
@@ -15351,6 +15504,11 @@ api_key = "anthropic-key"
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(())
+        }
+
+        async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.final_send_calls.fetch_add(1, Ordering::SeqCst);
+            self.send(message).await
         }
 
         async fn listen(
@@ -15572,6 +15730,11 @@ api_key = "anthropic-key"
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.as_slice(), ["chat-42:ok"]);
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            1,
+            "a no-draft assistant response must use the final-response send path"
+        );
 
         let events = hook_events.lock().await;
         assert_eq!(
@@ -15954,6 +16117,11 @@ api_key = "anthropic-key"
         assert_eq!(
             channel_impl.sent_messages.lock().await.as_slice(),
             ["chat-42:ok"]
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            1,
+            "a failed draft finalization must preserve final-response policy on fallback"
         );
         assert_eq!(
             hook_events.lock().await.as_slice(),
@@ -20706,6 +20874,86 @@ BTC is currently around $65,000 based on latest tool output."#
             *channel_impl.delivery_events.lock().await,
             ["typing-start", "typing-stop", "draft"]
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_typing_refreshes_before_notice_expiry() {
+        let channel_impl = Arc::new(ExpiringTypingChannel {
+            expiry: Duration::from_millis(70),
+            start_delay: Duration::from_millis(30),
+            expires_at: tokio::sync::Mutex::new(None),
+            start_calls: AtomicUsize::new(0),
+            lapsed_refreshes: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel,
+            "chat-typing".to_string(),
+            Duration::from_millis(50),
+        );
+
+        tokio::time::sleep(Duration::from_millis(230)).await;
+
+        assert!(
+            channel_impl.start_calls.load(Ordering::SeqCst) >= 4,
+            "typing must be refreshed while pre-delivery work is still running"
+        );
+        assert_eq!(
+            channel_impl.lapsed_refreshes.load(Ordering::SeqCst),
+            0,
+            "refresh scheduling must include the initial typing request latency"
+        );
+        assert!(
+            channel_impl
+                .expires_at
+                .lock()
+                .await
+                .is_some_and(|expires_at| expires_at > tokio::time::Instant::now()),
+            "periodic refresh must keep an expiring typing notice active"
+        );
+
+        stop_matrix_single_message_typing_scope(scope).await;
+        assert_eq!(channel_impl.stop_calls.load(Ordering::SeqCst), 1);
+        assert!(channel_impl.expires_at.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_typing_scope_drop_stops_refresh_task() {
+        let channel_impl = Arc::new(ExpiringTypingChannel {
+            expiry: Duration::from_millis(70),
+            start_delay: Duration::ZERO,
+            expires_at: tokio::sync::Mutex::new(None),
+            start_calls: AtomicUsize::new(0),
+            lapsed_refreshes: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel,
+            "chat-typing".to_string(),
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        drop(scope);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while channel_impl.stop_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the scope must stop typing");
+
+        let starts_after_cleanup = channel_impl.start_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            channel_impl.start_calls.load(Ordering::SeqCst),
+            starts_after_cleanup,
+            "dropping the scope must terminate the refresh task"
+        );
+        assert_eq!(channel_impl.stop_calls.load(Ordering::SeqCst), 1);
+        assert!(channel_impl.expires_at.lock().await.is_none());
     }
 
     #[tokio::test]
