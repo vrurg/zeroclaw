@@ -3790,8 +3790,9 @@ impl AliasedAgentConfig {
 /// Per-agent goal-mode admission policy (`[agents.<alias>.goal]`).
 ///
 /// This is the agent-local half of the goal gate. Global goal policy still
-/// lives in [`GoalConfig`]; both gates must allow admission before a durable
-/// goal can be created for an agent.
+/// lives in [`GoalConfig`]; both gates must allow every goal command. Applying
+/// `enabled = false` durably cancels the agent's nonterminal goals before the
+/// live configuration generation is published.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agents.goal"]
@@ -3819,8 +3820,10 @@ impl Default for AgentGoalConfig {
 pub struct GoalConfig {
     /// Global feature gate for durable goal mode.
     ///
-    /// When false, every goal surface must reject `/goal` and model-initiated
-    /// goal starts before mutating control-plane state.
+    /// When false, live config application durably cancels every nonterminal
+    /// goal before publishing the disabled generation. Every `/goal` command
+    /// and model-initiated goal action is then rejected until re-enabled;
+    /// cancelled goals never revive.
     #[serde(default)]
     pub enabled: bool,
     /// Emit goal state/status updates into channel threads when goal admission
@@ -3834,13 +3837,14 @@ pub struct GoalConfig {
     /// extension rows.
     #[serde(default)]
     pub restart_recovery: GoalRestartRecovery,
-    /// Command surfaces allowed to start or manage durable goals.
+    /// Command surfaces allowed to issue any durable-goal command.
     ///
     /// Values are normalized transport classes (`web`, `tui`, `channel`), not
     /// individual channel aliases or user identities.
     #[serde(default = "default_goal_allowed_command_surfaces")]
     pub allowed_command_surfaces: Vec<String>,
-    /// Channel types allowed to accept goal commands or model-initiated starts.
+    /// Channel types allowed to accept any goal command or model-initiated
+    /// goal action.
     ///
     /// Values are bare channel families such as `matrix` or `telegram`; alias
     /// and principal visibility remain trusted ingress facts.
@@ -4466,17 +4470,12 @@ impl Config {
             .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
     }
 
-    /// Reverse-lookup the agent alias that owns a configured channel
-    /// (`<type>.<alias>`). Returns the first agent listing the channel in
-    /// its `channels` field. `None` when no agent owns the channel —
-    /// orphaned channels are a config error the orchestrator surfaces at
-    /// startup.
+    /// Resolve the deterministic runtime owner of a configured channel
+    /// (`<type>.<alias>`). This shares the router's collision and legacy
+    /// fallback semantics through [`Self::active_channel_owner`].
     #[must_use]
     pub fn agent_for_channel(&self, channel_alias: &str) -> Option<&str> {
-        self.agents
-            .iter()
-            .find(|(_, agent)| agent.enabled && agent.channels.iter().any(|c| c == channel_alias))
-            .map(|(alias, _)| alias.as_str())
+        self.active_channel_owner(channel_alias)
     }
 
     /// Workspace dir a channel's inbound-media handler writes into. Resolves
@@ -4520,6 +4519,73 @@ impl Config {
                 }
             })
             .collect()
+    }
+
+    /// Whether an enabled agent still owns an enabled exact channel binding.
+    ///
+    /// This mirrors the channel runtime's explicit-binding and legacy-fallback
+    /// ownership rules. When any agent declares channel bindings, only an
+    /// enabled owner's exact `<type>.<alias>` entry is active. When no agent
+    /// declares bindings, the enabled runtime agent owns every enabled channel
+    /// for backward compatibility.
+    #[must_use]
+    pub fn enabled_channel_owned_by_agent(
+        &self,
+        agent_alias: &str,
+        channel_type: &str,
+        channel_alias: &str,
+    ) -> bool {
+        let channel_type = channel_type.trim();
+        let channel_alias = channel_alias.trim();
+        if channel_type.is_empty() || channel_alias.is_empty() {
+            return false;
+        }
+        self.channels_by_alias().into_iter().any(|channel| {
+            channel.enabled
+                && channel.channel_type == channel_type
+                && channel.alias == channel_alias
+                && channel.owning_agent.as_deref() == Some(agent_alias)
+        })
+    }
+
+    /// Resolve the enabled agent that owns a channel key at runtime.
+    ///
+    /// Exact `<type>.<alias>` collisions use the lexicographically-later
+    /// enabled agent, matching the channel router's deterministic overwrite
+    /// order. Bare channel types use the lexicographically-earlier owner for
+    /// backward-compatible singleton routing. When no agent declares any
+    /// channel binding, the enabled runtime agent owns collected channels.
+    #[must_use]
+    pub fn active_channel_owner(&self, channel_key: &str) -> Option<&str> {
+        let channel_key = channel_key.trim();
+        if channel_key.is_empty() {
+            return None;
+        }
+        if !self.agents.values().any(|agent| !agent.channels.is_empty()) {
+            return self.resolved_runtime_agent_alias();
+        }
+
+        let exact = channel_key.contains('.');
+        let owners = self.agents.iter().filter_map(|(alias, agent)| {
+            if !agent.enabled {
+                return None;
+            }
+            let owns = if exact {
+                agent
+                    .channels
+                    .iter()
+                    .any(|candidate| candidate.as_str() == channel_key)
+            } else {
+                agent.channels.iter().any(|candidate| {
+                    candidate
+                        .as_str()
+                        .split_once('.')
+                        .is_some_and(|(channel_type, _)| channel_type == channel_key)
+                })
+            };
+            owns.then_some(alias.as_str())
+        });
+        if exact { owners.max() } else { owners.min() }
     }
 
     /// Reverse-lookup the agent alias that owns a declaratively-configured
@@ -4674,9 +4740,9 @@ impl Config {
     #[must_use]
     pub fn resolved_runtime_agent_alias(&self) -> Option<&str> {
         self.agents
-            .keys()
-            .find(|k| k.as_str() == "default")
-            .map(String::as_str)
+            .get("default")
+            .filter(|agent| agent.enabled)
+            .map(|_| "default")
             .or_else(|| {
                 self.agents
                     .iter()
@@ -35970,5 +36036,82 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[test]
+    async fn active_channel_owner_matches_router_collision_order() {
+        let mut config = Config::default();
+        let channel = crate::providers::ChannelRef::new("telegram.default");
+        config.agents.insert(
+            "agent-a".into(),
+            AliasedAgentConfig {
+                channels: vec![channel.clone()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "agent-z".into(),
+            AliasedAgentConfig {
+                channels: vec![channel],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.active_channel_owner("telegram.default"),
+            Some("agent-z"),
+            "exact channel collisions follow the router's last-writer order"
+        );
+        assert_eq!(
+            config.active_channel_owner("telegram"),
+            Some("agent-a"),
+            "bare channel routing keeps the existing first-owner fallback"
+        );
+    }
+
+    #[test]
+    async fn enabled_channel_ownership_requires_live_config_and_exact_owner() {
+        let mut config = Config::default();
+        let channel = crate::providers::ChannelRef::new("telegram.default");
+        config.agents.insert(
+            "agent-a".into(),
+            AliasedAgentConfig {
+                channels: vec![channel],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "default".into(),
+            TelegramConfig {
+                enabled: true,
+                ..TelegramConfig::default()
+            },
+        );
+
+        assert!(config.enabled_channel_owned_by_agent("agent-a", "telegram", "default"));
+        assert!(!config.enabled_channel_owned_by_agent("agent-b", "telegram", "default"));
+
+        config.channels.telegram.get_mut("default").unwrap().enabled = false;
+        assert!(!config.enabled_channel_owned_by_agent("agent-a", "telegram", "default"));
+    }
+
+    #[test]
+    async fn disabled_default_agent_is_not_a_legacy_channel_owner() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .agents
+            .insert("enabled".into(), AliasedAgentConfig::default());
+
+        assert_eq!(
+            config.active_channel_owner("telegram.default"),
+            Some("enabled")
+        );
     }
 }

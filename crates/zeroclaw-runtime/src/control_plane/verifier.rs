@@ -474,7 +474,8 @@ mod tests {
         let agent_alias = format!("agent-{}", uuid::Uuid::new_v4());
         let goal_ctx = GoalAdmissionContext::new(agent_alias.clone())
             .with_originator_route(Some("route-a".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_goal_task_id(Some(goal_id.clone()));
         let mut config = Config {
             data_dir: temp.path().to_path_buf(),
             ..Config::default()

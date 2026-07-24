@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::{fs::OpenOptions, io::Write};
+use std::{collections::HashSet, fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
@@ -100,18 +100,42 @@ impl ControlPlaneHandle {
         })
     }
 
-    /// Drain goal IDs recovered by this boot's `last_state` policy.
+    /// Claim one goal ID recovered by this boot's `last_state` policy.
     ///
     /// This is an in-memory startup work queue, not canonical lifecycle state.
-    /// If the process crashes before the channel loop consumes it, the next boot
-    /// will recover the goal again under its new `boot_id`.
-    pub fn take_recovered_goal_ids(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .recovered_goal_ids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+    /// A claimant must return the ID with [`Self::requeue_recovered_goal_id`] if
+    /// it cannot transfer execution ownership or commit a non-running state.
+    pub fn take_recovered_goal_id(&self) -> Option<String> {
+        self.recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+    }
+
+    /// Return an unacknowledged startup-recovery claim to this boot's queue.
+    ///
+    /// The channel component supervisor can restart without changing the
+    /// process boot ID. Requeueing therefore preserves recovery work across a
+    /// component-only retry instead of relying on a full daemon restart.
+    pub fn requeue_recovered_goal_id(&self, task_id: String) {
+        self.requeue_recovered_goal_ids([task_id]);
+    }
+
+    /// Return a batch of unacknowledged startup-recovery claims atomically.
+    ///
+    /// One lock and one membership index keep late batch rollback linear while
+    /// preserving the caller's retry order and duplicate suppression.
+    pub fn requeue_recovered_goal_ids(&self, task_ids: impl IntoIterator<Item = String>) {
+        let mut recovered = self
+            .recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut queued: HashSet<String> = recovered.iter().cloned().collect();
+        for task_id in task_ids {
+            if queued.insert(task_id.clone()) {
+                recovered.push(task_id);
+            }
+        }
     }
 
     /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`
@@ -323,5 +347,65 @@ mod tests {
             h2.store.get("t").await.unwrap().unwrap().status,
             TaskStatus::Lost
         );
+    }
+
+    #[test]
+    fn component_retry_reclaims_failed_recovery_id_without_losing_unprocessed_ids() {
+        let sqlite = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let handle = ControlPlaneHandle {
+            store: sqlite.clone(),
+            goal_store: sqlite,
+            boot_id: "same-daemon-boot".into(),
+            recovered_goal_ids: Arc::new(Mutex::new(vec![
+                "goal-unprocessed".into(),
+                "goal-failed".into(),
+            ])),
+            data_dir_lock: None,
+        };
+
+        let failed = handle
+            .take_recovered_goal_id()
+            .expect("first component attempt claims a recovery id");
+        assert_eq!(failed, "goal-failed");
+        handle.requeue_recovered_goal_id(failed);
+
+        assert_eq!(
+            handle.take_recovered_goal_id().as_deref(),
+            Some("goal-failed"),
+            "the supervisor's same-boot retry must reclaim the failed id first"
+        );
+        assert_eq!(
+            handle.take_recovered_goal_id().as_deref(),
+            Some("goal-unprocessed"),
+            "a failed claim must not drain later startup recovery work"
+        );
+        assert_eq!(handle.take_recovered_goal_id(), None);
+    }
+
+    #[test]
+    fn batch_requeue_preserves_order_and_suppresses_duplicates() {
+        let sqlite = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let handle = ControlPlaneHandle {
+            store: sqlite.clone(),
+            goal_store: sqlite,
+            boot_id: "same-daemon-boot".into(),
+            recovered_goal_ids: Arc::new(Mutex::new(vec!["goal-existing".into()])),
+            data_dir_lock: None,
+        };
+
+        handle.requeue_recovered_goal_ids([
+            "goal-a".into(),
+            "goal-existing".into(),
+            "goal-b".into(),
+            "goal-a".into(),
+        ]);
+
+        assert_eq!(handle.take_recovered_goal_id().as_deref(), Some("goal-b"));
+        assert_eq!(handle.take_recovered_goal_id().as_deref(), Some("goal-a"));
+        assert_eq!(
+            handle.take_recovered_goal_id().as_deref(),
+            Some("goal-existing")
+        );
+        assert_eq!(handle.take_recovered_goal_id(), None);
     }
 }

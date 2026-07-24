@@ -121,11 +121,10 @@ impl Tool for GoalStartTool {
             let task_id = admission.task_id.as_deref().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            if !crate::control_plane::bind_current_goal_task(task_id) {
-                anyhow::bail!("goal admission could not bind its exact live task");
-            }
+            let config = crate::control_plane::current_goal_config()
+                .unwrap_or_else(|| std::sync::Arc::clone(&self.config));
             crate::agent::cost::enable_current_tool_loop_goal_attribution(
-                self.config.as_ref(),
+                config.as_ref(),
                 task_id,
             )?;
             crate::control_plane::mark_current_goal_turn_for_evaluation();
@@ -200,6 +199,21 @@ mod tests {
             };
         let mut config = zeroclaw_config::schema::Config::default();
         config.goal.enabled = true;
+        config.goal.allowed_channel_types = vec!["matrix".into()];
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                "matrix.default",
+            )],
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        config.agents.insert(agent.clone(), agent_config);
+        config.channels.matrix.insert(
+            "default".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MatrixConfig::default()
+            },
+        );
         let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config.clone()));
         let continuation_context = TaskContinuationContext {
             channel: "matrix".into(),
@@ -244,13 +258,14 @@ mod tests {
         assert_eq!(task.principal_id.as_deref(), Some("principal-a"));
         assert_eq!(
             goal_store.get_continuation_context(&task.id).await.unwrap(),
-            Some(continuation_context)
+            Some(continuation_context.clone())
         );
 
         let wrong_route = GoalAdmissionContext::new(agent)
             .with_channel_type(Some("matrix".into()))
             .with_originator_route(Some("channel:route-b".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation_context));
         let err = admit_goal_command(
             wrong_route,
             GoalCommand {
@@ -286,11 +301,36 @@ mod tests {
         }
         let mut config = zeroclaw_config::schema::Config::default();
         config.goal.enabled = true;
+        config.goal.allowed_channel_types = vec!["matrix".into()];
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                "matrix.default",
+            )],
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        config.agents.insert(agent.clone(), agent_config);
+        config.channels.matrix.insert(
+            "default".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MatrixConfig::default()
+            },
+        );
         let tool = GoalStartTool::new(agent.clone(), std::sync::Arc::new(config));
+        let continuation_context = TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: Some("default".into()),
+            reply_target: "room-a".into(),
+            sender: "operator-a".into(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+        };
         let owner = GoalAdmissionContext::new(agent)
             .with_channel_type(Some("matrix".into()))
             .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
-            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
+            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())))
+            .with_continuation_context(Some(continuation_context));
         let marker = Arc::new(AtomicBool::new(false));
         let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
 

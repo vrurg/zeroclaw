@@ -6,8 +6,9 @@
 //! objective/action payload.
 
 use anyhow::{Context, Result, bail};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use zeroclaw_commands::{BuiltinCommandId, CommandSurface, command_by_name};
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
@@ -16,8 +17,8 @@ use crate::agent::cost::{is_goal_accounting_failure, is_goal_accounting_pricing_
 
 use super::global::control_plane;
 use super::goal_task::{
-    GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, TaskContinuationContext, TaskGoal,
+    ActiveGoalControlBinding, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
+    GoalTaskRecord, GoalTaskRegistry, TaskContinuationContext, TaskGoal,
 };
 use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 use super::verifier::{
@@ -29,6 +30,8 @@ tokio::task_local! {
     static GOAL_RUNTIME_SCOPE: GoalRuntimeScope;
     static GOAL_START_TOOL_BATCH: bool;
 }
+
+type GoalTaskBindingSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Ephemeral task-local context for one goal-aware model/tool turn.
 ///
@@ -48,6 +51,15 @@ pub struct GoalRuntimeScope {
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
     turn_evaluation_requested: Option<Arc<AtomicBool>>,
+    /// Live configuration resolver used by model-callable goal tools.
+    ///
+    /// Channel slash commands already receive the current snapshot directly.
+    /// Tools are assembled at startup, so they need this task-local resolver to
+    /// avoid authorizing a later call with a stale captured config.
+    config_resolver: Option<Arc<dyn Fn() -> Arc<Config> + Send + Sync>>,
+    /// Process-local sink that binds a newly admitted exact goal to the
+    /// already registered live worker executing this turn.
+    task_binding_sink: Option<GoalTaskBindingSink>,
 }
 
 impl GoalRuntimeScope {
@@ -60,7 +72,32 @@ impl GoalRuntimeScope {
             admission_context: Arc::new(parking_lot::RwLock::new(admission_context)),
             state_update_sink,
             turn_evaluation_requested,
+            config_resolver: None,
+            task_binding_sink: None,
         }
+    }
+
+    pub fn with_config_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> Arc<Config> + Send + Sync>,
+    ) -> Self {
+        self.config_resolver = Some(resolver);
+        self
+    }
+
+    pub fn with_task_binding_sink(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.task_binding_sink = Some(sink);
+        self
+    }
+
+    /// Return the current trusted admission facts for this live turn.
+    ///
+    /// Cloned runtime scopes share the same inner context, so a caller that
+    /// retains a clone across a scoped model loop observes any exact task id
+    /// bound by a successful goal tool call inside that loop.
+    #[must_use]
+    pub fn admission_context(&self) -> Option<GoalAdmissionContext> {
+        self.admission_context.read().clone()
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
@@ -716,7 +753,7 @@ pub struct GoalBudgetOverrides {
 /// model-callable tool both normalize into this type, then pass trusted runtime
 /// facts separately through [`GoalAdmissionContext`]. Do not add sender, route,
 /// principal, or owner fields here: those belong to ingress/runtime state and
-/// eventually to the canonical [`TaskRecord`](super::TaskRecord).
+/// eventually to the canonical [`TaskRecord`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalCommand {
     /// Requested controller action.
@@ -913,6 +950,33 @@ pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
         .flatten()
 }
 
+/// Resolve the configuration generation governing the current goal-aware turn.
+pub fn current_goal_config() -> Option<Arc<Config>> {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| scope.config_resolver.as_ref().map(|resolver| resolver()))
+        .ok()
+        .flatten()
+}
+
+fn goal_policy_update_lock() -> &'static tokio::sync::RwLock<()> {
+    static LOCK: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::RwLock::new(()))
+}
+
+/// Serialize a live goal-policy cutover against all goal command admissions.
+///
+/// The caller must durably revoke affected goals and publish the new config
+/// while this write guard is held. `admit_goal_command` takes the matching read
+/// guard, preventing a stale admission from landing between the cancellation
+/// sweep and config publication.
+pub async fn with_goal_policy_update_lock<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let _guard = goal_policy_update_lock().write().await;
+    future.await
+}
+
 /// Bind a just-admitted exact goal task to the current live turn.
 ///
 /// This does not persist lifecycle state or resolve a goal by route: callers
@@ -925,19 +989,68 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
     }
     GOAL_RUNTIME_SCOPE
         .try_with(|scope| {
-            let mut admission = scope.admission_context.write();
-            let Some(admission) = admission.as_mut() else {
-                return false;
-            };
-            match admission.goal_task_id.as_deref() {
-                Some(existing) => existing == task_id,
-                None => {
-                    admission.goal_task_id = Some(task_id.to_string());
-                    true
+            let bound = {
+                let mut admission = scope.admission_context.write();
+                let Some(admission) = admission.as_mut() else {
+                    return false;
+                };
+                match admission.goal_task_id.as_deref() {
+                    Some(existing) => existing == task_id,
+                    None => {
+                        admission.goal_task_id = Some(task_id.to_string());
+                        true
+                    }
                 }
+            };
+            if bound && let Some(sink) = scope.task_binding_sink.as_ref() {
+                sink(task_id);
             }
+            bound
         })
         .unwrap_or(false)
+}
+
+/// Durably pause an exact running goal before its process-local worker stops.
+///
+/// Generic channel interruption is not a goal lifecycle authority. It may stop
+/// a bound worker only after this guarded transition makes the durable goal
+/// resumable, or after a concurrent pause/terminal transition has already
+/// removed the worker's execution obligation.
+pub async fn pause_running_goal_for_interruption(task_id: &str) -> Result<()> {
+    if task_id.trim().is_empty() {
+        bail!("cannot pause an interrupted goal without an exact task id");
+    }
+    let cp = control_plane().context("goal control plane unavailable during interruption")?;
+    let pause = GoalPauseState {
+        reason: GoalPauseReason::OperatorPaused,
+        description: Some(msg("goal-interruption-pause-description", &[])),
+        blockers: vec![GoalBlocker {
+            kind: GoalBlockerKind::OperatorPause,
+            message: msg("goal-interruption-blocker", &[]),
+            payload: None,
+        }],
+    };
+    if cp
+        .goal_store
+        .pause_goal_task_if_status(task_id, TaskStatus::Running, pause)
+        .await
+        .with_context(|| format!("pause interrupted goal {task_id}"))?
+    {
+        return Ok(());
+    }
+
+    let current = cp
+        .store
+        .get(task_id)
+        .await
+        .with_context(|| format!("reload interrupted goal {task_id}"))?
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("interrupted goal {task_id} no longer exists"))
+        })?;
+    if current.status == TaskStatus::Running {
+        bail!("interrupted goal {task_id} remained running after guarded pause");
+    }
+    Ok(())
 }
 
 /// Durably stop the exact active goal after a provider boundary reports that
@@ -1409,9 +1522,10 @@ fn ensure_goal_admitted_by_config(
     if !config.goal.enabled {
         bail!("{}", msg("goal-command-error-disabled", &[]));
     }
-    if let Some(agent_config) = agent_config
-        && !agent_config.goal.enabled
-    {
+    let Some(agent_config) = agent_config else {
+        bail!("{}", msg("goal-command-error-agent-disabled", &[]));
+    };
+    if !agent_config.enabled || !agent_config.goal.enabled {
         bail!("{}", msg("goal-command-error-agent-disabled", &[]));
     }
     let surface = ctx.command_surface.as_str();
@@ -1452,19 +1566,162 @@ fn ensure_goal_admitted_by_config(
                 )
             );
         }
+        let exact_binding_allowed = ctx
+            .continuation_context
+            .as_ref()
+            .and_then(|context| context.channel_alias.as_deref())
+            .is_some_and(|channel_alias| {
+                config.enabled_channel_owned_by_agent(&ctx.agent_alias, channel_type, channel_alias)
+            });
+        if !exact_binding_allowed {
+            bail!(
+                "{}",
+                msg(
+                    "goal-command-error-channel-binding-disabled",
+                    &[("channel_type", channel_type)]
+                )
+            );
+        }
     }
     Ok(())
+}
+
+fn goal_channel_binding_is_allowed(
+    agent_alias: &str,
+    channel_type: &str,
+    context: &TaskContinuationContext,
+    enabled_channels: &HashMap<String, String>,
+) -> bool {
+    context
+        .channel_alias
+        .as_deref()
+        .is_some_and(|channel_alias| {
+            let channel_ref = format!("{channel_type}.{channel_alias}");
+            enabled_channels.get(&channel_ref).map(String::as_str) == Some(agent_alias)
+        })
+}
+
+fn goal_channel_type(channel: &str) -> &str {
+    channel
+        .split_once(':')
+        .map_or(channel, |(channel_type, _)| channel_type)
+}
+
+fn goal_control_binding_is_allowed_with_channels(
+    binding: &ActiveGoalControlBinding,
+    config: &Config,
+    enabled_channels: &HashMap<String, String>,
+) -> bool {
+    if !config.goal.enabled {
+        return false;
+    }
+    let Some(agent) = config.agent(&binding.agent) else {
+        return false;
+    };
+    if !agent.enabled || !agent.goal.enabled {
+        return false;
+    }
+    if !config
+        .goal
+        .allowed_command_surfaces
+        .iter()
+        .any(|surface| surface.trim() == CommandSurface::Channel.as_str())
+    {
+        return false;
+    }
+
+    // Goal admission is currently channel-only in the shared command
+    // catalogue, and every admitted channel goal persists this continuation
+    // binding. If another surface is added, it must first add its own durable
+    // binding instead of making revocation guess from route text.
+    let Some(context) = binding.continuation_context.as_ref() else {
+        return false;
+    };
+    let channel_type = goal_channel_type(context.channel.trim());
+    !channel_type.is_empty()
+        && config
+            .goal
+            .allowed_channel_types
+            .iter()
+            .any(|allowed| allowed.trim() == channel_type)
+        && goal_channel_binding_is_allowed(&binding.agent, channel_type, context, enabled_channels)
+}
+
+fn enabled_goal_channels(config: &Config) -> HashMap<String, String> {
+    config
+        .channels_by_alias()
+        .into_iter()
+        .filter_map(|channel| {
+            let owner = channel.owning_agent?;
+            channel
+                .enabled
+                .then(|| (format!("{}.{}", channel.channel_type, channel.alias), owner))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn goal_control_binding_is_allowed(binding: &ActiveGoalControlBinding, config: &Config) -> bool {
+    let enabled_channels = enabled_goal_channels(config);
+    goal_control_binding_is_allowed_with_channels(binding, config, &enabled_channels)
+}
+
+/// Resolve every active exact goal no longer authorized by `config`.
+///
+/// This is the read-only phase of live policy reconciliation. Callers that
+/// coordinate configuration generations may validate that their generation is
+/// still authoritative after this awaited lookup and before committing the
+/// returned exact ids.
+pub async fn goal_ids_revoked_by_config(
+    goal_store: &dyn GoalTaskRegistry,
+    config: &Config,
+) -> Result<Vec<String>> {
+    let bindings = goal_store
+        .list_active_goal_control_bindings()
+        .await
+        .context("list active goals for live policy reconciliation")?;
+    let enabled_channels = enabled_goal_channels(config);
+    Ok(bindings
+        .into_iter()
+        .filter(|binding| {
+            !goal_control_binding_is_allowed_with_channels(binding, config, &enabled_channels)
+        })
+        .map(|binding| binding.task_id)
+        .collect())
+}
+
+/// Commit a previously resolved exact live-policy revocation plan.
+pub async fn cancel_goals_for_policy_revocation(
+    goal_store: &dyn GoalTaskRegistry,
+    revoked: &[String],
+) -> Result<Vec<String>> {
+    goal_store
+        .cancel_active_goals_for_policy_revocation(
+            revoked,
+            &msg("goal-terminal-reason-cancelled-by-controller", &[]),
+        )
+        .await
+        .context("cancel goals revoked by live policy")
 }
 
 pub async fn admit_goal_command(
     ctx: GoalAdmissionContext,
     command: GoalCommand,
-    config: &Config,
-    agent_config: Option<&AliasedAgentConfig>,
+    fallback_config: &Config,
+    fallback_agent_config: Option<&AliasedAgentConfig>,
 ) -> Result<GoalAdmission> {
-    if command.action == GoalCommandAction::Start {
-        ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
-    }
+    let _policy_guard = goal_policy_update_lock().read().await;
+    let live_config = current_goal_config();
+    let (config, agent_config) = match live_config.as_deref() {
+        Some(config) => (config, config.agent(&ctx.agent_alias)),
+        None => (
+            fallback_config,
+            fallback_config
+                .agent(&ctx.agent_alias)
+                .or(fallback_agent_config),
+        ),
+    };
+    ensure_goal_admitted_by_config(&ctx, config, agent_config)?;
     if command.action == GoalCommandAction::Help {
         return Ok(GoalAdmission {
             task_id: None,
@@ -1473,17 +1730,6 @@ pub async fn admit_goal_command(
             continuation_reason: None,
             continue_goal: false,
         });
-    }
-    if !config.goal.enabled
-        && !matches!(
-            command.action,
-            GoalCommandAction::Status
-                | GoalCommandAction::Pause
-                | GoalCommandAction::Resume
-                | GoalCommandAction::Cancel
-        )
-    {
-        bail!("{}", msg("goal-command-error-disabled", &[]));
     }
     let cp = control_plane()
         .with_context(|| msg("goal-command-error-control-plane-unavailable", &[]))?;
@@ -1586,6 +1832,14 @@ pub async fn admit_goal_command(
             .await
         }
     }?;
+    if admission.continue_goal && GOAL_RUNTIME_SCOPE.try_with(|_| ()).is_ok() {
+        let task_id = admission.task_id.as_deref().ok_or_else(|| {
+            anyhow::Error::msg("continuing goal admission returned no exact task id")
+        })?;
+        if !bind_current_goal_task(task_id) {
+            anyhow::bail!("goal admission could not bind its exact live task");
+        }
+    }
     publish_goal_state_update(&admission);
     Ok(admission)
 }
@@ -2780,11 +3034,65 @@ mod tests {
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
     use std::sync::Arc;
 
-    fn test_config() -> Config {
+    fn configure_test_goal_channel(
+        config: &mut Config,
+        agent_alias: &str,
+        channel_type: &str,
+        channel_alias: &str,
+    ) {
+        let channel_ref = format!("{channel_type}.{channel_alias}");
+        let agent = AliasedAgentConfig {
+            channels: vec![zeroclaw_config::providers::ChannelRef::new(channel_ref)],
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert(agent_alias.to_string(), agent);
+        match channel_type {
+            "matrix" => {
+                config.channels.matrix.insert(
+                    channel_alias.to_string(),
+                    zeroclaw_config::schema::MatrixConfig {
+                        enabled: true,
+                        ..zeroclaw_config::schema::MatrixConfig::default()
+                    },
+                );
+            }
+            "telegram" => {
+                config.channels.telegram.insert(
+                    channel_alias.to_string(),
+                    zeroclaw_config::schema::TelegramConfig {
+                        enabled: true,
+                        ..zeroclaw_config::schema::TelegramConfig::default()
+                    },
+                );
+            }
+            other => panic!("unsupported goal test channel type: {other}"),
+        }
+    }
+
+    fn test_config_for_agent(agent_alias: &str) -> Config {
         let mut config = Config::default();
         config.cost.enabled = false;
         config.goal.enabled = true;
+        configure_test_goal_channel(&mut config, agent_alias, "matrix", "default");
         config
+    }
+
+    fn test_config() -> Config {
+        test_config_for_agent("agent-a")
+    }
+
+    fn test_goal_context(agent_alias: impl Into<String>) -> GoalAdmissionContext {
+        GoalAdmissionContext::new(agent_alias)
+            .with_channel_type(Some("matrix".into()))
+            .with_continuation_context(Some(TaskContinuationContext {
+                channel: "matrix".into(),
+                channel_alias: Some("default".into()),
+                reply_target: "test-room".into(),
+                sender: "test-operator".into(),
+                thread_ts: None,
+                interruption_scope_id: None,
+                conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+            }))
     }
 
     fn global_test_stores() -> (Arc<dyn TaskRegistry>, Arc<dyn GoalTaskRegistry>) {
@@ -2963,6 +3271,54 @@ mod tests {
             )
             .await
             .expect("create budget-paused goal fixture");
+    }
+
+    async fn create_policy_revocation_goal(
+        store: &SqliteTaskStore,
+        task_id: &str,
+        agent: &str,
+        channel: &str,
+    ) {
+        store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.to_string(),
+                    kind: TaskKind::Goal,
+                    agent: agent.to_string(),
+                    status: TaskStatus::Running,
+                    owner_pid: std::process::id(),
+                    owner_boot_id: "policy-test-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(format!("{channel}:route:{task_id}")),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(format!("principal:{task_id}")),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.to_string(),
+                    objective: format!("exercise {task_id} policy"),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                Some(TaskContinuationContext {
+                    channel: channel.to_string(),
+                    channel_alias: Some("default".into()),
+                    reply_target: format!("room:{task_id}"),
+                    sender: "operator".into(),
+                    thread_ts: None,
+                    interruption_scope_id: Some(format!("scope:{task_id}")),
+                    conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+                }),
+            )
+            .await
+            .expect("create policy-revocation goal");
     }
 
     /// Deterministic verifier fixture for controller transition tests.
@@ -3500,22 +3856,28 @@ mod tests {
 
     #[test]
     fn goal_policy_rejects_disabled_global_and_agent_config() {
-        let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
+        let ctx = test_goal_context("agent-a");
         let mut config = test_config();
         config.goal.enabled = false;
         let err = ensure_goal_admitted_by_config(&ctx, &config, None).unwrap_err();
         assert!(err.to_string().contains("disabled"));
 
         config.goal.enabled = true;
-        let mut agent = AliasedAgentConfig::default();
-        agent.goal.enabled = false;
-        let err = ensure_goal_admitted_by_config(&ctx, &config, Some(&agent)).unwrap_err();
+        config.agents.get_mut("agent-a").unwrap().goal.enabled = false;
+        let err =
+            ensure_goal_admitted_by_config(&ctx, &config, config.agent("agent-a")).unwrap_err();
+        assert!(err.to_string().contains("disabled for this agent"));
+
+        config.agents.get_mut("agent-a").unwrap().goal.enabled = true;
+        config.agents.get_mut("agent-a").unwrap().enabled = false;
+        let err =
+            ensure_goal_admitted_by_config(&ctx, &config, config.agent("agent-a")).unwrap_err();
         assert!(err.to_string().contains("disabled for this agent"));
     }
 
     #[tokio::test]
-    async fn goal_help_admission_honors_disabled_config() {
-        let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
+    async fn goal_help_is_rejected_when_goal_mode_is_disabled() {
+        let ctx = test_goal_context("agent-a");
         let command = GoalCommand {
             action: GoalCommandAction::Help,
             objective: None,
@@ -3525,9 +3887,14 @@ mod tests {
         };
         let mut config = test_config();
 
-        let help = admit_goal_command(ctx.clone(), command.clone(), &config, None)
-            .await
-            .unwrap();
+        let help = admit_goal_command(
+            ctx.clone(),
+            command.clone(),
+            &config,
+            config.agent("agent-a"),
+        )
+        .await
+        .unwrap();
         assert_eq!(help.message, msg("goal-command-help", &[]));
         assert!(help.message.contains("/goal help"));
         assert!(help.message.contains("/goal --help"));
@@ -3539,20 +3906,42 @@ mod tests {
         assert!(!help.continue_goal);
 
         config.goal.enabled = false;
-        let disabled_help = admit_goal_command(ctx, command, &config, None)
+        let error = admit_goal_command(ctx, command, &config, config.agent("agent-a"))
             .await
-            .unwrap();
-        assert_eq!(disabled_help.message, msg("goal-command-help", &[]));
-        assert!(!disabled_help.continue_goal);
+            .unwrap_err();
+        assert!(error.to_string().contains("disabled"));
+    }
+
+    #[tokio::test]
+    async fn goal_admission_uses_live_policy_instead_of_enabled_fallback() {
+        let fallback = test_config();
+        let mut disabled = fallback.clone();
+        disabled.goal.enabled = false;
+        let scope = GoalRuntimeScope::new(None, None, None)
+            .with_config_resolver(Arc::new(move || Arc::new(disabled.clone())));
+        let ctx = test_goal_context("agent-a");
+
+        let error = scope_goal_runtime(scope, async {
+            admit_goal_command(
+                ctx,
+                parse_goal_command("/goal help").unwrap(),
+                &fallback,
+                None,
+            )
+            .await
+            .unwrap_err()
+        })
+        .await;
+
+        assert!(error.to_string().contains("disabled"));
     }
 
     #[tokio::test]
     async fn goal_pause_command_records_operator_pause_reason() {
         let (_store, goal_store) = global_test_stores();
-        let config = test_config();
         let agent = format!("agent-{}", uuid::Uuid::new_v4());
-        let ctx = GoalAdmissionContext::new(agent)
-            .with_channel_type(Some("matrix".into()))
+        let config = test_config_for_agent(&agent);
+        let ctx = test_goal_context(agent)
             .with_originator_route(Some(format!("matrix:{}", uuid::Uuid::new_v4())))
             .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
 
@@ -3603,12 +3992,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_goal_mode_rejects_start_but_retains_exact_lifecycle_controls() {
+    async fn disabled_goal_mode_rejects_every_goal_command() {
         let _ = global_test_stores();
-        let config = test_config();
         let agent = format!("agent-{}", uuid::Uuid::new_v4());
-        let ctx = GoalAdmissionContext::new(agent)
-            .with_channel_type(Some("matrix".into()))
+        let config = test_config_for_agent(&agent);
+        let ctx = test_goal_context(agent)
             .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
             .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
         let started = admit_goal_command(
@@ -3632,72 +4020,228 @@ mod tests {
             .await
             .is_err()
         );
-        assert_eq!(
-            admit_goal_command(
+        for raw in [
+            format!("/goal status {task_id}"),
+            format!("/goal pause {task_id}"),
+            format!("/goal resume {task_id}"),
+            format!("/goal cancel {task_id}"),
+            "/goal help".to_string(),
+        ] {
+            let error = admit_goal_command(
                 ctx.clone(),
-                parse_goal_command(&format!("/goal status {task_id}")).unwrap(),
+                parse_goal_command(&raw).unwrap(),
                 &disabled,
                 None,
             )
             .await
-            .unwrap()
-            .status,
-            TaskStatus::Running
-        );
-        assert_eq!(
-            admit_goal_command(
-                ctx.clone(),
-                parse_goal_command(&format!("/goal pause {task_id}")).unwrap(),
-                &disabled,
-                None,
-            )
-            .await
-            .unwrap()
-            .status,
-            TaskStatus::Paused
-        );
-        assert_eq!(
-            admit_goal_command(
-                ctx.clone(),
-                parse_goal_command(&format!("/goal resume {task_id}")).unwrap(),
-                &disabled,
-                None,
-            )
-            .await
-            .unwrap()
-            .status,
-            TaskStatus::Running
-        );
-        assert_eq!(
-            admit_goal_command(
-                ctx,
-                parse_goal_command(&format!("/goal cancel {task_id}")).unwrap(),
-                &disabled,
-                None,
-            )
-            .await
-            .unwrap()
-            .status,
-            TaskStatus::Cancelled
-        );
+            .unwrap_err();
+            assert!(error.to_string().contains("disabled"), "{raw}: {error}");
+        }
     }
 
     #[test]
     fn goal_policy_rejects_disallowed_surface_and_channel_type() {
         let mut config = test_config();
         config.goal.allowed_command_surfaces = vec!["web".into()];
-        let ctx = GoalAdmissionContext::new("agent-a").with_channel_type(Some("matrix".into()));
-        let err = ensure_goal_admitted_by_config(&ctx, &config, None).unwrap_err();
+        let ctx = test_goal_context("agent-a");
+        let err =
+            ensure_goal_admitted_by_config(&ctx, &config, config.agent("agent-a")).unwrap_err();
         assert!(err.to_string().contains("command surface `channel`"));
 
         config.goal.allowed_command_surfaces = vec!["channel".into()];
         config.goal.allowed_channel_types = vec!["telegram".into()];
-        let err = ensure_goal_admitted_by_config(&ctx, &config, None).unwrap_err();
+        let err =
+            ensure_goal_admitted_by_config(&ctx, &config, config.agent("agent-a")).unwrap_err();
         assert!(err.to_string().contains("channel type `matrix`"));
 
-        let missing_channel_type = GoalAdmissionContext::new("agent-a");
-        let err = ensure_goal_admitted_by_config(&missing_channel_type, &config, None).unwrap_err();
+        let missing_channel_type = test_goal_context("agent-a").with_channel_type(None);
+        let err =
+            ensure_goal_admitted_by_config(&missing_channel_type, &config, config.agent("agent-a"))
+                .unwrap_err();
         assert!(err.to_string().contains("channel type is unavailable"));
+    }
+
+    #[test]
+    fn live_policy_binding_revokes_global_agent_surface_and_channel_scopes() {
+        let agent = "agent-a";
+        let binding = ActiveGoalControlBinding {
+            task_id: "goal-a".into(),
+            agent: agent.into(),
+            continuation_context: Some(TaskContinuationContext {
+                channel: "matrix".into(),
+                channel_alias: Some("default".into()),
+                reply_target: "room".into(),
+                sender: "operator".into(),
+                thread_ts: None,
+                interruption_scope_id: None,
+                conversation_scope: TaskContinuationConversationScope::ReplyTarget,
+            }),
+        };
+        let config = test_config();
+        assert!(goal_control_binding_is_allowed(&binding, &config));
+        let allowed = config.clone();
+
+        let mut revoked = config.clone();
+        revoked.goal.enabled = false;
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.agents.get_mut(agent).unwrap().goal.enabled = false;
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.agents.get_mut(agent).unwrap().enabled = false;
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.goal.allowed_command_surfaces = vec!["web".into()];
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.goal.allowed_channel_types = vec!["telegram".into()];
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.channels.matrix.remove("default");
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config.clone();
+        revoked.channels.matrix.get_mut("default").unwrap().enabled = false;
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let mut revoked = config;
+        revoked.agents.get_mut(agent).unwrap().channels.clear();
+        revoked.agents.insert(
+            "agent-b".into(),
+            AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "matrix.default",
+                )],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert!(!goal_control_binding_is_allowed(&binding, &revoked));
+
+        let missing_binding = ActiveGoalControlBinding {
+            continuation_context: None,
+            ..binding
+        };
+        assert!(!goal_control_binding_is_allowed(&missing_binding, &allowed));
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_cancels_each_revoked_scope_and_never_revives_it() {
+        #[derive(Clone, Copy)]
+        enum Revocation {
+            Global,
+            AgentGoal,
+            AgentDisabled,
+            Surface,
+            ChannelType,
+            ChannelRemoved,
+            ChannelDisabled,
+            ChannelOwnership,
+            DuplicateChannelOwnership,
+        }
+
+        for revocation in [
+            Revocation::Global,
+            Revocation::AgentGoal,
+            Revocation::AgentDisabled,
+            Revocation::Surface,
+            Revocation::ChannelType,
+            Revocation::ChannelRemoved,
+            Revocation::ChannelDisabled,
+            Revocation::ChannelOwnership,
+            Revocation::DuplicateChannelOwnership,
+        ] {
+            let store = SqliteTaskStore::new_in_memory().unwrap();
+            create_policy_revocation_goal(&store, "target", "agent-a", "matrix").await;
+            create_policy_revocation_goal(&store, "unaffected", "agent-b", "telegram").await;
+
+            let mut allowed = test_config();
+            allowed.goal.allowed_command_surfaces = vec!["channel".into()];
+            allowed.goal.allowed_channel_types = vec!["matrix".into(), "telegram".into()];
+            configure_test_goal_channel(&mut allowed, "agent-b", "telegram", "default");
+            let mut revoked = allowed.clone();
+            match revocation {
+                Revocation::Global => revoked.goal.enabled = false,
+                Revocation::AgentGoal => {
+                    revoked.agents.get_mut("agent-a").unwrap().goal.enabled = false;
+                }
+                Revocation::AgentDisabled => {
+                    revoked.agents.get_mut("agent-a").unwrap().enabled = false;
+                }
+                Revocation::Surface => {
+                    revoked.goal.allowed_command_surfaces = vec!["web".into()];
+                }
+                Revocation::ChannelType => {
+                    revoked.goal.allowed_channel_types = vec!["telegram".into()];
+                }
+                Revocation::ChannelRemoved => {
+                    revoked.channels.matrix.remove("default");
+                }
+                Revocation::ChannelDisabled => {
+                    revoked.channels.matrix.get_mut("default").unwrap().enabled = false;
+                }
+                Revocation::ChannelOwnership => {
+                    revoked.agents.get_mut("agent-a").unwrap().channels.clear();
+                }
+                Revocation::DuplicateChannelOwnership => {
+                    revoked.agents.insert(
+                        "agent-z".into(),
+                        AliasedAgentConfig {
+                            channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                                "matrix.default",
+                            )],
+                            ..AliasedAgentConfig::default()
+                        },
+                    );
+                }
+            }
+
+            let revoked_ids = goal_ids_revoked_by_config(&store, &revoked).await.unwrap();
+            let cancelled = cancel_goals_for_policy_revocation(&store, &revoked_ids)
+                .await
+                .unwrap();
+            assert!(cancelled.iter().any(|task_id| task_id == "target"));
+            assert_eq!(
+                store.get("target").await.unwrap().unwrap().status,
+                TaskStatus::Cancelled
+            );
+
+            let unaffected_status = store.get("unaffected").await.unwrap().unwrap().status;
+            match revocation {
+                Revocation::Global | Revocation::Surface => {
+                    assert_eq!(unaffected_status, TaskStatus::Cancelled);
+                }
+                Revocation::AgentGoal
+                | Revocation::AgentDisabled
+                | Revocation::ChannelType
+                | Revocation::ChannelRemoved
+                | Revocation::ChannelDisabled
+                | Revocation::ChannelOwnership
+                | Revocation::DuplicateChannelOwnership => {
+                    assert_eq!(unaffected_status, TaskStatus::Running);
+                }
+            }
+
+            assert!(
+                cancel_goals_for_policy_revocation(
+                    &store,
+                    &goal_ids_revoked_by_config(&store, &allowed).await.unwrap(),
+                )
+                .await
+                .unwrap()
+                .iter()
+                .all(|task_id| task_id != "target"),
+                "re-enabling policy must not revive or re-transition a cancelled goal"
+            );
+            assert_eq!(
+                store.get("target").await.unwrap().unwrap().status,
+                TaskStatus::Cancelled
+            );
+        }
     }
 
     #[tokio::test]

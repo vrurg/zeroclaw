@@ -1387,6 +1387,92 @@ impl TelegramChannel {
         }
     }
 
+    async fn claim_startup_polling_slot(&self, offset: &mut i64) {
+        loop {
+            let url = self.api_url("getUpdates");
+            let probe = serde_json::json!({
+                "offset": *offset,
+                "timeout": 0,
+                "allowed_updates": ["message", "callback_query"]
+            });
+            match self.http_client().post(&url).json(&probe).send().await {
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
+                            ),
+                        "startup probe error; retrying in 5s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Ok(resp) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                                "startup probe parse error: ; retrying in 5s"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                        Ok(data) => {
+                            let ok = data
+                                .get("ok")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            if ok {
+                                // Slot claimed — advance offset past any queued updates.
+                                if let Some(results) =
+                                    data.get("result").and_then(serde_json::Value::as_array)
+                                {
+                                    for update in results {
+                                        if let Some(uid) = update
+                                            .get("update_id")
+                                            .and_then(serde_json::Value::as_i64)
+                                        {
+                                            *offset = uid + 1;
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+
+                            let error_code = data
+                                .get("error_code")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or_default();
+                            if error_code == 409 {
+                                ::zeroclaw_log::record!(
+                                    DEBUG,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    ),
+                                    "Startup probe: slot busy (409), retrying in 5s"
+                                );
+                            } else {
+                                let desc = data
+                                    .get("description")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("unknown");
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error_code": error_code, "desc": desc})), "Startup probe: API error : ; retrying in 5s");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn is_telegram_username_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '_'
     }
@@ -3690,99 +3776,20 @@ impl Channel for TelegramChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
 
-        if self.mention_only {
-            let _ = self.get_bot_username().await;
-        }
-
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "channel listening for messages..."
         );
 
-        loop {
-            let url = self.api_url("getUpdates");
-            let probe = serde_json::json!({
-                "offset": offset,
-                "timeout": 0,
-                "allowed_updates": ["message", "callback_query"]
-            });
-            match self.http_client().post(&url).json(&probe).send().await {
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
-                            ),
-                        "startup probe error; retrying in 5s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-                Ok(resp) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                                "startup probe parse error: ; retrying in 5s"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                        Ok(data) => {
-                            let ok = data
-                                .get("ok")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false);
-                            if ok {
-                                // Slot claimed — advance offset past any queued updates.
-                                if let Some(results) =
-                                    data.get("result").and_then(serde_json::Value::as_array)
-                                {
-                                    for update in results {
-                                        if let Some(uid) = update
-                                            .get("update_id")
-                                            .and_then(serde_json::Value::as_i64)
-                                        {
-                                            offset = uid + 1;
-                                        }
-                                    }
-                                }
-                                break; // Probe succeeded; enter the long-poll loop.
-                            }
-
-                            let error_code = data
-                                .get("error_code")
-                                .and_then(serde_json::Value::as_i64)
-                                .unwrap_or_default();
-                            if error_code == 409 {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    ),
-                                    "Startup probe: slot busy (409), retrying in 5s"
-                                );
-                            } else {
-                                let desc = data
-                                    .get("description")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("unknown");
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error_code": error_code, "desc": desc})), "Startup probe: API error : ; retrying in 5s");
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                    }
-                }
-            }
-        }
+        // Telegram identity and polling-slot acquisition are independent API
+        // calls. Overlap them, but do not enter message dispatch until both
+        // finish: targeted `/command@botname` input remains fail-closed unless
+        // `getMe` supplied the trusted self username.
+        let _ = tokio::join!(
+            self.get_bot_username(),
+            self.claim_startup_polling_slot(&mut offset)
+        );
 
         ::zeroclaw_log::record!(
             DEBUG,
@@ -3793,11 +3800,9 @@ impl Channel for TelegramChannel {
         self.register_bot_commands().await;
 
         loop {
-            if self.mention_only {
-                let missing_username = self.bot_username.lock().is_none();
-                if missing_username {
-                    let _ = self.get_bot_username().await;
-                }
+            let missing_username = self.bot_username.lock().is_none();
+            if missing_username {
+                let _ = self.get_bot_username().await;
             }
 
             let url = self.api_url("getUpdates");
@@ -7617,6 +7622,104 @@ mod tests {
         let mut commands = telegram_builtin_command_values();
         commands.extend(extra_commands);
         serde_json::json!({ "commands": commands })
+    }
+
+    #[tokio::test]
+    async fn telegram_identity_fetch_overlaps_startup_probe() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": {
+                            "id": 42,
+                            "username": "trusted_test_bot"
+                        }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 0,
+                "allowed_updates": ["message", "callback_query"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = mock_server
+                    .received_requests()
+                    .await
+                    .expect("mock server should retain startup requests");
+                let saw_identity = requests
+                    .iter()
+                    .any(|request| request.url.path().ends_with("/getMe"));
+                let saw_probe = requests
+                    .iter()
+                    .any(|request| request.url.path().ends_with("/getUpdates"));
+                if saw_identity && saw_probe {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("identity fetch and startup probe must become in-flight together");
+
+        assert_eq!(
+            channel.self_handle().as_deref(),
+            None,
+            "the delayed identity response must not publish an untrusted self handle"
+        );
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should retain startup requests");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/setMyCommands")),
+            "message dispatch and command registration must wait for trusted identity"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no inbound message may be dispatched while trusted identity is unresolved"
+        );
+
+        listener.abort();
+        let _ = listener.await;
     }
 
     #[tokio::test]
