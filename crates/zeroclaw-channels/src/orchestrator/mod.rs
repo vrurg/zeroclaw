@@ -3641,6 +3641,27 @@ async fn load_runtime_config_and_defaults(
     Ok((parsed, defaults))
 }
 
+#[cfg(test)]
+async fn maybe_apply_runtime_config_update_for_test(
+    ctx: &ChannelRuntimeContext,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    requeue_stops: &RecoveredGoalRequeueStops,
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+) -> Result<Option<ProviderDefaultsReload>> {
+    maybe_apply_runtime_config_update_with_goal_store(
+        ctx,
+        in_flight,
+        requeue_stops,
+        pending_by_scope,
+        || {
+            let goal_store: Arc<dyn zeroclaw_runtime::control_plane::GoalTaskRegistry> =
+                Arc::new(zeroclaw_runtime::control_plane::SqliteTaskStore::new_in_memory()?);
+            Ok(goal_store)
+        },
+    )
+    .await
+}
+
 async fn revoke_goal_execution_ownership(
     task_ids: &[String],
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
@@ -3759,6 +3780,26 @@ async fn maybe_apply_runtime_config_update(
     requeue_stops: &RecoveredGoalRequeueStops,
     pending_by_scope: &PendingRecoveredGoalsByScope,
 ) -> Result<Option<ProviderDefaultsReload>> {
+    maybe_apply_runtime_config_update_with_goal_store(
+        ctx,
+        in_flight,
+        requeue_stops,
+        pending_by_scope,
+        || goal_store_for_live_policy_cutover(zeroclaw_runtime::control_plane::control_plane()),
+    )
+    .await
+}
+
+async fn maybe_apply_runtime_config_update_with_goal_store<F>(
+    ctx: &ChannelRuntimeContext,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    requeue_stops: &RecoveredGoalRequeueStops,
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+    resolve_goal_store: F,
+) -> Result<Option<ProviderDefaultsReload>>
+where
+    F: FnOnce() -> Result<Arc<dyn zeroclaw_runtime::control_plane::GoalTaskRegistry>>,
+{
     let Some(config_path) = runtime_config_path(ctx) else {
         let config = runtime_config_snapshot(ctx);
         initialize_or_retry_channel_command_menus(ctx, config.as_ref());
@@ -3788,8 +3829,7 @@ async fn maybe_apply_runtime_config_update(
     // Goal authorization is local control-plane policy. Commit its cutover
     // before provider construction or warmup can wait on an external service.
     // Provider defaults remain per-agent and can converge afterward.
-    let goal_store =
-        goal_store_for_live_policy_cutover(zeroclaw_runtime::control_plane::control_plane())?;
+    let goal_store = resolve_goal_store()?;
     apply_goal_policy_cutover(
         ctx,
         &config_path,
@@ -18312,11 +18352,15 @@ uri = "{}/v1"
         let pending: PendingRecoveredGoalsByScope =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-        let reload =
-            maybe_apply_runtime_config_update(ctx.as_ref(), in_flight.as_ref(), &stops, &pending)
-                .await
-                .unwrap()
-                .expect("changed provider defaults need one reload");
+        let reload = maybe_apply_runtime_config_update_for_test(
+            ctx.as_ref(),
+            in_flight.as_ref(),
+            &stops,
+            &pending,
+        )
+        .await
+        .unwrap()
+        .expect("changed provider defaults need one reload");
         assert!(
             ctx.live_config_override
                 .lock()
@@ -18388,13 +18432,14 @@ model = "missing-model"
         let pending: PendingRecoveredGoalsByScope =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-        let reload = maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
-            .await
-            .unwrap()
-            .expect("first message claims the changed provider generation");
+        let reload =
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
+                .await
+                .unwrap()
+                .expect("first message claims the changed provider generation");
         spawn_provider_defaults_reload(Arc::clone(&ctx), reload);
         assert!(
-            maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -18428,7 +18473,7 @@ model = "missing-model"
         .await
         .expect("failed generation becomes retryable after bounded cooldown");
         assert!(
-            maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
                 .await
                 .unwrap()
                 .is_some(),
@@ -18509,10 +18554,11 @@ uri = "{}/v1"
         let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let pending: PendingRecoveredGoalsByScope =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let reload = maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
-            .await
-            .unwrap()
-            .expect("the changed provider generation must be claimed");
+        let reload =
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
+                .await
+                .unwrap()
+                .expect("the changed provider generation must be claimed");
         spawn_provider_defaults_reload(Arc::clone(&ctx), reload);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -18525,7 +18571,7 @@ uri = "{}/v1"
         .await
         .expect("the production provider warmup must reach the 503 endpoint");
         assert!(
-            maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -18577,7 +18623,7 @@ uri = "{}/v1"
             "the claimed generation must perform exactly one production warmup"
         );
         assert!(
-            maybe_apply_runtime_config_update(ctx.as_ref(), &in_flight, &stops, &pending)
+            maybe_apply_runtime_config_update_for_test(ctx.as_ref(), &in_flight, &stops, &pending)
                 .await
                 .unwrap()
                 .is_some(),
@@ -18618,8 +18664,7 @@ model = "test-model"
         let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let pending: PendingRecoveredGoalsByScope =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-
-        let reload = maybe_apply_runtime_config_update(&ctx, &in_flight, &stops, &pending)
+        let reload = maybe_apply_runtime_config_update_for_test(&ctx, &in_flight, &stops, &pending)
             .await
             .unwrap()
             .expect("policy publication prepares provider defaults independently");
