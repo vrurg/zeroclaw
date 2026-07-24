@@ -87,8 +87,8 @@ impl CostTracker {
         self.session_totals.lock()
     }
 
-    fn storage_path(&self) -> PathBuf {
-        self.lock_storage().path.clone()
+    fn uses_storage_path(&self, path: &Path) -> bool {
+        self.lock_storage().path == path
     }
 
     /// Confirm that the canonical JSONL ledger can accept a durable record
@@ -496,7 +496,8 @@ impl CostTracker {
         };
 
         if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
+            && (ct.uses_storage_path(&storage_path)
+                || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
@@ -508,7 +509,8 @@ impl CostTracker {
 
         let mut guard = slot.write();
         if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || (!config.enabled && !initialize_when_disabled))
+            && (ct.uses_storage_path(&storage_path)
+                || (!config.enabled && !initialize_when_disabled))
         {
             ct.update_config(config);
             return Some(ct);
@@ -540,11 +542,11 @@ impl CostTracker {
     ) -> Option<Arc<Self>> {
         let storage_path = workspace_dir.join("state").join("costs.jsonl");
         let tracker = slot.read().as_ref().cloned()?;
-        if tracker.storage_path() != storage_path {
+        if !tracker.uses_storage_path(&storage_path) {
             return None;
         }
         tracker.update_config(config);
-        tracker.is_enabled().then_some(tracker)
+        Some(tracker)
     }
 }
 
@@ -1621,6 +1623,60 @@ mod tests {
             !canonical_path.exists(),
             "read-only lookup must not create the canonical ledger path"
         );
+    }
+
+    #[test]
+    fn existing_global_returns_disabled_goal_ledger_without_creating_storage() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let tracker = Arc::new(CostTracker::new(config.clone(), tmp.path()).unwrap());
+        let slot = RwLock::new(Some(Arc::clone(&tracker)));
+        let canonical_path = tmp.path().join("state").join("costs.jsonl");
+
+        let existing = CostTracker::existing_global_in_slot(&slot, config, tmp.path())
+            .expect("disabled goal ledger remains readable");
+        let totals = existing
+            .get_usage_totals_for_task_with_pricing("goal-a")
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&tracker, &existing));
+        assert_eq!(totals.0, 0);
+        assert!(!existing.is_enabled());
+        assert!(
+            !canonical_path.exists(),
+            "read-only totals must not create the canonical ledger"
+        );
+    }
+
+    #[test]
+    fn existing_global_exposes_disabled_goal_token_rows() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let tracker = Arc::new(CostTracker::new(config.clone(), tmp.path()).unwrap());
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1_000, 500, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+        let slot = RwLock::new(Some(tracker));
+
+        let existing = CostTracker::existing_global_in_slot(&slot, config, tmp.path())
+            .expect("disabled goal ledger remains readable");
+        let (tokens, _cost, _pricing_available, usage_available) = existing
+            .get_usage_totals_for_task_with_pricing("goal-a")
+            .unwrap();
+
+        assert_eq!(tokens, 1_500);
+        assert!(usage_available);
+        assert!(!existing.is_enabled());
     }
 
     #[test]

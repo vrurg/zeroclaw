@@ -903,6 +903,7 @@ impl WhatsAppWebChannel {
                 timestamp: chrono::Utc::now().timestamp() as u64,
                 thread_ts: None,
                 interruption_scope_id: None,
+                internal_goal_task_id: None,
                 attachments,
                 subject: None,
                 internal_sop_event: None,

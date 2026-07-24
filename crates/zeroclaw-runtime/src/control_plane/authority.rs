@@ -88,8 +88,8 @@ mod tests {
 
     #[test]
     fn unstamped_boot_id_with_live_pid_is_not_reclaimed() {
-        // Review finding #7: a record written before its boot_id is stamped (empty) and
-        // owned by a LIVE pid must NOT be reaped via the boot-mismatch path — fail closed.
+        // An unstamped boot id is not proof of abandonment while its owner pid
+        // is still live, so reclamation must fail closed.
         let me = std::process::id();
         assert!(!is_authoritative(&rec(me, ""), "boot-NEW"));
     }

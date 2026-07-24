@@ -272,6 +272,26 @@ pub struct TaskContinuationContext {
     pub conversation_scope: TaskContinuationConversationScope,
 }
 
+impl TaskContinuationContext {
+    /// Return the exact key used by the live channel registry.
+    ///
+    /// Goal continuations, approval prompts, and human-gate notifications must
+    /// all resolve the same durable channel identity. Keeping the composite-key
+    /// rule here prevents those egress paths from inventing independent alias
+    /// precedence or falling back to an arbitrary registered channel.
+    #[must_use]
+    pub fn channel_key(&self) -> Option<String> {
+        let channel = self.channel.trim();
+        if channel.is_empty() {
+            return None;
+        }
+        match self.channel_alias.as_deref().map(str::trim) {
+            Some(alias) if !alias.is_empty() => Some(format!("{channel}.{alias}")),
+            _ => Some(channel.to_string()),
+        }
+    }
+}
+
 /// Durable representation of the channel history scope for a continuation
 /// prompt. Kept local to the control plane so the store does not depend on
 /// channel transport structs.
@@ -421,6 +441,18 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         task_id: &str,
         pause: GoalPauseState,
+    ) -> anyhow::Result<bool>;
+
+    /// Atomically fail a structurally incomplete running goal.
+    ///
+    /// Restart recovery may discover a canonical `TaskRecord` whose required
+    /// goal extension is absent. This guarded transition quarantines only that
+    /// exact corrupt shape; it must not fail a task if the extension exists or
+    /// a concurrent lifecycle transition already won.
+    async fn fail_running_goal_without_extension(
+        &self,
+        task_id: &str,
+        error: String,
     ) -> anyhow::Result<bool>;
 
     /// Atomically cancel exactly a paused goal. A false result means the

@@ -641,6 +641,32 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(true)
     }
 
+    async fn fail_running_goal_without_extension(
+        &self,
+        task_id: &str,
+        error: String,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE tasks
+                    SET status = 'failed',
+                        error = ?2,
+                        finished_at = ?3
+                  WHERE id = ?1
+                    AND kind = 'goal'
+                    AND status = 'running'
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM goal_tasks
+                         WHERE goal_tasks.task_id = tasks.id
+                    )",
+                params![task_id, error, chrono::Utc::now().to_rfc3339()],
+            )
+            .context("fail running goal without extension")?;
+        Ok(updated == 1)
+    }
+
     async fn cancel_paused_goal_task(&self, task_id: &str, error: String) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -1390,6 +1416,46 @@ mod tests {
             .await
             .expect_err("pause updates must reject missing goal extension rows");
         assert!(format!("{err:#}").contains("goal extension"));
+    }
+
+    #[tokio::test]
+    async fn missing_extension_quarantine_is_guarded_by_exact_corrupt_shape() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut missing = rec("goal-without-extension", "main", 1, "boot-1");
+        missing.kind = TaskKind::Goal;
+        s.create(missing).await.unwrap();
+
+        assert!(
+            s.fail_running_goal_without_extension(
+                "goal-without-extension",
+                "missing goal extension".into(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            s.get("goal-without-extension")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+
+        let mut valid = rec("valid-goal", "main", 1, "boot-1");
+        valid.kind = TaskKind::Goal;
+        s.create_goal(valid, goal_record("valid-goal", "continue"), None)
+            .await
+            .unwrap();
+        assert!(
+            !s.fail_running_goal_without_extension("valid-goal", "must not fail".into())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("valid-goal").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
     }
 
     #[tokio::test]

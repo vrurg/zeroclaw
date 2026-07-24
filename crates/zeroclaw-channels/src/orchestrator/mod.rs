@@ -124,6 +124,13 @@ fn recovered_goal_startup_queue_capacity(recovered_goals: usize) -> usize {
     CHANNEL_DISPATCH_QUEUE_CAPACITY.max(recovered_goals)
 }
 
+const RECOVERED_GOAL_PAUSE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const RECOVERED_GOAL_PAUSE_LOG_INTERVAL: u64 = 600;
+
+fn should_log_recovered_goal_pause_failure(failure_count: u64) -> bool {
+    failure_count == 1 || failure_count.is_multiple_of(RECOVERED_GOAL_PAUSE_LOG_INTERVAL)
+}
+
 #[cfg(test)]
 #[test]
 fn recovered_goal_startup_queue_capacity_covers_every_recovered_goal() {
@@ -132,6 +139,22 @@ fn recovered_goal_startup_queue_capacity_covers_every_recovered_goal() {
         recovered_goal_startup_queue_capacity(recovered_goals),
         recovered_goals
     );
+}
+
+#[cfg(test)]
+#[test]
+fn recovered_goal_pause_failure_logging_is_bounded() {
+    assert!(should_log_recovered_goal_pause_failure(1));
+    assert!(!should_log_recovered_goal_pause_failure(2));
+    assert!(!should_log_recovered_goal_pause_failure(
+        RECOVERED_GOAL_PAUSE_LOG_INTERVAL - 1
+    ));
+    assert!(should_log_recovered_goal_pause_failure(
+        RECOVERED_GOAL_PAUSE_LOG_INTERVAL
+    ));
+    assert!(!should_log_recovered_goal_pause_failure(
+        RECOVERED_GOAL_PAUSE_LOG_INTERVAL + 1
+    ));
 }
 #[cfg(test)]
 use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
@@ -816,9 +839,19 @@ fn current_in_flight_goal_task() -> Option<String> {
         .flatten()
 }
 
-/// Extract dispatcher-owned recovery provenance only from the current worker.
-/// Public message fields, including adapter-controlled identifiers, play no
-/// role in this decision.
+fn current_in_flight_goal_task_is(task_id: &str) -> bool {
+    IN_FLIGHT_GOAL_TASK
+        .try_with(|bound| {
+            bound
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_deref()
+                == Some(task_id)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
 fn recovered_goal_task_id() -> Option<String> {
     current_in_flight_goal_task()
 }
@@ -844,15 +877,25 @@ struct RecoveredGoalDispatchMessage {
 struct RecoveredGoalDispatchToken {
     task_id: String,
     agent_alias: String,
-    requeue_generation: Option<u64>,
     /// Unique private handoff identity. This lets the dispatcher retire only
     /// the exact pending enqueue it has redeemed, never a newer successor for
     /// the same durable goal.
-    queue_id: String,
+    queue_id: uuid::Uuid,
 }
 
-type RecoveredGoalRequeueGenerations = Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicU64>>>>;
+type RecoveredGoalRequeueStops = Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>;
 type PendingRecoveredGoalsByScope = Arc<tokio::sync::Mutex<HashMap<String, PendingRecoveredGoal>>>;
+
+/// Recovery-only state carried by a worker that redeemed a private envelope.
+///
+/// Keeping these values together makes ordinary workers structurally unable to
+/// retain recovery maps or present partial recovery ownership.
+struct RecoveredGoalWorkerContext {
+    task_id: String,
+    live_tx: tokio::sync::mpsc::WeakSender<RecoveredGoalDispatchMessage>,
+    requeue_stops: RecoveredGoalRequeueStops,
+    pending_by_scope: PendingRecoveredGoalsByScope,
+}
 
 /// Dispatcher-local bridge between a private queue entry and its in-flight
 /// registration. The durable task registry remains the goal lifecycle source
@@ -861,10 +904,26 @@ type PendingRecoveredGoalsByScope = Arc<tokio::sync::Mutex<HashMap<String, Pendi
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingRecoveredGoal {
     task_id: String,
-    queue_id: String,
+    queue_id: uuid::Uuid,
 }
 
-const RECOVERED_GOAL_REQUEUE_STOPPED: u64 = 1 << 63;
+impl From<&RecoveredGoalDispatchToken> for PendingRecoveredGoal {
+    fn from(token: &RecoveredGoalDispatchToken) -> Self {
+        Self {
+            task_id: token.task_id.clone(),
+            queue_id: token.queue_id,
+        }
+    }
+}
+
+impl From<RecoveredGoalDispatchToken> for PendingRecoveredGoal {
+    fn from(token: RecoveredGoalDispatchToken) -> Self {
+        Self {
+            task_id: token.task_id,
+            queue_id: token.queue_id,
+        }
+    }
+}
 
 async fn register_pending_recovered_goal(
     pending_by_scope: &PendingRecoveredGoalsByScope,
@@ -873,10 +932,7 @@ async fn register_pending_recovered_goal(
 ) {
     pending_by_scope.lock().await.insert(
         interruption_scope_key(msg),
-        PendingRecoveredGoal {
-            task_id: token.task_id.clone(),
-            queue_id: token.queue_id.clone(),
-        },
+        PendingRecoveredGoal::from(token),
     );
 }
 
@@ -886,11 +942,42 @@ async fn retire_pending_recovered_goal(
     token: &RecoveredGoalDispatchToken,
 ) {
     let scope_key = interruption_scope_key(msg);
+    retire_pending_recovered_goal_by_scope(
+        pending_by_scope,
+        &scope_key,
+        &token.task_id,
+        token.queue_id,
+    )
+    .await;
+}
+
+async fn retire_stopped_recovered_goal(
+    requeue_stops: &RecoveredGoalRequeueStops,
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    token: &RecoveredGoalDispatchToken,
+) -> bool {
+    if !recovered_goal_requeue_stop(requeue_stops, &token.task_id)
+        .await
+        .load(Ordering::Acquire)
+    {
+        return false;
+    }
+    retire_pending_recovered_goal(pending_by_scope, msg, token).await;
+    true
+}
+
+async fn retire_pending_recovered_goal_by_scope(
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+    scope_key: &str,
+    expected_task_id: &str,
+    expected_queue_id: uuid::Uuid,
+) {
     let mut pending = pending_by_scope.lock().await;
-    if pending.get(&scope_key).is_some_and(|current| {
-        current.task_id == token.task_id && current.queue_id == token.queue_id
+    if pending.get(scope_key).is_some_and(|current| {
+        current.task_id == expected_task_id && current.queue_id == expected_queue_id
     }) {
-        pending.remove(&scope_key);
+        pending.remove(scope_key);
     }
 }
 
@@ -925,16 +1012,17 @@ async fn recovered_goal_task_for_stop(
         .and_then(in_flight_worker_goal_task_id)
 }
 
-async fn recovered_goal_requeue_authority(
-    generations: &RecoveredGoalRequeueGenerations,
+async fn recovered_goal_requeue_stop(
+    stops: &RecoveredGoalRequeueStops,
     task_id: &str,
-) -> Arc<AtomicU64> {
-    generations
-        .lock()
-        .await
-        .entry(task_id.to_string())
-        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-        .clone()
+) -> Arc<AtomicBool> {
+    let mut stops = stops.lock().await;
+    if let Some(stop) = stops.get(task_id) {
+        return Arc::clone(stop);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    stops.insert(task_id.to_owned(), Arc::clone(&stop));
+    stop
 }
 
 fn in_flight_worker_goal_task_id(state: &InFlightSenderTaskState) -> Option<String> {
@@ -946,6 +1034,47 @@ fn in_flight_worker_goal_task_id(state: &InFlightSenderTaskState) -> Option<Stri
         current = candidate.predecessor.as_deref();
     }
     None
+}
+
+fn in_flight_worker_is_bound_to_goal(state: &InFlightSenderTaskState, task_id: &str) -> bool {
+    state
+        .goal_task_id
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(task_id)
+}
+
+fn in_flight_goal_worker_cancellation(
+    head: &InFlightSenderTaskState,
+    task_id: &str,
+) -> Option<CancellationToken> {
+    let mut current = Some(head);
+    while let Some(state) = current {
+        if in_flight_worker_is_bound_to_goal(state, task_id) {
+            return Some(state.cancellation.clone());
+        }
+        current = state.predecessor.as_deref();
+    }
+    None
+}
+
+async fn interrupt_in_flight_goal_worker(
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    sender_scope_key: &str,
+    task_id: &str,
+) -> bool {
+    let cancellation = {
+        let in_flight = in_flight.lock().await;
+        in_flight
+            .get(sender_scope_key)
+            .and_then(|head| in_flight_goal_worker_cancellation(head, task_id))
+    };
+    let Some(cancellation) = cancellation else {
+        return false;
+    };
+    cancellation.cancel();
+    true
 }
 
 #[cfg(test)]
@@ -973,8 +1102,23 @@ fn stop_goal_lookup_follows_a_newer_live_input_predecessor() {
 
 #[cfg(test)]
 #[test]
+fn in_flight_worker_binding_requires_the_exact_goal_task() {
+    let state = InFlightSenderTaskState {
+        task_id: 1,
+        cancellation: CancellationToken::new(),
+        completion: Arc::new(InFlightTaskCompletion::new()),
+        goal_task_id: Arc::new(std::sync::Mutex::new(Some("goal-a".into()))),
+        predecessor: None,
+    };
+
+    assert!(in_flight_worker_is_bound_to_goal(&state, "goal-a"));
+    assert!(!in_flight_worker_is_bound_to_goal(&state, "goal-b"));
+}
+
+#[cfg(test)]
+#[test]
 fn public_event_id_cannot_redeem_private_recovery_envelope() {
-    let recovery_id = "goal-restart:goal-123:requeue-0-private";
+    let recovery_id = "goal-restart:goal-123:requeue-private";
     let external = zeroclaw_api::channel::ChannelMessage {
         id: recovery_id.into(),
         ..Default::default()
@@ -985,8 +1129,7 @@ fn public_event_id_cannot_redeem_private_recovery_envelope() {
         token: RecoveredGoalDispatchToken {
             task_id: "goal-123".into(),
             agent_alias: "main".into(),
-            requeue_generation: Some(0),
-            queue_id: "private-test-token".into(),
+            queue_id: uuid::Uuid::from_u128(1),
         },
     };
     assert_eq!(envelope.token.task_id, "goal-123");
@@ -1071,14 +1214,11 @@ impl InFlightTaskCompletion {
         let mut observed = self.cancellation_cause.load(Ordering::Acquire);
         loop {
             let current = InFlightCancellationCause::from_u8(observed);
-            // Explicit control is terminal for recovery requeue. A later
-            // ordinary input must never downgrade `/stop` or `/goal` control
-            // back to a requeue-eligible cancellation cause.
-            if matches!(
-                current,
-                InFlightCancellationCause::StopCommand | InFlightCancellationCause::GoalControl
-            ) || (current == InFlightCancellationCause::NewerInput
-                && cause == InFlightCancellationCause::NewerInput)
+            // `/stop` is terminal for recovery requeue. A later ordinary input
+            // must never downgrade it back to a requeue-eligible cause.
+            if current == InFlightCancellationCause::StopCommand
+                || (current == InFlightCancellationCause::NewerInput
+                    && cause == InFlightCancellationCause::NewerInput)
             {
                 return;
             }
@@ -1130,14 +1270,13 @@ impl InFlightTaskCompletion {
 }
 
 /// Dispatcher-local cancellation intent. Only newer live input resumes an
-/// interrupted recovered goal; explicit goal control and `/stop` must not.
+/// interrupted recovered goal; `/stop` must not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum InFlightCancellationCause {
     None = 0,
     NewerInput = 1,
     StopCommand = 2,
-    GoalControl = 3,
 }
 
 impl InFlightCancellationCause {
@@ -1145,39 +1284,23 @@ impl InFlightCancellationCause {
         match value {
             1 => Self::NewerInput,
             2 => Self::StopCommand,
-            3 => Self::GoalControl,
             _ => Self::None,
         }
     }
 }
 
 #[cfg(test)]
-#[test]
-fn explicit_control_cancellation_cannot_be_overwritten_by_newer_input() {
-    let completion = InFlightTaskCompletion::new();
-    completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
-    completion.set_cancellation_cause(InFlightCancellationCause::GoalControl);
-    completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
-    assert_eq!(
-        completion.cancellation_cause(),
-        InFlightCancellationCause::GoalControl
-    );
-}
-
-#[cfg(test)]
 #[tokio::test]
-async fn stop_revokes_a_requeue_authority_snapshot() {
-    let generations: RecoveredGoalRequeueGenerations =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let authority = recovered_goal_requeue_authority(&generations, "goal-a").await;
-    let snapshot = authority.load(Ordering::Acquire);
+async fn stop_revokes_requeue_authority() {
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let stop = recovered_goal_requeue_stop(&stops, "goal-a").await;
     let completion = InFlightTaskCompletion::new();
     completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
     completion.set_cancellation_cause(InFlightCancellationCause::StopCommand);
-    authority.fetch_or(RECOVERED_GOAL_REQUEUE_STOPPED, Ordering::AcqRel);
+    stop.store(true, Ordering::Release);
     assert!(
         completion.cancellation_cause() != InFlightCancellationCause::NewerInput
-            || authority.load(Ordering::Acquire) != snapshot
+            || stop.load(Ordering::Acquire)
     );
 }
 
@@ -1195,8 +1318,7 @@ async fn stop_finds_and_revokes_a_private_queued_recovered_successor() {
     let token = RecoveredGoalDispatchToken {
         task_id: "goal-queued".into(),
         agent_alias: "main".into(),
-        requeue_generation: Some(0),
-        queue_id: "queued-successor".into(),
+        queue_id: uuid::Uuid::from_u128(1),
     };
     let pending_by_scope: PendingRecoveredGoalsByScope =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -1208,17 +1330,65 @@ async fn stop_finds_and_revokes_a_private_queued_recovered_successor() {
         .expect("queued successor must be visible to stop");
     assert_eq!(task_id, token.task_id);
 
-    let generations: RecoveredGoalRequeueGenerations =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    recovered_goal_requeue_authority(&generations, &task_id)
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    recovered_goal_requeue_stop(&stops, &task_id)
         .await
-        .fetch_or(RECOVERED_GOAL_REQUEUE_STOPPED, Ordering::AcqRel);
-    assert_ne!(
-        recovered_goal_requeue_authority(&generations, &token.task_id)
+        .store(true, Ordering::Release);
+    assert!(
+        recovered_goal_requeue_stop(&stops, &token.task_id)
             .await
             .load(Ordering::Acquire)
-            & RECOVERED_GOAL_REQUEUE_STOPPED,
-        0
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn stop_cannot_select_a_pending_recovered_goal_from_another_channel_alias() {
+    let mut alias_a = zeroclaw_api::channel::ChannelMessage::new(
+        "stop-a", "alice", "room", "/stop", "discord", 1,
+    );
+    alias_a.channel_alias = Some("clamps".into());
+    let mut alias_b = zeroclaw_api::channel::ChannelMessage::new(
+        "goal-restart:goal-b:private",
+        "alice",
+        "room",
+        "continue",
+        "discord",
+        1,
+    );
+    alias_b.channel_alias = Some("glados".into());
+    let token = RecoveredGoalDispatchToken {
+        task_id: "goal-b".into(),
+        agent_alias: "main".into(),
+        queue_id: uuid::Uuid::from_u128(1),
+    };
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    register_pending_recovered_goal(&pending_by_scope, &alias_b, &token).await;
+    let in_flight = tokio::sync::Mutex::new(HashMap::new());
+
+    assert_ne!(
+        interruption_scope_key(&alias_a),
+        interruption_scope_key(&alias_b)
+    );
+    assert_eq!(
+        recovered_goal_task_for_stop(
+            &in_flight,
+            &pending_by_scope,
+            &interruption_scope_key(&alias_a),
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        recovered_goal_task_for_stop(
+            &in_flight,
+            &pending_by_scope,
+            &interruption_scope_key(&alias_b),
+        )
+        .await
+        .as_deref(),
+        Some("goal-b")
     );
 }
 
@@ -1236,11 +1406,10 @@ async fn stale_recovered_envelope_retires_exact_pending_ownership() {
     let older = RecoveredGoalDispatchToken {
         task_id: "goal-queued".into(),
         agent_alias: "main".into(),
-        requeue_generation: Some(0),
-        queue_id: "older".into(),
+        queue_id: uuid::Uuid::from_u128(1),
     };
     let newer = RecoveredGoalDispatchToken {
-        queue_id: "newer".into(),
+        queue_id: uuid::Uuid::from_u128(2),
         ..older.clone()
     };
     let pending_by_scope: PendingRecoveredGoalsByScope =
@@ -1255,8 +1424,85 @@ async fn stale_recovered_envelope_retires_exact_pending_ownership() {
             .lock()
             .await
             .get(&scope_key)
-            .map(|entry| entry.queue_id.as_str()),
-        Some("newer")
+            .map(|entry| entry.queue_id),
+        Some(newer.queue_id)
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn moved_goal_command_message_retires_pending_recovery_scope() {
+    let mut message = zeroclaw_api::channel::ChannelMessage::new(
+        "goal-restart:goal-queued:private",
+        "alice",
+        "room",
+        "continue",
+        "telegram",
+        1,
+    );
+    message.channel_alias = Some("main".into());
+    let token = RecoveredGoalDispatchToken {
+        task_id: "goal-queued".into(),
+        agent_alias: "main".into(),
+        queue_id: uuid::Uuid::from_u128(1),
+    };
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    register_pending_recovered_goal(&pending_by_scope, &message, &token).await;
+
+    let mut goal_command_message = message;
+    goal_command_message.content = "/goal pause operator requested".into();
+    retire_pending_recovered_goal(&pending_by_scope, &goal_command_message, &token).await;
+
+    assert!(pending_by_scope.lock().await.is_empty());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn stopped_startup_envelope_retirement_preserves_unrelated_active_scope() {
+    let message = zeroclaw_api::channel::ChannelMessage::new(
+        "goal-restart:goal-a:startup",
+        "alice",
+        "room",
+        "continue",
+        "telegram",
+        1,
+    );
+    let scope_key = interruption_scope_key(&message);
+    let token = RecoveredGoalDispatchToken {
+        task_id: "goal-a".into(),
+        agent_alias: "main".into(),
+        queue_id: uuid::Uuid::from_u128(1),
+    };
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    register_pending_recovered_goal(&pending_by_scope, &message, &token).await;
+
+    // This represents ordinary work registered after `/stop` committed but
+    // before the dispatcher redeemed the stale startup envelope.
+    let ordinary = InFlightSenderTaskState {
+        task_id: 42,
+        cancellation: CancellationToken::new(),
+        completion: Arc::new(InFlightTaskCompletion::new()),
+        goal_task_id: Arc::new(std::sync::Mutex::new(None)),
+        predecessor: None,
+    };
+    let in_flight = tokio::sync::Mutex::new(HashMap::from([(scope_key.clone(), ordinary)]));
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    recovered_goal_requeue_stop(&stops, &token.task_id)
+        .await
+        .store(true, Ordering::Release);
+
+    assert!(retire_stopped_recovered_goal(&stops, &pending_by_scope, &message, &token,).await);
+    assert!(pending_by_scope.lock().await.is_empty());
+    assert_eq!(
+        in_flight
+            .lock()
+            .await
+            .get(&scope_key)
+            .map(|state| state.task_id),
+        Some(42),
+        "stale recovery retirement must not unregister unrelated work"
     );
 }
 
@@ -1309,7 +1555,7 @@ enum InFlightPreRegistration {
     /// This message is registered but must wait for a predecessor first.
     Queued {
         registration: InFlightRegistration,
-        predecessor: InFlightSenderTaskState,
+        predecessor: Arc<InFlightSenderTaskState>,
     },
     /// Newer input superseded this message before it could run.
     Abandoned,
@@ -1325,11 +1571,11 @@ impl InFlightPreRegistration {
 }
 
 fn cancel_in_flight_chain(state: &InFlightSenderTaskState, cause: InFlightCancellationCause) {
-    let mut current = Some(state.clone());
+    let mut current = Some(state);
     while let Some(state) = current {
         state.completion.set_cancellation_cause(cause);
         state.cancellation.cancel();
-        current = state.predecessor.as_deref().cloned();
+        current = state.predecessor.as_deref();
     }
 }
 
@@ -1473,12 +1719,34 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
         (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, None) => {
             sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
         }
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
-        ),
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
-            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, scope) => {
+            let alias_len = msg
+                .channel_alias
+                .as_deref()
+                .map_or(0, |alias| alias.len() + 1);
+            let scope_len = scope.map_or(0, |scope| scope.len() + 1);
+            let mut key = String::with_capacity(
+                msg.channel.len()
+                    + alias_len
+                    + msg.reply_target.len()
+                    + msg.sender.len()
+                    + scope_len
+                    + 2,
+            );
+            key.push_str(&msg.channel);
+            if let Some(alias) = msg.channel_alias.as_deref() {
+                key.push('.');
+                key.push_str(alias);
+            }
+            key.push('_');
+            key.push_str(&msg.reply_target);
+            key.push('_');
+            key.push_str(&msg.sender);
+            if let Some(scope) = scope {
+                key.push('_');
+                key.push_str(scope);
+            }
+            key
         }
     }
 }
@@ -2281,6 +2549,7 @@ fn goal_continuation_message_with_prompt(
         msg,
         format!("{}:goal:{}", msg.id, uuid::Uuid::new_v4()),
         goal_continuation_prompt(task_id, prompt),
+        Some(task_id.to_owned()),
     )
 }
 
@@ -2288,6 +2557,7 @@ fn synthetic_goal_message_from(
     msg: &zeroclaw_api::channel::ChannelMessage,
     id: String,
     content: String,
+    internal_goal_task_id: Option<String>,
 ) -> zeroclaw_api::channel::ChannelMessage {
     let mut next = zeroclaw_api::channel::ChannelMessage::new(
         id,
@@ -2303,6 +2573,7 @@ fn synthetic_goal_message_from(
     next.subject = msg.subject.clone();
     next.conversation_scope = msg.conversation_scope;
     next.passive_context = false;
+    next.internal_goal_task_id = internal_goal_task_id;
     next
 }
 
@@ -2330,20 +2601,28 @@ fn recovered_goal_continuation_message(
     msg.interruption_scope_id = context.interruption_scope_id;
     msg.conversation_scope = goal_channel_conversation_scope(context.conversation_scope);
     msg.passive_context = false;
+    msg.internal_goal_task_id = Some(task_id.to_string());
     msg
 }
 
-fn is_recovered_goal_continuation_message() -> bool {
-    recovered_goal_task_id().is_some()
+fn is_recovered_goal_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    msg.id.starts_with("goal-restart:")
+        && msg
+            .internal_goal_task_id
+            .as_deref()
+            .is_some_and(current_in_flight_goal_task_is)
 }
 
 fn is_goal_controller_continuation_message(msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
-    msg.id.contains(":goal:") || is_recovered_goal_continuation_message()
+    if msg.id.starts_with("goal-restart:") {
+        is_recovered_goal_continuation_message(msg)
+    } else {
+        msg.internal_goal_task_id.is_some()
+    }
 }
 
 fn should_enrich_message_links(
-    msg: &zeroclaw_api::channel::ChannelMessage,
-    command_requested_goal_continuation: bool,
+    goal_controller_continuation: bool,
     link_enricher_enabled: bool,
 ) -> bool {
     if !link_enricher_enabled {
@@ -2352,7 +2631,7 @@ fn should_enrich_message_links(
     // Goal-controller continuations are runtime-authored prompts. Enriching an
     // objective URL here would prepend text outside the controller prompt shape,
     // blurring trusted runtime instructions with untrusted objective content.
-    !command_requested_goal_continuation && !is_goal_controller_continuation_message(msg)
+    !goal_controller_continuation
 }
 
 fn should_autosave_message_to_memory(
@@ -2380,22 +2659,16 @@ fn should_consolidate_message_memory(
 fn goal_admission_context_for_message(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    _history_key: &str,
-    goal_task_id: Option<&str>,
+    history_key: &str,
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
         .with_originator_route(Some(goal_trusted_route(msg)))
         .with_principal_id(goal_principal_id(msg))
-        .with_legacy_identity(
-            Some(conversation_history_key(msg)),
-            legacy_goal_principal_id(msg),
-        )
+        .with_legacy_identity(Some(history_key.to_string()), legacy_goal_principal_id(msg))
         .with_goal_task_id(
-            goal_task_id
-                .map(ToOwned::to_owned)
-                .or_else(current_in_flight_goal_task),
+            current_in_flight_goal_task().or_else(|| msg.internal_goal_task_id.clone()),
         )
         .with_continuation_context(Some(goal_continuation_context_from_message(msg)))
 }
@@ -2417,11 +2690,16 @@ fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 }
 
 fn canonical_goal_identity(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| format!("{}:{part}", part.len()))
-        .collect::<Vec<_>>()
-        .join("|")
+    let capacity = parts.iter().map(|part| part.len() + 4).sum();
+    let mut identity = String::with_capacity(capacity);
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            identity.push('|');
+        }
+        write!(&mut identity, "{}:{part}", part.len())
+            .expect("writing canonical identity into String cannot fail");
+    }
+    identity
 }
 
 fn goal_cost_tracking_context_for_turn(
@@ -2433,8 +2711,7 @@ fn goal_cost_tracking_context_for_turn(
         Some(goal_ctx) if goal_controller_continuation => {
             context.with_goal_admission_context(goal_ctx)
         }
-        Some(goal_ctx) => context.with_goal_admission_filters(goal_ctx),
-        None => context,
+        _ => context,
     }
 }
 
@@ -2469,6 +2746,7 @@ fn goal_controller_limit_pause_message(
         msg,
         format!("{}:goal-limit:{}", msg.id, uuid::Uuid::new_v4()),
         format!("/goal pause {reason}"),
+        msg.internal_goal_task_id.clone(),
     )
 }
 
@@ -2478,7 +2756,39 @@ async fn send_goal_controller_update(
     msg: &zeroclaw_api::channel::ChannelMessage,
     message: &str,
 ) {
-    if !goal_channel_status_updates_enabled(config, msg.channel.as_str()) {
+    let target = goal_controller_update_target(msg);
+    send_goal_controller_update_to(config, channel, target, message).await;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GoalControllerUpdateTarget {
+    channel: String,
+    reply_target: String,
+    thread_id: Option<String>,
+}
+
+fn goal_controller_update_target(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> GoalControllerUpdateTarget {
+    GoalControllerUpdateTarget {
+        channel: msg.channel.clone(),
+        reply_target: msg.reply_target.clone(),
+        thread_id: followup_thread_id(msg),
+    }
+}
+
+async fn send_goal_controller_update_to(
+    config: &zeroclaw_config::schema::Config,
+    channel: Option<&Arc<dyn Channel>>,
+    target: GoalControllerUpdateTarget,
+    message: &str,
+) {
+    let GoalControllerUpdateTarget {
+        channel: channel_name,
+        reply_target,
+        thread_id,
+    } = target;
+    if !goal_channel_status_updates_enabled(config, channel_name.as_str()) {
         return;
     }
     let Some(channel) = channel else {
@@ -2491,10 +2801,10 @@ async fn send_goal_controller_update(
     let text = redact_channel_outbound_leaks(
         &text,
         &config.security.leak_detection,
-        outbound_content_format_for_channel(&msg.channel),
+        outbound_content_format_for_channel(&channel_name),
     );
     if let Err(err) = channel
-        .send(&SendMessage::new(text, &msg.reply_target).in_thread(followup_thread_id(msg)))
+        .send(&SendMessage::new(text, reply_target).in_thread(thread_id))
         .await
     {
         ::zeroclaw_log::record!(
@@ -4044,6 +4354,7 @@ async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
+    goal_workers: Option<&tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
 ) -> RuntimeCommandOutcome {
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return RuntimeCommandOutcome::NotCommand;
@@ -4054,7 +4365,6 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
-    let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key, None);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -4304,10 +4614,15 @@ async fn handle_runtime_command_if_needed(
         ),
         ChannelRuntimeCommand::Goal(command) => {
             let action = command.action;
-            let command_objective = command.objective.clone();
-            let defaults_snapshot = runtime_defaults_snapshot(ctx);
+            let command_objective =
+                if action == zeroclaw_runtime::control_plane::GoalCommandAction::Start {
+                    command.objective.clone()
+                } else {
+                    None
+                };
+            let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
             match zeroclaw_runtime::control_plane::admit_goal_command(
-                goal_admission_context.clone(),
+                goal_admission_context,
                 command,
                 defaults_snapshot.config.as_ref(),
                 Some(ctx.agent_cfg.as_ref()),
@@ -4315,39 +4630,44 @@ async fn handle_runtime_command_if_needed(
             .await
             {
                 Ok(admission) => {
-                    let admitted_task_id = admission.task_id.clone();
-                    if admission.continue_goal
-                        && let Some(task_id) = admission.task_id.clone()
-                    {
-                        let prompt = match action {
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
+                    let zeroclaw_runtime::control_plane::GoalAdmission {
+                        task_id,
+                        status: _,
+                        message,
+                        continuation_reason,
+                        continue_goal,
+                    } = admission;
+                    let continuation_prompt = if continue_goal {
+                        match (action, task_id.as_deref()) {
+                            (zeroclaw_runtime::control_plane::GoalCommandAction::Start, _) => {
                                 command_objective
-                                    .clone()
                                     .map(|objective| GoalContinuationPrompt::Start { objective })
                             }
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
-                                Some(GoalContinuationPrompt::Resume {
-                                    objective: goal_objective_for_prompt(&task_id).await,
-                                    resume_reason: admission.continuation_reason.clone(),
-                                })
-                            }
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
-                                Some(GoalContinuationPrompt::Budget {
-                                    objective: goal_objective_for_prompt(&task_id).await,
-                                })
-                            }
+                            (
+                                zeroclaw_runtime::control_plane::GoalCommandAction::Resume,
+                                Some(task_id),
+                            ) => Some(GoalContinuationPrompt::Resume {
+                                objective: goal_objective_for_prompt(task_id).await,
+                                resume_reason: continuation_reason,
+                            }),
+                            (
+                                zeroclaw_runtime::control_plane::GoalCommandAction::Budget,
+                                Some(task_id),
+                            ) => Some(GoalContinuationPrompt::Budget {
+                                objective: goal_objective_for_prompt(task_id).await,
+                            }),
                             _ => None,
-                        };
-                        if let Some(prompt) = prompt {
-                            outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
                         }
-                    }
-                    if matches!(&outcome, RuntimeCommandOutcome::Handled) {
-                        outcome = RuntimeCommandOutcome::HandledGoal {
-                            task_id: admitted_task_id,
-                        };
-                    }
-                    admission.message
+                    } else {
+                        None
+                    };
+                    outcome = match (task_id, continuation_prompt) {
+                        (Some(task_id), Some(prompt)) => {
+                            RuntimeCommandOutcome::ContinueGoal { task_id, prompt }
+                        }
+                        (task_id, _) => RuntimeCommandOutcome::HandledGoal { task_id },
+                    };
+                    message
                 }
                 Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-command-failed",
@@ -4368,6 +4688,25 @@ async fn handle_runtime_command_if_needed(
         &defaults_snapshot.config.security.leak_detection,
         outbound_content_format_for_channel(&msg.channel),
     );
+
+    finish_runtime_command(outcome, response, msg, channel, goal_workers).await
+}
+
+async fn finish_runtime_command(
+    outcome: RuntimeCommandOutcome,
+    response: String,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel: &Arc<dyn Channel>,
+    goal_workers: Option<&tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+) -> RuntimeCommandOutcome {
+    if let RuntimeCommandOutcome::HandledGoal {
+        task_id: Some(task_id),
+    } = &outcome
+        && let Some(goal_workers) = goal_workers
+    {
+        let sender_scope_key = interruption_scope_key(msg);
+        interrupt_in_flight_goal_worker(goal_workers, &sender_scope_key, task_id).await;
+    }
 
     if let Err(err) = channel
         .send(&{
@@ -5995,7 +6334,8 @@ async fn process_channel_message_body(
     // mutate the leading command token. Otherwise `/goal start ... https://...`
     // can become `[Link: ...]\n/goal ...` and leak into the model as prompt text.
     let mut command_requested_goal_continuation = false;
-    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    match handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref(), None).await
+    {
         RuntimeCommandOutcome::NotCommand => {}
         RuntimeCommandOutcome::Handled | RuntimeCommandOutcome::HandledGoal { .. } => {
             reconcile_early_ack(
@@ -6014,6 +6354,7 @@ async fn process_channel_message_body(
             msg.content = goal_continuation_prompt(&task_id, &prompt);
             msg.attachments.clear();
             msg.passive_context = false;
+            msg.internal_goal_task_id = Some(task_id);
             command_requested_goal_continuation = true;
         }
     }
@@ -6073,7 +6414,7 @@ async fn process_channel_message_body(
 
     // ── Link enricher: prepend URL summaries before agent sees the message ──
     let le_config = &ctx.prompt_config.link_enricher;
-    if should_enrich_message_links(&msg, command_requested_goal_continuation, le_config.enabled) {
+    if should_enrich_message_links(goal_controller_continuation, le_config.enabled) {
         let enricher_cfg = link_enricher::LinkEnricherConfig {
             enabled: le_config.enabled,
             max_links: le_config.max_links,
@@ -6091,13 +6432,9 @@ async fn process_channel_message_body(
         }
     }
 
+    let mut controller_goal_context = None;
     if goal_controller_continuation {
-        let goal_ctx = goal_admission_context_for_message(
-            ctx.as_ref(),
-            &msg,
-            &history_key,
-            recovered_goal_task_id().as_deref(),
-        );
+        let goal_ctx = goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key);
         match zeroclaw_runtime::control_plane::admit_goal_autonomous_turn(
             &goal_ctx,
             runtime_defaults.config.as_ref(),
@@ -6122,7 +6459,7 @@ async fn process_channel_message_body(
                 .await;
                 return ChannelProcessOutcome::Done;
             }
-            Ok(None) => {}
+            Ok(None) => controller_goal_context = Some(goal_ctx),
             Err(error) => {
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-controller-failed",
@@ -6760,12 +7097,10 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
-    let goal_admission_context = Some(goal_admission_context_for_message(
-        ctx.as_ref(),
-        &msg,
-        &history_key,
-        recovered_goal_task_id().as_deref(),
-    ));
+    let goal_admission_context =
+        Some(controller_goal_context.unwrap_or_else(|| {
+            goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key)
+        }));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
@@ -7814,11 +8149,10 @@ async fn process_channel_message_body(
 async fn pre_register_in_flight_before_permit(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-    recovered_task_id: Option<&str>,
+    recovered: Option<(&str, &RecoveredGoalRequeueStops)>,
     target_channel: Option<&Arc<dyn Channel>>,
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
     task_sequence: &AtomicU64,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
 ) -> InFlightPreRegistration {
     if msg.channel == "cli" || msg.passive_context {
         return InFlightPreRegistration::NotNeeded;
@@ -7830,17 +8164,26 @@ async fn pre_register_in_flight_before_permit(
     // `/goal pause` and `/goal cancel` keep their explicit escape hatch above.
     let is_goal_command = goal_command_content_and_action(msg, target_channel).is_some();
     let interrupt_enabled = !is_goal_command
-        && recovered_task_id.is_none()
+        && recovered.is_none()
         && ctx
             .interrupt_on_new_message
             .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(msg);
-    let recovered_authority = match recovered_task_id {
-        Some(task_id) => Some(recovered_goal_requeue_authority(requeue_generations, task_id).await),
+    let recovered_stop = match recovered {
+        Some((task_id, requeue_stops)) => {
+            Some(recovered_goal_requeue_stop(requeue_stops, task_id).await)
+        }
         None => None,
     };
     let mut active = in_flight.lock().await;
-    let predecessor = active.get(&sender_scope_key).cloned();
+    if recovered_stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+        // This terminal check is deliberately inside the same sender-scope
+        // critical section that `/stop` uses. Match the prior insert-then-remove
+        // result without allocating a registration that cannot run.
+        active.remove(&sender_scope_key);
+        return InFlightPreRegistration::Abandoned;
+    }
+    let predecessor = active.get(&sender_scope_key).cloned().map(Arc::new);
     let state = InFlightSenderTaskState {
         task_id: task_sequence.fetch_add(1, Ordering::Relaxed),
         cancellation: CancellationToken::new(),
@@ -7849,22 +8192,12 @@ async fn pre_register_in_flight_before_permit(
         // superseded, so `/stop` can revoke the exact durable task through a
         // newer live-input predecessor chain.
         goal_task_id: Arc::new(std::sync::Mutex::new(
-            recovered_task_id.map(ToOwned::to_owned),
+            recovered.map(|(task_id, _stops)| task_id.to_owned()),
         )),
-        predecessor: predecessor.clone().map(Arc::new),
+        predecessor: predecessor.as_ref().map(Arc::clone),
     };
-    active.insert(sender_scope_key.clone(), state.clone());
+    active.insert(sender_scope_key, state.clone());
     let registration = InFlightRegistration::new(state);
-    if recovered_authority.is_some_and(|authority| {
-        authority.load(Ordering::Acquire) & RECOVERED_GOAL_REQUEUE_STOPPED != 0
-    }) {
-        // This terminal check is deliberately inside the same sender-scope
-        // critical section that `/stop` uses. Do not leave this short-lived
-        // registration behind: callers return directly on `Abandoned`.
-        active.remove(&sender_scope_key);
-        registration.mark_done();
-        return InFlightPreRegistration::Abandoned;
-    }
 
     match predecessor {
         Some(predecessor) if interrupt_enabled => {
@@ -7890,11 +8223,8 @@ async fn pre_register_in_flight_before_permit(
 
 async fn complete_pre_registered_in_flight(
     msg: &zeroclaw_api::channel::ChannelMessage,
-    recovered_task_id: Option<&str>,
     pre_registration: InFlightPreRegistration,
-    live_tx: Option<&tokio::sync::mpsc::WeakSender<RecoveredGoalDispatchMessage>>,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
-    pending_by_scope: &PendingRecoveredGoalsByScope,
+    recovery: Option<&RecoveredGoalWorkerContext>,
 ) -> InFlightPreRegistration {
     match pre_registration {
         InFlightPreRegistration::Queued {
@@ -7921,11 +8251,8 @@ async fn complete_pre_registered_in_flight(
             {
                 requeue_abandoned_recovered_continuation(
                     msg,
-                    recovered_task_id,
                     &registration.state.completion,
-                    live_tx,
-                    requeue_generations,
-                    pending_by_scope,
+                    recovery,
                 )
                 .await;
                 registration.mark_done();
@@ -7956,13 +8283,10 @@ async fn unregister_pre_registered_in_flight(
 
 async fn acquire_dispatch_permit_or_cancel(
     msg: &zeroclaw_api::channel::ChannelMessage,
-    recovered_task_id: Option<&str>,
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
     semaphore: Arc<tokio::sync::Semaphore>,
     pre_registered: &mut Option<InFlightRegistration>,
-    live_tx: Option<&tokio::sync::mpsc::WeakSender<RecoveredGoalDispatchMessage>>,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
-    pending_by_scope: &PendingRecoveredGoalsByScope,
+    recovery: Option<&RecoveredGoalWorkerContext>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let cancellation = pre_registered
         .as_ref()
@@ -7976,11 +8300,8 @@ async fn acquire_dispatch_permit_or_cancel(
                     if let Some(state) = pre_registered.take() {
                         requeue_abandoned_recovered_continuation(
                             msg,
-                            recovered_task_id,
                             &state.state.completion,
-                            live_tx,
-                            requeue_generations,
-                            pending_by_scope,
+                            recovery,
                         ).await;
                         unregister_pre_registered_in_flight(msg, in_flight, state).await;
                     }
@@ -8003,25 +8324,22 @@ async fn acquire_dispatch_permit_or_cancel(
 
 async fn requeue_abandoned_recovered_continuation(
     msg: &zeroclaw_api::channel::ChannelMessage,
-    recovered_task_id: Option<&str>,
     completion: &InFlightTaskCompletion,
-    live_tx: Option<&tokio::sync::mpsc::WeakSender<RecoveredGoalDispatchMessage>>,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
-    pending_by_scope: &PendingRecoveredGoalsByScope,
+    recovery: Option<&RecoveredGoalWorkerContext>,
 ) {
-    let (Some(task_id), Some(live_tx)) = (recovered_task_id, live_tx) else {
+    let Some(recovery) = recovery else {
         return;
     };
     if completion.cancellation_cause() != InFlightCancellationCause::NewerInput {
         return;
     }
     requeue_interrupted_recovered_goal(
-        live_tx,
-        task_id,
+        &recovery.live_tx,
+        &recovery.task_id,
         msg.clone(),
         completion,
-        requeue_generations,
-        pending_by_scope,
+        &recovery.requeue_stops,
+        &recovery.pending_by_scope,
     )
     .await;
 }
@@ -8029,14 +8347,11 @@ async fn requeue_abandoned_recovered_continuation(
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
-    recovered_task_id: Option<String>,
+    recovery: Option<RecoveredGoalWorkerContext>,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     pre_registered: Option<InFlightRegistration>,
     permit: tokio::sync::OwnedSemaphorePermit,
-    live_tx: Option<tokio::sync::mpsc::WeakSender<RecoveredGoalDispatchMessage>>,
-    requeue_generations: RecoveredGoalRequeueGenerations,
-    pending_by_scope: PendingRecoveredGoalsByScope,
 ) {
     let _permit = permit;
     let sender_scope_key = interruption_scope_key(&msg);
@@ -8060,7 +8375,7 @@ async fn dispatch_worker(
         goal_task_id,
         ..
     } = state;
-    let recovered_successor = recovered_task_id.as_ref().map(|_| msg.clone());
+    let recovered_successor = recovery.as_ref().map(|_| msg.clone());
 
     let register_in_flight = msg.channel != "cli" && !msg.passive_context;
 
@@ -8106,19 +8421,15 @@ async fn dispatch_worker(
 
     if cancellation_token.is_cancelled()
         && completion.cancellation_cause() == InFlightCancellationCause::NewerInput
-        && let (Some(task_id), Some(successor), Some(live_tx)) = (
-            recovered_task_id.as_deref(),
-            recovered_successor,
-            live_tx.as_ref(),
-        )
+        && let (Some(recovery), Some(successor)) = (recovery.as_ref(), recovered_successor)
     {
         requeue_interrupted_recovered_goal(
-            live_tx,
-            task_id,
+            &recovery.live_tx,
+            &recovery.task_id,
             successor,
             &completion,
-            &requeue_generations,
-            &pending_by_scope,
+            &recovery.requeue_stops,
+            &recovery.pending_by_scope,
         )
         .await;
     }
@@ -8146,7 +8457,7 @@ async fn requeue_interrupted_recovered_goal(
     task_id: &str,
     successor: zeroclaw_api::channel::ChannelMessage,
     completion: &InFlightTaskCompletion,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
+    requeue_stops: &RecoveredGoalRequeueStops,
     pending_by_scope: &PendingRecoveredGoalsByScope,
 ) {
     let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
@@ -8157,9 +8468,17 @@ async fn requeue_interrupted_recovered_goal(
                 .with_attrs(::serde_json::json!({"task_id": task_id})),
             "cannot requeue interrupted recovered goal without control plane"
         );
+        drop(successor);
+        pause_running_recovered_goal_until_resolved(
+            task_id,
+            RecoveredGoalContinuationBlocker::QueueUnavailable,
+            ::serde_json::json!({"error": "control plane is unavailable"}),
+        )
+        .await;
         return;
     };
     let Some(live_tx) = live_tx.upgrade() else {
+        drop(successor);
         pause_interrupted_recovered_goal_for_queue_failure(
             control_plane,
             task_id,
@@ -8174,7 +8493,7 @@ async fn requeue_interrupted_recovered_goal(
         task_id,
         successor,
         completion,
-        requeue_generations,
+        requeue_stops,
         pending_by_scope,
     )
     .await;
@@ -8186,7 +8505,7 @@ async fn requeue_interrupted_recovered_goal_with_control_plane(
     task_id: &str,
     mut successor: zeroclaw_api::channel::ChannelMessage,
     completion: &InFlightTaskCompletion,
-    requeue_generations: &RecoveredGoalRequeueGenerations,
+    requeue_stops: &RecoveredGoalRequeueStops,
     pending_by_scope: &PendingRecoveredGoalsByScope,
 ) {
     let task = match control_plane.store.get(task_id).await {
@@ -8208,6 +8527,7 @@ async fn requeue_interrupted_recovered_goal_with_control_plane(
                     })),
                 "failed to read interrupted recovered goal before live requeue"
             );
+            drop(successor);
             pause_interrupted_recovered_goal_for_queue_failure(
                 control_plane,
                 task_id,
@@ -8237,7 +8557,9 @@ async fn requeue_interrupted_recovered_goal_with_control_plane(
                     == goal_channel_conversation_scope(context.conversation_scope)
         }
         Ok(None) => {
-            pause_running_recovered_goal(
+            drop(successor);
+            drop(task);
+            pause_running_recovered_goal_until_resolved(
                 task_id,
                 RecoveredGoalContinuationBlocker::MissingContinuationContext,
                 ::serde_json::json!({}),
@@ -8246,17 +8568,22 @@ async fn requeue_interrupted_recovered_goal_with_control_plane(
             return;
         }
         Err(error) => {
-            pause_running_recovered_goal(
+            let payload = ::serde_json::json!({"error": format!("{error:#}")});
+            drop(successor);
+            drop(task);
+            pause_running_recovered_goal_until_resolved(
                 task_id,
                 RecoveredGoalContinuationBlocker::ContinuationContextReadFailed,
-                ::serde_json::json!({"error": format!("{error:#}")}),
+                payload,
             )
             .await;
             return;
         }
     };
     if !continuation_matches {
-        pause_running_recovered_goal(
+        drop(successor);
+        drop(task);
+        pause_running_recovered_goal_until_resolved(
             task_id,
             RecoveredGoalContinuationBlocker::RouteUnavailable,
             ::serde_json::json!({"reason": "continuation context no longer matches recovery envelope"}),
@@ -8268,69 +8595,65 @@ async fn requeue_interrupted_recovered_goal_with_control_plane(
     if completion.cancellation_cause() != InFlightCancellationCause::NewerInput {
         return;
     }
-    let authority = recovered_goal_requeue_authority(requeue_generations, task_id).await;
-    let generation = authority.load(Ordering::Acquire);
-    if generation & RECOVERED_GOAL_REQUEUE_STOPPED != 0 {
+    let stop = recovered_goal_requeue_stop(requeue_stops, task_id).await;
+    if stop.load(Ordering::Acquire) {
         return;
     }
-    successor.id = format!(
-        "goal-restart:{task_id}:requeue-{generation}-{}",
-        uuid::Uuid::new_v4()
-    );
-    let current_authority = authority.load(Ordering::Acquire);
+    successor.id = format!("goal-restart:{task_id}:requeue-{}", uuid::Uuid::new_v4());
     if completion.cancellation_cause() != InFlightCancellationCause::NewerInput
-        || current_authority != generation
-        || current_authority & RECOVERED_GOAL_REQUEUE_STOPPED != 0
+        || stop.load(Ordering::Acquire)
     {
         return;
     }
+    let zeroclaw_runtime::control_plane::TaskRecord {
+        agent: agent_alias, ..
+    } = task;
     let requeued = RecoveredGoalDispatchMessage {
         message: successor,
         token: RecoveredGoalDispatchToken {
             task_id: task_id.to_owned(),
-            agent_alias: task.agent.clone(),
-            requeue_generation: Some(generation),
-            queue_id: uuid::Uuid::new_v4().to_string(),
+            agent_alias,
+            queue_id: uuid::Uuid::new_v4(),
         },
     };
     register_pending_recovered_goal(pending_by_scope, &requeued.message, &requeued.token).await;
     if let Err(error) = live_tx.send(requeued).await {
-        retire_pending_recovered_goal(pending_by_scope, &error.0.message, &error.0.token).await;
-        let error_text = format!("{error}");
+        let error_text = error.to_string();
+        let RecoveredGoalDispatchMessage { message, token } = error.0;
+        let scope_key = interruption_scope_key(&message);
+        let proof = PendingRecoveredGoal::from(token);
+        drop(message);
         let pause = recovered_goal_continuation_blocked_pause(
             RecoveredGoalContinuationBlocker::QueueUnavailable,
             ::serde_json::json!({"error": error_text}),
         );
-        match control_plane
-            .goal_store
-            .pause_running_goal_task(task_id, pause)
-            .await
-        {
-            Ok(true) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"task_id": task.id})),
-                "paused interrupted recovered goal after live requeue failure"
-            ),
-            Ok(false) => {}
-            Err(pause_error) => ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "task_id": task.id,
-                        "error": format!("{pause_error:#}"),
-                    })),
-                "failed to pause interrupted recovered goal after live requeue failure"
-            ),
-        }
+        pause_running_recovered_goal_until_resolved_with_store(
+            control_plane.goal_store.as_ref(),
+            task_id,
+            pause,
+            RecoveredGoalContinuationBlocker::QueueUnavailable,
+        )
+        .await;
+        retire_pending_recovered_goal_by_scope(
+            pending_by_scope,
+            &scope_key,
+            &proof.task_id,
+            proof.queue_id,
+        )
+        .await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"task_id": task_id})),
+            "paused interrupted recovered goal after live requeue failure"
+        );
         return;
     }
 
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(::serde_json::json!({"task_id": task.id})),
+            .with_attrs(::serde_json::json!({"task_id": task_id})),
         "requeued interrupted recovered goal through live dispatcher"
     );
 }
@@ -8344,10 +8667,92 @@ async fn pause_interrupted_recovered_goal_for_queue_failure(
         RecoveredGoalContinuationBlocker::QueueUnavailable,
         ::serde_json::json!({"error": error}),
     );
-    let _ = control_plane
+    pause_running_recovered_goal_until_resolved_with_store(
+        control_plane.goal_store.as_ref(),
+        task_id,
+        pause,
+        RecoveredGoalContinuationBlocker::QueueUnavailable,
+    )
+    .await;
+}
+
+#[cfg(test)]
+async fn recovered_goal_pause_failure_fixture(
+    task_id: &str,
+) -> (
+    tempfile::TempDir,
+    zeroclaw_runtime::control_plane::ControlPlaneHandle,
+    zeroclaw_api::channel::ChannelMessage,
+) {
+    let temp = tempfile::tempdir().expect("temporary control-plane directory");
+    let control_plane = zeroclaw_runtime::control_plane::ControlPlaneHandle::start_with_boot_id(
+        temp.path(),
+        format!("{task_id}-boot"),
+        zeroclaw_config::schema::GoalRestartRecovery::LastState,
+    )
+    .await
+    .expect("test control plane");
+    let continuation = zeroclaw_runtime::control_plane::TaskContinuationContext {
+        channel: "telegram".into(),
+        channel_alias: None,
+        reply_target: "room".into(),
+        sender: "alice".into(),
+        thread_ts: None,
+        interruption_scope_id: None,
+        conversation_scope:
+            zeroclaw_runtime::control_plane::TaskContinuationConversationScope::Sender,
+    };
+    control_plane
         .goal_store
-        .pause_running_goal_task(task_id, pause)
-        .await;
+        .create_goal(
+            zeroclaw_runtime::control_plane::TaskRecord {
+                id: task_id.into(),
+                kind: zeroclaw_runtime::control_plane::TaskKind::Goal,
+                agent: "main".into(),
+                status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: control_plane.boot_id.clone(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some(task_id.into()),
+                delivered: false,
+                idem_key: None,
+                principal_id: Some(task_id.into()),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            },
+            zeroclaw_runtime::control_plane::GoalTaskRecord {
+                task_id: task_id.into(),
+                objective: "finish recovery".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+            },
+            Some(continuation.clone()),
+        )
+        .await
+        .expect("create running recovered goal");
+    let message =
+        recovered_goal_continuation_message(task_id, "finish recovery".into(), continuation);
+    (temp, control_plane, message)
+}
+
+#[cfg(test)]
+fn inject_recovered_goal_pause_failure(temp: &tempfile::TempDir) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(temp.path().join("control_plane.db"))
+        .expect("open control-plane database for failure injection");
+    conn.execute_batch(
+        "CREATE TRIGGER fail_recovered_goal_pause
+         BEFORE UPDATE ON goal_tasks
+         BEGIN
+             SELECT RAISE(ABORT, 'injected recovered-goal pause failure');
+         END;",
+    )
+    .expect("install recovered-goal pause failure");
+    conn
 }
 
 #[cfg(test)]
@@ -8416,8 +8821,7 @@ async fn interrupted_recovered_goal_requeues_exact_running_task_to_live_queue() 
 
     let completion = InFlightTaskCompletion::new();
     completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
-    let generations: RecoveredGoalRequeueGenerations =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_by_scope: PendingRecoveredGoalsByScope =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     requeue_interrupted_recovered_goal_with_control_plane(
@@ -8426,7 +8830,7 @@ async fn interrupted_recovered_goal_requeues_exact_running_task_to_live_queue() 
         task_id,
         original,
         &completion,
-        &generations,
+        &stops,
         &pending_by_scope,
     )
     .await;
@@ -8465,7 +8869,7 @@ async fn interrupted_recovered_goal_requeues_exact_running_task_to_live_queue() 
             2,
         ),
         &completion,
-        &generations,
+        &stops,
         &pending_by_scope,
     )
     .await;
@@ -8479,6 +8883,199 @@ async fn interrupted_recovered_goal_requeues_exact_running_task_to_live_queue() 
             .status,
         zeroclaw_runtime::control_plane::TaskStatus::Paused
     );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn failed_live_enqueue_retains_ownership_until_pause_persists() {
+    let task_id = "recovered-live-enqueue-pause-failure";
+    let (temp, control_plane, message) = recovered_goal_pause_failure_fixture(task_id).await;
+    let fault = inject_recovered_goal_pause_failure(&temp);
+    let control_plane = Arc::new(control_plane);
+    let completion = Arc::new(InFlightTaskCompletion::new());
+    completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+
+    let requeue = {
+        let control_plane = Arc::clone(&control_plane);
+        let completion = Arc::clone(&completion);
+        let stops = Arc::clone(&stops);
+        let pending_by_scope = Arc::clone(&pending_by_scope);
+        ::zeroclaw_spawn::spawn!(async move {
+            requeue_interrupted_recovered_goal_with_control_plane(
+                control_plane.as_ref(),
+                &tx,
+                task_id,
+                message,
+                completion.as_ref(),
+                &stops,
+                &pending_by_scope,
+            )
+            .await;
+        })
+    };
+
+    tokio::time::sleep(RECOVERED_GOAL_PAUSE_RETRY_DELAY / 2).await;
+    assert!(!requeue.is_finished(), "the exact recovery owner exited");
+    assert!(
+        pending_by_scope
+            .lock()
+            .await
+            .values()
+            .any(|pending| pending.task_id == task_id),
+        "pending ownership was retired before the durable pause committed"
+    );
+    assert_eq!(
+        control_plane
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zeroclaw_runtime::control_plane::TaskStatus::Running
+    );
+
+    fault
+        .execute_batch("DROP TRIGGER fail_recovered_goal_pause;")
+        .expect("remove recovered-goal pause failure");
+    tokio::time::timeout(Duration::from_secs(2), requeue)
+        .await
+        .expect("recovery owner should finish after pause persistence recovers")
+        .expect("recovery owner task");
+    assert_eq!(
+        control_plane
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zeroclaw_runtime::control_plane::TaskStatus::Paused
+    );
+    assert!(pending_by_scope.lock().await.is_empty());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn unroutable_recovery_retains_pending_ownership_until_pause_persists() {
+    let task_id = "recovered-unroutable-pause-failure";
+    let (temp, control_plane, message) = recovered_goal_pause_failure_fixture(task_id).await;
+    let fault = inject_recovered_goal_pause_failure(&temp);
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let token = RecoveredGoalDispatchToken {
+        task_id: task_id.into(),
+        agent_alias: "main".into(),
+        queue_id: uuid::Uuid::new_v4(),
+    };
+    register_pending_recovered_goal(&pending_by_scope, &message, &token).await;
+    let scope_key = interruption_scope_key(&message);
+    let proof = PendingRecoveredGoal::from(token);
+
+    let guardian_store = Arc::clone(&control_plane.goal_store);
+    let guardian_pending = Arc::clone(&pending_by_scope);
+    let guardian = ::zeroclaw_spawn::spawn!(pause_and_retire_unroutable_recovered_goal_with_store(
+        guardian_store,
+        guardian_pending,
+        scope_key,
+        proof,
+        RecoveredGoalContinuationBlocker::RouteUnavailable,
+        serde_json::json!({"reason": "injected route failure"}),
+    ));
+
+    tokio::time::sleep(RECOVERED_GOAL_PAUSE_RETRY_DELAY / 2).await;
+    assert!(!guardian.is_finished(), "the pause guardian exited");
+    assert!(
+        pending_by_scope
+            .lock()
+            .await
+            .values()
+            .any(|pending| pending.task_id == task_id),
+        "unroutable pending ownership was retired before pause persistence"
+    );
+    assert_eq!(
+        control_plane
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zeroclaw_runtime::control_plane::TaskStatus::Running
+    );
+
+    fault
+        .execute_batch("DROP TRIGGER fail_recovered_goal_pause;")
+        .expect("remove recovered-goal pause failure");
+    tokio::time::timeout(Duration::from_secs(2), guardian)
+        .await
+        .expect("pause guardian should finish after persistence recovers")
+        .expect("pause guardian task");
+    assert_eq!(
+        control_plane
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zeroclaw_runtime::control_plane::TaskStatus::Paused
+    );
+    assert!(pending_by_scope.lock().await.is_empty());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn failed_recovered_stop_preserves_requeue_for_newer_input() {
+    let task_id = "recovered-stop-pause-failure";
+    let (temp, control_plane, message) = recovered_goal_pause_failure_fixture(task_id).await;
+    let fault = inject_recovered_goal_pause_failure(&temp);
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    assert!(!commit_recovered_goal_stop_with_control_plane(&control_plane, task_id, &stops,).await);
+    assert!(
+        !recovered_goal_requeue_stop(&stops, task_id)
+            .await
+            .load(Ordering::Acquire),
+        "a failed durable stop must not tombstone the only recovery path"
+    );
+
+    let completion = InFlightTaskCompletion::new();
+    completion.set_cancellation_cause(InFlightCancellationCause::NewerInput);
+    let pending_by_scope: PendingRecoveredGoalsByScope =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    requeue_interrupted_recovered_goal_with_control_plane(
+        &control_plane,
+        &tx,
+        task_id,
+        message,
+        &completion,
+        &stops,
+        &pending_by_scope,
+    )
+    .await;
+    let successor = rx.recv().await.expect("live successor after failed stop");
+    assert_eq!(successor.token.task_id, task_id);
+    assert_eq!(
+        control_plane
+            .store
+            .get(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        zeroclaw_runtime::control_plane::TaskStatus::Running
+    );
+
+    fault
+        .execute_batch("DROP TRIGGER fail_recovered_goal_pause;")
+        .expect("remove recovered-goal pause failure");
 }
 
 #[cfg(test)]
@@ -8567,20 +9164,22 @@ async fn queued_recovered_continuation_requeues_before_worker_entry() {
         predecessor: Some(Arc::new(predecessor.clone())),
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    let generations: RecoveredGoalRequeueGenerations =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_by_scope: PendingRecoveredGoalsByScope =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let recovery = RecoveredGoalWorkerContext {
+        task_id: task_id.clone(),
+        live_tx: tx.downgrade(),
+        requeue_stops: Arc::clone(&stops),
+        pending_by_scope: Arc::clone(&pending_by_scope),
+    };
     let outcome = complete_pre_registered_in_flight(
         &msg,
-        Some(&task_id),
         InFlightPreRegistration::Queued {
             registration,
-            predecessor,
+            predecessor: Arc::new(predecessor),
         },
-        Some(&tx.downgrade()),
-        &generations,
-        &pending_by_scope,
+        Some(&recovery),
     )
     .await;
     assert!(matches!(outcome, InFlightPreRegistration::Abandoned));
@@ -8676,19 +9275,21 @@ async fn permit_blocked_recovered_continuation_requeues_before_worker_entry() {
         predecessor: None,
     }));
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    let generations: RecoveredGoalRequeueGenerations =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let pending_by_scope: PendingRecoveredGoalsByScope =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let recovery = RecoveredGoalWorkerContext {
+        task_id: task_id.clone(),
+        live_tx: tx.downgrade(),
+        requeue_stops: Arc::clone(&stops),
+        pending_by_scope: Arc::clone(&pending_by_scope),
+    };
     let permit = acquire_dispatch_permit_or_cancel(
         &msg,
-        Some(&task_id),
         &tokio::sync::Mutex::new(HashMap::new()),
         Arc::new(tokio::sync::Semaphore::new(0)),
         &mut registration,
-        Some(&tx.downgrade()),
-        &generations,
-        &pending_by_scope,
+        Some(&recovery),
     )
     .await;
     assert!(permit.is_none());
@@ -9295,12 +9896,18 @@ async fn run_message_dispatch_loop_with_recovery(
         InFlightSenderTaskState,
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
-    let requeue_generations: RecoveredGoalRequeueGenerations =
+    let requeue_stops: RecoveredGoalRequeueStops =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let mut recovery_queue_open = true;
     loop {
         let (msg, recovered_token) = tokio::select! {
+            completed = workers.join_next(), if !workers.is_empty() => {
+                if let Some(result) = completed {
+                    log_worker_join_result(result);
+                }
+                continue;
+            },
             inbound = rx.recv() => match inbound {
                 Some(msg) => (msg, None),
                 // The normal ingress lifetime owns dispatcher shutdown. This
@@ -9317,143 +9924,121 @@ async fn run_message_dispatch_loop_with_recovery(
                 }
             },
         };
-        let recovered_task_id = recovered_token.as_ref().map(|token| token.task_id.clone());
+        let recovered_task_id = recovered_token.as_ref().map(|token| token.task_id.as_str());
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
         // intentionally unowned by an agent; it can present gate prompts but
         // must never receive ordinary agent traffic. All live contexts share
         // this global channel registry and prompt config.
-        let gate_ctx = router
-            .single_ctx
-            .as_ref()
-            .cloned()
-            .or_else(|| router.by_agent.values().next().cloned());
-        if let Some(gate_ctx) = gate_ctx {
-            let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
-            let gate_channel_route_keys = gate_channel
+        if recovered_token.is_none() {
+            let gate_ctx = router
+                .single_ctx
                 .as_ref()
-                .map(|target| {
-                    let mut keys: Vec<String> = gate_ctx
-                        .channels_by_name
-                        .iter()
-                        .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
-                        .map(|(key, _channel)| key.clone())
-                        .collect();
-                    let inbound_key = channel_key_for_message(&msg);
-                    if !keys.iter().any(|key| key == &inbound_key) {
-                        keys.push(inbound_key);
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    keys
-                })
-                .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
-            let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
-            if dispatch_channel_sop_gate(
-                &router,
-                &msg,
-                gate_ctx.prompt_config.as_ref(),
-                &gate_prompt_channels,
-                &gate_channel_route_keys,
-            )
-            .await
-            {
-                continue;
+                .cloned()
+                .or_else(|| router.by_agent.values().next().cloned());
+            if let Some(gate_ctx) = gate_ctx {
+                let gate_channel =
+                    find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
+                let gate_channel_route_keys = gate_channel
+                    .as_ref()
+                    .map(|target| {
+                        let mut keys: Vec<String> = gate_ctx
+                            .channels_by_name
+                            .iter()
+                            .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
+                            .map(|(key, _channel)| key.clone())
+                            .collect();
+                        let inbound_key = channel_key_for_message(&msg);
+                        if !keys.iter().any(|key| key == &inbound_key) {
+                            keys.push(inbound_key);
+                        }
+                        keys.sort();
+                        keys.dedup();
+                        keys
+                    })
+                    .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
+                let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+                if dispatch_channel_sop_gate(
+                    &router,
+                    &msg,
+                    gate_ctx.prompt_config.as_ref(),
+                    &gate_prompt_channels,
+                    &gate_channel_route_keys,
+                )
+                .await
+                {
+                    continue;
+                }
             }
         }
 
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
-            if let Some(task_id) = recovered_task_id.as_deref() {
-                pause_running_recovered_goal(
-                    task_id,
+            if let Some(token) = recovered_token.as_ref() {
+                retain_unroutable_recovered_goal_ownership(
+                    &mut workers,
+                    &pending_by_scope,
+                    &msg,
+                    token,
                     RecoveredGoalContinuationBlocker::RouteUnavailable,
                     ::serde_json::json!({"channel": msg.channel, "channel_alias": msg.channel_alias}),
-                )
-                .await;
-            }
-            if let Some(token) = recovered_token.as_ref() {
-                retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
+                );
             }
             continue;
         };
         if let Some(token) = recovered_token.as_ref() {
             if token.agent_alias != *ctx.agent_alias {
-                pause_running_recovered_goal(
-                    &token.task_id,
+                retain_unroutable_recovered_goal_ownership(
+                    &mut workers,
+                    &pending_by_scope,
+                    &msg,
+                    token,
                     RecoveredGoalContinuationBlocker::RouteUnavailable,
                     ::serde_json::json!({"expected_agent": token.agent_alias, "resolved_agent": ctx.agent_alias.as_ref()}),
-                )
-                .await;
-                retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
+                );
                 continue;
             }
-            if let Some(generation) = token.requeue_generation {
-                let current_generation =
-                    recovered_goal_requeue_authority(&requeue_generations, &token.task_id)
-                        .await
-                        .load(Ordering::Acquire);
-                if generation != current_generation
-                    || current_generation & RECOVERED_GOAL_REQUEUE_STOPPED != 0
-                {
-                    retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
-                    continue;
-                }
+            if retire_stopped_recovered_goal(&requeue_stops, &pending_by_scope, &msg, token).await {
+                continue;
             }
         }
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
         // ordinary messages to an agent-owned runtime.
-        if dispatch_channel_sop_event(&router, &msg).await {
-            if let Some(token) = recovered_token.as_ref() {
-                retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
-            }
+        if recovered_token.is_none() && dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
         let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
         if msg.channel != "cli"
             && let Some(goal_command_content) =
-                goal_interrupt_command_content(&msg, target_channel.as_ref())
+                goal_interrupt_command_content(&msg, target_channel.as_ref()).map(str::to_owned)
         {
-            let mut goal_command_msg = msg.clone();
-            goal_command_msg.content = goal_command_content.to_string();
+            let mut goal_command_msg = msg;
+            goal_command_msg.content = goal_command_content;
             let outcome = handle_runtime_command_if_needed(
                 ctx.as_ref(),
                 &goal_command_msg,
                 target_channel.as_ref(),
+                Some(in_flight_by_sender.as_ref()),
             )
             .await;
             if let RuntimeCommandOutcome::HandledGoal {
                 task_id: Some(task_id),
             } = outcome
             {
-                let scope_key = interruption_scope_key(&goal_command_msg);
-                let pending_matches_task = pending_by_scope
-                    .lock()
+                // A committed pause/cancel revokes every private recovery
+                // handoff for this exact task. The command handler has
+                // already interrupted an active bound worker; this also closes
+                // the pending-handoff and fast-resume race.
+                recovered_goal_requeue_stop(&requeue_stops, &task_id)
                     .await
-                    .get(&scope_key)
-                    .is_some_and(|pending| pending.task_id == task_id);
-                let bound_worker = {
-                    let mut active = in_flight_by_sender.lock().await;
-                    let matches_task = active.get(&scope_key).is_some_and(|state| {
-                        in_flight_worker_goal_task_id(state).as_deref() == Some(task_id.as_str())
-                    });
-                    if matches_task || pending_matches_task {
-                        recovered_goal_requeue_authority(&requeue_generations, &task_id)
-                            .await
-                            .fetch_or(RECOVERED_GOAL_REQUEUE_STOPPED, Ordering::AcqRel);
-                    }
-                    matches_task.then(|| active.remove(&scope_key)).flatten()
-                };
-                if let Some(state) = bound_worker {
-                    cancel_in_flight_chain(&state, InFlightCancellationCause::GoalControl);
-                }
+                    .store(true, Ordering::Release);
             }
             // Pause/cancel admission has committed (or failed) before this
             // point. It is never folded into debounce or an active model turn.
             if let Some(token) = recovered_token.as_ref() {
-                retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
+                retire_pending_recovered_goal(&pending_by_scope, &goal_command_msg, token).await;
             }
             continue;
         }
@@ -9469,13 +10054,7 @@ async fn run_message_dispatch_loop_with_recovery(
             )
             .await;
             let recovered_stop_committed = if let Some(task_id) = recovered_task_id.as_deref() {
-                // Revocation prevents the handoff from becoming executable
-                // while the durable exact-task pause commits. The goal store,
-                // not this dispatcher-local bit, is the lifecycle authority.
-                recovered_goal_requeue_authority(&requeue_generations, task_id)
-                    .await
-                    .fetch_or(RECOVERED_GOAL_REQUEUE_STOPPED, Ordering::AcqRel);
-                pause_recovered_goal_for_stop(task_id).await
+                commit_recovered_goal_stop(task_id, &requeue_stops).await
             } else {
                 true
             };
@@ -9545,9 +10124,6 @@ async fn run_message_dispatch_loop_with_recovery(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
-                    let debounce_live_tx = None;
-                    let debounce_requeue_generations = Arc::clone(&requeue_generations);
-                    let debounce_pending_by_scope = Arc::clone(&pending_by_scope);
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match rx.await {
@@ -9570,16 +10146,12 @@ async fn run_message_dispatch_loop_with_recovery(
                             debounce_target_channel.as_ref(),
                             debounce_in_flight.as_ref(),
                             debounce_task_seq.as_ref(),
-                            &debounce_requeue_generations,
                         )
                         .await;
                         let mut pre_registered = match complete_pre_registered_in_flight(
                             &debounce_msg,
-                            None,
                             pre_registration,
-                            debounce_live_tx.as_ref(),
-                            &debounce_requeue_generations,
-                            &debounce_pending_by_scope,
+                            None,
                         )
                         .await
                         {
@@ -9589,13 +10161,10 @@ async fn run_message_dispatch_loop_with_recovery(
 
                         let Some(permit) = acquire_dispatch_permit_or_cancel(
                             &debounce_msg,
-                            None,
                             debounce_in_flight.as_ref(),
                             debounce_semaphore,
                             &mut pre_registered,
-                            debounce_live_tx.as_ref(),
-                            &debounce_requeue_generations,
-                            &debounce_pending_by_scope,
+                            None,
                         )
                         .await else {
                             return;
@@ -9609,9 +10178,6 @@ async fn run_message_dispatch_loop_with_recovery(
                             debounce_task_seq,
                             pre_registered,
                             permit,
-                            debounce_live_tx,
-                            debounce_requeue_generations,
-                            debounce_pending_by_scope,
                         )
                         .await;
                     });
@@ -9631,46 +10197,41 @@ async fn run_message_dispatch_loop_with_recovery(
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         let worker_semaphore = Arc::clone(&semaphore);
-        let worker_live_tx = recovered_task_id.is_some().then(|| live_tx.clone());
-        let worker_requeue_generations = Arc::clone(&requeue_generations);
-        let worker_pending_by_scope = Arc::clone(&pending_by_scope);
         let pre_registration = pre_register_in_flight_before_permit(
             worker_ctx.as_ref(),
             &msg,
-            recovered_task_id.as_deref(),
+            recovered_task_id.map(|task_id| (task_id, &requeue_stops)),
             target_channel.as_ref(),
             in_flight.as_ref(),
             task_sequence.as_ref(),
-            &worker_requeue_generations,
         )
         .await;
-        if let Some(token) = recovered_token.as_ref() {
-            retire_pending_recovered_goal(&pending_by_scope, &msg, token).await;
-        }
+        let recovery = if let Some(token) = recovered_token {
+            retire_pending_recovered_goal(&pending_by_scope, &msg, &token).await;
+            Some(RecoveredGoalWorkerContext {
+                task_id: token.task_id,
+                live_tx: live_tx.clone(),
+                requeue_stops: Arc::clone(&requeue_stops),
+                pending_by_scope: Arc::clone(&pending_by_scope),
+            })
+        } else {
+            None
+        };
         workers.spawn(async move {
-            let mut pre_registered = match complete_pre_registered_in_flight(
-                &msg,
-                recovered_task_id.as_deref(),
-                pre_registration,
-                worker_live_tx.as_ref(),
-                &worker_requeue_generations,
-                &worker_pending_by_scope,
-            )
-            .await
-            {
-                InFlightPreRegistration::Abandoned => return,
-                pre_registered => pre_registered.into_registered(),
-            };
+            let mut pre_registered =
+                match complete_pre_registered_in_flight(&msg, pre_registration, recovery.as_ref())
+                    .await
+                {
+                    InFlightPreRegistration::Abandoned => return,
+                    pre_registered => pre_registered.into_registered(),
+                };
 
             let Some(permit) = acquire_dispatch_permit_or_cancel(
                 &msg,
-                recovered_task_id.as_deref(),
                 in_flight.as_ref(),
                 worker_semaphore,
                 &mut pre_registered,
-                worker_live_tx.as_ref(),
-                &worker_requeue_generations,
-                &worker_pending_by_scope,
+                recovery.as_ref(),
             )
             .await
             else {
@@ -9680,14 +10241,11 @@ async fn run_message_dispatch_loop_with_recovery(
             dispatch_worker(
                 worker_ctx,
                 msg,
-                recovered_task_id,
+                recovery,
                 in_flight,
                 task_sequence,
                 pre_registered,
                 permit,
-                worker_live_tx,
-                worker_requeue_generations,
-                worker_pending_by_scope,
             )
             .await;
         });
@@ -9711,12 +10269,75 @@ async fn enqueue_recovered_goal_continuations(
     agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
     recovered_goal_ids: Vec<String>,
     pending_by_scope: &PendingRecoveredGoalsByScope,
-) {
+) -> Result<()> {
     let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
-        return;
+        return Ok(());
     };
+    enqueue_recovered_goal_continuations_with_control_plane(
+        control_plane,
+        tx,
+        agent_ctxs,
+        recovered_goal_ids,
+        pending_by_scope,
+    )
+    .await
+}
+
+/// Resolve a structurally incomplete recovery record without retrying an
+/// impossible pause forever.
+///
+/// The guarded failure is limited to a still-running goal whose extension is
+/// still absent. If another actor restores the extension or changes lifecycle
+/// state first, recovery follows that winning durable state.
+async fn resolve_missing_recovered_goal_extension(
+    control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
+    task_id: &str,
+) -> Result<Option<zeroclaw_runtime::control_plane::GoalTaskRecord>> {
+    let error = RecoveredGoalContinuationBlocker::MissingGoalExtension.localized_reason();
+    if control_plane
+        .goal_store
+        .fail_running_goal_without_extension(task_id, error)
+        .await
+        .context("quarantine recovered goal without extension")?
+    {
+        return Ok(None);
+    }
+
+    let still_running = control_plane
+        .store
+        .get(task_id)
+        .await
+        .context("re-read recovered goal after extension quarantine race")?
+        .is_some_and(|task| {
+            task.kind == zeroclaw_runtime::control_plane::TaskKind::Goal
+                && task.status == zeroclaw_runtime::control_plane::TaskStatus::Running
+        });
+    if !still_running {
+        return Ok(None);
+    }
+
+    match control_plane
+        .goal_store
+        .get_goal_task(task_id)
+        .await
+        .context("re-read restored recovered goal extension")?
+    {
+        Some(goal) => Ok(Some(goal)),
+        None => anyhow::bail!(
+            "recovered goal {task_id} remained running without an extension after quarantine"
+        ),
+    }
+}
+
+async fn enqueue_recovered_goal_continuations_with_control_plane(
+    control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
+    tx: &tokio::sync::mpsc::Sender<RecoveredGoalDispatchMessage>,
+    agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
+    recovered_goal_ids: Vec<String>,
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+) -> Result<()> {
     if recovered_goal_ids.is_empty() {
-        return;
+        return Ok(());
     }
 
     for task_id in recovered_goal_ids {
@@ -9759,14 +10380,66 @@ async fn enqueue_recovered_goal_continuations(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "task_id": task_id,
-                        "error": error_text.clone(),
+                        "error": error_text.as_str(),
                         })),
                     "failed to read recovered goal task"
                 );
-                pause_running_recovered_goal(
-                    &task_id,
-                    RecoveredGoalContinuationBlocker::QueueUnavailable,
+                let blocker = RecoveredGoalContinuationBlocker::QueueUnavailable;
+                let pause = recovered_goal_continuation_blocked_pause(
+                    blocker,
                     ::serde_json::json!({"error": error_text}),
+                );
+                pause_running_recovered_goal_until_resolved_with_store(
+                    control_plane.goal_store.as_ref(),
+                    &task_id,
+                    pause,
+                    blocker,
+                )
+                .await;
+                continue;
+            }
+        };
+
+        // Read the required extension before any API that itself validates the
+        // extension row. This keeps structural absence on its dedicated
+        // quarantine path instead of misclassifying it as a transient context
+        // read failure and retrying an impossible pause.
+        let goal = match control_plane.goal_store.get_goal_task(&task.id).await {
+            Ok(Some(goal)) => goal,
+            Ok(None) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"task_id": task.id})),
+                    "recovered goal is missing its extension; quarantining exact running task"
+                );
+                match resolve_missing_recovered_goal_extension(control_plane, &task_id).await? {
+                    Some(goal) => goal,
+                    None => continue,
+                }
+            }
+            Err(error) => {
+                let error_text = format!("{error:#}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task.id,
+                            "error": error_text,
+                        })),
+                    "failed to read recovered goal extension"
+                );
+                let payload = ::serde_json::json!({
+                    "error": error_text,
+                });
+                drop(task);
+                pause_recovered_goal_continuation_blocked(
+                    control_plane.goal_store.as_ref(),
+                    &task_id,
+                    RecoveredGoalContinuationBlocker::GoalExtensionReadFailed,
+                    payload,
                 )
                 .await;
                 continue;
@@ -9784,13 +10457,15 @@ async fn enqueue_recovered_goal_continuations(
                     })),
                 "skipping recovered goal continuation for disabled or unknown agent"
             );
+            let payload = ::serde_json::json!({
+                "agent": task.agent.as_str(),
+            });
+            drop(task);
             pause_recovered_goal_continuation_blocked(
                 control_plane.goal_store.as_ref(),
-                &task,
+                &task_id,
                 RecoveredGoalContinuationBlocker::AgentUnavailable,
-                ::serde_json::json!({
-                    "agent": task.agent.as_str(),
-                }),
+                payload,
             )
             .await;
             continue;
@@ -9810,9 +10485,10 @@ async fn enqueue_recovered_goal_continuations(
                         .with_attrs(::serde_json::json!({"task_id": task.id})),
                     "skipping recovered goal continuation without channel context"
                 );
+                drop(task);
                 pause_recovered_goal_continuation_blocked(
                     control_plane.goal_store.as_ref(),
-                    &task,
+                    &task_id,
                     RecoveredGoalContinuationBlocker::MissingContinuationContext,
                     ::serde_json::json!({}),
                 )
@@ -9831,64 +10507,23 @@ async fn enqueue_recovered_goal_continuations(
                         })),
                     "failed to read recovered goal continuation context"
                 );
+                let payload = ::serde_json::json!({
+                    "error": error_text,
+                });
+                drop(task);
                 pause_recovered_goal_continuation_blocked(
                     control_plane.goal_store.as_ref(),
-                    &task,
+                    &task_id,
                     RecoveredGoalContinuationBlocker::ContinuationContextReadFailed,
-                    ::serde_json::json!({
-                        "error": error_text,
-                    }),
+                    payload,
                 )
                 .await;
                 continue;
             }
         };
 
-        let goal = match control_plane.goal_store.get_goal_task(&task.id).await {
-            Ok(Some(goal)) => goal,
-            Ok(None) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"task_id": task.id})),
-                    "skipping recovered goal continuation without goal extension"
-                );
-                pause_recovered_goal_continuation_blocked(
-                    control_plane.goal_store.as_ref(),
-                    &task,
-                    RecoveredGoalContinuationBlocker::MissingGoalExtension,
-                    ::serde_json::json!({}),
-                )
-                .await;
-                continue;
-            }
-            Err(error) => {
-                let error_text = format!("{error:#}");
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "task_id": task.id,
-                            "error": error_text,
-                        })),
-                    "failed to read recovered goal extension"
-                );
-                pause_recovered_goal_continuation_blocked(
-                    control_plane.goal_store.as_ref(),
-                    &task,
-                    RecoveredGoalContinuationBlocker::GoalExtensionReadFailed,
-                    ::serde_json::json!({
-                        "error": error_text,
-                    }),
-                )
-                .await;
-                continue;
-            }
-        };
         let objective = goal.objective.clone();
-        let msg = recovered_goal_continuation_message(&task.id, objective, context);
+        let msg = recovered_goal_continuation_message(&task_id, objective, context);
         let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg).cloned() else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -9901,52 +10536,74 @@ async fn enqueue_recovered_goal_continuations(
                     })),
                 "skipping recovered goal continuation for unavailable channel"
             );
+            let payload = ::serde_json::json!({
+                "channel": msg.channel.as_str(),
+                "channel_alias": msg.channel_alias.as_deref(),
+            });
+            drop(msg);
+            drop(goal);
+            drop(task);
             pause_recovered_goal_continuation_blocked(
                 control_plane.goal_store.as_ref(),
-                &task,
+                &task_id,
                 RecoveredGoalContinuationBlocker::ChannelUnavailable,
-                ::serde_json::json!({
-                    "channel": msg.channel,
-                    "channel_alias": msg.channel_alias,
-                }),
+                payload,
             )
             .await;
             continue;
         };
 
-        let status_context = msg.clone();
+        let status_target = goal_controller_update_target(&msg);
+        let zeroclaw_runtime::control_plane::TaskRecord {
+            id: recovered_task_id,
+            agent: recovered_agent_alias,
+            ..
+        } = task;
 
         let recovered = RecoveredGoalDispatchMessage {
             message: msg,
             token: RecoveredGoalDispatchToken {
-                task_id: task.id.clone(),
-                agent_alias: task.agent.clone(),
-                requeue_generation: None,
-                queue_id: uuid::Uuid::new_v4().to_string(),
+                task_id: recovered_task_id,
+                agent_alias: recovered_agent_alias,
+                queue_id: uuid::Uuid::new_v4(),
             },
         };
         register_pending_recovered_goal(pending_by_scope, &recovered.message, &recovered.token)
             .await;
         if let Err(error) = tx.send(recovered).await {
-            retire_pending_recovered_goal(pending_by_scope, &error.0.message, &error.0.token).await;
-            let error_text = format!("{error}");
+            let error_text = error.to_string();
+            let RecoveredGoalDispatchMessage { message, token } = error.0;
+            let scope_key = interruption_scope_key(&message);
+            let proof = PendingRecoveredGoal::from(token);
+            drop(message);
+            drop(status_target);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
-                        "task_id": task.id,
+                        "task_id": task_id,
                         "error": error_text,
                     })),
                 "failed to enqueue recovered goal continuation"
             );
+            let payload = ::serde_json::json!({
+                "error": error_text,
+            });
+            drop(channel);
+            drop(goal);
             pause_recovered_goal_continuation_blocked(
                 control_plane.goal_store.as_ref(),
-                &task,
+                &task_id,
                 RecoveredGoalContinuationBlocker::QueueUnavailable,
-                ::serde_json::json!({
-                    "error": error_text,
-                }),
+                payload,
+            )
+            .await;
+            retire_pending_recovered_goal_by_scope(
+                pending_by_scope,
+                &scope_key,
+                &proof.task_id,
+                proof.queue_id,
             )
             .await;
             continue;
@@ -9957,14 +10614,15 @@ async fn enqueue_recovered_goal_continuations(
             &goal,
             Some(runtime_defaults.config.as_ref()),
         );
-        send_goal_controller_update(
+        send_goal_controller_update_to(
             runtime_defaults.config.as_ref(),
             Some(&channel),
-            &status_context,
+            status_target,
             &recovery_message,
         )
         .await;
     }
+    Ok(())
 }
 
 /// Controller-owned reason a recovered goal could not be re-enqueued.
@@ -10031,39 +10689,162 @@ impl RecoveredGoalContinuationBlocker {
     }
 }
 
+/// Attempt to transfer one recovered goal from executor ownership into a
+/// durable pause. Any successful call, including a lost `Running` CAS, proves
+/// that this executor no longer owns a running task.
+async fn try_pause_running_recovered_goal(
+    goal_store: &dyn zeroclaw_runtime::control_plane::GoalTaskRegistry,
+    task_id: &str,
+    pause: zeroclaw_runtime::control_plane::GoalPauseState,
+    blocker: RecoveredGoalContinuationBlocker,
+    failure_count: u64,
+) -> bool {
+    match goal_store.pause_running_goal_task(task_id, pause).await {
+        Ok(_) => true,
+        Err(error) => {
+            if should_log_recovered_goal_pause_failure(failure_count) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "task_id": task_id,
+                            "reason_code": blocker.code(),
+                            "failure_count": failure_count,
+                            "error": format!("{error:#}"),
+                        })),
+                    "failed to pause recovered goal; retaining exact recovery ownership"
+                );
+            }
+            false
+        }
+    }
+}
+
+/// Keep the current executor alive until durable state proves that another
+/// lifecycle state won or the exact running goal was paused.
+async fn pause_running_recovered_goal_until_resolved_with_store(
+    goal_store: &dyn zeroclaw_runtime::control_plane::GoalTaskRegistry,
+    task_id: &str,
+    pause: zeroclaw_runtime::control_plane::GoalPauseState,
+    blocker: RecoveredGoalContinuationBlocker,
+) {
+    let mut failure_count = 0_u64;
+    loop {
+        failure_count = failure_count.saturating_add(1);
+        if try_pause_running_recovered_goal(
+            goal_store,
+            task_id,
+            pause.clone(),
+            blocker,
+            failure_count,
+        )
+        .await
+        {
+            return;
+        }
+        tokio::time::sleep(RECOVERED_GOAL_PAUSE_RETRY_DELAY).await;
+    }
+}
+
 /// Fail closed when a dispatcher-owned recovery envelope cannot be routed.
 /// The exact task id comes from the private envelope, not from the message.
-async fn pause_running_recovered_goal(
+async fn pause_running_recovered_goal_until_resolved(
     task_id: &str,
     blocker: RecoveredGoalContinuationBlocker,
     payload: serde_json::Value,
 ) {
-    let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
-        return;
-    };
     let pause = recovered_goal_continuation_blocked_pause(blocker, payload);
-    if let Err(error) = control_plane
-        .goal_store
-        .pause_running_goal_task(task_id, pause)
-        .await
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(
-                    ::serde_json::json!({"task_id": task_id, "error": format!("{error:#}")})
-                ),
-            "failed to pause unroutable recovered goal"
-        );
+    let mut failure_count = 0_u64;
+    loop {
+        if let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() {
+            failure_count = failure_count.saturating_add(1);
+            if try_pause_running_recovered_goal(
+                control_plane.goal_store.as_ref(),
+                task_id,
+                pause.clone(),
+                blocker,
+                failure_count,
+            )
+            .await
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(RECOVERED_GOAL_PAUSE_RETRY_DELAY).await;
+    }
+}
+
+async fn pause_and_retire_unroutable_recovered_goal_with_store(
+    goal_store: Arc<dyn zeroclaw_runtime::control_plane::GoalTaskRegistry>,
+    pending_by_scope: PendingRecoveredGoalsByScope,
+    scope_key: String,
+    proof: PendingRecoveredGoal,
+    blocker: RecoveredGoalContinuationBlocker,
+    payload: serde_json::Value,
+) {
+    let pause = recovered_goal_continuation_blocked_pause(blocker, payload);
+    pause_running_recovered_goal_until_resolved_with_store(
+        goal_store.as_ref(),
+        &proof.task_id,
+        pause,
+        blocker,
+    )
+    .await;
+    retire_pending_recovered_goal_by_scope(
+        &pending_by_scope,
+        &scope_key,
+        &proof.task_id,
+        proof.queue_id,
+    )
+    .await;
+}
+
+/// Move an unroutable private envelope into a tracked pause guardian. The
+/// pending entry remains visible to `/stop` until durable state resolves.
+fn retain_unroutable_recovered_goal_ownership(
+    workers: &mut tokio::task::JoinSet<()>,
+    pending_by_scope: &PendingRecoveredGoalsByScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    token: &RecoveredGoalDispatchToken,
+    blocker: RecoveredGoalContinuationBlocker,
+    payload: serde_json::Value,
+) {
+    let pending_by_scope = Arc::clone(pending_by_scope);
+    let scope_key = interruption_scope_key(msg);
+    let proof = PendingRecoveredGoal::from(token);
+    if let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() {
+        let goal_store = Arc::clone(&control_plane.goal_store);
+        workers.spawn(pause_and_retire_unroutable_recovered_goal_with_store(
+            goal_store,
+            pending_by_scope,
+            scope_key,
+            proof,
+            blocker,
+            payload,
+        ));
+    } else {
+        workers.spawn(async move {
+            pause_running_recovered_goal_until_resolved(&proof.task_id, blocker, payload).await;
+            retire_pending_recovered_goal_by_scope(
+                &pending_by_scope,
+                &scope_key,
+                &proof.task_id,
+                proof.queue_id,
+            )
+            .await;
+        });
     }
 }
 
 /// Commit `/stop` against the exact recovered goal before cancelling a worker.
 /// A `false` CAS means the task was already no longer `Running`, which is safe
-/// to interrupt; a store error leaves the worker intact and the requeue
-/// authority revoked so the goal cannot be advanced without a durable result.
-async fn pause_recovered_goal_for_stop(task_id: &str) -> bool {
+/// to interrupt. A store error leaves both the worker and requeue authority
+/// intact so a later interruption can still transfer exact-task ownership.
+async fn commit_recovered_goal_stop(
+    task_id: &str,
+    requeue_stops: &RecoveredGoalRequeueStops,
+) -> bool {
     let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
         ::zeroclaw_log::record!(
             WARN,
@@ -10074,12 +10855,13 @@ async fn pause_recovered_goal_for_stop(task_id: &str) -> bool {
         );
         return false;
     };
-    pause_recovered_goal_for_stop_with_control_plane(control_plane, task_id).await
+    commit_recovered_goal_stop_with_control_plane(control_plane, task_id, requeue_stops).await
 }
 
-async fn pause_recovered_goal_for_stop_with_control_plane(
+async fn commit_recovered_goal_stop_with_control_plane(
     control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
     task_id: &str,
+    requeue_stops: &RecoveredGoalRequeueStops,
 ) -> bool {
     let pause = zeroclaw_runtime::control_plane::GoalPauseState {
         reason: zeroclaw_runtime::control_plane::GoalPauseReason::OperatorPaused,
@@ -10091,7 +10873,12 @@ async fn pause_recovered_goal_for_stop_with_control_plane(
         .pause_running_goal_task(task_id, pause)
         .await
     {
-        Ok(_) => true,
+        Ok(_) => {
+            recovered_goal_requeue_stop(requeue_stops, task_id)
+                .await
+                .store(true, Ordering::Release);
+            true
+        }
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -10137,27 +10924,13 @@ fn recovered_goal_continuation_blocked_pause(
 
 async fn pause_recovered_goal_continuation_blocked(
     goal_store: &dyn zeroclaw_runtime::control_plane::GoalTaskRegistry,
-    task: &zeroclaw_runtime::control_plane::TaskRecord,
+    task_id: &str,
     blocker: RecoveredGoalContinuationBlocker,
     payload: serde_json::Value,
 ) {
     let pause = recovered_goal_continuation_blocked_pause(blocker, payload);
-    if let Err(error) = goal_store
-        .pause_goal_task_if_status(&task.id, task.status, pause)
-        .await
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "task_id": task.id,
-                    "reason_code": blocker.code(),
-                    "error": format!("{error:#}"),
-                })),
-            "failed to pause recovered goal after continuation blocker"
-        );
-    }
+    pause_running_recovered_goal_until_resolved_with_store(goal_store, task_id, pause, blocker)
+        .await;
 }
 
 fn normalize_telegram_identity(value: &str) -> String {
@@ -14239,7 +15012,7 @@ pub async fn start_channels(
         recovered_goal_ids,
         &pending_recovered_by_scope,
     )
-    .await;
+    .await?;
 
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
@@ -15770,6 +16543,155 @@ temperature = 0.3
         }
     }
 
+    #[tokio::test]
+    async fn missing_goal_extension_is_quarantined_without_blocking_recovery_startup() {
+        let task_id = format!("missing-goal-extension-{}", uuid::Uuid::new_v4());
+        let (temp, control_plane, _message) = recovered_goal_pause_failure_fixture(&task_id).await;
+        let fault = rusqlite::Connection::open(temp.path().join("control_plane.db"))
+            .expect("open file-backed control-plane database");
+        fault
+            .execute(
+                "DELETE FROM goal_tasks WHERE task_id = ?1",
+                rusqlite::params![task_id],
+            )
+            .expect("remove goal extension");
+
+        let ctx = Arc::new(channel_runtime_context_for_defaults_test(
+            temp.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        ));
+        let agent_ctxs = HashMap::from([("main".to_string(), ctx)]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let pending_by_scope: PendingRecoveredGoalsByScope =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            enqueue_recovered_goal_continuations_with_control_plane(
+                &control_plane,
+                &tx,
+                &agent_ctxs,
+                vec![task_id.clone()],
+                &pending_by_scope,
+            ),
+        )
+        .await
+        .expect("recovery must not retry a structurally impossible pause")
+        .expect("missing extension recovery should quarantine the exact task");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let task = control_plane
+            .store
+            .get(&task_id)
+            .await
+            .expect("read quarantined task")
+            .expect("quarantined task remains recorded");
+        assert_eq!(
+            task.status,
+            zeroclaw_runtime::control_plane::TaskStatus::Failed
+        );
+        assert!(task.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn tombstoned_recovery_pre_registration_retires_existing_scope_without_allocating() {
+        let temp = tempfile::tempdir().expect("temporary runtime directory");
+        let ctx = channel_runtime_context_for_defaults_test(
+            temp.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        );
+        let message = zeroclaw_api::channel::ChannelMessage::new(
+            "goal-restart:goal-a:private",
+            "alice",
+            "room",
+            "continue",
+            "telegram",
+            1,
+        );
+        let scope_key = interruption_scope_key(&message);
+        let predecessor = InFlightSenderTaskState {
+            task_id: 1,
+            cancellation: CancellationToken::new(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            goal_task_id: Arc::new(std::sync::Mutex::new(Some("goal-a".into()))),
+            predecessor: None,
+        };
+        let in_flight = tokio::sync::Mutex::new(HashMap::from([(scope_key.clone(), predecessor)]));
+        let sequence = AtomicU64::new(2);
+        let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        recovered_goal_requeue_stop(&stops, "goal-a")
+            .await
+            .store(true, Ordering::Release);
+
+        let outcome = pre_register_in_flight_before_permit(
+            &ctx,
+            &message,
+            Some(("goal-a", &stops)),
+            None,
+            &in_flight,
+            &sequence,
+        )
+        .await;
+
+        assert!(matches!(outcome, InFlightPreRegistration::Abandoned));
+        assert!(in_flight.lock().await.get(&scope_key).is_none());
+        assert_eq!(
+            sequence.load(Ordering::Relaxed),
+            2,
+            "tombstoned recovery must not allocate a discarded task state"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_tombstone_can_remove_an_already_registered_recovery() {
+        let temp = tempfile::tempdir().expect("temporary runtime directory");
+        let ctx = channel_runtime_context_for_defaults_test(
+            temp.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        );
+        let message = zeroclaw_api::channel::ChannelMessage::new(
+            "goal-restart:goal-a:private",
+            "alice",
+            "room",
+            "continue",
+            "telegram",
+            1,
+        );
+        let scope_key = interruption_scope_key(&message);
+        let in_flight = tokio::sync::Mutex::new(HashMap::new());
+        let sequence = AtomicU64::new(1);
+        let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        let outcome = pre_register_in_flight_before_permit(
+            &ctx,
+            &message,
+            Some(("goal-a", &stops)),
+            None,
+            &in_flight,
+            &sequence,
+        )
+        .await;
+        assert!(matches!(outcome, InFlightPreRegistration::Registered(_)));
+        assert!(in_flight.lock().await.contains_key(&scope_key));
+
+        recovered_goal_requeue_stop(&stops, "goal-a")
+            .await
+            .store(true, Ordering::Release);
+        let removed = in_flight.lock().await.remove(&scope_key);
+
+        assert!(removed.is_some());
+        assert!(in_flight.lock().await.is_empty());
+    }
+
     #[test]
     fn runtime_defaults_are_scoped_by_runtime_context() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -16744,6 +17666,12 @@ api_key = "anthropic-key"
         send_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct PendingSendChannel {
+        send_started: tokio::sync::Notify,
+        release_send: tokio::sync::Notify,
+    }
+
     struct DraftRecordingChannel {
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
@@ -16929,6 +17857,18 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for PendingSendChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "pending-send-test"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for DraftRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -16949,6 +17889,26 @@ api_key = "anthropic-key"
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             self.send_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("send boom")
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PendingSendChannel {
+        fn name(&self) -> &str {
+            "pending-send-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_started.notify_one();
+            self.release_send.notified().await;
+            Ok(())
         }
 
         async fn listen(
@@ -24049,6 +25009,39 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn goal_controller_update_target_preserves_channel_thread_semantics() {
+        let matrix = zeroclaw_api::channel::ChannelMessage {
+            id: "$event:server".into(),
+            reply_target: "!room:server".into(),
+            channel: "matrix".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            goal_controller_update_target(&matrix),
+            GoalControllerUpdateTarget {
+                channel: "matrix".into(),
+                reply_target: "!room:server".into(),
+                thread_id: None,
+            }
+        );
+
+        let slack = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_abc123".into(),
+            reply_target: "C456".into(),
+            channel: "slack".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            goal_controller_update_target(&slack),
+            GoalControllerUpdateTarget {
+                channel: "slack".into(),
+                reply_target: "C456".into(),
+                thread_id: Some("msg_abc123".into()),
+            }
+        );
+    }
+
+    #[test]
     fn matrix_root_conversation_history_key_omits_event_id() {
         let first = zeroclaw_api::channel::ChannelMessage {
             id: "$first:server".into(),
@@ -24076,6 +25069,29 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(key, conversation_history_key(&second));
         assert!(!key.contains("$first:server"));
         assert!(!key.contains("$second:server"));
+    }
+
+    #[test]
+    fn goal_trusted_route_does_not_collide_when_history_sanitization_does() {
+        let mut first =
+            zeroclaw_api::channel::ChannelMessage::new("one", "a:b", "room", "x", "matrix", 1);
+        first.reply_target = "r-c".into();
+        let mut second = first.clone();
+        second.sender = "a b".into();
+        assert_eq!(
+            conversation_history_key(&first),
+            conversation_history_key(&second)
+        );
+        assert_ne!(goal_trusted_route(&first), goal_trusted_route(&second));
+        assert_ne!(goal_principal_id(&first), goal_principal_id(&second));
+    }
+
+    #[test]
+    fn canonical_goal_identity_preserves_exact_byte_length_framing() {
+        assert_eq!(
+            canonical_goal_identity(&["matrix", "бот", "", "room|thread"]),
+            "6:matrix|6:бот|0:|11:room|thread"
+        );
     }
 
     #[test]
@@ -24761,6 +25777,79 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn goal_command_interrupts_bound_predecessor_before_response_delivery() {
+        let goal_cancellation = CancellationToken::new();
+        let goal_worker = InFlightSenderTaskState {
+            task_id: 1,
+            cancellation: goal_cancellation.clone(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            goal_task_id: Arc::new(std::sync::Mutex::new(Some("goal-a".into()))),
+            predecessor: None,
+        };
+        let ordinary_cancellation = CancellationToken::new();
+        let ordinary_worker = InFlightSenderTaskState {
+            task_id: 2,
+            cancellation: ordinary_cancellation.clone(),
+            completion: Arc::new(InFlightTaskCompletion::new()),
+            goal_task_id: Arc::new(std::sync::Mutex::new(None)),
+            predecessor: Some(Arc::new(goal_worker)),
+        };
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "pause-goal-a".into(),
+            sender: "alice".into(),
+            reply_target: "chan-1".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            content: "/goal pause wait".into(),
+            ..Default::default()
+        };
+        let scope_key = interruption_scope_key(&msg);
+        let workers = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            scope_key,
+            ordinary_worker,
+        )])));
+        let pending_channel = Arc::new(PendingSendChannel::default());
+        let channel: Arc<dyn Channel> = pending_channel.clone();
+        let task = {
+            let workers = Arc::clone(&workers);
+            zeroclaw_spawn::spawn!(async move {
+                finish_runtime_command(
+                    RuntimeCommandOutcome::HandledGoal {
+                        task_id: Some("goal-a".into()),
+                    },
+                    "Goal paused".into(),
+                    &msg,
+                    &channel,
+                    Some(workers.as_ref()),
+                )
+                .await
+            })
+        };
+
+        pending_channel.send_started.notified().await;
+        assert!(
+            goal_cancellation.is_cancelled(),
+            "the exact goal worker must be interrupted before response delivery"
+        );
+        assert!(
+            !ordinary_cancellation.is_cancelled(),
+            "an unrelated queued successor must remain registered"
+        );
+        assert!(
+            !task.is_finished(),
+            "the response transport should still be pending during the ordering assertion"
+        );
+
+        pending_channel.release_send.notify_one();
+        assert_eq!(
+            task.await.unwrap(),
+            RuntimeCommandOutcome::HandledGoal {
+                task_id: Some("goal-a".into())
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_agent_scope_writes_override_for_admin_sender() {
         // Authorized sender: dispatch must reach the SetModelScoped(Agent)
         // accept branch and write a scope override.
@@ -24777,6 +25866,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("alice"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -24810,6 +25900,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("mallory"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -24841,6 +25932,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_user_msg("mallory"),
             Some(&target),
+            None,
         )
         .await;
         assert!(
@@ -24871,6 +25963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.as_ref(),
             &scope_agent_msg("alice"),
             Some(&target),
+            None,
         )
         .await;
         assert!(!matches!(handled, RuntimeCommandOutcome::NotCommand));
@@ -24947,8 +26040,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert!(cost_ctx.exact_goal_task_id().is_none());
         assert!(!cost_ctx.goal_attribution_enabled());
     }
 
@@ -24965,14 +26057,14 @@ BTC is currently around $65,000 based on latest tool output."#
     fn controller_goal_turn_enables_goal_attribution() {
         let goal_ctx = zeroclaw_runtime::control_plane::GoalAdmissionContext::new("agent-a")
             .with_originator_route(Some("route-a".into()))
-            .with_principal_id(Some("principal-a".into()));
+            .with_principal_id(Some("principal-a".into()))
+            .with_goal_task_id(Some("goal-a".into()));
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true);
 
-        assert_eq!(cost_ctx.originator_route.as_deref(), Some("route-a"));
-        assert_eq!(cost_ctx.principal_id.as_deref(), Some("principal-a"));
+        assert_eq!(cost_ctx.exact_goal_task_id().as_deref(), Some("goal-a"));
         assert!(cost_ctx.goal_attribution_enabled());
     }
 
@@ -25083,7 +26175,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn synthetic_goal_messages_are_preflighted_before_model_turn() {
-        let original = zeroclaw_api::channel::ChannelMessage::new(
+        let mut original = zeroclaw_api::channel::ChannelMessage::new(
             "msg-1",
             "@operator:example.org",
             "!room:example.org",
@@ -25102,6 +26194,43 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(is_goal_controller_continuation_message(&next));
         assert!(!is_goal_controller_continuation_message(&original));
+        assert_eq!(next.internal_goal_task_id.as_deref(), Some("goal-1"));
+
+        let mut already_bound = original.clone();
+        already_bound.internal_goal_task_id = Some("stale-goal".into());
+        let repeated = goal_continuation_message_with_prompt(
+            &already_bound,
+            "goal-1",
+            &GoalContinuationPrompt::Continue {
+                objective: "ship it".into(),
+            },
+        );
+        assert_eq!(
+            repeated.internal_goal_task_id.as_deref(),
+            Some("goal-1"),
+            "a repeated continuation must install the exact current task binding"
+        );
+
+        original.id = "goal-restart:spoofed:message".into();
+        assert!(!is_recovered_goal_continuation_message(&original));
+        assert!(!is_goal_controller_continuation_message(&original));
+    }
+
+    #[test]
+    fn goal_controller_limit_pause_preserves_exact_task_binding() {
+        let mut original = zeroclaw_api::channel::ChannelMessage::new(
+            "msg-1",
+            "@operator:example.org",
+            "!room:example.org",
+            "continue",
+            "matrix",
+            1,
+        );
+        original.internal_goal_task_id = Some("goal-1".into());
+
+        let pause = goal_controller_limit_pause_message(&original);
+
+        assert_eq!(pause.internal_goal_task_id, original.internal_goal_task_id);
     }
 
     #[test]
@@ -25126,10 +26255,11 @@ BTC is currently around $65,000 based on latest tool output."#
         // Goal controller prompts are already structured runtime input. Link
         // enrichment belongs to ordinary user messages, not synthetic
         // continuation turns generated after a trusted controller admission.
-        assert!(!should_enrich_message_links(&next, false, true));
-        assert!(!should_enrich_message_links(&original, true, true));
-        assert!(should_enrich_message_links(&original, false, true));
-        assert!(!should_enrich_message_links(&original, false, false));
+        assert!(is_goal_controller_continuation_message(&next));
+        assert!(!is_goal_controller_continuation_message(&original));
+        assert!(!should_enrich_message_links(true, true));
+        assert!(should_enrich_message_links(false, true));
+        assert!(!should_enrich_message_links(false, false));
     }
 
     #[test]
@@ -25172,10 +26302,11 @@ BTC is currently around $65,000 based on latest tool output."#
         let binding = Arc::new(std::sync::Mutex::new(Some("goal-1".to_string())));
         IN_FLIGHT_GOAL_TASK
             .scope(binding, async {
-                assert!(is_recovered_goal_continuation_message());
+                assert!(is_recovered_goal_continuation_message(&msg));
                 assert!(is_goal_controller_continuation_message(&msg));
             })
             .await;
+        assert_eq!(msg.internal_goal_task_id.as_deref(), Some("goal-1"));
         assert_eq!(msg.channel, context.channel);
         assert_eq!(msg.channel_alias, context.channel_alias);
         assert_eq!(msg.reply_target, context.reply_target);
@@ -25232,7 +26363,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         pause_recovered_goal_continuation_blocked(
             &store,
-            &task,
+            &task.id,
             RecoveredGoalContinuationBlocker::MissingContinuationContext,
             serde_json::json!({}),
         )
@@ -25319,7 +26450,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         pause_recovered_goal_continuation_blocked(
             &store,
-            &task,
+            &task.id,
             RecoveredGoalContinuationBlocker::MissingContinuationContext,
             serde_json::json!({}),
         )
@@ -27308,6 +28439,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )
@@ -29068,6 +30200,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                internal_goal_task_id: None,
             },
             CancellationToken::new(),
         )
@@ -30699,6 +31832,46 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+    }
+
+    #[test]
+    fn interruption_scope_key_separates_channel_aliases() {
+        let mut alias_a = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "hi".into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let mut alias_b = alias_a.clone();
+        alias_b.channel_alias = Some("glados".into());
+
+        assert_eq!(
+            interruption_scope_key(&alias_a),
+            "discord.clamps_C123_alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&alias_b),
+            "discord.glados_C123_alice"
+        );
+
+        alias_a.interruption_scope_id = Some("thread-1".into());
+        alias_b.interruption_scope_id = Some("thread-1".into());
+        assert_eq!(
+            interruption_scope_key(&alias_a),
+            "discord.clamps_C123_alice_thread-1"
+        );
+        assert_eq!(
+            interruption_scope_key(&alias_b),
+            "discord.glados_C123_alice_thread-1"
+        );
     }
 
     #[tokio::test]

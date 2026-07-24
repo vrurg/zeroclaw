@@ -197,9 +197,11 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     })
 }
 
-/// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
-/// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
-/// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
+/// Collect query rows, skipping and logging any row that fails to convert.
+///
+/// One unrecognised or corrupt record, including a forward-incompatible
+/// `kind` or `status`, must not fail the whole enumeration and starve the
+/// reaper.
 fn collect_skipping_bad_rows<I>(rows: I) -> Vec<TaskRecord>
 where
     I: Iterator<Item = rusqlite::Result<TaskRecord>>,
@@ -225,9 +227,9 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
 }
 
 fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
-    // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
-    // must be a true no-op, never clobber an already-recorded output/error/terminal
-    // status back to NULL/running (review finding— the documented idempotency).
+    // ON CONFLICT DO NOTHING, not INSERT OR REPLACE: re-registering an existing
+    // id must be a true no-op and never clobber recorded output, errors, or
+    // terminal status back to NULL/running.
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,

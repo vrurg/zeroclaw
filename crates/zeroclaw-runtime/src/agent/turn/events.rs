@@ -65,12 +65,16 @@ pub(crate) async fn emit_tool_call_pending(
     event_tx: &Sender<TurnEvent>,
     id: &str,
     call: &ParsedToolCall,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
 ) {
     let _ = event_tx
         .send(TurnEvent::ToolCall {
             id: id.to_string(),
             name: call.name.clone(),
-            args: call.arguments.clone(),
+            args: crate::agent::tool_execution::scrub_tool_arguments_for_presentation(
+                &call.arguments,
+                leak_detection,
+            ),
         })
         .await;
 }
@@ -100,9 +104,10 @@ pub(crate) async fn emit_tool_call_pair(
     event_tx: &Sender<TurnEvent>,
     call: &ParsedToolCall,
     outcome: &ToolExecutionOutcome,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
 ) {
     let call_id = resolve_tool_call_id(call);
-    emit_tool_call_pending(event_tx, &call_id, call).await;
+    emit_tool_call_pending(event_tx, &call_id, call, leak_detection).await;
     emit_tool_result(event_tx, &call_id, &call.name, outcome).await;
 }
 
@@ -145,8 +150,9 @@ mod tests {
     #[tokio::test]
     async fn idless_calls_get_distinct_synthesized_pair_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
-        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
+        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
+        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome(), &leak_detection).await;
+        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome(), &leak_detection).await;
         drop(tx);
 
         let mut ids = Vec::new();
@@ -172,7 +178,13 @@ mod tests {
     #[tokio::test]
     async fn existing_ids_pass_through() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("native-7")), &ok_outcome()).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("native-7")),
+            &ok_outcome(),
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        )
+        .await;
         drop(tx);
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -189,7 +201,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let call = parsed_call(None);
         let id = resolve_tool_call_id(&call);
-        emit_tool_call_pending(&tx, &id, &call).await;
+        emit_tool_call_pending(
+            &tx,
+            &id,
+            &call,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        )
+        .await;
         emit_tool_result(&tx, &id, &call.name, &ok_outcome()).await;
         drop(tx);
 
@@ -211,6 +229,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_tool_call_arguments_are_scrubbed_for_rendering() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let call = ParsedToolCall {
+            name: "escalate_to_human".into(),
+            arguments: serde_json::json!({
+                "summary": "operator approval requires sk_test_1234567890abcdefghijklmnop",
+                "context": "password=longsecretvalue"
+            }),
+            tool_call_id: Some("secret-call".into()),
+        };
+        emit_tool_call_pending(
+            &tx,
+            "secret-call",
+            &call,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        )
+        .await;
+
+        let TurnEvent::ToolCall { args, .. } = rx.recv().await.unwrap() else {
+            panic!("expected pending tool-call event");
+        };
+        let rendered = args.to_string();
+        assert!(!rendered.contains("sk_test_"));
+        assert!(!rendered.contains("longsecretvalue"));
+        assert!(rendered.contains("REDACTED"));
+    }
+
+    #[tokio::test]
     async fn tool_result_event_is_scrubbed_for_rendering() {
         let outcome = ToolExecutionOutcome {
             output: "api_key = \"sk-live-abcd1234efgh5678\"".into(),
@@ -221,7 +267,13 @@ mod tests {
             output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+        emit_tool_call_pair(
+            &tx,
+            &parsed_call(Some("c1")),
+            &outcome,
+            &zeroclaw_config::schema::LeakDetectionConfig::default(),
+        )
+        .await;
         drop(tx);
         let mut saw_result = false;
         while let Some(ev) = rx.recv().await {
