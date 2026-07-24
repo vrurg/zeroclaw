@@ -240,6 +240,21 @@ pub fn commands_for_surface(
         .filter(move |spec| spec.supports(surface))
 }
 
+/// Runtime-owned commands that a surface may advertise for the current policy.
+///
+/// Parsing remains independent from advertisement so a stale remote menu or a
+/// hand-written command still reaches the authoritative runtime admission
+/// check. Goal admission is the only policy-conditional command class today.
+pub fn advertised_runtime_commands(
+    surface: CommandSurface,
+    goal_admission_visible: bool,
+) -> impl Iterator<Item = CommandSpec> + 'static {
+    commands_for_surface(surface).filter(move |spec| {
+        matches!(spec.execution, CommandExecution::RuntimeCommand)
+            || (goal_admission_visible && matches!(spec.execution, CommandExecution::GoalAdmission))
+    })
+}
+
 pub fn command_by_name(name: &str) -> Option<CommandSpec> {
     let (normalized, _) = parse_command_name(name)?;
     BUILTIN_COMMANDS
@@ -343,6 +358,21 @@ mod tests {
             command_by_name("/think").map(|spec| spec.id),
             Some(BuiltinCommandId::Thinking)
         );
+    }
+
+    #[test]
+    fn runtime_advertisement_hides_goal_without_hiding_runtime_commands() {
+        let hidden: Vec<_> = advertised_runtime_commands(CommandSurface::Channel, false).collect();
+        assert!(
+            hidden
+                .iter()
+                .all(|spec| spec.execution == CommandExecution::RuntimeCommand)
+        );
+        assert!(hidden.iter().any(|spec| spec.id == BuiltinCommandId::Clear));
+        assert!(hidden.iter().all(|spec| spec.id != BuiltinCommandId::Goal));
+
+        let visible: Vec<_> = advertised_runtime_commands(CommandSurface::Channel, true).collect();
+        assert!(visible.iter().any(|spec| spec.id == BuiltinCommandId::Goal));
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub use crate::wecom_ws::WeComWsChannel;
 use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_api::channel::{Channel, ChannelCommandMenuEntry, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -97,6 +97,7 @@ use parking_lot::RwLock;
 use portable_atomic::{AtomicU8, AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
@@ -112,8 +113,8 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_commands::{
-    BuiltinCommandId, CommandSurface, CommandTokenClassification, classify_command_token,
-    parse_command_token,
+    BuiltinCommandId, CommandSurface, CommandTokenClassification, advertised_runtime_commands,
+    classify_command_token, parse_command_token,
 };
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
@@ -167,9 +168,9 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    build_tool_entries_for_names, build_tool_instructions_for_names, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
+    scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -280,6 +281,8 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+const CHANNEL_COMMAND_MENU_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_COMMAND_MENU_RETRY_COOLDOWN: Duration = Duration::from_secs(30);
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
@@ -545,16 +548,21 @@ struct LiveConfigOverride {
     stamp: Option<ConfigFileStamp>,
 }
 
-/// File identity used to detect config changes cheaply.
+/// File identity used to detect config changes without trusting metadata alone.
 ///
-/// It intentionally stores only filesystem metadata. Parsed config remains in
-/// `Config`; this stamp just decides when to attempt a reload.
+/// Docker Desktop and other shared filesystems can expose new file contents
+/// while retaining the old modification time. Length is also insufficient
+/// when a config edit replaces one same-sized value with another. The digest
+/// keeps live policy responsive on those mounts; parsed config remains in
+/// `Config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigFileStamp {
     /// Last modification time reported by the filesystem.
     modified: SystemTime,
     /// File length reported by the filesystem.
     len: u64,
+    /// SHA-256 of the observed file contents.
+    digest: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -657,6 +665,130 @@ struct ChannelCostTrackingState {
     agent_alias: Arc<String>,
 }
 
+struct ChannelToolExclusions {
+    base: Vec<String>,
+    base_with_goal_tools: Vec<String>,
+    goal_tools_only: Vec<String>,
+}
+
+impl ChannelToolExclusions {
+    fn new(base: Vec<String>) -> Self {
+        let goal_tools_only: Vec<String> = zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut base_with_goal_tools = base.clone();
+        for name in &goal_tools_only {
+            if !base_with_goal_tools.iter().any(|excluded| excluded == name) {
+                base_with_goal_tools.push(name.clone());
+            }
+        }
+        Self {
+            base,
+            base_with_goal_tools,
+            goal_tools_only,
+        }
+    }
+
+    fn for_turn(&self, restricted: bool, goal_commands_visible: bool) -> &[String] {
+        match (restricted, goal_commands_visible) {
+            (true, true) => &self.base,
+            (true, false) => &self.base_with_goal_tools,
+            (false, true) => &[],
+            (false, false) => &self.goal_tools_only,
+        }
+    }
+
+    fn base(&self) -> &[String] {
+        &self.base
+    }
+}
+
+impl Default for ChannelToolExclusions {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+struct ChannelCommandMenuSync {
+    projections: std::sync::OnceLock<ChannelCommandMenuProjections>,
+    state: Mutex<ChannelCommandMenuSyncState>,
+    cancellation: CancellationToken,
+    refresh_timeout: Duration,
+    retry_cooldown: Duration,
+    now: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+struct ChannelCommandMenuProjections {
+    with_goal: Arc<[ChannelCommandMenuEntry]>,
+    without_goal: Arc<[ChannelCommandMenuEntry]>,
+}
+
+#[derive(Default)]
+struct ChannelCommandMenuSyncState {
+    initialized: bool,
+    next_revision: u64,
+    entries: HashMap<String, ChannelCommandMenuSyncEntry>,
+}
+
+struct ChannelCommandMenuSyncEntry {
+    channel: Arc<dyn Channel>,
+    desired: Arc<[ChannelCommandMenuEntry]>,
+    desired_revision: u64,
+    worker_running: bool,
+    retry_pending: bool,
+    retry_not_before: Option<Instant>,
+}
+
+impl Default for ChannelCommandMenuSync {
+    fn default() -> Self {
+        Self::new(
+            CancellationToken::new(),
+            CHANNEL_COMMAND_MENU_REFRESH_TIMEOUT,
+            CHANNEL_COMMAND_MENU_RETRY_COOLDOWN,
+        )
+    }
+}
+
+impl ChannelCommandMenuSync {
+    fn new(
+        cancellation: CancellationToken,
+        refresh_timeout: Duration,
+        retry_cooldown: Duration,
+    ) -> Self {
+        Self::new_with_clock(
+            cancellation,
+            refresh_timeout,
+            retry_cooldown,
+            Arc::new(Instant::now),
+        )
+    }
+
+    fn new_with_clock(
+        cancellation: CancellationToken,
+        refresh_timeout: Duration,
+        retry_cooldown: Duration,
+        now: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        Self {
+            projections: std::sync::OnceLock::new(),
+            state: Mutex::new(ChannelCommandMenuSyncState::default()),
+            cancellation,
+            refresh_timeout,
+            retry_cooldown,
+            now,
+        }
+    }
+
+    fn projections(&self) -> &ChannelCommandMenuProjections {
+        self.projections
+            .get_or_init(|| ChannelCommandMenuProjections {
+                with_goal: channel_command_menu_entries(true).into(),
+                without_goal: channel_command_menu_entries(false).into(),
+            })
+    }
+}
+
 /// Immutable-ish runtime bundle shared by channel message workers.
 ///
 /// This is operational wiring, not a durable session snapshot. Per-message
@@ -740,7 +872,10 @@ struct ChannelRuntimeContext {
     /// Optional hook runner for channel turn lifecycle hooks.
     hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     /// Tool names withheld from non-CLI channel turns by policy.
-    non_cli_excluded_tools: Arc<Vec<String>>,
+    non_cli_excluded_tools: Arc<ChannelToolExclusions>,
+    /// Best-effort native menu projection. This is display state only; live
+    /// goal policy remains the execution authority.
+    command_menu_sync: Arc<ChannelCommandMenuSync>,
     /// Autonomy level used by approval and tool-admission policy.
     autonomy_level: AutonomyLevel,
     /// Tool names excluded from tool-call de-duplication.
@@ -2548,11 +2683,80 @@ fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
-fn goal_channel_type(channel_name: &str) -> String {
+fn goal_channel_type(channel_name: &str) -> &str {
     channel_name
         .split_once(':')
         .map_or(channel_name, |(channel_type, _)| channel_type)
-        .to_string()
+}
+
+fn channel_command_menu_entries(goal_commands_visible: bool) -> Vec<ChannelCommandMenuEntry> {
+    advertised_runtime_commands(CommandSurface::Channel, goal_commands_visible)
+        .map(|spec| ChannelCommandMenuEntry {
+            name: spec.name.to_string(),
+            description: zeroclaw_runtime::i18n::get_required_cli_string(spec.description_key),
+        })
+        .collect()
+}
+
+fn goal_commands_available_for_message(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    config: &Config,
+) -> bool {
+    msg.channel_alias.as_deref().is_some_and(|channel_alias| {
+        let channel_type = goal_channel_type(msg.channel.as_str());
+        zeroclaw_runtime::control_plane::goal_commands_available_on_channel(
+            config,
+            ctx.agent_alias.as_str(),
+            channel_type,
+            channel_alias,
+        )
+    })
+}
+
+fn excluded_tools_for_channel_turn<'a>(
+    ctx: &'a ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    goal_commands_visible: bool,
+) -> &'a [String] {
+    let restricted = msg.channel != "cli" && ctx.autonomy_level != AutonomyLevel::Full;
+    ctx.non_cli_excluded_tools
+        .for_turn(restricted, goal_commands_visible)
+}
+
+fn channel_startup_effective_tool_names(tools_registry: &[Box<dyn Tool>]) -> HashSet<&str> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| !zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES.contains(name))
+        .collect()
+}
+
+fn append_goal_text_tool_instructions_for_turn(
+    system_prompt: &mut String,
+    tools_registry: &[Box<dyn Tool>],
+    goal_commands_visible: bool,
+    native_tools: bool,
+    strict_tool_parsing: bool,
+) {
+    if !goal_commands_visible || native_tools || strict_tool_parsing {
+        return;
+    }
+
+    let goal_tool_names: HashSet<&str> = zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+        .into_iter()
+        .collect();
+    if system_prompt.contains("## Tool Use Protocol") {
+        system_prompt.push_str(&build_tool_entries_for_names(
+            tools_registry,
+            &goal_tool_names,
+        ));
+    } else {
+        system_prompt.push_str(&build_tool_instructions_for_names(
+            tools_registry,
+            &goal_tool_names,
+        ));
+    }
 }
 
 fn goal_channel_status_updates_enabled(
@@ -2563,8 +2767,9 @@ fn goal_channel_status_updates_enabled(
 }
 
 const GOAL_CONTROLLER_MAX_CONTINUATIONS_PER_MESSAGE: usize = 16;
-// Channel turns construct a trusted `GoalAdmissionContext` per message, so
-// their model registry must include the tools that consume that context.
+// The static registry is only a capability reservoir. Live per-turn policy
+// filters exposure and execution, allowing config re-enable without rebuilding
+// the daemon while disabled scopes see no goal tools.
 const CHANNEL_GOAL_ADMISSION_TOOL_POLICY: tools::GoalAdmissionToolPolicy =
     tools::GoalAdmissionToolPolicy::Include;
 
@@ -2749,7 +2954,7 @@ fn goal_admission_context_for_message(
 ) -> zeroclaw_runtime::control_plane::GoalAdmissionContext {
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
-        .with_channel_type(Some(goal_channel_type(msg.channel.as_str())))
+        .with_channel_type(Some(goal_channel_type(msg.channel.as_str()).to_owned()))
         .with_originator_route(Some(goal_trusted_route(msg)))
         .with_principal_id(goal_principal_id(msg))
         .with_legacy_identity(Some(history_key.to_string()), legacy_goal_principal_id(msg))
@@ -3389,11 +3594,13 @@ fn goal_config_resolver(ctx: &ChannelRuntimeContext) -> Arc<dyn Fn() -> Arc<Conf
 }
 
 async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
+    let contents = tokio::fs::read(path).await.ok()?;
     let metadata = tokio::fs::metadata(path).await.ok()?;
     let modified = metadata.modified().ok()?;
     Some(ConfigFileStamp {
         modified,
         len: metadata.len(),
+        digest: Sha256::digest(contents).into(),
     })
 }
 
@@ -3538,6 +3745,14 @@ where
     .await
 }
 
+fn goal_store_for_live_policy_cutover(
+    control_plane: Option<&zeroclaw_runtime::control_plane::ControlPlaneHandle>,
+) -> Result<Arc<dyn zeroclaw_runtime::control_plane::GoalTaskRegistry>> {
+    control_plane
+        .map(|control_plane| Arc::clone(&control_plane.goal_store))
+        .context("goal control plane unavailable during live policy cutover")
+}
+
 async fn maybe_apply_runtime_config_update(
     ctx: &ChannelRuntimeContext,
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
@@ -3545,10 +3760,14 @@ async fn maybe_apply_runtime_config_update(
     pending_by_scope: &PendingRecoveredGoalsByScope,
 ) -> Result<Option<ProviderDefaultsReload>> {
     let Some(config_path) = runtime_config_path(ctx) else {
+        let config = runtime_config_snapshot(ctx);
+        initialize_or_retry_channel_command_menus(ctx, config.as_ref());
         return Ok(None);
     };
 
     let Some(stamp) = config_file_stamp(&config_path).await else {
+        let config = runtime_config_snapshot(ctx);
+        initialize_or_retry_channel_command_menus(ctx, config.as_ref());
         return Ok(None);
     };
 
@@ -3558,6 +3777,8 @@ async fn maybe_apply_runtime_config_update(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if *last == Some(stamp) {
+            let config = runtime_config_snapshot(ctx);
+            initialize_or_retry_channel_command_menus(ctx, config.as_ref());
             return Ok(None);
         }
     }
@@ -3567,6 +3788,8 @@ async fn maybe_apply_runtime_config_update(
     // Goal authorization is local control-plane policy. Commit its cutover
     // before provider construction or warmup can wait on an external service.
     // Provider defaults remain per-agent and can converge afterward.
+    let goal_store =
+        goal_store_for_live_policy_cutover(zeroclaw_runtime::control_plane::control_plane())?;
     apply_goal_policy_cutover(
         ctx,
         &config_path,
@@ -3575,18 +3798,17 @@ async fn maybe_apply_runtime_config_update(
         in_flight,
         requeue_stops,
         pending_by_scope,
-        |config| async move {
-            let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
-                return Ok(Vec::new());
-            };
+        move |config| async move {
             zeroclaw_runtime::control_plane::cancel_goals_revoked_by_config(
-                control_plane.goal_store.as_ref(),
+                goal_store.as_ref(),
                 config.as_ref(),
             )
             .await
         },
     )
     .await?;
+    let config = runtime_config_snapshot(ctx);
+    publish_channel_command_menus(ctx, config.as_ref());
 
     // Claim this per-agent provider generation before returning to the
     // dispatcher. Later messages keep using prior defaults while one detached
@@ -6956,12 +7178,10 @@ async fn process_channel_message_body(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let per_turn_excluded_tools: &[String] =
-        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-            &[]
-        } else {
-            ctx.non_cli_excluded_tools.as_ref()
-        };
+    let goal_commands_visible =
+        goal_commands_available_for_message(ctx.as_ref(), &msg, runtime_defaults.config.as_ref());
+    let per_turn_excluded_tools =
+        excluded_tools_for_channel_turn(ctx.as_ref(), &msg, goal_commands_visible);
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -6975,6 +7195,13 @@ async fn process_channel_message_body(
         &msg,
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
+    );
+    append_goal_text_tool_instructions_for_turn(
+        &mut system_prompt,
+        ctx.tools_registry.as_ref(),
+        goal_commands_visible,
+        active_model_provider.supports_native_tools(),
+        ctx.agent_cfg.resolved.strict_tool_parsing,
     );
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
@@ -7479,12 +7706,6 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
-                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                };
             let tool_loop = run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -7511,7 +7732,7 @@ async fn process_channel_message_body(
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
+                        excluded_tools: per_turn_excluded_tools,
                         dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
                         pacing: &ctx.pacing,
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
@@ -9716,6 +9937,273 @@ fn unique_channel_handles(
     unique
 }
 
+/// Publish native command menus without awaiting transport APIs on ingress.
+///
+/// Remote menus are discoverability projections, not admission authorities.
+/// The synchronizer coalesces policy generations per channel, keeps one worker
+/// per adapter, and applies the newest desired projection after any older
+/// in-flight request returns. The tradeoff is eventual menu consistency when a
+/// transport is slow or unavailable; runtime command and tool admission change
+/// immediately and remain authoritative.
+fn publish_channel_command_menus(ctx: &ChannelRuntimeContext, config: &Config) {
+    let commands_with_goal = Arc::clone(&ctx.command_menu_sync.projections().with_goal);
+    let commands_without_goal = Arc::clone(&ctx.command_menu_sync.projections().without_goal);
+    let mut workers = Vec::new();
+    {
+        let mut state = ctx
+            .command_menu_sync
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.initialized = true;
+        for channel in unique_channel_handles(ctx.channels_by_name.as_ref()) {
+            let channel_type = channel.name();
+            let channel_alias = zeroclaw_api::attribution::Attributable::alias(channel.as_ref());
+            let channel_ref = composite_channel_key(channel_type, Some(channel_alias));
+            let goal_commands_visible =
+                config.agent_for_channel(&channel_ref).is_some_and(|owner| {
+                    zeroclaw_runtime::control_plane::goal_commands_available_on_channel(
+                        config,
+                        owner,
+                        channel_type,
+                        channel_alias,
+                    )
+                });
+            let desired = if goal_commands_visible {
+                Arc::clone(&commands_with_goal)
+            } else {
+                Arc::clone(&commands_without_goal)
+            };
+            let projection_changed = state
+                .entries
+                .get(&channel_ref)
+                .is_none_or(|entry| entry.desired.as_ref() != desired.as_ref());
+            let desired_revision = if projection_changed {
+                state.next_revision = state.next_revision.wrapping_add(1).max(1);
+                state.next_revision
+            } else {
+                state
+                    .entries
+                    .get(&channel_ref)
+                    .expect("unchanged command-menu entry exists")
+                    .desired_revision
+            };
+            let entry = state.entries.entry(channel_ref.clone()).or_insert_with(|| {
+                ChannelCommandMenuSyncEntry {
+                    channel: Arc::clone(&channel),
+                    desired: Arc::clone(&desired),
+                    desired_revision,
+                    worker_running: false,
+                    retry_pending: true,
+                    retry_not_before: None,
+                }
+            });
+            entry.channel = channel;
+            if projection_changed {
+                entry.desired = desired;
+                entry.desired_revision = desired_revision;
+                entry.retry_pending = true;
+                entry.retry_not_before = None;
+            }
+            if command_menu_retry_due(entry, (ctx.command_menu_sync.now)()) {
+                entry.worker_running = true;
+                workers.push(channel_ref);
+            }
+        }
+    }
+    for channel_ref in workers {
+        spawn_channel_command_menu_worker(Arc::clone(&ctx.command_menu_sync), channel_ref);
+    }
+}
+
+fn initialize_or_retry_channel_command_menus(ctx: &ChannelRuntimeContext, config: &Config) {
+    let initialize = {
+        let state = ctx
+            .command_menu_sync
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        !state.initialized
+    };
+    if initialize {
+        publish_channel_command_menus(ctx, config);
+    } else {
+        retry_stale_channel_command_menus(ctx);
+    }
+}
+
+fn retry_stale_channel_command_menus(ctx: &ChannelRuntimeContext) {
+    let workers = {
+        let now = (ctx.command_menu_sync.now)();
+        let mut state = ctx
+            .command_menu_sync
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .entries
+            .iter_mut()
+            .filter_map(|(channel_ref, entry)| {
+                if command_menu_retry_due(entry, now) {
+                    entry.worker_running = true;
+                    Some(channel_ref.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    for channel_ref in workers {
+        spawn_channel_command_menu_worker(Arc::clone(&ctx.command_menu_sync), channel_ref);
+    }
+}
+
+fn command_menu_retry_due(entry: &ChannelCommandMenuSyncEntry, now: Instant) -> bool {
+    entry.retry_pending
+        && !entry.worker_running
+        && entry
+            .retry_not_before
+            .is_none_or(|retry_not_before| now >= retry_not_before)
+}
+
+fn spawn_channel_command_menu_worker(sync: Arc<ChannelCommandMenuSync>, channel_ref: String) {
+    zeroclaw_spawn::spawn!(async move {
+        loop {
+            let (channel, desired, revision) = {
+                let state = sync.state.lock().unwrap_or_else(|error| error.into_inner());
+                let Some(entry) = state.entries.get(&channel_ref) else {
+                    return;
+                };
+                (
+                    Arc::clone(&entry.channel),
+                    Arc::clone(&entry.desired),
+                    entry.desired_revision,
+                )
+            };
+            let outcome = tokio::select! {
+                biased;
+                () = sync.cancellation.cancelled() => ChannelCommandMenuRefreshOutcome::Cancelled,
+                result = tokio::time::timeout(
+                    sync.refresh_timeout,
+                    channel.refresh_command_menu(desired.as_ref()),
+                ) => match result {
+                    Ok(result) => ChannelCommandMenuRefreshOutcome::Completed(result),
+                    Err(_) => ChannelCommandMenuRefreshOutcome::TimedOut,
+                },
+            };
+            let mut log_error = None;
+            let continue_with_latest = {
+                let mut state = sync.state.lock().unwrap_or_else(|error| error.into_inner());
+                let Some(entry) = state.entries.get_mut(&channel_ref) else {
+                    return;
+                };
+                if matches!(outcome, ChannelCommandMenuRefreshOutcome::Cancelled) {
+                    entry.worker_running = false;
+                    entry.retry_pending = true;
+                    entry.retry_not_before = Some((sync.now)() + sync.retry_cooldown);
+                    false
+                } else if entry.desired_revision != revision {
+                    true
+                } else {
+                    entry.worker_running = false;
+                    match outcome {
+                        ChannelCommandMenuRefreshOutcome::Completed(Ok(())) => {
+                            entry.retry_pending = false;
+                            entry.retry_not_before = None;
+                        }
+                        ChannelCommandMenuRefreshOutcome::Completed(Err(error)) => {
+                            entry.retry_pending = true;
+                            entry.retry_not_before = Some((sync.now)() + sync.retry_cooldown);
+                            log_error = Some(zeroclaw_runtime::security::scrub(&error.to_string()));
+                        }
+                        ChannelCommandMenuRefreshOutcome::TimedOut => {
+                            entry.retry_pending = true;
+                            entry.retry_not_before = Some((sync.now)() + sync.retry_cooldown);
+                            log_error = Some(format!(
+                                "command-menu refresh timed out after {:?}",
+                                sync.refresh_timeout
+                            ));
+                        }
+                        ChannelCommandMenuRefreshOutcome::Cancelled => {
+                            unreachable!("cancellation is handled before revision settlement")
+                        }
+                    }
+                    false
+                }
+            };
+            if continue_with_latest {
+                continue;
+            }
+            if let Some(error) = log_error {
+                // A native menu is a discoverability projection owned by the
+                // external transport. Durable policy has already committed,
+                // so failure cannot roll it back or make the stale menu an
+                // authorization source. The entry remains stale and only that
+                // adapter is retried after a bounded cooldown on later ingress.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel": channel_ref,
+                            "error": error,
+                        })),
+                    "Channel command-menu refresh failed; runtime admission remains authoritative"
+                );
+            }
+            return;
+        }
+    });
+}
+
+enum ChannelCommandMenuRefreshOutcome {
+    Completed(anyhow::Result<()>),
+    TimedOut,
+    Cancelled,
+}
+
+#[cfg(test)]
+async fn wait_for_channel_command_menu_sync(ctx: &ChannelRuntimeContext) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let settled = {
+                let state = ctx
+                    .command_menu_sync
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                state.entries.values().all(|entry| !entry.worker_running)
+            };
+            if settled {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("channel command-menu synchronization settles");
+}
+
+#[cfg(test)]
+fn channel_command_menu_sync_state(ctx: &ChannelRuntimeContext) -> Vec<(String, bool, bool)> {
+    let state = ctx
+        .command_menu_sync
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state
+        .entries
+        .iter()
+        .map(|(channel_ref, entry)| {
+            (
+                channel_ref.clone(),
+                entry.worker_running,
+                entry.retry_pending,
+            )
+        })
+        .collect()
+}
+
 async fn finalize_gate_prompts(
     channels: &[Arc<dyn Channel>],
     reference: &str,
@@ -10632,6 +11120,32 @@ async fn enqueue_recovered_goal_continuations(
         recovered_goal_ids,
         pending_by_scope,
     )
+    .await
+}
+
+async fn take_recovered_goal_ids_after_policy_reconciliation(
+    control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
+    config: &Config,
+) -> Result<Vec<String>> {
+    // The recovered-id vector is this boot's only in-memory delivery ownership.
+    // Reconcile durable policy before destructively taking it so a transient
+    // reconciliation failure leaves the complete batch available to the
+    // channel supervisor's next startup attempt.
+    reconcile_recovered_goals_with_current_policy(control_plane, config).await?;
+    Ok(control_plane.take_recovered_goal_ids())
+}
+
+async fn reconcile_recovered_goals_with_current_policy(
+    control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
+    config: &Config,
+) -> Result<Vec<String>> {
+    zeroclaw_runtime::control_plane::with_goal_policy_update_lock(async {
+        zeroclaw_runtime::control_plane::cancel_goals_revoked_by_config(
+            control_plane.goal_store.as_ref(),
+            config,
+        )
+        .await
+    })
     .await
 }
 
@@ -12441,6 +12955,7 @@ fn send_message_to_peer_tool_available(
     if excluded_for_turn
         && ctx
             .non_cli_excluded_tools
+            .base()
             .iter()
             .any(|tool_name| tool_name == "send_message_to_peer")
     {
@@ -14679,6 +15194,15 @@ pub async fn start_channels(
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
     let live_config_override: Arc<Mutex<Option<Arc<LiveConfigOverride>>>> =
         Arc::new(Mutex::new(None));
+    // Every agent context routes through the same channel adapters, so their
+    // native command-menu projection must also have one owner. Independent
+    // synchronizers could replay an older failed projection after another
+    // agent had already applied newer live policy to the same remote menu.
+    let command_menu_sync = Arc::new(ChannelCommandMenuSync::new(
+        cancel.clone(),
+        CHANNEL_COMMAND_MENU_REFRESH_TIMEOUT,
+        CHANNEL_COMMAND_MENU_RETRY_COOLDOWN,
+    ));
 
     for agent_alias in &enabled_agents {
         let agent = config
@@ -14896,8 +15420,10 @@ pub async fn start_channels(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+        // Goal tools remain in the registry as reload-safe capabilities but
+        // never enter the cached startup prompt. The current config generation
+        // appends them only to an authorized turn.
+        let effective_tool_names = channel_startup_effective_tool_names(tools_registry.as_ref());
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
@@ -15207,7 +15733,10 @@ pub async fn start_channels(
             } else {
                 None
             },
-            non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::new(
+                risk_profile.excluded_tools.clone(),
+            )),
+            command_menu_sync: Arc::clone(&command_menu_sync),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),
             model_routes: Arc::new(config.model_routes.clone()),
@@ -15341,9 +15870,12 @@ pub async fn start_channels(
         }
     }
 
-    let recovered_goal_ids = zeroclaw_runtime::control_plane::control_plane()
-        .map(|control_plane| control_plane.take_recovered_goal_ids())
-        .unwrap_or_default();
+    let recovered_goal_ids =
+        if let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() {
+            take_recovered_goal_ids_after_policy_reconciliation(control_plane, &config).await?
+        } else {
+            Vec::new()
+        };
     // Recovery is enqueued before the dispatcher starts. Size the private
     // queue from the exact startup batch so enqueueing never waits for a
     // receiver that has not started yet.
@@ -15796,7 +16328,8 @@ fn concurrent_persist_lock_serialization() {
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-        non_cli_excluded_tools: Arc::new(Vec::new()),
+        non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+        command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
         autonomy_level: AutonomyLevel::default(),
         tool_call_dedup_exempt: Arc::new(Vec::new()),
         model_routes: Arc::new(Vec::new()),
@@ -16328,7 +16861,8 @@ temperature = 0.3
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -17003,7 +17537,8 @@ temperature = 0.3
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -17164,6 +17699,191 @@ temperature = 0.3
             zeroclaw_runtime::control_plane::TaskStatus::Failed
         );
         assert!(task.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_cancels_goal_revoked_by_current_policy_before_enqueue() {
+        let task_id = format!("disabled-goal-recovery-{}", uuid::Uuid::new_v4());
+        let (temp, control_plane, _message) = recovered_goal_pause_failure_fixture(&task_id).await;
+        let disabled = zeroclaw_config::schema::Config::default();
+
+        let cancelled = reconcile_recovered_goals_with_current_policy(&control_plane, &disabled)
+            .await
+            .expect("startup policy reconciliation");
+        assert!(
+            cancelled
+                .iter()
+                .any(|cancelled_id| cancelled_id == &task_id)
+        );
+
+        let ctx = Arc::new(channel_runtime_context_for_defaults_test(
+            temp.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        ));
+        let agent_ctxs = HashMap::from([("main".to_string(), ctx)]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let pending_by_scope: PendingRecoveredGoalsByScope =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        enqueue_recovered_goal_continuations_with_control_plane(
+            &control_plane,
+            &tx,
+            &agent_ctxs,
+            vec![task_id.clone()],
+            &pending_by_scope,
+        )
+        .await
+        .expect("cancelled recovery record is skipped");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            control_plane
+                .store
+                .get(&task_id)
+                .await
+                .expect("read reconciled task")
+                .expect("cancelled goal remains recorded")
+                .status,
+            zeroclaw_runtime::control_plane::TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_retry_retains_ids_when_policy_reconciliation_fails() {
+        use zeroclaw_runtime::control_plane::TaskStatus;
+
+        let temp = tempfile::tempdir().expect("temporary control-plane directory");
+        let authorized_id = format!("authorized-recovery-{}", uuid::Uuid::new_v4());
+        let revoked_id = format!("revoked-recovery-{}", uuid::Uuid::new_v4());
+        let seed_store = zeroclaw_runtime::control_plane::SqliteTaskStore::new(temp.path())
+            .expect("seed recovery store");
+        create_local_policy_goal(&seed_store, &authorized_id, "main", "telegram").await;
+        create_local_policy_goal(&seed_store, &revoked_id, "main", "matrix").await;
+        drop(seed_store);
+
+        let control_plane =
+            zeroclaw_runtime::control_plane::ControlPlaneHandle::start_with_boot_id(
+                temp.path(),
+                "startup-retry-boot".into(),
+                zeroclaw_config::schema::GoalRestartRecovery::LastState,
+            )
+            .await
+            .expect("recover prior-boot goals");
+
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_command_surfaces = vec!["channel".into()];
+        config.goal.allowed_channel_types = vec!["telegram".into()];
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+            channels: vec![
+                zeroclaw_config::providers::ChannelRef::new("telegram.default"),
+                zeroclaw_config::providers::ChannelRef::new("matrix.default"),
+            ],
+            ..Default::default()
+        };
+        agent.goal.enabled = true;
+        config.agents.insert("main".into(), agent);
+        config.channels.telegram.insert(
+            "default".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.matrix.insert(
+            "default".into(),
+            zeroclaw_config::schema::MatrixConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let fault = rusqlite::Connection::open(temp.path().join("control_plane.db"))
+            .expect("open recovery database for failure injection");
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_startup_policy_reconciliation
+                 BEFORE UPDATE ON tasks
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected startup policy reconciliation failure');
+                 END;",
+            )
+            .expect("install reconciliation failure");
+
+        let first_attempt =
+            take_recovered_goal_ids_after_policy_reconciliation(&control_plane, &config).await;
+        assert!(
+            first_attempt.is_err(),
+            "the injected durable cancellation failure must abort startup"
+        );
+        fault
+            .execute_batch("DROP TRIGGER fail_startup_policy_reconciliation;")
+            .expect("remove reconciliation failure");
+
+        let mut recovered_ids =
+            take_recovered_goal_ids_after_policy_reconciliation(&control_plane, &config)
+                .await
+                .expect("supervisor retry retains the complete recovery batch");
+        recovered_ids.sort();
+        let mut expected_ids = vec![authorized_id.clone(), revoked_id.clone()];
+        expected_ids.sort();
+        assert_eq!(recovered_ids, expected_ids);
+
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            temp.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        );
+        ctx.channels_by_name = Arc::new(HashMap::from([(
+            "telegram.default".to_string(),
+            mock_channel("telegram"),
+        )]));
+        let agent_ctxs = HashMap::from([("main".to_string(), Arc::new(ctx))]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let pending_by_scope: PendingRecoveredGoalsByScope =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        enqueue_recovered_goal_continuations_with_control_plane(
+            &control_plane,
+            &tx,
+            &agent_ctxs,
+            recovered_ids,
+            &pending_by_scope,
+        )
+        .await
+        .expect("retry enqueues authorized recovery");
+
+        let recovered = rx.try_recv().expect("authorized goal is enqueued");
+        assert_eq!(recovered.token.task_id, authorized_id);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            control_plane
+                .store
+                .get(&authorized_id)
+                .await
+                .expect("read authorized goal")
+                .expect("authorized goal remains recorded")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            control_plane
+                .store
+                .get(&revoked_id)
+                .await
+                .expect("read revoked goal")
+                .expect("revoked goal remains recorded")
+                .status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -17468,6 +18188,34 @@ temperature = 0.3
             Some("goal-model-start".to_string()),
             "post-loop evaluation must retain the exact task bound inside the model tool scope"
         );
+    }
+
+    #[tokio::test]
+    async fn config_stamp_detects_same_metadata_content_changes() {
+        use std::fs::{File, FileTimes};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(&config_path, b"goal_enabled=true\n")
+            .await
+            .unwrap();
+        let original_modified = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let first = config_file_stamp(&config_path).await.unwrap();
+
+        tokio::fs::write(&config_path, b"goal_enabled=deny\n")
+            .await
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&config_path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        let second = config_file_stamp(&config_path).await.unwrap();
+
+        assert_eq!(first.modified, second.modified);
+        assert_eq!(first.len, second.len);
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
@@ -18260,7 +19008,8 @@ api_key = "anthropic-key"
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -18358,7 +19107,8 @@ api_key = "anthropic-key"
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -18474,7 +19224,8 @@ api_key = "anthropic-key"
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -18594,7 +19345,8 @@ api_key = "anthropic-key"
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -18786,6 +19538,39 @@ api_key = "anthropic-key"
     #[derive(Default)]
     struct TelegramRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
+        command_menus: tokio::sync::Mutex<Vec<Vec<ChannelCommandMenuEntry>>>,
+    }
+
+    struct MenuSyncRecordingChannel {
+        channel_name: &'static str,
+        channel_alias: &'static str,
+        calls: AtomicUsize,
+        failures_remaining: AtomicUsize,
+        block_next_call: AtomicBool,
+        release_call: tokio::sync::Semaphore,
+        completed_menus: tokio::sync::Mutex<Vec<Vec<ChannelCommandMenuEntry>>>,
+    }
+
+    impl MenuSyncRecordingChannel {
+        fn new(channel_name: &'static str, channel_alias: &'static str) -> Self {
+            Self {
+                channel_name,
+                channel_alias,
+                calls: AtomicUsize::new(0),
+                failures_remaining: AtomicUsize::new(0),
+                block_next_call: AtomicBool::new(false),
+                release_call: tokio::sync::Semaphore::new(0),
+                completed_menus: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn block_next_refresh(&self) {
+            self.block_next_call.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_refreshes(&self, count: usize) {
+            self.failures_remaining.store(count, Ordering::SeqCst);
+        }
     }
 
     #[derive(Default)]
@@ -18809,10 +19594,73 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for MenuSyncRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            self.channel_alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for MenuSyncRecordingChannel {
+        fn name(&self) -> &str {
+            self.channel_name
+        }
+
+        async fn refresh_command_menu(
+            &self,
+            commands: &[ChannelCommandMenuEntry],
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.block_next_call.swap(false, Ordering::SeqCst) {
+                self.release_call
+                    .acquire()
+                    .await
+                    .expect("menu-sync test release semaphore remains open")
+                    .forget();
+            }
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("synthetic menu refresh failure");
+            }
+            self.completed_menus.lock().await.push(commands.to_vec());
+            Ok(())
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
             "telegram"
+        }
+
+        async fn refresh_command_menu(
+            &self,
+            commands: &[ChannelCommandMenuEntry],
+        ) -> anyhow::Result<()> {
+            self.command_menus.lock().await.push(commands.to_vec());
+            Ok(())
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -19366,7 +20214,8 @@ api_key = "anthropic-key"
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -21538,7 +22387,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -21618,7 +22468,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -21746,7 +22597,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -21870,7 +22722,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::Full,
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -22030,7 +22883,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             // Match the enabled-test setup so the tool actually runs; the
             // assertion below proves the receipt-block send is gated on
             // `show_receipts_in_response` and not on whether the loop saw
@@ -22161,7 +23015,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::Full,
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -22315,7 +23170,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 matrix: false,
                 whatsapp: false,
             },
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -22455,7 +23311,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -22577,7 +23434,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -22717,7 +23575,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -22881,7 +23740,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -23067,7 +23927,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(model_routes),
@@ -23588,7 +24449,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -23704,7 +24566,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -23831,7 +24694,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24207,7 +25071,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24357,7 +25222,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24520,7 +25386,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24680,7 +25547,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24833,7 +25701,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -24967,7 +25836,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -25087,7 +25957,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -25220,7 +26091,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -25401,7 +26273,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -27483,6 +28356,59 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn missing_control_plane_cannot_publish_disabled_live_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(&config_path, "schema_version = 3\n")
+            .await
+            .unwrap();
+        let stamp = config_file_stamp(&config_path).await.unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agent-a",
+            "openrouter.default",
+            "startup-model",
+        );
+        let cancellation = CancellationToken::new();
+        let in_flight = tokio::sync::Mutex::new(HashMap::from([(
+            "target-scope".into(),
+            InFlightSenderTaskState {
+                task_id: 1,
+                cancellation: cancellation.clone(),
+                completion: Arc::new(InFlightTaskCompletion::new()),
+                goal_task_id: Arc::new(std::sync::Mutex::new(Some("target".into()))),
+                predecessor: None,
+            },
+        )]));
+        let stops: RecoveredGoalRequeueStops = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pending: PendingRecoveredGoalsByScope =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let missing_control_plane = goal_store_for_live_policy_cutover(None)
+            .err()
+            .expect("a live policy cutover without the durable control plane must fail closed");
+
+        let error = apply_goal_policy_cutover(
+            &ctx,
+            &config_path,
+            stamp,
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            &in_flight,
+            &stops,
+            &pending,
+            move |_config| async move { Err(missing_control_plane) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("goal control plane unavailable"));
+        assert!(!cancellation.is_cancelled());
+        assert!(
+            ctx.live_config_override.lock().unwrap().is_none(),
+            "disabled policy cannot publish before durable cancellation is available"
+        );
+    }
+
+    #[tokio::test]
     async fn live_policy_cutover_rejects_a_stale_config_stamp_without_mutation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -27805,12 +28731,504 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn channel_registry_includes_goal_admission_tools() {
+    fn channel_registry_keeps_goal_tools_as_reload_safe_capabilities() {
         assert_eq!(
             CHANNEL_GOAL_ADMISSION_TOOL_POLICY,
             tools::GoalAdmissionToolPolicy::Include,
-            "channel turns need goal tools to consume their trusted per-message admission context"
+            "the static reservoir must retain goal tools so live config can re-enable them"
         );
+    }
+
+    #[test]
+    fn channel_tool_exclusions_precompute_all_visibility_projections() {
+        let exclusions = ChannelToolExclusions::new(vec!["shell".into(), "goal_start".into()]);
+
+        assert_eq!(
+            exclusions.for_turn(true, true),
+            &["shell".to_string(), "goal_start".to_string()]
+        );
+        let restricted_hidden = exclusions.for_turn(true, false);
+        assert!(restricted_hidden.iter().any(|name| name == "shell"));
+        assert!(
+            zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+                .iter()
+                .all(|name| restricted_hidden.iter().any(|excluded| excluded == name))
+        );
+        assert_eq!(
+            restricted_hidden
+                .iter()
+                .filter(|name| name.as_str() == "goal_start")
+                .count(),
+            1,
+            "an already-excluded goal tool is not duplicated"
+        );
+        assert!(exclusions.for_turn(false, true).is_empty());
+        assert!(
+            exclusions
+                .for_turn(false, false)
+                .iter()
+                .all(|name| name != "shell"),
+            "CLI/full autonomy keeps its base policy while hidden goal tools remain hidden"
+        );
+    }
+
+    fn command_menu_test_policy() -> (Config, zeroclaw_config::schema::AliasedAgentConfig) {
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+            channels: vec![zeroclaw_config::providers::ChannelRef::new("telegram.test")],
+            ..Default::default()
+        };
+        agent.goal.enabled = true;
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_command_surfaces = vec!["channel".into()];
+        config.goal.allowed_channel_types = vec!["telegram".into()];
+        config.agents.insert("test-agent".into(), agent.clone());
+        config.channels.telegram.insert(
+            "test".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        (config, agent)
+    }
+
+    #[test]
+    fn live_goal_policy_composes_text_tool_prompt_without_stale_or_duplicate_entries() {
+        let mut tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("shell"))];
+        tools_registry.extend(
+            zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+                .into_iter()
+                .map(|name| Box::new(NamedMockTool(name)) as Box<dyn Tool>),
+        );
+        let startup_names = channel_startup_effective_tool_names(&tools_registry);
+        let startup_prompt = build_tool_instructions_for_names(&tools_registry, &startup_names);
+
+        for goal_tool in zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES {
+            assert!(
+                !startup_prompt.contains(goal_tool),
+                "the cached startup prompt must not advertise live-policy goal tool {goal_tool}"
+            );
+        }
+
+        let mut disabled_prompt = startup_prompt.clone();
+        append_goal_text_tool_instructions_for_turn(
+            &mut disabled_prompt,
+            &tools_registry,
+            false,
+            false,
+            false,
+        );
+        for goal_tool in zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES {
+            assert!(!disabled_prompt.contains(goal_tool));
+        }
+
+        let mut enabled_prompt = startup_prompt;
+        append_goal_text_tool_instructions_for_turn(
+            &mut enabled_prompt,
+            &tools_registry,
+            true,
+            false,
+            false,
+        );
+        for goal_tool in zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES {
+            let entry = format!("**{goal_tool}**:");
+            assert_eq!(
+                enabled_prompt.matches(&entry).count(),
+                1,
+                "authorized text-tool turns advertise {goal_tool} exactly once"
+            );
+        }
+        assert_eq!(
+            enabled_prompt.matches("## Tool Use Protocol").count(),
+            1,
+            "the live goal projection extends the existing text protocol"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_goal_policy_drives_tool_exclusion_and_command_menu_from_one_projection() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (enabled, agent) = command_menu_test_policy();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            enabled.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let msg = ChannelMessage {
+            channel: "telegram".into(),
+            channel_alias: Some("test".into()),
+            ..Default::default()
+        };
+
+        assert!(goal_commands_available_for_message(&ctx, &msg, &enabled));
+        let enabled_exclusions = excluded_tools_for_channel_turn(&ctx, &msg, true);
+        assert!(
+            zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+                .iter()
+                .all(|name| !enabled_exclusions.iter().any(|excluded| excluded == name))
+        );
+        publish_channel_command_menus(&ctx, &enabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+
+        let mut disabled = enabled.clone();
+        disabled.goal.enabled = false;
+        assert!(!goal_commands_available_for_message(&ctx, &msg, &disabled));
+        let disabled_exclusions = excluded_tools_for_channel_turn(&ctx, &msg, false);
+        assert!(
+            zeroclaw_runtime::tools::GOAL_ADMISSION_TOOL_NAMES
+                .iter()
+                .all(|name| disabled_exclusions.iter().any(|excluded| excluded == name)),
+            "the same per-turn exclusions filter native schemas and execution"
+        );
+        publish_channel_command_menus(&ctx, &disabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        publish_channel_command_menus(&ctx, &enabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+
+        let menus = channel_impl.command_menus.lock().await;
+        assert_eq!(menus.len(), 3);
+        assert!(menus[0].iter().any(|entry| entry.name == "goal"));
+        assert!(menus[1].iter().all(|entry| entry.name != "goal"));
+        assert!(
+            menus[2].iter().any(|entry| entry.name == "goal"),
+            "re-enabling policy affects later admissions without reviving old goals"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_is_non_blocking_and_latest_projection_wins() {
+        let channel_impl = Arc::new(MenuSyncRecordingChannel::new("telegram", "test"));
+        channel_impl.block_next_refresh();
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (enabled, agent) = command_menu_test_policy();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            enabled.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+
+        publish_channel_command_menus(&ctx, &enabled);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while channel_impl.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first remote menu refresh starts");
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .any(|(_channel, running, _pending)| *running)
+        );
+
+        let mut disabled = enabled.clone();
+        disabled.goal.enabled = false;
+        publish_channel_command_menus(&ctx, &disabled);
+        channel_impl.release_call.add_permits(1);
+        wait_for_channel_command_menu_sync(&ctx).await;
+
+        let completed = channel_impl.completed_menus.lock().await;
+        assert_eq!(completed.len(), 2);
+        assert!(completed[0].iter().any(|entry| entry.name == "goal"));
+        assert!(completed[1].iter().all(|entry| entry.name != "goal"));
+        drop(completed);
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && !pending)
+        );
+
+        publish_channel_command_menus(&ctx, &disabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(channel_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_cools_down_only_the_stale_adapter() {
+        let failing = Arc::new(MenuSyncRecordingChannel::new("telegram", "first"));
+        failing.fail_refreshes(1);
+        let healthy = Arc::new(MenuSyncRecordingChannel::new("telegram", "second"));
+        let first_channel: Arc<dyn Channel> = failing.clone();
+        let second_channel: Arc<dyn Channel> = healthy.clone();
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+            channels: vec![
+                zeroclaw_config::providers::ChannelRef::new("telegram.first"),
+                zeroclaw_config::providers::ChannelRef::new("telegram.second"),
+            ],
+            ..Default::default()
+        };
+        agent.goal.enabled = true;
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_command_surfaces = vec!["channel".into()];
+        config.goal.allowed_channel_types = vec!["telegram".into()];
+        config.agents.insert("test-agent".into(), agent.clone());
+        for alias in ["first", "second"] {
+            config.channels.telegram.insert(
+                alias.into(),
+                zeroclaw_config::schema::TelegramConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            first_channel.clone(),
+            Arc::new(DummyModelProvider),
+            config.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::get_mut(&mut ctx).expect("test owns the only runtime-context Arc");
+        runtime_ctx.channels_by_name = Arc::new(HashMap::from([
+            ("telegram.first".into(), first_channel),
+            ("telegram.second".into(), second_channel),
+        ]));
+        let elapsed_secs = Arc::new(AtomicUsize::new(0));
+        let clock_elapsed = Arc::clone(&elapsed_secs);
+        let clock_base = Instant::now();
+        runtime_ctx.command_menu_sync = Arc::new(ChannelCommandMenuSync::new_with_clock(
+            CancellationToken::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            Arc::new(move || {
+                clock_base + Duration::from_secs(clock_elapsed.load(Ordering::SeqCst) as u64)
+            }),
+        ));
+
+        publish_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(failing.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .any(|(channel, _running, pending)| channel == "telegram.first" && *pending)
+        );
+
+        initialize_or_retry_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        initialize_or_retry_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(
+            failing.calls.load(Ordering::SeqCst),
+            1,
+            "repeated ingress inside the cooldown does not hammer the stale adapter"
+        );
+        assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
+
+        elapsed_secs.store(10, Ordering::SeqCst);
+        initialize_or_retry_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(failing.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && !pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_new_revision_bypasses_retry_cooldown() {
+        let channel_impl = Arc::new(MenuSyncRecordingChannel::new("telegram", "test"));
+        channel_impl.fail_refreshes(1);
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (enabled, agent) = command_menu_test_policy();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            enabled.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime-context Arc")
+            .command_menu_sync = Arc::new(ChannelCommandMenuSync::new(
+            CancellationToken::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ));
+
+        publish_channel_command_menus(&ctx, &enabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(channel_impl.calls.load(Ordering::SeqCst), 1);
+
+        let mut disabled = enabled;
+        disabled.goal.enabled = false;
+        publish_channel_command_menus(&ctx, &disabled);
+        wait_for_channel_command_menu_sync(&ctx).await;
+
+        assert_eq!(
+            channel_impl.calls.load(Ordering::SeqCst),
+            2,
+            "new policy revisions are not delayed by an older failure cooldown"
+        );
+        let completed = channel_impl.completed_menus.lock().await;
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].iter().all(|entry| entry.name != "goal"));
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_shares_latest_projection_across_agent_contexts() {
+        let channel_impl = Arc::new(MenuSyncRecordingChannel::new("telegram", "test"));
+        channel_impl.fail_refreshes(2);
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (enabled, agent) = command_menu_test_policy();
+        let mut first_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::clone(&channel),
+            Arc::new(DummyModelProvider),
+            enabled.clone(),
+            agent.clone(),
+            "test-provider",
+            None,
+        );
+        let mut second_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            enabled.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let shared_sync = Arc::new(ChannelCommandMenuSync::new(
+            CancellationToken::new(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+        ));
+        Arc::get_mut(&mut first_ctx)
+            .expect("test owns the first runtime-context Arc")
+            .command_menu_sync = Arc::clone(&shared_sync);
+        Arc::get_mut(&mut second_ctx)
+            .expect("test owns the second runtime-context Arc")
+            .command_menu_sync = shared_sync;
+
+        publish_channel_command_menus(&second_ctx, &enabled);
+        wait_for_channel_command_menu_sync(&second_ctx).await;
+
+        let mut disabled = enabled.clone();
+        disabled.goal.enabled = false;
+        publish_channel_command_menus(&first_ctx, &disabled);
+        wait_for_channel_command_menu_sync(&first_ctx).await;
+
+        initialize_or_retry_channel_command_menus(&second_ctx, &disabled);
+        wait_for_channel_command_menu_sync(&second_ctx).await;
+
+        assert_eq!(channel_impl.calls.load(Ordering::SeqCst), 3);
+        let completed = channel_impl.completed_menus.lock().await;
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].iter().all(|entry| entry.name != "goal"));
+        assert!(
+            channel_command_menu_sync_state(&first_ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && !pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_timeout_leaves_adapter_retryable() {
+        let channel_impl = Arc::new(MenuSyncRecordingChannel::new("telegram", "test"));
+        channel_impl.block_next_refresh();
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (config, agent) = command_menu_test_policy();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime-context Arc")
+            .command_menu_sync = Arc::new(ChannelCommandMenuSync::new(
+            CancellationToken::new(),
+            Duration::from_millis(10),
+            Duration::ZERO,
+        ));
+
+        publish_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(channel_impl.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && *pending)
+        );
+
+        initialize_or_retry_channel_command_menus(&ctx, &config);
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert_eq!(channel_impl.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && !pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_menu_sync_cancellation_releases_detached_worker_ownership() {
+        let channel_impl = Arc::new(MenuSyncRecordingChannel::new("telegram", "test"));
+        channel_impl.block_next_refresh();
+        let weak_channel = Arc::downgrade(&channel_impl);
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (config, agent) = command_menu_test_policy();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config.clone(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let cancellation = CancellationToken::new();
+        let sync = Arc::new(ChannelCommandMenuSync::new(
+            cancellation.clone(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+        ));
+        let weak_sync = Arc::downgrade(&sync);
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime-context Arc")
+            .command_menu_sync = Arc::clone(&sync);
+
+        publish_channel_command_menus(&ctx, &config);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while channel_impl.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked remote projection starts");
+        drop(sync);
+        drop(channel_impl);
+
+        cancellation.cancel();
+        wait_for_channel_command_menu_sync(&ctx).await;
+        assert!(
+            channel_command_menu_sync_state(&ctx)
+                .iter()
+                .all(|(_channel, running, pending)| !running && *pending)
+        );
+        drop(ctx);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak_sync.upgrade().is_some() || weak_channel.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled worker releases the synchronizer and adapter");
     }
 
     #[test]
@@ -29036,7 +30454,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -29211,7 +30630,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -29613,7 +31033,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -30152,7 +31573,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -30310,7 +31732,8 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -32069,7 +33492,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -32191,7 +33615,8 @@ This is an example JSON object for profile settings."#;
                 transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
                 agent_transcription_provider: String::new(),
                 hooks: None,
-                non_cli_excluded_tools: Arc::new(Vec::new()),
+                non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+                command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
                 autonomy_level: AutonomyLevel::default(),
                 tool_call_dedup_exempt: Arc::new(Vec::new()),
                 model_routes: Arc::new(Vec::new()),
@@ -32361,7 +33786,8 @@ This is an example JSON object for profile settings."#;
                 },
                 multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
                 hooks: None,
-                non_cli_excluded_tools: Arc::new(Vec::new()),
+                non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+                command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
                 autonomy_level: AutonomyLevel::default(),
                 tool_call_dedup_exempt: Arc::new(Vec::new()),
                 model_routes: Arc::new(Vec::new()),
@@ -32608,7 +34034,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(model_routes),
@@ -32768,7 +34195,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(model_routes),
@@ -32920,7 +34348,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(model_routes),
@@ -33092,7 +34521,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(model_routes),
@@ -33710,7 +35140,8 @@ This is an example JSON object for profile settings."#;
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(ChannelToolExclusions::default()),
+            command_menu_sync: Arc::new(ChannelCommandMenuSync::default()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),

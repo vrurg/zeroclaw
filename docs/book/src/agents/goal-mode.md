@@ -89,6 +89,13 @@ active. It also revokes live and queued continuation ownership. While the scope
 is disabled, every `/goal` command is rejected; re-enabling the scope can start
 new goals but cannot revive the cancelled records.
 
+The same live policy controls command discovery. Subsequent turns do not expose
+the `goal_start`, `goal_objective`, or `goal_resume` model tools while their
+exact channel scope is disabled. Channels with a native command menu receive a
+best-effort refresh that removes `/goal`; if the remote service rejects that
+refresh, the stale menu remains display-only and runtime admission still
+rejects the command. A later inbound message retries the remote refresh.
+
 `channel_status_updates` controls extra in-channel goal state/status messages
 emitted by goal admission inside an agent turn, such as a model-initiated
 `goal_start`, controller transitions, and verifier progress. When the channel
@@ -123,11 +130,13 @@ still derived from the usage ledger. If a budget-paused goal becomes eligible
 after a budget update, the controller resumes it through the same trusted
 continuation path instead of only flipping its lifecycle state.
 
-The model-facing `goal_start`, `goal_objective`, and `goal_resume` tools are
-registered only for tool loops that have trusted goal admission context.
-General CLI, gateway, and tool-listing registries do not advertise them yet. If
-those surfaces grow a trusted admission context later, they can opt in
-explicitly.
+The channel runtime retains the model-facing `goal_start`, `goal_objective`, and
+`goal_resume` tools in its internal capability registry so a later live
+configuration can re-enable them without restarting the daemon. Each turn
+filters their native schemas, text-tool instructions, and execution from the
+current trusted channel policy. General CLI, gateway, and tool-listing
+registries do not advertise them yet. If those surfaces grow a trusted
+admission context later, they can opt in explicitly.
 
 ## Lifecycle
 

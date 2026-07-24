@@ -1645,6 +1645,40 @@ fn ensure_goal_admitted_by_config(
     Ok(())
 }
 
+/// Whether live policy exposes goal commands on one exact channel.
+///
+/// This is the display/tool-schema projection of the same gates enforced by
+/// [`ensure_goal_admitted_by_config`]. It deliberately excludes principal and
+/// route facts because visibility is shared by everyone on the configured
+/// channel; invocation still revalidates the full trusted admission context.
+#[must_use]
+pub fn goal_commands_available_on_channel(
+    config: &Config,
+    agent_alias: &str,
+    channel_type: &str,
+    channel_alias: &str,
+) -> bool {
+    if !config.goal.enabled {
+        return false;
+    }
+    let Some(agent) = config.agent(agent_alias) else {
+        return false;
+    };
+    agent.enabled
+        && agent.goal.enabled
+        && config
+            .goal
+            .allowed_command_surfaces
+            .iter()
+            .any(|surface| surface.trim() == CommandSurface::Channel.as_str())
+        && config
+            .goal
+            .allowed_channel_types
+            .iter()
+            .any(|allowed| allowed.trim() == channel_type.trim())
+        && config.enabled_channel_owned_by_agent(agent_alias, channel_type, channel_alias)
+}
+
 fn goal_channel_binding_is_allowed(
     agent_alias: &str,
     channel_type: &str,

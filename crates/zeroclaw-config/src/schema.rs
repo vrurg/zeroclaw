@@ -4563,12 +4563,10 @@ impl Config {
         if channel_type.is_empty() || channel_alias.is_empty() {
             return false;
         }
-        let configured_and_enabled = self.channels_by_alias().into_iter().any(|channel| {
-            channel.enabled
-                && channel.channel_type == channel_type
-                && channel.alias == channel_alias
-        });
-        if !configured_and_enabled {
+        if !self
+            .channels
+            .exact_channel_enabled(channel_type, channel_alias)
+        {
             return false;
         }
 
@@ -13354,6 +13352,58 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
+    /// Resolve one exact canonical channel key without reflecting the whole
+    /// configuration. Runtime admission calls this for every inbound message,
+    /// so the administrative schema walk in `Config::channels_by_alias` would
+    /// be both broader and substantially more expensive than the lookup.
+    fn exact_channel_enabled(&self, channel_type: &str, alias: &str) -> bool {
+        macro_rules! enabled {
+            ($field:ident) => {
+                self.$field.get(alias).is_some_and(|config| config.enabled)
+            };
+        }
+
+        match channel_type {
+            "telegram" => enabled!(telegram),
+            "discord" => enabled!(discord),
+            "slack" => enabled!(slack),
+            "mattermost" => enabled!(mattermost),
+            "webhook" => enabled!(webhook),
+            "imessage" => enabled!(imessage),
+            "matrix" => enabled!(matrix),
+            "signal" => enabled!(signal),
+            "whatsapp" => enabled!(whatsapp),
+            "linq" => enabled!(linq),
+            "wati" => enabled!(wati),
+            "nextcloud_talk" => enabled!(nextcloud_talk),
+            "email" => enabled!(email),
+            "gmail_push" => enabled!(gmail_push),
+            "irc" => enabled!(irc),
+            "twitch" => enabled!(twitch),
+            "lark" => enabled!(lark),
+            "line" => enabled!(line),
+            "dingtalk" => enabled!(dingtalk),
+            "wecom" => enabled!(wecom),
+            "wecom_ws" => enabled!(wecom_ws),
+            "wechat" => enabled!(wechat),
+            "qq" => enabled!(qq),
+            "twitter" => enabled!(twitter),
+            "mochat" => enabled!(mochat),
+            "nostr" => enabled!(nostr),
+            "clawdtalk" => enabled!(clawdtalk),
+            "reddit" => enabled!(reddit),
+            "bluesky" => enabled!(bluesky),
+            "git" => enabled!(git),
+            "voice_call" => enabled!(voice_call),
+            "voice_wake" => enabled!(voice_wake),
+            "voice_duplex" => enabled!(voice_duplex),
+            "mqtt" => enabled!(mqtt),
+            "amqp" => enabled!(amqp),
+            "filesystem" => enabled!(filesystem),
+            _ => false,
+        }
+    }
+
     /// Returns metadata and configuration status for every known channel type.
     ///
     /// Always returns the full set of channel types regardless of compile-time
@@ -22560,6 +22610,62 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn exact_channel_admission_preserves_owner_and_enabled_semantics() {
+        let mut config = super::Config::default();
+        config.channels.telegram.insert(
+            "work".into(),
+            super::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        for alias in ["alpha", "omega"] {
+            config.agents.insert(
+                alias.into(),
+                super::AliasedAgentConfig {
+                    channels: vec![crate::providers::ChannelRef::new("telegram.work")],
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(config.enabled_channel_owned_by_agent("omega", " telegram ", " work "));
+        assert!(
+            !config.enabled_channel_owned_by_agent("alpha", "telegram", "work"),
+            "the lexicographically later exact owner wins collisions"
+        );
+        assert!(!config.enabled_channel_owned_by_agent("omega", "telegram", "missing"));
+
+        config
+            .channels
+            .telegram
+            .get_mut("work")
+            .expect("test channel exists")
+            .enabled = false;
+        assert!(!config.enabled_channel_owned_by_agent("omega", "telegram", "work"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn exact_channel_admission_preserves_legacy_owner_fallback() {
+        let mut config = super::Config::default();
+        config.channels.voice_call.insert(
+            "desk".into(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .insert("alpha".into(), super::AliasedAgentConfig::default());
+
+        assert!(config.enabled_channel_owned_by_agent("alpha", "voice_call", "desk"));
+        assert!(
+            !config.enabled_channel_owned_by_agent("alpha", "voice-call", "desk"),
+            "runtime admission accepts the canonical configured channel type"
+        );
+    }
 
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {
