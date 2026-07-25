@@ -127,9 +127,8 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_entries_for_names, build_tool_instructions_for_names, clear_model_switch_request,
-    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_session_key,
-    scope_thread_id, scrub_credentials,
+    build_tool_entries_for_names, build_tool_instructions_for_names, is_model_switch_requested,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -18323,10 +18322,6 @@ api_key = "anthropic-key"
     /// `AgentStart` (before the LLM request) and one `AgentEnd` (last),
     /// all sharing one `turn_id` and carrying the channel + agent alias.
     async fn assert_process_channel_message_brackets_turn_with_agent_start_and_agent_end() {
-        // The exactly-one-AgentStart assertion is sensitive to a leaked
-        // process-wide model-switch request (the switch retry emits an
-        // extra re-attributing AgentStart), so serialize on the guard.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -18399,8 +18394,6 @@ api_key = "anthropic-key"
     /// An erroring LLM turn must still close its bracket: one `AgentStart`
     /// and one `AgentEnd`, same `turn_id`.
     async fn assert_process_channel_message_emits_brackets_when_llm_errors() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
@@ -18441,8 +18434,6 @@ api_key = "anthropic-key"
     /// turn cannot wedge an "agent in flight" indicator with an unmatched
     /// `AgentStart`.
     async fn assert_process_channel_message_emits_brackets_when_cancelled_mid_turn() {
-        // See the guard note on the success-turn bracket test.
-        let _guard = model_switch_test_guard().lock().await;
         let token = CancellationToken::new();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -22153,11 +22144,6 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     async fn assert_model_switch_persists_route_credential() {
-        // Serialize on the process-wide model-switch state so this test
-        // doesn't race other tests that also touch the same static.
-        let _guard = model_switch_test_guard().lock().await;
-        clear_model_switch_request();
-
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -29624,13 +29610,6 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     async fn assert_process_channel_message_persists_image_payload_verbatim() {
-        // `calls.len() == 1` below is sensitive to a leaked process-wide
-        // model-switch request (a pending request makes this turn
-        // short-circuit and retry, doubling the provider calls), so
-        // serialize on the shared guard. Observed colliding with
-        // `process_channel_message_persists_model_switch_with_route_credential`
-        // in parallel runs.
-        let _guard = model_switch_test_guard().lock().await;
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
