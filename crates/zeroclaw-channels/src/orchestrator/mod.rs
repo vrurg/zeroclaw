@@ -18533,8 +18533,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
     }
 
-    #[tokio::test]
-    async fn message_dispatch_processes_messages_in_parallel() {
+    async fn assert_message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18679,8 +18678,14 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent_messages.len(), 2);
     }
 
-    #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+    #[test]
+    fn message_dispatch_processes_messages_in_parallel() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_message_dispatch_processes_messages_in_parallel())
+        });
+    }
+
+    async fn assert_message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18838,8 +18843,17 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
+    #[test]
+    fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context(
+                ),
+            )
+        });
+    }
+
+    async fn assert_message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
         let channel_impl = Arc::new(SlackRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -18997,8 +19011,16 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
+    #[test]
+    fn message_dispatch_interrupts_in_flight_slack_request_and_preserves_context() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_message_dispatch_interrupts_in_flight_slack_request_and_preserves_context(),
+            )
+        });
+    }
+
+    async fn assert_message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
         let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19155,8 +19177,17 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    #[tokio::test]
-    async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
+    #[test]
+    fn message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
+        run_channel_dispatch_test(|| {
+            Box::pin(
+                assert_message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context(
+                ),
+            )
+        });
+    }
+
+    async fn assert_message_dispatch_interrupt_scope_is_same_sender_same_chat() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -19287,6 +19318,13 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent_messages.len(), 2);
         assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-1:")));
         assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-2:")));
+    }
+
+    #[test]
+    fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_message_dispatch_interrupt_scope_is_same_sender_same_chat())
+        });
     }
 
     async fn assert_process_channel_message_cancels_scoped_typing_task() {
@@ -24854,8 +24892,7 @@ This is an example JSON object for profile settings."#;
         assert!(cleaned.contains("look at") && cleaned.contains("please"));
     }
 
-    #[tokio::test]
-    async fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
+    async fn assert_media_pipeline_preserves_image_bytes_when_vision_route_configured() {
         use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -24970,6 +25007,13 @@ This is an example JSON object for profile settings."#;
                 .contains("data:image/png;base64,AQIDBA=="),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
+    }
+
+    #[test]
+    fn media_pipeline_preserves_image_bytes_when_vision_route_configured() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_media_pipeline_preserves_image_bytes_when_vision_route_configured())
+        });
     }
 
     async fn assert_e2e_photo_attachment_rejected_by_non_vision_provider() {
@@ -26565,8 +26609,7 @@ This is an example JSON object for profile settings."#;
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
 
-    #[tokio::test]
-    async fn message_dispatch_different_threads_do_not_cancel_each_other() {
+    async fn assert_message_dispatch_different_threads_do_not_cancel_each_other() {
         let channel_impl = Arc::new(SlackRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -26702,6 +26745,13 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[test]
+    fn message_dispatch_different_threads_do_not_cancel_each_other() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_message_dispatch_different_threads_do_not_cancel_each_other())
+        });
     }
 
     #[test]
