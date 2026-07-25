@@ -4348,79 +4348,83 @@ mod tests {
 
         #[test]
         fn addressed_runtime_command_strips_localpart_alias() {
-            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            let bot = user_id!("@goal-bot:example.test");
             assert_eq!(
-                strip_leading_command_address(bot, None, "@zc-architect /goal status"),
+                strip_leading_command_address(bot, None, "@goal-bot /goal status"),
                 Some("/goal status")
             );
             assert_eq!(
-                strip_leading_command_address(bot, None, "@zc-architect: /goal start ship it"),
+                strip_leading_command_address(bot, None, "@goal-bot: /goal start ship it"),
                 Some("/goal start ship it")
             );
             assert_eq!(
-                strip_leading_command_address(bot, None, "@zc-architect: /goal@ status"),
+                strip_leading_command_address(bot, None, "@goal-bot: /goal@ status"),
                 Some("/goal@ status")
             );
         }
 
         #[test]
         fn addressed_runtime_command_strips_full_mxid_and_display_name() {
-            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            let bot = user_id!("@goal-bot:example.test");
             assert_eq!(
                 strip_leading_command_address(
                     bot,
-                    Some("Architect"),
-                    "@zc-architect:crayfish.lflat.org: /goal status"
+                    Some("ZeroClaw-Bot"),
+                    "@goal-bot:example.test: /goal status"
                 ),
-                Some("/goal status")
-            );
-            assert_eq!(
-                strip_leading_command_address(bot, Some("Architect"), "@architect /goal status"),
                 Some("/goal status")
             );
             assert_eq!(
                 strip_leading_command_address(
                     bot,
-                    Some("Task Orchestrator"),
-                    "Task Orchestrator: /goal status"
+                    Some("ZeroClaw-Bot"),
+                    "@zeroclaw-bot /goal status"
                 ),
                 Some("/goal status")
             );
             assert_eq!(
-                strip_leading_command_address(bot, Some("Кіготь"), "@Кіготь /goal status"),
+                strip_leading_command_address(
+                    bot,
+                    Some("ZeroClaw Goal Bot"),
+                    "ZeroClaw Goal Bot: /goal status"
+                ),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("ZeroClaw-Помічник"),
+                    "@ZeroClaw-Помічник /goal status"
+                ),
                 Some("/goal status")
             );
         }
 
         #[test]
         fn addressed_runtime_command_does_not_strip_non_commands_or_other_mentions() {
-            let bot = user_id!("@zc-architect:crayfish.lflat.org");
+            let bot = user_id!("@goal-bot:example.test");
             assert_eq!(
-                strip_leading_command_address(bot, Some("Architect"), "@zc-architect hello /goal"),
+                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot hello /goal"),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot-helper: /goal"),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@other: /goal status"),
                 None
             );
             assert_eq!(
                 strip_leading_command_address(
                     bot,
-                    Some("Architect"),
-                    "@zc-architect-helper: /goal"
+                    Some("ZeroClaw-Bot"),
+                    "@goal-bot /weather today"
                 ),
                 None
             );
             assert_eq!(
-                strip_leading_command_address(bot, Some("Architect"), "@other: /goal status"),
-                None
-            );
-            assert_eq!(
-                strip_leading_command_address(
-                    bot,
-                    Some("Architect"),
-                    "@zc-architect /weather today"
-                ),
-                None
-            );
-            assert_eq!(
-                strip_leading_command_address(bot, Some("Architect"), "@zc-architect /help"),
+                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot /help"),
                 None
             );
         }
