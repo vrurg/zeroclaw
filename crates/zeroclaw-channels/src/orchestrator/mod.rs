@@ -23306,6 +23306,9 @@ BTC is currently around $65,000 based on latest tool output."#
     #[test]
     fn initial_recovery_backlog_is_not_limited_by_listener_queue_capacity() {
         run_channel_dispatch_test(|| async {
+            let _goal_test_guard = acquire_goal_control_plane_test_guard().await;
+            ensure_test_control_plane().await;
+
             let channel_impl = Arc::new(RecordingChannel::default());
             let channel: Arc<dyn Channel> = channel_impl.clone();
             let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
@@ -31449,8 +31452,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+    async fn assert_e2e_photo_attachment_rejected_by_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -31571,6 +31573,13 @@ This is an example JSON object for profile settings."#;
             "reply must start with error prefix, got: {}",
             sent[0]
         );
+    }
+
+    #[test]
+    fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_e2e_photo_attachment_rejected_by_non_vision_provider())
+        });
     }
 
     async fn assert_e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
