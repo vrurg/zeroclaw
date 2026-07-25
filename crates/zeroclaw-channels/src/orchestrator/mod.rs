@@ -12564,7 +12564,7 @@ fn concurrent_persist_lock_serialization() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
@@ -15678,6 +15678,22 @@ api_key = "anthropic-key"
             hooks,
             Arc::new(NoopObserver),
         )
+    }
+
+    pub(crate) async fn process_message_with_dummy_provider(
+        channel: Arc<dyn Channel>,
+        msg: zeroclaw_api::channel::ChannelMessage,
+        prompt_config: zeroclaw_config::schema::Config,
+    ) {
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
     }
 
     fn test_runtime_ctx_with_observer(

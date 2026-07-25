@@ -2252,6 +2252,16 @@ mod inbound {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) async fn handle_message_for_test(
+        ctx: HandlerCtx,
+        ev: OriginalSyncRoomMessageEvent,
+        room: Room,
+        raw: RawEvent,
+    ) -> anyhow::Result<()> {
+        handle_message(ctx, ev, room, raw).await
+    }
+
     async fn is_group_room(room: &Room) -> bool {
         !matches!(room.is_direct().await, Ok(true))
     }
@@ -4896,6 +4906,235 @@ mod tests {
                 .remove_reaction("bad-room", "bad-event", "✅")
                 .await
                 .expect("ack-disabled reaction removal should be a no-op");
+        }
+    }
+
+    mod user_boundary {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{owned_room_id, owned_user_id};
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{Config, MatrixConfig, MatrixStreamMode};
+
+        use super::super::{MatrixChannel, inbound};
+
+        #[tokio::test]
+        async fn matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            let server = MockServer::start().await;
+            let room_id = owned_room_id!("!room:server");
+            let bot_user_id = owned_user_id!("@bot:server");
+            let sender = "@alice:server";
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id.as_str(): {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": []
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
+                .and(body_partial_json(serde_json::json!({ "typing": true })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
+                .and(body_partial_json(serde_json::json!({ "typing": false })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "..." })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$draft:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$redaction:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "ok" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let matrix_config = MatrixConfig {
+                homeserver: server.uri(),
+                access_token: Some("secret-token".to_string()),
+                user_id: Some(bot_user_id.to_string()),
+                device_id: Some("DEVICE".to_string()),
+                allowed_rooms: vec![room_id.to_string()],
+                stream_mode: MatrixStreamMode::SingleMessage,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = Arc::new(
+                MatrixChannel::new(
+                    matrix_config.clone(),
+                    "single",
+                    Arc::new(move || vec![sender.to_string()]),
+                    state_dir.path().to_path_buf(),
+                )
+                .expect("matrix channel"),
+            );
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates joined room");
+            let room = client.get_room(&room_id).expect("joined room");
+
+            let event_json = serde_json::json!({
+                "type": "m.room.message",
+                "sender": sender,
+                "event_id": "$inbound:server",
+                "origin_server_ts": 1,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello"
+                }
+            });
+            let event: OriginalSyncRoomMessageEvent =
+                serde_json::from_value(event_json.clone()).expect("Matrix room-message event");
+            let raw: Raw<serde_json::Value> = Raw::new(&event_json).expect("raw Matrix event");
+            let (tx, mut rx) = mpsc::channel(1);
+            let handler_ctx = inbound::HandlerCtx {
+                config: Arc::clone(&channel.config),
+                alias: channel.alias.clone(),
+                peer_resolver: Arc::clone(&channel.peer_resolver),
+                transcription: channel.transcription.clone(),
+                workspace_dir: channel.workspace_dir.clone(),
+                tx,
+                pending_approvals: Arc::clone(&channel.pending_approvals),
+                threads_seen: Arc::clone(&channel.threads_seen),
+                bot_user_id: bot_user_id.clone(),
+                bot_display_name: Arc::clone(&channel.bot_display_name),
+                initial_sync_done: Arc::clone(&channel.initial_sync_done),
+                undecryptable_seen: Arc::clone(&channel.undecryptable_seen),
+            };
+            inbound::handle_message_for_test(handler_ctx, event, room, RawEvent(raw.into_json()))
+                .await
+                .expect("Matrix inbound adapter accepts event");
+            let message = rx.recv().await.expect("adapter forwards channel message");
+
+            assert_eq!(message.content, "hello");
+            assert_eq!(message.sender, sender);
+            assert_eq!(message.reply_target, room_id.as_str());
+            assert_eq!(message.channel_alias.as_deref(), Some("single"));
+
+            let mut config = Config::default();
+            config
+                .channels
+                .matrix
+                .insert("single".to_string(), matrix_config);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::orchestrator::tests::process_message_with_dummy_provider(
+                    channel as Arc<dyn Channel>,
+                    message,
+                    config,
+                ),
+            )
+            .await
+            .expect("Matrix inbound-to-outbound dispatch completes");
         }
     }
 
