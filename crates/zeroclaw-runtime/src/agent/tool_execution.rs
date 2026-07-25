@@ -1074,6 +1074,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 leak_detection: Some(&leak_detection),
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
