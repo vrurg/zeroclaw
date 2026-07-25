@@ -1,6 +1,7 @@
 //! Tool execution helpers extracted from `loop_`.
 
 use anyhow::Result;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -13,7 +14,10 @@ use zeroclaw_config::schema::LeakDetectionConfig;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
-use super::turn::{TurnMeta, redact::scrub_credentials_value_with_config};
+use super::turn::{
+    ModelSwitchCallback, TurnMeta, redact::scrub_credentials_value_with_config,
+    scope_model_switch_state,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -58,6 +62,7 @@ pub(crate) struct ToolDispatchContext<'a> {
     /// model-loop history. `None` is reserved for configless test/subturn
     /// callers and uses the secure default policy.
     pub leak_detection: Option<&'a LeakDetectionConfig>,
+    pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
 pub(crate) fn scrub_tool_arguments_for_presentation(
@@ -300,14 +305,21 @@ pub(crate) async fn execute_one_tool(
     let tool_future = tool
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+    let execute = async {
+        if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                result = tool_future => Ok(result),
+            }
+        } else {
+            Ok(tool_future.await)
         }
-    } else {
-        tool_future.await
     };
+    let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
+        scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
+    } else {
+        execute.await
+    }?;
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -823,6 +835,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 leak_detection: None,
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
@@ -853,6 +866,7 @@ mod tests {
             activated_tools: None,
             excluded_tools: &[],
             leak_detection: None,
+            model_switch_callback: None,
         };
         let meta = super::super::turn::TurnMeta {
             channel_name: "test",
@@ -909,6 +923,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 leak_detection: Some(&leak_detection),
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
@@ -982,6 +997,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 leak_detection: None,
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
@@ -1038,6 +1054,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 leak_detection: None,
+                model_switch_callback: None,
             },
             &meta,
             &NoopObserver,
