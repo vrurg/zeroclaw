@@ -33480,8 +33480,7 @@ This is an example JSON object for profile settings."#;
         );
     }
 
-    #[tokio::test]
-    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+    async fn assert_e2e_photo_attachment_rejected_by_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -33601,6 +33600,13 @@ This is an example JSON object for profile settings."#;
             "reply must start with error prefix, got: {}",
             sent[0]
         );
+    }
+
+    #[test]
+    fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_e2e_photo_attachment_rejected_by_non_vision_provider())
+        });
     }
 
     async fn assert_e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
