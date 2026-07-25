@@ -1458,9 +1458,17 @@ pub fn all_tools_with_runtime(
                 trusted_publisher_keys,
             ) {
                 Ok(host) => {
-                    let details = host.tool_plugin_details();
+                    let mut details = host.tool_plugin_details();
+                    details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
                     let discovered_count = details.len();
                     let mut registered_count = 0_usize;
+                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
+                        .iter()
+                        .map(|tool| tool.name().to_string())
+                        .collect();
+                    if root_config.pipeline.enabled {
+                        registered_names.insert(PipelineTool::NAME.to_string());
+                    }
                     let plugin_limits = zeroclaw_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1494,20 +1502,22 @@ pub fn all_tools_with_runtime(
                         })();
                         match tool {
                             Ok(tool) => {
-                                if wasm_plugin_name_conflicts(
-                                    tool.name(),
-                                    &tool_arcs,
-                                    root_config.pipeline.enabled,
-                                ) {
+                                if !claim_plugin_tool_name(&mut registered_names, tool.name()) {
                                     ::zeroclaw_log::record!(
                                         WARN,
                                         ::zeroclaw_log::Event::new(
                                             module_path!(),
-                                            ::zeroclaw_log::Action::Reject
+                                            ::zeroclaw_log::Action::Load
                                         )
                                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(::serde_json::json!({"tool": tool.name()})),
-                                        "WASM plugin tool shadows an active tool name; skipping"
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "plugin": manifest.name,
+                                                "tool": tool.name(),
+                                                "error_key": "plugin_tool_name_conflict",
+                                            })
+                                        ),
+                                        "Plugin tool conflicts with an already registered tool"
                                     );
                                     continue;
                                 }
@@ -1594,13 +1604,11 @@ pub fn all_tools_with_runtime(
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn wasm_plugin_name_conflicts(
-    name: &str,
-    registered_tools: &[Arc<dyn Tool>],
-    pipeline_enabled: bool,
+fn claim_plugin_tool_name(
+    registered_names: &mut std::collections::HashSet<String>,
+    plugin_name: &str,
 ) -> bool {
-    registered_tools.iter().any(|tool| tool.name() == name)
-        || (pipeline_enabled && name == PipelineTool::NAME)
+    registered_names.insert(plugin_name.to_string())
 }
 
 #[cfg(test)]
@@ -1611,25 +1619,6 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
-
-    #[cfg(feature = "plugins-wasm")]
-    #[test]
-    fn wasm_plugin_names_conflict_only_with_active_tools() {
-        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(CalculatorTool::new())];
-
-        assert!(wasm_plugin_name_conflicts("calculator", &registered, false));
-        assert!(!wasm_plugin_name_conflicts("browser", &registered, false));
-        assert!(wasm_plugin_name_conflicts(
-            PipelineTool::NAME,
-            &registered,
-            true
-        ));
-        assert!(!wasm_plugin_name_conflicts(
-            PipelineTool::NAME,
-            &registered,
-            false
-        ));
-    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -1664,6 +1653,27 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_cannot_shadow_native_reserved_or_prior_plugin_tools() {
+        let mut registered_names =
+            std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
+        let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
+            .into_iter()
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted, vec!["novel-tool"]);
+        assert_eq!(
+            registered_names,
+            std::collections::HashSet::from([
+                "shell".to_string(),
+                PipelineTool::NAME.to_string(),
+                "novel-tool".to_string(),
+            ])
+        );
     }
 
     #[cfg(feature = "plugins-wasm")]
