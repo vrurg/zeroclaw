@@ -4927,8 +4927,7 @@ mod tests {
 
         use super::super::{MatrixChannel, inbound};
 
-        #[tokio::test]
-        async fn matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+        async fn assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
             let server = MockServer::start().await;
             let room_id = owned_room_id!("!room:server");
             let bot_user_id = owned_user_id!("@bot:server");
@@ -5135,6 +5134,13 @@ mod tests {
             )
             .await
             .expect("Matrix inbound-to-outbound dispatch completes");
+        }
+
+        #[test]
+        fn matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            crate::orchestrator::tests::run_channel_dispatch_test(|| {
+                Box::pin(assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary())
+            });
         }
     }
 

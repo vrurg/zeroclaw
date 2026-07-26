@@ -12572,6 +12572,29 @@ pub(crate) mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    /// Runs a channel-dispatch test on an explicit stack because its async
+    /// future can exceed the default test-thread stack on hosted CI.
+    pub(crate) fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+        MakeFuture: FnOnce() -> F + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-channel-dispatch-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build channel dispatch test runtime");
+                runtime.block_on(make_future());
+            })
+            .expect("spawn channel dispatch test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     struct CountingObserver {
         events: Arc<AtomicUsize>,
     }
@@ -15674,6 +15697,7 @@ api_key = "anthropic-key"
         )
     }
 
+    #[cfg(feature = "channel-matrix")]
     pub(crate) async fn process_message_with_dummy_provider(
         channel: Arc<dyn Channel>,
         msg: zeroclaw_api::channel::ChannelMessage,
@@ -23850,8 +23874,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][3].1.contains("follow up"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_refreshes_available_skills_after_new_session() {
+    async fn assert_process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
@@ -24095,6 +24118,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+    }
+
+    #[test]
+    fn process_channel_message_refreshes_available_skills_after_new_session() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
+        });
     }
 
     #[tokio::test]
