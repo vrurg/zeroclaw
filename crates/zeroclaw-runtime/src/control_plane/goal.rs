@@ -3319,7 +3319,7 @@ mod tests {
             .await
             .expect("open gate grants an admission lease");
         let closing_gate = Arc::clone(&gate);
-        let close = tokio::spawn(async move {
+        let close = zeroclaw_spawn::spawn!(async move {
             closing_gate.close().await;
         });
 
