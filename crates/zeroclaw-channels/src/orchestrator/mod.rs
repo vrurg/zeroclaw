@@ -3119,11 +3119,10 @@ fn project_live_goal_policy_config(startup: &Config, next: &Config) -> Config {
     let mut projected = startup.clone();
     projected.goal = next.goal.clone();
 
-    // Cost accounting itself is initialized with the running channel's
-    // startup configuration. A live disable must still reject a later finite
-    // goal cost budget, but live pricing/provider changes are not safe to
-    // apply independently of the normal provider/runtime reload path.
-    projected.cost.enabled = next.cost.enabled;
+    // Cost accounting is initialized with the running channel's startup
+    // configuration. Do not make either enabled state live through this narrow
+    // goal-policy view: its tracker and per-turn context require the normal
+    // runtime reload path to change coherently.
 
     for (alias, agent) in &mut projected.agents {
         let Some(next_agent) = next.agents.get(alias) else {
@@ -16605,10 +16604,12 @@ temperature = 0.3
         let mut startup = (*runtime_config_snapshot(&ctx)).clone();
         startup.security.leak_detection.enabled = true;
         startup.goal.enabled = false;
+        startup.cost.enabled = false;
         let mut next = startup.clone();
         next.goal.enabled = true;
         next.security.leak_detection.enabled = false;
         next.channels.debounce_ms = startup.channels.debounce_ms.saturating_add(1);
+        next.cost.enabled = true;
 
         let projected = project_live_goal_policy_config(&startup, &next);
         assert!(projected.goal.enabled);
@@ -16619,6 +16620,18 @@ temperature = 0.3
         assert_eq!(
             projected.channels.debounce_ms, startup.channels.debounce_ms,
             "a goal policy update must not make a later channel-runtime setting live"
+        );
+        assert_eq!(
+            projected.cost.enabled, startup.cost.enabled,
+            "a goal policy update must not enable startup-disabled cost accounting"
+        );
+
+        startup.cost.enabled = true;
+        next.cost.enabled = false;
+        let projected = project_live_goal_policy_config(&startup, &next);
+        assert_eq!(
+            projected.cost.enabled, startup.cost.enabled,
+            "a goal policy update must not disable startup-enabled cost accounting"
         );
     }
 
