@@ -924,11 +924,18 @@ static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<Option<HeartbeatMcpReg
 /// the hook before the first test observes it, and a concurrent
 /// `set_heartbeat_mcp_registry_test_hook` from another test would
 /// swap in a hook whose counter Arc belongs to the other test. To
-/// keep the regression tests deterministic, every hook-using test
-/// takes this mutex (via [`HeartbeatMcpRegistryTestHookGuard`]) for
-/// the entire duration of its hook-installed work.
+/// keep the regression tests deterministic, every test that calls the
+/// hookable connection helper takes this mutex for the entire duration
+/// of that work. Hook-installing tests use
+/// [`HeartbeatMcpRegistryTestHookGuard`]; real-connection tests take
+/// the lock without installing a hook.
 #[cfg(test)]
-static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+async fn lock_heartbeat_mcp_registry_test_state() -> tokio::sync::MutexGuard<'static, ()> {
+    HEARTBEAT_MCP_REGISTRY_TEST_LOCK.lock().await
+}
 
 /// RAII guard that ties a test-only MCP registry hook installation
 /// to the global serialising lock. Construction takes the global
@@ -941,20 +948,18 @@ static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex
 /// see a stale or absent hook.
 #[cfg(test)]
 pub(crate) struct HeartbeatMcpRegistryTestHookGuard {
-    serial_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    serial_lock: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 #[cfg(test)]
 impl HeartbeatMcpRegistryTestHookGuard {
     /// Install `hook` under the global serialising lock and return a
     /// guard whose `Drop` clears the hook and releases the lock.
-    fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
+    async fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
         // Hold the serial lock before mutating the hook global so a
         // concurrent test cannot observe a torn state (hook swapped
         // halfway, or reset between this test's set and use).
-        let serial_lock = HEARTBEAT_MCP_REGISTRY_TEST_LOCK
-            .lock()
-            .expect("heartbeat MCP registry test serial lock should not be poisoned");
+        let serial_lock = lock_heartbeat_mcp_registry_test_state().await;
         let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
             .lock()
             .expect("heartbeat MCP registry test hook lock should not be poisoned");
@@ -995,10 +1000,10 @@ impl Drop for HeartbeatMcpRegistryTestHookGuard {
 /// Spinning off a detached future that outlives the guard will leave
 /// the hook pointing at a stale closure and is not supported.
 #[cfg(test)]
-pub(crate) fn set_heartbeat_mcp_registry_test_hook(
+pub(crate) async fn set_heartbeat_mcp_registry_test_hook(
     hook: HeartbeatMcpRegistryTestHook,
 ) -> HeartbeatMcpRegistryTestHookGuard {
-    HeartbeatMcpRegistryTestHookGuard::install(hook)
+    HeartbeatMcpRegistryTestHookGuard::install(hook).await
 }
 
 /// Snapshot the current test hook (cloned). Returns `None` when no
@@ -3225,7 +3230,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // (a) Simulate worker boot: the daemon calls
         //     `connect_heartbeat_mcp_registry` exactly once.
@@ -3354,6 +3360,8 @@ mod tests {
     async fn heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks() {
         use std::sync::Arc;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
+
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
 
         // `pgrep -f` matches the full command line. The
         // `@modelcontextprotocol/server-filesystem` package runs as
@@ -3564,7 +3572,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias, None)
             .await
@@ -3645,7 +3654,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // ── Worker boot: connect ONCE ──────────────────────────────
         // Mirrors `run_heartbeat_worker`'s pre-loop call. The fix
@@ -3750,7 +3760,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // 5 invocations → counter must reach 5. A buggy helper that
         // memoised the first call's Arc would leave the counter at 1,
@@ -3967,7 +3978,8 @@ mod tests {
                     .unwrap()
                     .push(servers.iter().map(|s| s.name.clone()).collect());
                 std::sync::Arc::clone(&empty_registry)
-            }));
+            }))
+            .await;
 
         const TICKS: usize = 5;
         for tick in 0..TICKS {
@@ -4006,6 +4018,8 @@ mod tests {
     #[tokio::test]
     async fn connect_heartbeat_mcp_registry_returns_none_when_all_healthy() {
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
+
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
 
         let a_handle = make_test_server_handle("server-a");
         let current = std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
@@ -4265,6 +4279,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
+        // This test must not observe a hook installed by a concurrent
+        // heartbeat-registry regression test while it connects the real child.
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
         let tmp = TempDir::new().unwrap();
 
         // ── 1. Build a tiny stdio MCP server script ──────────────────────
@@ -4420,7 +4437,8 @@ done
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&complete_registry_for_hook)
-            }));
+            }))
+            .await;
 
         // (1) Worker boot — single pre-loop call.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
@@ -4597,7 +4615,8 @@ done
                     .expect("returned_ptrs mutex not poisoned")
                     .push(ptr);
                 next
-            }));
+            }))
+            .await;
 
         // (1) Worker boot — single pre-loop call. Hook returns the
         //     EMPTY registry (call #0).
@@ -4886,7 +4905,8 @@ done
                     );
                 }
                 seq.remove(0)
-            }));
+            }))
+            .await;
 
         // Boot — hook call #0 returns the empty registry.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
