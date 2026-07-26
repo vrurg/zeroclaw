@@ -20616,9 +20616,13 @@ api_key = "anthropic-key"
         )
         .await
         .expect("start test control plane");
+        // Other channel fixtures may initialize the same process-global
+        // control plane between the check above and this call. Either handle
+        // is valid for this test; all that matters is that one is available.
+        let _ = zeroclaw_runtime::control_plane::init_control_plane(handle);
         assert!(
-            zeroclaw_runtime::control_plane::init_control_plane(handle),
-            "serialized test control-plane initialization must install its handle"
+            zeroclaw_runtime::control_plane::control_plane().is_some(),
+            "test control plane must be available"
         );
     }
 
