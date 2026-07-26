@@ -15050,6 +15050,9 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    /// Runs a deeply nested channel-dispatch future on an explicit stack.
+    /// Hosted test workers use a smaller default stack than this regression
+    /// requires; production dispatch is unchanged.
     fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
     where
         F: std::future::Future<Output = ()> + 'static,
