@@ -15,18 +15,19 @@ pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
 pub use goal::{
-    GoalAdmission, GoalAdmissionContext, GoalCommand, GoalCommandAction, GoalRuntimeScope,
-    GoalTurnEvaluation, admit_goal_autonomous_turn, admit_goal_command,
-    apply_current_goal_approval_denial, bind_current_goal_task, cancel_goals_revoked_by_config,
+    GoalAdmission, GoalAdmissionContext, GoalAdmissionGate, GoalCommand, GoalCommandAction,
+    GoalRuntimeScope, GoalTurnEvaluation, admit_goal_autonomous_turn, admit_goal_command,
+    apply_current_goal_approval_denial, bind_current_goal_task,
+    cancel_goal_ids_for_policy_revocation, cancel_goals_revoked_by_config,
     current_goal_admission_context, current_goal_approval_deny_behavior, current_goal_config,
     current_goal_start_tool_batch_requested, current_goal_turn_evaluation_marker,
     current_goal_turn_evaluation_requested, evaluate_goal_turn, evaluate_goal_turn_with_verifier,
-    goal_commands_available_on_channel, goal_recovery_status_message, has_running_goal_for_context,
-    mark_current_goal_turn_for_evaluation, pause_current_goal_for_human_gate,
-    pause_goal_for_accounting_failure, resume_current_goal_after_human_gate,
-    scope_goal_admission_context, scope_goal_runtime, scope_goal_start_tool_batch,
-    scope_goal_state_updates, scope_goal_turn_evaluation_marker, with_goal_policy_read_lock,
-    with_goal_policy_update_lock,
+    goal_commands_available_on_channel, goal_recovery_status_message, goals_revoked_by_config,
+    has_running_goal_for_context, mark_current_goal_turn_for_evaluation,
+    pause_current_goal_for_human_gate, pause_goal_for_accounting_failure,
+    resume_current_goal_after_human_gate, scope_goal_admission_context, scope_goal_runtime,
+    scope_goal_start_tool_batch, scope_goal_state_updates, scope_goal_turn_evaluation_marker,
+    with_goal_policy_read_lock, with_goal_policy_update_lock,
 };
 pub use goal::{GoalStateUpdateEvent, GoalStateUpdateSink};
 pub use goal_task::{

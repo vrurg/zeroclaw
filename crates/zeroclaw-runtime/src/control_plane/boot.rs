@@ -100,18 +100,37 @@ impl ControlPlaneHandle {
         })
     }
 
-    /// Drain goal IDs recovered by this boot's `last_state` policy.
+    /// Snapshot exact goal IDs that still need transient channel handoff.
     ///
-    /// This is an in-memory startup work queue, not canonical lifecycle state.
-    /// If the process crashes before the channel loop consumes it, the next boot
-    /// will recover the goal again under its new `boot_id`.
-    pub fn take_recovered_goal_ids(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .recovered_goal_ids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+    /// This is not lifecycle authority: the task and goal-extension stores
+    /// remain canonical. An id is retained until a channel worker has accepted
+    /// it or a durable non-running transition wins, so replacing a component
+    /// cannot lose a `Running` goal between handoff stages.
+    pub fn recovered_goal_ids(&self) -> Vec<String> {
+        self.recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Retain an exact running goal for the next channel handoff.
+    pub fn retain_recovered_goal_id(&self, task_id: String) {
+        let mut ids = self
+            .recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !ids.iter().any(|id| id == &task_id) {
+            ids.push(task_id);
+        }
+    }
+
+    /// Acknowledge that another transient owner now holds this exact task, or
+    /// that its durable lifecycle is no longer `Running`.
+    pub fn acknowledge_recovered_goal_id(&self, task_id: &str) {
+        self.recovered_goal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id| id != task_id);
     }
 
     /// Spawn the periodic reaper as a detached task whose lifetime `DaemonRegistry`

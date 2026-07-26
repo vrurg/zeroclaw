@@ -32,6 +32,32 @@ tokio::task_local! {
 
 type GoalTaskBindingSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Process-local admission barrier for one channel component.
+///
+/// It is deliberately not a lifecycle authority: durable goal state remains
+/// in `TaskRecord` and its goal extension. The barrier only prevents a
+/// retiring component from committing a new running goal after it has begun
+/// transferring its existing goals to a successor.
+#[derive(Default)]
+pub struct GoalAdmissionGate {
+    closed: AtomicBool,
+    lock: tokio::sync::RwLock<()>,
+}
+
+impl GoalAdmissionGate {
+    /// Stop future admissions and wait for every already-admitted caller to
+    /// leave its guarded admission section.
+    pub async fn close(&self) {
+        let _guard = self.lock.write().await;
+        self.closed.store(true, Ordering::Release);
+    }
+
+    async fn enter(&self) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self.lock.read().await;
+        (!self.closed.load(Ordering::Acquire)).then_some(guard)
+    }
+}
+
 /// Ephemeral task-local context for one goal-aware model/tool turn.
 ///
 /// This is deliberately not durable goal state. Durable lifecycle facts live in
@@ -60,6 +86,9 @@ pub struct GoalRuntimeScope {
     /// Process-local sink that binds a newly admitted exact goal to the
     /// already registered live worker executing this turn.
     task_binding_sink: Option<GoalTaskBindingSink>,
+    /// Optional per-component gate that closes goal admissions before a
+    /// retiring channel dispatcher transfers its current goals to recovery.
+    admission_gate: Option<Arc<GoalAdmissionGate>>,
 }
 
 impl GoalRuntimeScope {
@@ -75,6 +104,7 @@ impl GoalRuntimeScope {
             approval_deny_behavior: None,
             config_resolver: None,
             task_binding_sink: None,
+            admission_gate: None,
         }
     }
 
@@ -98,6 +128,12 @@ impl GoalRuntimeScope {
 
     pub fn with_task_binding_sink(mut self, sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.task_binding_sink = Some(sink);
+        self
+    }
+
+    /// Attach the live channel component's transient admission barrier.
+    pub fn with_admission_gate(mut self, gate: Arc<GoalAdmissionGate>) -> Self {
+        self.admission_gate = Some(gate);
         self
     }
 
@@ -1742,7 +1778,7 @@ fn goal_control_binding_is_allowed(binding: &ActiveGoalControlBinding, config: &
 /// returned task ids have had their process-local execution ownership revoked.
 /// The store is passed explicitly so the transaction boundary remains
 /// testable without replacing the process-global control-plane handle.
-pub async fn cancel_goals_revoked_by_config(
+pub async fn goals_revoked_by_config(
     goal_store: &dyn GoalTaskRegistry,
     config: &Config,
 ) -> Result<Vec<String>> {
@@ -1755,13 +1791,34 @@ pub async fn cancel_goals_revoked_by_config(
         .filter(|binding| !goal_control_binding_is_allowed(binding, config))
         .map(|binding| binding.task_id)
         .collect();
+    Ok(revoked)
+}
+
+/// Commit the previously planned policy revocations.
+///
+/// Callers that observe a mutable policy source must validate that source
+/// between [`goals_revoked_by_config`] and this transaction. The task store
+/// remains the only lifecycle authority.
+pub async fn cancel_goal_ids_for_policy_revocation(
+    goal_store: &dyn GoalTaskRegistry,
+    revoked: &[String],
+) -> Result<Vec<String>> {
     goal_store
         .cancel_active_goals_for_policy_revocation(
-            &revoked,
+            revoked,
             &msg("goal-terminal-reason-cancelled-by-controller", &[]),
         )
         .await
         .context("cancel goals revoked by live policy")
+}
+
+/// Durably cancel every active goal no longer authorized by `config`.
+pub async fn cancel_goals_revoked_by_config(
+    goal_store: &dyn GoalTaskRegistry,
+    config: &Config,
+) -> Result<Vec<String>> {
+    let revoked = goals_revoked_by_config(goal_store, config).await?;
+    cancel_goal_ids_for_policy_revocation(goal_store, &revoked).await
 }
 
 pub async fn admit_goal_command(
@@ -1770,6 +1827,13 @@ pub async fn admit_goal_command(
     fallback_config: &Config,
     fallback_agent_config: Option<&AliasedAgentConfig>,
 ) -> Result<GoalAdmission> {
+    let admission_gate = current_goal_runtime_scope().admission_gate;
+    let _component_admission_guard = match admission_gate.as_ref() {
+        Some(gate) => Some(gate.enter().await.with_context(
+            || "goal admission is unavailable while the channel component is shutting down",
+        )?),
+        None => None,
+    };
     let _policy_guard = goal_policy_update_lock().read().await;
     let live_config = current_goal_config();
     let (config, agent_config) = match live_config.as_deref() {
@@ -3246,6 +3310,57 @@ mod tests {
     use crate::control_plane::TaskContinuationConversationScope;
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn goal_admission_gate_closes_only_after_existing_admission_leases_finish() {
+        let gate = Arc::new(GoalAdmissionGate::default());
+        let active_lease = gate
+            .enter()
+            .await
+            .expect("open gate grants an admission lease");
+        let closing_gate = Arc::clone(&gate);
+        let close = tokio::spawn(async move {
+            closing_gate.close().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !close.is_finished(),
+            "shutdown waits until an already-admitted turn has bound its exact task"
+        );
+
+        drop(active_lease);
+        close.await.expect("close gate task");
+        assert!(
+            gate.enter().await.is_none(),
+            "a retired component cannot admit another running goal after handoff starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_goal_admission_gate_rejects_goal_command_before_control_plane_mutation() {
+        let gate = Arc::new(GoalAdmissionGate::default());
+        gate.close().await;
+        let scope = GoalRuntimeScope::new(None, None, None).with_admission_gate(gate);
+
+        let error = scope_goal_runtime(scope, async {
+            admit_goal_command(
+                test_goal_context("agent-a"),
+                parse_goal_command("/goal start finish reload handoff").expect("goal command"),
+                &test_config(),
+                None,
+            )
+            .await
+        })
+        .await
+        .expect_err("retired channel component must reject new goal admission");
+
+        assert!(
+            error
+                .to_string()
+                .contains("channel component is shutting down")
+        );
+    }
 
     fn configure_test_goal_channel(
         config: &mut Config,

@@ -498,6 +498,26 @@ impl GoalTaskRegistry for SqliteTaskStore {
             .context("decode active goal control bindings")
     }
 
+    async fn list_running_goal_ids_for_boot(&self, owner_boot_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT tasks.id
+                   FROM tasks
+                   JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                  WHERE tasks.kind = 'goal'
+                    AND tasks.status = 'running'
+                    AND tasks.owner_boot_id = ?1
+               ORDER BY tasks.started_at, tasks.rowid",
+            )
+            .context("prepare running goal ids for boot")?;
+        let rows = stmt
+            .query_map(params![owner_boot_id], |row| row.get::<_, String>(0))
+            .context("query running goal ids for boot")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("decode running goal ids for boot")
+    }
+
     async fn cancel_active_goals_for_policy_revocation(
         &self,
         task_ids: &[String],

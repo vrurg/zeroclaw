@@ -376,6 +376,17 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
     ) -> anyhow::Result<Vec<ActiveGoalControlBinding>>;
 
+    /// List the exact ids of running goals owned by one daemon boot.
+    ///
+    /// This intentionally projects only canonical task ids joined to their
+    /// goal extensions. Reload handoff needs an exact durable successor lease,
+    /// not a decoded snapshot of unrelated running tasks; one malformed
+    /// delegate row must therefore not orphan an otherwise valid goal.
+    async fn list_running_goal_ids_for_boot(
+        &self,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<Vec<String>>;
+
     /// Atomically cancel the supplied exact nonterminal goals for policy
     /// revocation and return the ids actually transitioned.
     ///
