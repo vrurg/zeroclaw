@@ -11597,6 +11597,30 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
+    /// Runs a deeply nested channel-dispatch future on an explicit stack.
+    /// Hosted test workers use a smaller default stack than this regression
+    /// requires; production dispatch is unchanged.
+    fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+        MakeFuture: FnOnce() -> F + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-channel-dispatch-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build channel dispatch test runtime");
+                runtime.block_on(make_future());
+            })
+            .expect("spawn channel dispatch test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[test]
     fn no_real_time_channels_message_points_at_quickstart_not_onboard() {
         // The "no channels configured" message must point operators at the
@@ -21899,8 +21923,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][3].1.contains("follow up"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_refreshes_available_skills_after_new_session() {
+    async fn assert_process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
@@ -22144,6 +22167,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+    }
+
+    #[test]
+    fn process_channel_message_refreshes_available_skills_after_new_session() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
+        });
     }
 
     #[tokio::test]
