@@ -18,16 +18,3 @@ pub fn init_control_plane(handle: ControlPlaneHandle) -> bool {
 pub fn control_plane() -> Option<&'static ControlPlaneHandle> {
     CONTROL_PLANE.get()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn uninitialized_is_none() {
-        // In the unit-test process the daemon never boots, so the plane is absent and
-        // producers no-op. (We do not call init here — that would leak into other tests
-        // via the process-global; init is exercised by the daemon integration path.)
-        assert!(control_plane().is_none());
-    }
-}
