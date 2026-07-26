@@ -388,6 +388,17 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        self.inner
+            .update_draft_progress_batch(recipient, message_id, texts)
+            .await
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -544,6 +555,51 @@ mod tests {
             _suppress_voice: bool,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct BatchProgressChannel {
+        progress_updates: AtomicUsize,
+        batch_updates: AtomicUsize,
+    }
+
+    impl Attributable for BatchProgressChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "batch-progress"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for BatchProgressChannel {
+        fn name(&self) -> &str {
+            "batch-progress"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn update_draft_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> Result<()> {
+            self.progress_updates.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_draft_progress_batch(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _texts: &[String],
+        ) -> Result<()> {
+            self.batch_updates.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -804,6 +860,33 @@ mod tests {
             counting.sends.load(Ordering::SeqCst),
             0,
             "final response policy must survive the pacing wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_batch_delegates_without_falling_back_to_individual_updates() {
+        let batch_progress = Arc::new(BatchProgressChannel {
+            progress_updates: AtomicUsize::new(0),
+            batch_updates: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = batch_progress.clone();
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        let progress = vec!["tool started".to_string(), "tool completed".to_string()];
+
+        paced
+            .update_draft_progress_batch("alice", "msg-1", &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(batch_progress.batch_updates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            batch_progress.progress_updates.load(Ordering::SeqCst),
+            0,
+            "the pacing wrapper must retain an inner channel's coalesced progress batch",
         );
     }
 
