@@ -7250,8 +7250,17 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         bail!("Token cannot be empty");
     }
 
-    let path = format!("providers.models.anthropic.{alias}.api_key");
-    config.set_prop_persistent(&path, token.trim())?;
+    let kind = auth::anthropic_token::detect_auth_kind(token.trim(), Some("authorization"));
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "auth_kind".to_string(),
+        kind.as_metadata_value().to_string(),
+    );
+    auth::AuthService::from_config(config)
+        .store_model_provider_token("anthropic", alias, token.trim(), metadata, true)
+        .await?;
+    let path = format!("providers.models.anthropic.{alias}.auth_mode");
+    config.set_prop_persistent(&path, "oauth")?;
     Box::pin(config.save_dirty()).await?;
     println!(
         "{}",
@@ -9602,6 +9611,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
 

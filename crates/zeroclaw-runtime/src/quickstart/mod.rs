@@ -708,13 +708,23 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         return Vec::new();
     }
     let leaf_prefix = format!("{section_path}.{SYNTHETIC_ALIAS}.");
+    // OpenAI and Anthropic translate their UI-only choices into their
+    // respective persisted authentication settings. Do not also expose a
+    // schema-level `auth_mode` row: it would duplicate the selector and can
+    // advertise a persisted value that Quickstart does not accept as input.
+    let has_custom_auth_mode_selector = matches!(section, FieldSection::ModelProvider)
+        && section_path
+            .strip_prefix("providers.models.")
+            .is_some_and(|provider_type| auth_modes_for(provider_type).is_some());
 
     let mut out = Vec::new();
     for info in probe.prop_fields() {
         let Some(field_path) = info.name.strip_prefix(&leaf_prefix) else {
             continue;
         };
-        if !essentials.contains(&field_path) {
+        if !essentials.contains(&field_path)
+            || (has_custom_auth_mode_selector && field_path == QUICKSTART_AUTH_MODE_FIELD)
+        {
             continue;
         }
         let default = if info.is_secret {
@@ -1146,6 +1156,8 @@ fn apply_model_provider(
                 return None;
             }
             let codex_auth = provider_type == "openai" && auth_mode == QUICKSTART_AUTH_MODE_CODEX;
+            let anthropic_oauth =
+                provider_type == "anthropic" && auth_mode == QUICKSTART_AUTH_MODE_SETUP_TOKEN;
             let prefix = format!("providers.models.{}.{}", provider_type, choice.alias);
             if let Err(err) = config.create_map_key(
                 &format!("providers.models.{}", provider_type),
@@ -1189,6 +1201,17 @@ fn apply_model_provider(
                     return None;
                 }
             }
+            if anthropic_oauth
+                && let Err(err) =
+                    config.set_prop_persistent(&format!("{prefix}.auth_mode"), "oauth")
+            {
+                errors.push(QuickstartError::new(
+                    QuickstartStep::ModelProvider,
+                    "auth_mode",
+                    err.to_string(),
+                ));
+                return None;
+            }
             // Round-trip every field the surface echoed back. Keys are
             // whatever `field_shape()` emitted — the daemon authored
             // them, so it knows where they go.
@@ -1198,7 +1221,7 @@ fn apply_model_provider(
                 if key == QUICKSTART_AUTH_MODE_FIELD {
                     continue;
                 }
-                if codex_auth
+                if (codex_auth || anthropic_oauth)
                     && matches!(
                         key.as_str(),
                         "api_key" | "wire_api" | "requires_openai_auth"
@@ -2397,10 +2420,11 @@ mod tests {
             .find("anthropic", "max")
             .expect("anthropic.max entry");
         assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(entry.api_key.as_deref(), Some("sk-ant-oat01-test-token"));
-        assert!(
+        assert_eq!(entry.api_key, None);
+        assert_eq!(
             cfg.get_prop("providers.models.anthropic.max.auth_mode")
-                .is_err()
+                .expect("Anthropic OAuth mode"),
+            "oauth"
         );
         let agent = cfg.agents.get("bot").expect("agent created");
         assert_eq!(agent.model_provider.as_str(), "anthropic.max");
@@ -2674,6 +2698,13 @@ mod tests {
         assert_eq!(
             auth.enum_variants.as_deref(),
             Some(["api_key".to_string(), "setup_token".to_string()].as_slice())
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.key == QUICKSTART_AUTH_MODE_FIELD)
+                .count(),
+            1,
+            "Anthropic must expose one UI-facing auth selector"
         );
         assert_eq!(auth.default.as_deref(), Some("api_key"));
         let api_key = rows

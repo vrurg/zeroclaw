@@ -11,6 +11,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
+use crate::auth::AuthService;
+use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+use crate::auth::profiles::AuthProfileKind;
+
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
@@ -19,13 +23,23 @@ const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90)
 
 use crate::stream_guard::AbortOnDrop;
 
+#[derive(Clone)]
 pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
+    credential_auth_kind: Option<AnthropicAuthKind>,
+    auth_service: Option<AuthService>,
+    auth_profile_override: Option<String>,
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAnthropicCredential {
+    token: String,
+    auth_kind: AnthropicAuthKind,
 }
 
 #[cfg(test)]
@@ -240,6 +254,8 @@ struct NativeContentIn {
 pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
+    auth_service: Option<AuthService>,
+    auth_profile_override: Option<String>,
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
@@ -254,6 +270,19 @@ impl AnthropicBuilder {
             .map(str::trim)
             .filter(|k| !k.is_empty())
             .map(ToString::to_string);
+        self
+    }
+
+    /// Resolve the active stored Anthropic auth profile at request time.
+    /// This is intentionally separate from `credential`: aliases with no
+    /// explicit OAuth mode must never consult the profile store.
+    pub fn auth_profile(
+        mut self,
+        auth_service: AuthService,
+        profile_override: Option<String>,
+    ) -> Self {
+        self.auth_service = Some(auth_service);
+        self.auth_profile_override = profile_override;
         self
     }
 
@@ -282,6 +311,9 @@ impl AnthropicBuilder {
         AnthropicModelProvider {
             alias: self.alias,
             credential: self.credential,
+            credential_auth_kind: None,
+            auth_service: self.auth_service,
+            auth_profile_override: self.auth_profile_override,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             max_tokens: self
                 .max_tokens
@@ -300,6 +332,8 @@ impl AnthropicModelProvider {
         AnthropicBuilder {
             alias: alias.to_string(),
             credential: None,
+            auth_service: None,
+            auth_profile_override: None,
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
@@ -310,33 +344,77 @@ impl AnthropicModelProvider {
         token.starts_with("sk-ant-oat01-")
     }
 
+    fn legacy_auth_kind(token: &str) -> AnthropicAuthKind {
+        if Self::is_setup_token(token) {
+            AnthropicAuthKind::Authorization
+        } else {
+            detect_auth_kind(token, None)
+        }
+    }
+
+    fn missing_credentials_error() -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"missing": "credentials"})),
+            "anthropic: no credentials configured"
+        );
+        anyhow::Error::msg(
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" with an active Anthropic auth profile.",
+        )
+    }
+
+    async fn resolve_credential(&self) -> anyhow::Result<ResolvedAnthropicCredential> {
+        if let Some(token) = self.credential.as_deref() {
+            return Ok(ResolvedAnthropicCredential {
+                token: token.to_string(),
+                auth_kind: self
+                    .credential_auth_kind
+                    .unwrap_or_else(|| Self::legacy_auth_kind(token)),
+            });
+        }
+
+        let Some(auth_service) = &self.auth_service else {
+            return Err(Self::missing_credentials_error());
+        };
+        let profile = auth_service
+            .get_profile("anthropic", self.auth_profile_override.as_deref())
+            .await?
+            .ok_or_else(Self::missing_credentials_error)?;
+        let token = match profile.kind {
+            AuthProfileKind::Token => profile.token,
+            AuthProfileKind::OAuth => profile.token_set.map(|tokens| tokens.access_token),
+        }
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(Self::missing_credentials_error)?;
+        let auth_kind = profile
+            .metadata
+            .get("auth_kind")
+            .and_then(|value| AnthropicAuthKind::from_metadata_value(value))
+            .unwrap_or_else(|| Self::legacy_auth_kind(&token));
+
+        Ok(ResolvedAnthropicCredential { token, auth_kind })
+    }
+
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
-        credential: &str,
+        credential: &ResolvedAnthropicCredential,
     ) -> reqwest::RequestBuilder {
-        let is_setup = Self::is_setup_token(credential);
-        let len = credential.len();
-        let head: String = credential.chars().take(8).collect();
-        let tail: String = credential
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len, "credential_head": head, "credential_tail": tail})), "Anthropic auth header applied");
-        if is_setup {
+        let authorization = credential.auth_kind == AnthropicAuthKind::Authorization;
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if authorization { "Authorization" } else { "x-api-key" }})), "Anthropic auth header applied");
+        if authorization {
             request
-                .header("Authorization", format!("Bearer {credential}"))
+                .header("Authorization", format!("Bearer {}", credential.token))
                 .header(
                     "anthropic-beta",
                     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            request.header("x-api-key", credential)
+            request.header("x-api-key", &credential.token)
         }
     }
 
@@ -1164,21 +1242,10 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "anthropic: no credentials configured"
-            );
-            anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
-            )
-        })?;
+        let credential = self.resolve_credential().await?;
 
         let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
-        let system = if Self::is_setup_token(credential) {
+        let system = if credential.auth_kind == AnthropicAuthKind::Authorization {
             Self::apply_oauth_system_prompt(system)
         } else {
             system
@@ -1215,7 +1282,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&request);
 
-        request = self.apply_auth(request, credential);
+        request = self.apply_auth(request, &credential);
 
         let response = request.send().await?;
 
@@ -1242,18 +1309,7 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "anthropic: no credentials configured"
-            );
-            anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
-            )
-        })?;
+        let credential = self.resolve_credential().await?;
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
@@ -1277,7 +1333,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         // For OAuth tokens, prepend Claude Code identity to system prompt
-        let system_prompt = if Self::is_setup_token(credential) {
+        let system_prompt = if credential.auth_kind == AnthropicAuthKind::Authorization {
             Self::apply_oauth_system_prompt(system_prompt)
         } else {
             system_prompt
@@ -1323,7 +1379,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self.apply_auth(req, &credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -1402,12 +1458,13 @@ impl ModelProvider for AnthropicModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
+        if self.credential.is_some() || self.auth_service.is_some() {
+            let credential = self.resolve_credential().await?;
             let mut request = self
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
+            request = self.apply_auth(request, &credential);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
@@ -1440,9 +1497,8 @@ impl ModelProvider for AnthropicModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let credential = match self.credential.as_ref() {
-            Some(c) => c.clone(),
-            None => {
+        if self.credential.is_none() {
+            if self.auth_service.is_none() {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
                         "Anthropic credentials not set".to_string(),
@@ -1450,7 +1506,48 @@ impl ModelProvider for AnthropicModelProvider {
                 })
                 .boxed();
             }
-        };
+
+            // Profile reads are asynchronous, while this trait method returns
+            // a stream synchronously. Resolve once when the stream is polled,
+            // then recurse through the unchanged static-credential stream path.
+            let messages = request.messages.to_vec();
+            let tools = request.tools.map(ToOwned::to_owned);
+            let thinking = request.thinking;
+            let model = model.to_string();
+            let mut provider = self.clone();
+            return stream::once(async move {
+                match provider.resolve_credential().await {
+                    Ok(credential) => {
+                        provider.credential = Some(credential.token);
+                        provider.credential_auth_kind = Some(credential.auth_kind);
+                        provider.auth_service = None;
+                        provider.stream_chat(
+                            ProviderChatRequest {
+                                messages: &messages,
+                                tools: tools.as_deref(),
+                                thinking,
+                            },
+                            &model,
+                            temperature,
+                            options,
+                        )
+                    }
+                    Err(error) => {
+                        stream::once(
+                            async move { Err(StreamError::ModelProvider(error.to_string())) },
+                        )
+                        .boxed()
+                    }
+                }
+            })
+            .flatten()
+            .boxed();
+        }
+
+        let credential = self.credential.clone().expect("credential checked above");
+        let auth_kind = self
+            .credential_auth_kind
+            .unwrap_or_else(|| Self::legacy_auth_kind(&credential));
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
         if Self::should_cache_conversation(request.messages) {
@@ -1469,7 +1566,7 @@ impl ModelProvider for AnthropicModelProvider {
             None
         };
 
-        let system_prompt = if Self::is_setup_token(&credential) {
+        let system_prompt = if auth_kind == AnthropicAuthKind::Authorization {
             Self::apply_oauth_system_prompt(system_prompt)
         } else {
             system_prompt
@@ -1510,7 +1607,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .expect("NativeChatRequest should serialize to JSON");
             let client = self.http_client();
             let url = format!("{}/v1/messages", self.base_url);
-            let is_oauth = Self::is_setup_token(&credential);
+            let is_oauth = auth_kind == AnthropicAuthKind::Authorization;
 
             return stream::once(async move {
                 let mut req = client
@@ -1614,7 +1711,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
         let client = self.http_client();
         let url = format!("{}/v1/messages", self.base_url);
-        let is_oauth = Self::is_setup_token(&credential);
+        let is_oauth = auth_kind == AnthropicAuthKind::Authorization;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
 
@@ -2053,6 +2150,114 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(!AnthropicModelProvider::is_setup_token("sk-ant-api-key"));
     }
 
+    #[tokio::test]
+    async fn oauth_mode_resolves_profile_and_preserves_auth_kind_metadata() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service, None)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve profile");
+        assert_eq!(credential.token, "profile-token");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                &credential,
+            )
+            .build()
+            .expect("profile-auth request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer profile-token")
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn static_alias_ignores_available_anthropic_profile() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("legacy")
+            .credential(Some("sk-ant-oat01-legacy-token"))
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve legacy key");
+        assert_eq!(credential.token, "sk-ant-oat01-legacy-token");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_without_profile_fails_at_request_resolution() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(AuthService::new(state_dir.path(), false), None)
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("missing profile must fail");
+        assert!(error.to_string().contains("credentials not set"));
+    }
+
+    #[test]
+    fn oauth_factory_allows_profile_backed_fallback_but_rejects_api_key_conflicts() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+
+        let config = AnthropicModelProviderConfig {
+            base: Default::default(),
+            auth_mode: Some(AuthMode::OAuth),
+        };
+        assert!(config.fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()));
+        let error = config
+            .create_provider(
+                "subscription",
+                Some("inline-key"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .err()
+            .expect("OAuth plus api_key must not construct a provider");
+        assert!(error.to_string().contains("must not be combined"));
+    }
+
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
         let model_provider = AnthropicModelProvider::builder("test").build();
@@ -2061,7 +2266,10 @@ data: {\"type\":\"message_stop\"}\n\n";
                 model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
-                "sk-ant-oat01-test-token",
+                &ResolvedAnthropicCredential {
+                    token: "sk-ant-oat01-test-token".to_string(),
+                    auth_kind: AnthropicAuthKind::Authorization,
+                },
             )
             .build()
             .expect("request should build");
@@ -2098,7 +2306,10 @@ data: {\"type\":\"message_stop\"}\n\n";
                 model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
-                "sk-ant-api-key",
+                &ResolvedAnthropicCredential {
+                    token: "sk-ant-api-key".to_string(),
+                    auth_kind: AnthropicAuthKind::ApiKey,
+                },
             )
             .build()
             .expect("request should build");
@@ -2856,6 +3067,9 @@ data: {\"type\":\"message_stop\"}\n\n";
         let model_provider = AnthropicModelProvider {
             alias: "test".to_string(),
             credential: Some("test-key".to_string()),
+            credential_auth_kind: None,
+            auth_service: None,
+            auth_profile_override: None,
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,

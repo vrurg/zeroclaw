@@ -761,6 +761,7 @@ pub enum AuthMode {
     ApiKey,
     /// OAuth flow — credential resolution defers to the family runtime impl
     /// (typically reading a vendor-specific token cache or env var).
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
 }
 
@@ -1097,9 +1098,11 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// Anthropic model provider config.
+///
+/// Omitting `auth_mode` deliberately preserves the legacy static-credential
+/// path, including setup tokens stored in `api_key`. Set `auth_mode = "oauth"`
+/// only to resolve the active stored Anthropic auth profile instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1107,6 +1110,14 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Resolve credentials from ZeroClaw's stored Anthropic auth profile.
+    ///
+    /// `None` (the compatibility default) and `api_key` use `base.api_key`.
+    /// OAuth mode must leave `api_key` unset so the credential source is
+    /// unambiguous.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -19189,6 +19200,17 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
 
+        for (alias, provider) in &self.providers.models.anthropic {
+            if provider.auth_mode == Some(AuthMode::OAuth) && provider.base.api_key.is_some() {
+                let path = format!("providers.models.anthropic.{alias}.api_key");
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+                );
+            }
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -25674,6 +25696,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         config.save().await.unwrap();
@@ -25863,6 +25886,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -27796,6 +27820,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                auth_mode: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -36700,5 +36725,52 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_legacy_alias_omits_auth_mode_on_round_trip() {
+        let legacy: AnthropicModelProviderConfig =
+            toml::from_str("model = \"claude-sonnet-4-5\"\napi_key = \"sk-ant-oat01-legacy\"\n")
+                .expect("legacy Anthropic alias should deserialize");
+        assert_eq!(legacy.auth_mode, None);
+        assert_eq!(legacy.base.api_key.as_deref(), Some("sk-ant-oat01-legacy"));
+
+        let serialized = toml::to_string(&legacy).expect("legacy alias should serialize");
+        assert!(
+            !serialized.contains("auth_mode"),
+            "legacy aliases must not be rewritten with auth_mode: {serialized}"
+        );
+        let round_trip: AnthropicModelProviderConfig =
+            toml::from_str(&serialized).expect("serialized alias should deserialize");
+        assert_eq!(round_trip.auth_mode, None);
+        assert_eq!(round_trip.base.api_key, legacy.base.api_key);
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_oauth_rejects_inline_api_key() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("not-allowed-in-oauth-mode".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+
+        let error = config.validate().expect_err("OAuth plus api_key must fail");
+        assert!(error.to_string().contains("auth_mode = \"oauth\""));
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_mode_accepts_legacy_o_auth_spelling_but_serializes_as_oauth() {
+        let parsed: AuthMode = serde_json::from_str("\"o_auth\"").expect("legacy spelling parses");
+        assert_eq!(parsed, AuthMode::OAuth);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("serialize mode"),
+            "\"oauth\""
+        );
     }
 }
