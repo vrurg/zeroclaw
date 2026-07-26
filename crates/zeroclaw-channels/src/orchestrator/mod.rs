@@ -3643,7 +3643,11 @@ fn current_goal_policy_config(ctx: &ChannelRuntimeContext) -> Arc<Config> {
 fn project_live_goal_policy_config(startup: &Config, next: &Config) -> Config {
     let mut projected = startup.clone();
     projected.goal = next.goal.clone();
-    projected.cost.enabled = next.cost.enabled;
+
+    // Cost accounting is initialized with the running channel's startup
+    // configuration. Do not make either enabled state live through this narrow
+    // goal-policy view: its tracker and per-turn context require the normal
+    // runtime reload path to change coherently.
     for (alias, agent) in &mut projected.agents {
         let Some(next_agent) = next.agents.get(alias) else {
             agent.enabled = false;
@@ -18467,14 +18471,22 @@ temperature = 0.3
         let mut startup = zeroclaw_config::schema::Config::default();
         startup.goal.enabled = true;
         startup.security.leak_detection.enabled = true;
+        startup.cost.enabled = false;
 
         let mut next = startup.clone();
         next.goal.enabled = false;
         next.security.leak_detection.enabled = false;
+        next.cost.enabled = true;
 
         let projected = project_live_goal_policy_config(&startup, &next);
         assert!(!projected.goal.enabled);
         assert!(projected.security.leak_detection.enabled);
+        assert_eq!(projected.cost.enabled, startup.cost.enabled);
+
+        startup.cost.enabled = true;
+        next.cost.enabled = false;
+        let projected = project_live_goal_policy_config(&startup, &next);
+        assert_eq!(projected.cost.enabled, startup.cost.enabled);
     }
 
     #[tokio::test]
