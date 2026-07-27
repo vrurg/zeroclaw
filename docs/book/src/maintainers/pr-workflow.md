@@ -86,6 +86,28 @@ PR lanes are routing expectations, not another required label family. Use them t
 
 Do not build a separate manual PR board for these lanes unless native GitHub state and CODEOWNERS stop answering the routing question. Check native GitHub merge state before normal lane review: `DIRTY` means resolve conflicts first; `BEHIND` alone is mergeability housekeeping, not an author-facing blocker.
 
+### Stacked PR readiness
+
+Stacked PRs may be opened, validated, and reviewed concurrently, but reviewability
+is not merge readiness.
+
+- Every dependent PR must declare `Depends on #...` and identify the
+  predecessor that owns its base behavior.
+- A dependent PR is not merge-ready while that predecessor is unmerged and has
+  active requested changes, failing required checks, conflicts, or an unresolved
+  blocker. `BEHIND` alone remains branch-freshness housekeeping.
+- Reviewers may assess the incremental slice and leave actionable feedback, but
+  must not give an unconditional approval or merge recommendation when merging
+  the dependent head would implicitly land an unresolved predecessor.
+- After the predecessor reaches its final accepted head and lands, update the
+  dependent branch against current `master`, resolve any resulting conflicts,
+  rerun validation affected by the new ancestry, refresh stale PR evidence, and
+  obtain a final current-head review.
+
+Native PR state plus the explicit `Depends on #...` relationship are the source
+of truth. Do not mirror per-push predecessor readiness into a manual board lane
+or a second dependency registry.
+
 ## Required repository settings
 
 Branch protection on `master`:
@@ -165,7 +187,7 @@ For AI-heavy PRs, reviewers focus on:
 - Blocked PRs get one actionable checklist comment, not a series of partial reviews.
 - `status:no-stale` is reserved for accepted or otherwise long-lived work with a recorded stale-exemption reason and contributor-visible routing evidence when the issue is not already protected by another stale exclusion. Active release trackers and active RFC or design trackers may use the tracker itself as that visible reason and routing surface while they remain active. Existing exemptions missing those facts are audit findings until the stale-exemption repair packet lands.
 
-For stacked work, require explicit `Depends on #...` so review order is deterministic.
+For stacked work, follow [Stacked PR readiness](#stacked-pr-readiness).
 
 For replacements, require explicit `Supersedes #...`. See [Superseding PRs](./superseding.md) for attribution and template rules.
 
