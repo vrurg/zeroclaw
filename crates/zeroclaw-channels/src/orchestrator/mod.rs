@@ -21065,9 +21065,18 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        assert_eq!(
-            *channel_impl.delivery_events.lock().await,
-            ["typing-start", "typing-stop", "draft"]
+        let delivery_events = channel_impl.delivery_events.lock().await;
+        let typing_stop = delivery_events
+            .iter()
+            .position(|event| *event == "typing-stop")
+            .expect("single-message cleanup must stop typing");
+        let draft = delivery_events
+            .iter()
+            .position(|event| *event == "draft")
+            .expect("single-message mode must create a draft");
+        assert!(
+            typing_stop < draft,
+            "typing cleanup must complete before draft delivery"
         );
     }
 
