@@ -15294,13 +15294,7 @@ api_key = "anthropic-key"
     async fn wait_for_draft_recording_event(channel: &DraftRecordingChannel, event: &'static str) {
         tokio::time::timeout(Duration::from_millis(100), async {
             loop {
-                if channel
-                    .delivery_events
-                    .lock()
-                    .await
-                    .iter()
-                    .any(|observed| *observed == event)
-                {
+                if channel.delivery_events.lock().await.contains(&event) {
                     return;
                 }
                 tokio::task::yield_now().await;
