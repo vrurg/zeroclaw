@@ -29,7 +29,6 @@ pub struct AnthropicModelProvider {
     alias: String,
     credential: Option<String>,
     auth_service: Option<AuthService>,
-    auth_profile_override: Option<String>,
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
@@ -276,7 +275,6 @@ pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
     auth_service: Option<AuthService>,
-    auth_profile_override: Option<String>,
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
@@ -294,16 +292,12 @@ impl AnthropicBuilder {
         self
     }
 
-    /// Resolve the active stored Anthropic auth profile at request time.
+    /// Resolve the stored Anthropic auth profile named after this provider's
+    /// alias at request time.
     /// This is intentionally separate from `credential`: aliases with no
     /// explicit OAuth mode must never consult the profile store.
-    pub fn auth_profile(
-        mut self,
-        auth_service: AuthService,
-        profile_override: Option<String>,
-    ) -> Self {
+    pub fn auth_profile(mut self, auth_service: AuthService) -> Self {
         self.auth_service = Some(auth_service);
-        self.auth_profile_override = profile_override;
         self
     }
 
@@ -333,7 +327,6 @@ impl AnthropicBuilder {
             alias: self.alias,
             credential: self.credential,
             auth_service: self.auth_service,
-            auth_profile_override: self.auth_profile_override,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             max_tokens: self
                 .max_tokens
@@ -353,7 +346,6 @@ impl AnthropicModelProvider {
             alias: alias.to_string(),
             credential: None,
             auth_service: None,
-            auth_profile_override: None,
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
@@ -381,7 +373,7 @@ impl AnthropicModelProvider {
             "anthropic: no credentials configured"
         );
         anyhow::Error::msg(
-            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" with an active Anthropic auth profile.",
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile.",
         )
     }
 
@@ -396,15 +388,15 @@ impl AnthropicModelProvider {
         let Some(auth_service) = &self.auth_service else {
             return Err(Self::missing_credentials_error());
         };
-        Self::resolve_profile_credential(auth_service, self.auth_profile_override.as_deref()).await
+        Self::resolve_profile_credential(auth_service, &self.alias).await
     }
 
     async fn resolve_profile_credential(
         auth_service: &AuthService,
-        profile_override: Option<&str>,
+        profile_name: &str,
     ) -> anyhow::Result<ResolvedAnthropicCredential> {
         let profile = auth_service
-            .get_profile("anthropic", profile_override)
+            .get_profile("anthropic", Some(profile_name))
             .await?
             .ok_or_else(Self::missing_credentials_error)?;
         let token = match profile.kind {
@@ -1791,10 +1783,10 @@ impl AnthropicModelProvider {
             })
             .boxed();
         };
-        let profile_override = self.auth_profile_override.clone();
+        let profile_name = self.alias.clone();
         stream::once(async move {
-            match Self::resolve_profile_credential(&auth_service, profile_override.as_deref()).await
-            {
+            let credential = Self::resolve_profile_credential(&auth_service, &profile_name).await;
+            match credential {
                 Ok(credential) => Self::stream_prepared(prepared, credential, transport),
                 Err(error) => {
                     stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
@@ -2192,7 +2184,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("store profile");
 
         let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(auth_service.clone(), None)
+            .auth_profile(auth_service.clone())
             .build();
         let credential = provider
             .resolve_credential()
@@ -2246,13 +2238,44 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn oauth_mode_without_profile_fails_at_request_resolution() {
+    async fn oauth_mode_without_same_named_profile_fails_despite_active_profile() {
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode, Config};
+
         let state_dir = tempfile::tempdir().expect("temporary state directory");
-        let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(AuthService::new(state_dir.path(), false), None)
-            .build();
+        AuthService::new(state_dir.path(), false)
+            .store_model_provider_token(
+                "anthropic",
+                "other",
+                "other-profile-token",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store active nonmatching profile");
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: Default::default(),
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+        let options = crate::ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(state_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..Default::default()
+        };
+        let provider = crate::create_model_provider_for_alias_with_url(
+            &config,
+            "anthropic",
+            "subscription",
+            None,
+            None,
+            &options,
+        )
+        .expect("factory should build OAuth alias");
         let error = provider
-            .resolve_credential()
+            .chat_with_system(None, "hello", "claude-opus-4-6", None)
             .await
             .expect_err("missing profile must fail");
         assert!(error.to_string().contains("credentials not set"));
@@ -2279,6 +2302,19 @@ data: {\"type\":\"message_stop\"}\n\n";
             )
             .await
             .expect("store profile");
+        AuthService::new(state_dir.path(), false)
+            .store_model_provider_token(
+                "anthropic",
+                "other",
+                "other-profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("make nonmatching profile active");
         let captured = Arc::new(Mutex::new(None));
         let captured_request = captured.clone();
         let app = Router::new().route(
@@ -2385,7 +2421,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         });
 
         let provider = AnthropicModelProvider::builder("subscription")
-            .auth_profile(auth_service.clone(), None)
+            .auth_profile(auth_service.clone())
             .base_url(&format!("http://{address}"))
             .build();
         let messages = vec![ChatMessage::user("hello")];
@@ -3272,7 +3308,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             alias: "test".to_string(),
             credential: Some("test-key".to_string()),
             auth_service: None,
-            auth_profile_override: None,
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,

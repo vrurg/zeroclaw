@@ -72,9 +72,11 @@ zeroclaw quickstart --model-provider anthropic --model claude-sonnet-4-5 --agent
 Choose **Anthropic**, set **Authentication** to `setup_token`, then paste the
 token from `claude setup-token` into the setup prompt. Scripted input may use
 `--model-provider claude` as an alias. Quickstart stores the token in
-ZeroClaw's Anthropic auth profile and writes `auth_mode = "oauth"` on the
-canonical `[providers.models.anthropic.<alias>]` entry. Existing aliases with
-a setup token in `api_key` keep their legacy behavior and are not rewritten.
+ZeroClaw's Anthropic auth profile with the same `<alias>` and writes
+`auth_mode = "oauth"` on the canonical `[providers.models.anthropic.<alias>]`
+entry. An OAuth alias never falls back to another or active Anthropic profile.
+Existing aliases with a setup token in `api_key` keep their legacy behavior and
+are not rewritten.
 
 ## zerocode
 

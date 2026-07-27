@@ -1102,7 +1102,7 @@ impl ModelEndpoint for AnthropicEndpoint {
 ///
 /// Omitting `auth_mode` deliberately preserves the legacy static-credential
 /// path, including setup tokens stored in `api_key`. Set `auth_mode = "oauth"`
-/// only to resolve the active stored Anthropic auth profile instead.
+/// only to resolve the stored Anthropic auth profile with the same alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1110,7 +1110,7 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Resolve credentials from ZeroClaw's stored Anthropic auth profile.
+    /// Resolve credentials from the same-named stored Anthropic auth profile.
     ///
     /// `None` (the compatibility default) and `api_key` use `base.api_key`.
     /// OAuth mode must leave `api_key` unset so the credential source is

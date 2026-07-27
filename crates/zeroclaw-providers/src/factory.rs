@@ -974,10 +974,10 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
                     |dirs| dirs.home_dir().join(".zeroclaw"),
                 )
             });
-            b = b.auth_profile(
-                crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt),
-                opts.auth_profile_override.clone(),
-            );
+            b = b.auth_profile(crate::auth::AuthService::new(
+                &state_dir,
+                opts.secrets_encrypt,
+            ));
         } else {
             b = b.credential(key);
         }
