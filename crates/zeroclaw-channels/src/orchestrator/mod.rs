@@ -244,6 +244,9 @@ const _: () = assert!(
         && MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS < 4_000,
     "Matrix typing refresh must clear matrix-sdk's resend gate before notice expiry"
 );
+// Typing is best-effort auxiliary feedback. Never let a stalled stop request
+// delay the first visible single-message draft indefinitely.
+const MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS: u64 = 100;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -4347,7 +4350,6 @@ fn spawn_scoped_typing_task(
 /// A proper general lifecycle still requires event-subsystem ownership.
 struct MatrixSingleMessageTypingScope {
     cancellation: CancellationToken,
-    started: Option<tokio::sync::oneshot::Receiver<()>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -4375,7 +4377,6 @@ fn start_matrix_single_message_typing_scope_with_interval(
 ) -> MatrixSingleMessageTypingScope {
     let cancellation = CancellationToken::new();
     let stop_signal = cancellation.clone();
-    let (started_tx, started) = tokio::sync::oneshot::channel();
     let handle = zeroclaw_spawn::spawn!(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4399,7 +4400,6 @@ fn start_matrix_single_message_typing_scope_with_interval(
                 false
             }
         };
-        let _ = started_tx.send(());
         if !cancelled_before_start {
             loop {
                 tokio::select! {
@@ -4422,29 +4422,48 @@ fn start_matrix_single_message_typing_scope_with_interval(
                 }
             }
         }
-        if let Err(e) = channel.stop_typing(&recipient).await {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
-                "failed to stop typing"
-            );
+        match tokio::time::timeout(
+            Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS),
+            channel.stop_typing(&recipient),
+        )
+        .await
+        {
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                    "failed to stop typing"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "timed out stopping typing"
+                );
+            }
+            Ok(Ok(())) => {}
         }
     });
     MatrixSingleMessageTypingScope {
         cancellation,
-        started: Some(started),
         handle: Some(handle),
     }
 }
 
 async fn stop_matrix_single_message_typing_scope(mut scope: MatrixSingleMessageTypingScope) {
-    if let Some(started) = scope.started.take() {
-        let _ = started.await;
-    }
     scope.cancellation.cancel();
-    if let Some(handle) = scope.handle.take() {
-        log_worker_join_result(handle.await);
+    if let Some(mut handle) = scope.handle.take() {
+        match tokio::time::timeout(
+            Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS),
+            &mut handle,
+        )
+        .await
+        {
+            Ok(result) => log_worker_join_result(result),
+            Err(_) => handle.abort(),
+        }
     }
 }
 
@@ -15232,6 +15251,8 @@ api_key = "anthropic-key"
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
         delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
+        stall_start_typing: bool,
+        stall_stop_typing: bool,
     }
 
     struct ExpiringTypingChannel {
@@ -15255,6 +15276,8 @@ api_key = "anthropic-key"
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
                 delivery_events: tokio::sync::Mutex::new(Vec::new()),
+                stall_start_typing: false,
+                stall_stop_typing: false,
             }
         }
 
@@ -15560,11 +15583,17 @@ api_key = "anthropic-key"
 
         async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.delivery_events.lock().await.push("typing-start");
+            if self.stall_start_typing {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.delivery_events.lock().await.push("typing-stop");
+            if self.stall_stop_typing {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -21120,6 +21149,72 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert_eq!(channel_impl.stop_calls.load(Ordering::SeqCst), 1);
         assert!(channel_impl.expires_at.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_stalled_initial_typing_does_not_block_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            stall_start_typing: true,
+            ..DraftRecordingChannel::matrix(
+                zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+            )
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel.clone(),
+            "chat-typing".to_string(),
+            Duration::from_secs(1),
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_matrix_single_message_typing_scope(scope),
+        )
+        .await
+        .expect("cancelling a stalled initial typing request must not block delivery");
+        channel
+            .send_draft(&SendMessage::new("draft", "chat-typing"))
+            .await
+            .expect("draft delivery must proceed after stalled initial typing is cancelled");
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_stalled_typing_cleanup_does_not_block_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            stall_stop_typing: true,
+            ..DraftRecordingChannel::matrix(
+                zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+            )
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel.clone(),
+            "chat-typing".to_string(),
+            Duration::from_secs(1),
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_matrix_single_message_typing_scope(scope),
+        )
+        .await
+        .expect("stalled typing cleanup must not block delivery indefinitely");
+        channel
+            .send_draft(&SendMessage::new("draft", "chat-typing"))
+            .await
+            .expect("draft delivery must proceed after typing cleanup times out");
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
     }
 
     #[tokio::test]
