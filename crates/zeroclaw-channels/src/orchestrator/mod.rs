@@ -15291,6 +15291,25 @@ api_key = "anthropic-key"
         }
     }
 
+    async fn wait_for_draft_recording_event(channel: &DraftRecordingChannel, event: &'static str) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if channel
+                    .delivery_events
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|observed| *observed == event)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event}"));
+    }
+
     #[derive(Default)]
     struct RecordingMessageSentHook {
         events: Arc<tokio::sync::Mutex<Vec<(String, String, String)>>>,
@@ -21174,7 +21193,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "chat-typing".to_string(),
             Duration::from_secs(1),
         );
-        tokio::task::yield_now().await;
+        wait_for_draft_recording_event(channel_impl.as_ref(), "typing-start").await;
 
         tokio::time::timeout(
             Duration::from_millis(200),
@@ -21207,7 +21226,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "chat-typing".to_string(),
             Duration::from_secs(1),
         );
-        tokio::task::yield_now().await;
+        wait_for_draft_recording_event(channel_impl.as_ref(), "typing-start").await;
 
         tokio::time::timeout(
             Duration::from_millis(200),
