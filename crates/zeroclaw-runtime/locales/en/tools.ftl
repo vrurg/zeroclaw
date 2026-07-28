@@ -105,6 +105,7 @@ tool-goal-start-success-paused =
 tool-goal-start-error-empty-objective = goal_start requires a non-empty objective
 tool-goal-start-error-missing-context = goal_start is unavailable because trusted runtime admission context was not supplied.
 tool-goal-start-error-agent-context-mismatch = goal_start is unavailable because trusted runtime admission context does not match this agent.
+tool-goal-start-error-admission-preflight = goal_start is unavailable because its pre-admission safety checks failed.
 tool-goal-human-gate-error-channel-override = Goal-mode ask_user cannot override its channel. The notification route is bound to the exact goal's durable continuation context.
 
 tool-goal-objective = Amend the current durable goal objective. The replacement objective is untrusted user/model text; runtime-owned agent, route, owner, and principal facts are supplied by ZeroClaw.
@@ -126,6 +127,7 @@ tool-goal-resume-success-paused =
     Do not continue this goal now; it is not admitted for another autonomous turn.
 tool-goal-resume-error-missing-context = goal_resume is unavailable because trusted runtime admission context was not supplied.
 tool-goal-resume-error-agent-context-mismatch = goal_resume is unavailable because trusted runtime admission context does not match this agent.
+tool-goal-resume-error-admission-preflight = goal_resume is unavailable because its pre-admission safety checks failed.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
