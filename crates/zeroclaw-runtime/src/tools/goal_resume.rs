@@ -118,10 +118,10 @@ impl Tool for GoalResumeTool {
         )
         .await?;
         if admission.continue_goal {
-            let task_id = admission.task_id.as_deref().ok_or_else(|| {
+            let task_id = admission.task_id.clone().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            permit.activate(task_id)?;
+            permit.activate(task_id);
         }
         let output = goal_resume_tool_output(&admission);
 

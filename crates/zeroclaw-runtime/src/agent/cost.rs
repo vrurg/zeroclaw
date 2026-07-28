@@ -396,10 +396,10 @@ pub fn prepare_current_tool_loop_goal_attribution(
 
 impl PreparedToolLoopGoalAttribution {
     /// Bind the exact controller-returned id after the preflight succeeded.
-    pub fn activate(self, task_id: &str) -> anyhow::Result<()> {
-        self.context.bind_exact_goal_task_id(task_id)?;
+    pub fn activate(self, task_id: String) {
+        debug_assert!(!task_id.is_empty());
+        let _ = self.context.goal_task_id.set(task_id);
         self.context.enable_goal_attribution();
-        Ok(())
     }
 }
 
