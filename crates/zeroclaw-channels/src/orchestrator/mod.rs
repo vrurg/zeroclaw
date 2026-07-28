@@ -30285,6 +30285,46 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn consecutive_retiring_recovered_workers_keep_one_exact_handoff_lease() {
+        let (_temp, control_plane, message) =
+            recovered_goal_pause_failure_fixture("goal-two-reload-handoff").await;
+        let task_id = message
+            .internal_goal_task_id
+            .expect("recovered fixture binds its exact task");
+        let retiring = Arc::new(AtomicBool::new(true));
+
+        let mut first = RecoveredGoalClaim::new(
+            control_plane.clone(),
+            task_id.clone(),
+            Arc::clone(&retiring),
+        );
+        first.pause_for_unfinished_execution().await;
+        assert_eq!(control_plane.recovered_goal_ids(), vec![task_id.clone()]);
+
+        // The first successor claims the handoff lease before the next reload.
+        control_plane.acknowledge_recovered_goal_id(&task_id);
+        let mut second = RecoveredGoalClaim::new(
+            control_plane.clone(),
+            task_id.clone(),
+            Arc::clone(&retiring),
+        );
+        second.pause_for_unfinished_execution().await;
+
+        assert_eq!(control_plane.recovered_goal_ids(), vec![task_id.clone()]);
+        assert_eq!(
+            control_plane
+                .store
+                .get(&task_id)
+                .await
+                .expect("read retained goal")
+                .expect("retained goal exists")
+                .status,
+            zeroclaw_runtime::control_plane::TaskStatus::Running,
+            "two retirements transfer one exact task without pausing or duplicating it"
+        );
+    }
+
+    #[tokio::test]
     async fn non_retiring_recovered_worker_still_pauses_unfinished_execution() {
         let (_temp, control_plane, message) =
             recovered_goal_pause_failure_fixture("goal-recovered-nonretiring").await;
