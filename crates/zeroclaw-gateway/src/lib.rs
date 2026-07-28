@@ -825,6 +825,7 @@ pub async fn run_gateway(
                 connect_peripherals: false,
                 emit_assembly_logs: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: true,
             })
             .await;
@@ -963,6 +964,7 @@ pub async fn run_gateway(
             connect_peripherals: false,
             emit_assembly_logs: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: true,
         })
         .await;
