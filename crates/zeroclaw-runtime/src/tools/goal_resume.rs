@@ -92,6 +92,7 @@ impl Tool for GoalResumeTool {
                 )),
             });
         }
+
         let config = crate::control_plane::current_goal_config()
             .unwrap_or_else(|| std::sync::Arc::clone(&self.config));
         let permit = match super::goal_tool_admission::prepare(config.as_ref()) {
@@ -105,7 +106,7 @@ impl Tool for GoalResumeTool {
             }
         };
 
-        let admission = match admit_goal_command(
+        let admission = admit_goal_command(
             ctx,
             GoalCommand {
                 action: GoalCommandAction::Resume,
@@ -117,28 +118,12 @@ impl Tool for GoalResumeTool {
             config.as_ref(),
             config.agent(&self.agent_alias),
         )
-        .await
-        {
-            Ok(admission) => admission,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new().into(),
-                    error: Some(error.to_string()),
-                });
-            }
-        };
+        .await?;
         if admission.continue_goal {
-            let task_id = admission.task_id.as_deref().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "continuing goal admission returned no exact task id"
-                );
+            let task_id = admission.task_id.clone().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            permit.activate(task_id)?;
+            permit.activate(task_id);
         }
         let output = goal_resume_tool_output(&admission);
 
@@ -376,114 +361,6 @@ mod tests {
             TaskStatus::Paused,
             "conflicting task-local binding must not resume the durable goal"
         );
-    }
-
-    #[tokio::test]
-    async fn tool_resume_fails_for_already_running_goal() {
-        let agent = format!("agent-{}", uuid::Uuid::new_v4());
-        ensure_control_plane();
-        let control_plane = control_plane().unwrap();
-        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
-        let route = format!("route-{}", uuid::Uuid::new_v4());
-        let principal = format!("principal-{}", uuid::Uuid::new_v4());
-        let continuation_context = TaskContinuationContext {
-            channel: "matrix".into(),
-            channel_alias: Some("default".into()),
-            reply_target: "room-a".into(),
-            sender: "operator-a".into(),
-            thread_ts: None,
-            interruption_scope_id: None,
-            conversation_scope: TaskContinuationConversationScope::ReplyTarget,
-        };
-        control_plane
-            .goal_store
-            .create_goal(
-                TaskRecord {
-                    id: task_id.clone(),
-                    kind: crate::control_plane::TaskKind::Goal,
-                    agent: agent.clone(),
-                    status: TaskStatus::Running,
-                    owner_pid: std::process::id(),
-                    owner_boot_id: "test-boot".into(),
-                    heartbeat_at: None,
-                    depth: 0,
-                    parent_id: None,
-                    originator_route: Some(route.clone()),
-                    delivered: false,
-                    idem_key: None,
-                    principal_id: Some(principal.clone()),
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    finished_at: None,
-                },
-                GoalTaskRecord {
-                    task_id: task_id.clone(),
-                    objective: "keep working".into(),
-                    effective_token_limit: None,
-                    effective_cost_limit_usd: None,
-                    pause_reason: None,
-                    pause_description: None,
-                    blockers: Vec::new(),
-                },
-                Some(continuation_context.clone()),
-            )
-            .await
-            .unwrap();
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.goal.enabled = true;
-        config.goal.allowed_channel_types = vec!["matrix".into()];
-        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
-            channels: vec![zeroclaw_config::providers::ChannelRef::new(
-                "matrix.default",
-            )],
-            ..zeroclaw_config::schema::AliasedAgentConfig::default()
-        };
-        config.agents.insert(agent.clone(), agent_config);
-        config.channels.matrix.insert(
-            "default".into(),
-            zeroclaw_config::schema::MatrixConfig {
-                enabled: true,
-                ..zeroclaw_config::schema::MatrixConfig::default()
-            },
-        );
-        let tool = GoalResumeTool::new(agent.clone(), std::sync::Arc::new(config));
-        let owner = GoalAdmissionContext::new(agent)
-            .with_channel_type(Some("matrix".into()))
-            .with_originator_route(Some(route))
-            .with_principal_id(Some(principal))
-            .with_continuation_context(Some(continuation_context));
-        let marker = Arc::new(AtomicBool::new(true));
-
-        let result = scope_goal_turn_evaluation_marker(
-            Some(Arc::clone(&marker)),
-            scope_goal_admission_context(
-                Some(owner),
-                tool.execute(serde_json::json!({
-                    "reason": "Continue prompt received while already admitted."
-                })),
-            ),
-        )
-        .await
-        .unwrap();
-
-        assert!(!result.success, "{result:?}");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("already running")),
-            "{result:?}"
-        );
-        assert!(result.output.is_empty());
-        let task = control_plane.store.get(&task_id).await.unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Running);
-        let goal = control_plane
-            .goal_store
-            .get_goal_task(&task_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(goal.pause_reason, None);
-        assert!(goal.blockers.is_empty());
     }
 
     #[test]

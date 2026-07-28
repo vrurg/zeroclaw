@@ -131,16 +131,10 @@ impl Tool for GoalStartTool {
         )
         .await?;
         if admission.continue_goal {
-            let task_id = admission.task_id.as_deref().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "continuing goal admission returned no exact task id"
-                );
+            let task_id = admission.task_id.clone().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            permit.activate(task_id)?;
+            permit.activate(task_id);
         }
         let output = goal_start_tool_output(&admission);
 
