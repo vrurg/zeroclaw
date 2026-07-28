@@ -9,7 +9,7 @@ use crate::approval::ApprovalManager;
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
-use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use zeroclaw_config::schema::LeakDetectionConfig;
 
 // Items that still live in `loop_` — import via the parent module.
@@ -513,6 +513,10 @@ async fn execute_one_tool_with_presentation(
                 id: event_call_id,
                 name: call_name.to_string(),
                 output: scrub_credentials(&out.output),
+                artifact: out
+                    .output_data
+                    .as_ref()
+                    .and_then(ToolArtifact::from_delivered_data),
             })
             .await;
     }
