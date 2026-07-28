@@ -36,6 +36,12 @@ pub struct TurnUsage {
     pub last_input_tokens: u64,
 }
 
+#[derive(Default)]
+struct GoalTaskBindingState {
+    task_id: Option<String>,
+    reserved_for_admission: bool,
+}
+
 pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
     let rate_sheet = rate_sheet_pricing_by_provider_type(config);
@@ -190,12 +196,10 @@ pub struct ToolLoopCostTrackingContext {
     /// Alias of the agent driving this turn. Stamped onto persisted
     /// `CostRecord`s so `/api/cost?agent=<alias>` can attribute spend.
     pub agent_alias: Option<String>,
-    /// Exact durable goal task bound before any goal-owned provider call.
-    ///
-    /// The one-time cell lets a successful model-callable goal admission bind
-    /// the remainder of the already-scoped tool loop without permitting a
-    /// later active-goal lookup to retarget usage after provider I/O.
-    goal_task_id: Arc<OnceLock<String>>,
+    /// Exact durable goal task bound before any goal-owned provider call, with
+    /// its admission reservation protected by the
+    /// same mutex so no other binder can race a model-tool preflight.
+    goal_task_binding: Arc<Mutex<GoalTaskBindingState>>,
     /// Whether this scoped turn is allowed to attribute usage to its exact
     /// durable goal task.
     ///
@@ -215,7 +219,7 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing,
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
-            goal_task_id: Arc::new(OnceLock::new()),
+            goal_task_binding: Arc::new(Mutex::new(GoalTaskBindingState::default())),
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -232,7 +236,7 @@ impl ToolLoopCostTrackingContext {
             model_provider_pricing: Arc::new(ModelProviderPricing::new()),
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
-            goal_task_id: Arc::new(OnceLock::new()),
+            goal_task_binding: Arc::new(Mutex::new(GoalTaskBindingState::default())),
             goal_attribution_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -252,12 +256,10 @@ impl ToolLoopCostTrackingContext {
         mut self,
         ctx: &crate::control_plane::GoalAdmissionContext,
     ) -> Self {
-        self.goal_task_id = Arc::new(OnceLock::new());
-        if let Some(task_id) = ctx.goal_task_id.as_deref() {
-            self.goal_task_id
-                .set(task_id.to_string())
-                .expect("new goal task binding must be empty");
-        }
+        self.goal_task_binding = Arc::new(Mutex::new(GoalTaskBindingState {
+            task_id: ctx.goal_task_id.clone(),
+            reserved_for_admission: false,
+        }));
         self.enable_goal_attribution();
         self
     }
@@ -290,26 +292,25 @@ impl ToolLoopCostTrackingContext {
     }
 
     pub fn exact_goal_task_id(&self) -> Option<String> {
-        self.goal_task_id.get().cloned()
+        self.goal_task_binding.lock().task_id.clone()
     }
 
     fn bind_exact_goal_task_id(&self, task_id: &str) -> anyhow::Result<()> {
         if task_id.is_empty() {
             anyhow::bail!("goal accounting attribution has no active task");
         }
-        if let Some(bound) = self.goal_task_id.get() {
+        let mut binding = self.goal_task_binding.lock();
+        if binding.reserved_for_admission {
+            anyhow::bail!("goal accounting attribution is reserved for admission");
+        }
+        if let Some(bound) = binding.task_id.as_deref() {
             if bound == task_id {
                 return Ok(());
             }
             anyhow::bail!("goal accounting attribution is already bound to a different task");
         }
-        match self.goal_task_id.set(task_id.to_string()) {
-            Ok(()) => Ok(()),
-            Err(attempted) if self.goal_task_id.get() == Some(&attempted) => Ok(()),
-            Err(_) => {
-                anyhow::bail!("goal accounting attribution is already bound to a different task")
-            }
-        }
+        binding.task_id = Some(task_id.to_string());
+        Ok(())
     }
 
     /// Return whether this scoped context may attribute new usage to its exact
@@ -363,6 +364,7 @@ pub fn enable_current_tool_loop_goal_attribution(
 /// goal, so activation binds that returned id without re-opening the ledger.
 pub struct PreparedToolLoopGoalAttribution {
     context: ToolLoopCostTrackingContext,
+    active: bool,
 }
 
 /// Prepare the current model-tool turn to become goal-owned.
@@ -377,7 +379,7 @@ pub fn prepare_current_tool_loop_goal_attribution(
             let context = context
                 .as_ref()
                 .ok_or_else(|| anyhow::Error::msg("goal accounting context unavailable"))?;
-            if context.goal_attribution_enabled() || context.exact_goal_task_id().is_some() {
+            if context.goal_attribution_enabled() {
                 anyhow::bail!("goal accounting attribution is already bound to a task");
             }
             context.ensure_goal_usage_ledger(config)?;
@@ -387,8 +389,17 @@ pub fn prepare_current_tool_loop_goal_attribution(
             tracker.ensure_storage_ready().map_err(|error| {
                 anyhow::Error::msg(format!("goal accounting tracker unavailable: {error}"))
             })?;
+            let mut binding = context.goal_task_binding.lock();
+            if binding.task_id.is_some() {
+                anyhow::bail!("goal accounting attribution is already bound to a task");
+            }
+            if binding.reserved_for_admission {
+                anyhow::bail!("goal accounting attribution is reserved");
+            }
+            binding.reserved_for_admission = true;
             Ok(PreparedToolLoopGoalAttribution {
                 context: context.clone(),
+                active: true,
             })
         })
         .map_err(|_| anyhow::Error::msg("goal accounting context unavailable"))?
@@ -396,10 +407,24 @@ pub fn prepare_current_tool_loop_goal_attribution(
 
 impl PreparedToolLoopGoalAttribution {
     /// Bind the exact controller-returned id after the preflight succeeded.
-    pub fn activate(self, task_id: String) {
-        debug_assert!(!task_id.is_empty());
-        let _ = self.context.goal_task_id.set(task_id);
-        self.context.enable_goal_attribution();
+    pub fn activate(mut self, task_id: String) {
+        let mut binding = self.context.goal_task_binding.lock();
+        if !task_id.is_empty() {
+            if binding.task_id.is_none() {
+                binding.task_id = Some(task_id);
+                self.context.enable_goal_attribution();
+            }
+        }
+        binding.reserved_for_admission = false;
+        self.active = false;
+    }
+}
+
+impl Drop for PreparedToolLoopGoalAttribution {
+    fn drop(&mut self) {
+        if self.active {
+            self.context.goal_task_binding.lock().reserved_for_admission = false;
+        }
     }
 }
 
