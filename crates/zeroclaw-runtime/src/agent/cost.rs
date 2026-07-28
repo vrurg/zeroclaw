@@ -296,7 +296,7 @@ impl ToolLoopCostTrackingContext {
     }
 
     fn has_exact_goal_task_id(&self) -> bool {
-        self.goal_task_id.get().is_some()
+        self.goal_task_binding.lock().task_id.is_some()
     }
 
     fn bind_exact_goal_task_id(&self, task_id: &str) -> anyhow::Result<()> {
