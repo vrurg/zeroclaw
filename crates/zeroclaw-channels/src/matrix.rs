@@ -138,8 +138,15 @@ mod mention {
     pub(super) fn strip_leading_command_address<'a>(
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
+        mentioned_user_ids: Option<&[String]>,
         body: &'a str,
     ) -> Option<&'a str> {
+        if let Some(command) =
+            strip_element_rich_mention_command(bot_user_id, mentioned_user_ids, body)
+        {
+            return Some(command);
+        }
+
         // Matrix clients reserve naked `/commands`, so users often address bot
         // commands as mentions. Strip only when the addressed payload is itself
         // a runtime slash command; normal conversational mentions stay intact.
@@ -165,7 +172,47 @@ mod mention {
         .flatten();
 
         let command = crate::addressed_command::strip_leading_addressed_command(body, addresses)?;
-        let token = command.split_whitespace().next()?;
+        runtime_owned_command(command).then_some(command)
+    }
+
+    fn strip_element_rich_mention_command<'a>(
+        bot_user_id: &UserId,
+        mentioned_user_ids: Option<&[String]>,
+        body: &'a str,
+    ) -> Option<&'a str> {
+        // Element renders a rich mention in `body` as Markdown while retaining
+        // the authoritative MXID in `m.mentions.user_ids`. Recognize only that
+        // exact fallback shape; this is not a general Markdown parser.
+        if !mentioned_user_ids?
+            .iter()
+            .any(|id| id == bot_user_id.as_str())
+        {
+            return None;
+        }
+        let markdown = body.trim_start().strip_prefix('[')?;
+        let label_end = markdown.find("](")?;
+        if label_end == 0 {
+            return None;
+        }
+        let target_and_suffix = &markdown[label_end + 2..];
+        let target_end = target_and_suffix.find(')')?;
+        let target = &target_and_suffix[..target_end];
+        let expected = format!("https://matrix.to/#/{}", bot_user_id.as_str());
+        if target != expected {
+            return None;
+        }
+        let suffix = &target_and_suffix[target_end + 1..];
+        if !suffix.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let command = suffix.trim_start();
+        runtime_owned_command(command).then_some(command)
+    }
+
+    fn runtime_owned_command(command: &str) -> bool {
+        let Some(token) = command.split_whitespace().next() else {
+            return false;
+        };
         match zeroclaw_commands::classify_command_token(
             token,
             zeroclaw_commands::CommandSurface::Channel,
@@ -173,16 +220,16 @@ mod mention {
             zeroclaw_commands::CommandTokenClassification::Valid(parsed)
                 if parsed.command.is_runtime_owned() =>
             {
-                Some(command)
+                true
             }
             zeroclaw_commands::CommandTokenClassification::MalformedTarget(spec)
                 if spec.is_runtime_owned() =>
             {
-                Some(command)
+                true
             }
             zeroclaw_commands::CommandTokenClassification::Unknown
             | zeroclaw_commands::CommandTokenClassification::Valid(_)
-            | zeroclaw_commands::CommandTokenClassification::MalformedTarget(_) => None,
+            | zeroclaw_commands::CommandTokenClassification::MalformedTarget(_) => false,
         }
     }
 
@@ -1780,8 +1827,8 @@ mod inbound {
 
         let mention_required = ctx.config.mention_only && is_group_room(&room).await;
         let display_name = ctx.bot_display_name.read().await;
+        let mention_user_ids = extract_mentions_user_ids(&raw);
         if mention_required {
-            let mention_user_ids = extract_mentions_user_ids(&raw);
             if !mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
@@ -1802,6 +1849,7 @@ mod inbound {
         let mut content = mention::strip_leading_command_address(
             &ctx.bot_user_id,
             display_name.as_deref(),
+            mention_user_ids.as_deref(),
             &body,
         )
         .unwrap_or(&body)
@@ -5101,15 +5149,15 @@ mod tests {
         fn addressed_runtime_command_strips_localpart_alias() {
             let bot = user_id!("@goal-bot:example.test");
             assert_eq!(
-                strip_leading_command_address(bot, None, "@goal-bot /goal status"),
+                strip_leading_command_address(bot, None, None, "@goal-bot /goal status"),
                 Some("/goal status")
             );
             assert_eq!(
-                strip_leading_command_address(bot, None, "@goal-bot: /goal start ship it"),
+                strip_leading_command_address(bot, None, None, "@goal-bot: /goal start ship it"),
                 Some("/goal start ship it")
             );
             assert_eq!(
-                strip_leading_command_address(bot, None, "@goal-bot: /goal@ status"),
+                strip_leading_command_address(bot, None, None, "@goal-bot: /goal@ status"),
                 Some("/goal@ status")
             );
         }
@@ -5121,6 +5169,7 @@ mod tests {
                 strip_leading_command_address(
                     bot,
                     Some("ZeroClaw-Bot"),
+                    None,
                     "@goal-bot:example.test: /goal status"
                 ),
                 Some("/goal status")
@@ -5129,6 +5178,7 @@ mod tests {
                 strip_leading_command_address(
                     bot,
                     Some("ZeroClaw-Bot"),
+                    None,
                     "@zeroclaw-bot /goal status"
                 ),
                 Some("/goal status")
@@ -5137,6 +5187,7 @@ mod tests {
                 strip_leading_command_address(
                     bot,
                     Some("ZeroClaw Goal Bot"),
+                    None,
                     "ZeroClaw Goal Bot: /goal status"
                 ),
                 Some("/goal status")
@@ -5145,6 +5196,7 @@ mod tests {
                 strip_leading_command_address(
                     bot,
                     Some("ZeroClaw-Помічник"),
+                    None,
                     "@ZeroClaw-Помічник /goal status"
                 ),
                 Some("/goal status")
@@ -5155,27 +5207,122 @@ mod tests {
         fn addressed_runtime_command_does_not_strip_non_commands_or_other_mentions() {
             let bot = user_id!("@goal-bot:example.test");
             assert_eq!(
-                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot hello /goal"),
-                None
-            );
-            assert_eq!(
-                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot-helper: /goal"),
-                None
-            );
-            assert_eq!(
-                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@other: /goal status"),
+                strip_leading_command_address(
+                    bot,
+                    Some("ZeroClaw-Bot"),
+                    None,
+                    "@goal-bot hello /goal"
+                ),
                 None
             );
             assert_eq!(
                 strip_leading_command_address(
                     bot,
                     Some("ZeroClaw-Bot"),
+                    None,
+                    "@goal-bot-helper: /goal"
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("ZeroClaw-Bot"),
+                    None,
+                    "@other: /goal status"
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    Some("ZeroClaw-Bot"),
+                    None,
                     "@goal-bot /weather today"
                 ),
                 None
             );
             assert_eq!(
-                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), "@goal-bot /help"),
+                strip_leading_command_address(bot, Some("ZeroClaw-Bot"), None, "@goal-bot /help"),
+                None
+            );
+        }
+
+        #[test]
+        fn element_rich_mention_strips_runtime_goal_commands() {
+            let bot = user_id!("@goal-bot:example.test");
+            let mentions = ["@goal-bot:example.test".to_string()];
+
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&mentions),
+                    "[Goal Bot](https://matrix.to/#/@goal-bot:example.test) /goal status",
+                ),
+                Some("/goal status")
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&mentions),
+                    "[Goal Bot](https://matrix.to/#/@goal-bot:example.test) /goal resume",
+                ),
+                Some("/goal resume")
+            );
+        }
+
+        #[test]
+        fn element_rich_mention_requires_exact_structured_mention_and_runtime_command() {
+            let bot = user_id!("@goal-bot:example.test");
+            let bot_mentions = ["@goal-bot:example.test".to_string()];
+            let foreign_mentions = ["@other:example.test".to_string()];
+            let element_body =
+                "[Goal Bot](https://matrix.to/#/@goal-bot:example.test) /goal status";
+
+            assert_eq!(
+                strip_leading_command_address(bot, None, None, element_body),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(bot, None, Some(&foreign_mentions), element_body),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&bot_mentions),
+                    "[Goal Bot](https://matrix.to/#/@other:example.test) /goal status",
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&bot_mentions),
+                    "[Goal Bot](https://matrix.to/#/@goal-bot:example.test)/goal status",
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&bot_mentions),
+                    "[Goal Bot](https://matrix.to/#/@goal-bot:example.test) /help",
+                ),
+                None
+            );
+            assert_eq!(
+                strip_leading_command_address(
+                    bot,
+                    None,
+                    Some(&bot_mentions),
+                    "[Goal Bot](https://matrix.to/#/@goal-bot:example.test) hello",
+                ),
                 None
             );
         }
