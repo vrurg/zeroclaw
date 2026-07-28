@@ -1151,6 +1151,69 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Durably pause an exact running goal before its process-local worker stops.
+///
+/// Generic channel interruption is not a goal lifecycle authority. It may stop
+/// a bound worker only after this guarded transition makes the durable goal
+/// resumable, or after a concurrent pause/terminal transition has already
+/// removed the worker's execution obligation.
+pub async fn pause_running_goal_for_interruption(task_id: &str) -> Result<()> {
+    if task_id.trim().is_empty() {
+        bail!("cannot pause an interrupted goal without an exact task id");
+    }
+    let cp = control_plane().context("goal control plane unavailable during interruption")?;
+    let pause = GoalPauseState {
+        reason: GoalPauseReason::OperatorPaused,
+        description: Some(msg("goal-interruption-pause-description", &[])),
+        blockers: vec![GoalBlocker {
+            kind: GoalBlockerKind::OperatorPause,
+            message: msg("goal-interruption-blocker", &[]),
+            payload: None,
+        }],
+    };
+    if cp
+        .goal_store
+        .pause_goal_task_if_status(task_id, TaskStatus::Running, pause)
+        .await
+        .with_context(|| format!("pause interrupted goal {task_id}"))?
+    {
+        return Ok(());
+    }
+
+    let current = cp
+        .store
+        .get(task_id)
+        .await
+        .with_context(|| format!("reload interrupted goal {task_id}"))?
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("interrupted goal {task_id} no longer exists"))
+        })?;
+    if current.status == TaskStatus::Running {
+        bail!("interrupted goal {task_id} remained running after guarded pause");
+    }
+    Ok(())
+}
+
+/// Verify that this model-tool turn can bind one exact admitted goal task.
+///
+/// The durable task record remains the source of truth. This only guards the
+/// transient task-local binding used by later work in the same turn, and must
+/// run before a model tool performs a durable start or resume transition.
+pub fn ensure_current_goal_task_binding_available() -> Result<()> {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            let admission = scope.admission_context.read();
+            let admission = admission
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("goal admission context unavailable"))?;
+            if admission.goal_task_id.is_some() {
+                anyhow::bail!("goal admission already has an exact live task binding");
+            }
+            Ok(())
+        })
+        .map_err(|_| anyhow::Error::msg("goal admission context unavailable"))?
+}
+
 /// Durably stop the exact active goal after a provider boundary reports that
 /// its usage cannot be attributed. The task-local admission context supplies
 /// the task id; this never falls back to route or principal lookup.
