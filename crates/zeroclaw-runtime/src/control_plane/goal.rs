@@ -46,8 +46,7 @@ pub struct GoalRuntimeScope {
     /// successful exact goal admission can bind its returned task id before a
     /// later approval request. This remains transient trust plumbing; the
     /// canonical task and continuation rows remain authoritative.
-    admission_context: Arc<parking_lot::RwLock<Option<GoalAdmissionContext>>>,
-    admission_binding_reserved: Arc<AtomicBool>,
+    admission_binding: Arc<parking_lot::Mutex<GoalAdmissionBindingState>>,
     /// Optional live channel sink for controller/verifier progress messages.
     state_update_sink: Option<GoalStateUpdateSink>,
     /// Shared marker promoted when the current turn becomes goal work.
@@ -63,6 +62,12 @@ pub struct GoalRuntimeScope {
     task_binding_sink: Option<GoalTaskBindingSink>,
 }
 
+#[derive(Default)]
+struct GoalAdmissionBindingState {
+    context: Option<GoalAdmissionContext>,
+    reserved_for_admission: bool,
+}
+
 impl GoalRuntimeScope {
     pub fn new(
         admission_context: Option<GoalAdmissionContext>,
@@ -70,8 +75,10 @@ impl GoalRuntimeScope {
         turn_evaluation_requested: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
-            admission_context: Arc::new(parking_lot::RwLock::new(admission_context)),
-            admission_binding_reserved: Arc::new(AtomicBool::new(false)),
+            admission_binding: Arc::new(parking_lot::Mutex::new(GoalAdmissionBindingState {
+                context: admission_context,
+                reserved_for_admission: false,
+            })),
             state_update_sink,
             turn_evaluation_requested,
             config_resolver: None,
@@ -99,12 +106,14 @@ impl GoalRuntimeScope {
     /// bound by a successful goal tool call inside that loop.
     #[must_use]
     pub fn admission_context(&self) -> Option<GoalAdmissionContext> {
-        self.admission_context.read().clone()
+        self.admission_binding.lock().context.clone()
     }
 
     fn with_admission_context(mut self, admission_context: Option<GoalAdmissionContext>) -> Self {
-        self.admission_context = Arc::new(parking_lot::RwLock::new(admission_context));
-        self.admission_binding_reserved = Arc::new(AtomicBool::new(false));
+        self.admission_binding = Arc::new(parking_lot::Mutex::new(GoalAdmissionBindingState {
+            context: admission_context,
+            reserved_for_admission: false,
+        }));
         self
     }
 
@@ -948,7 +957,7 @@ impl GoalAdmissionContext {
 
 pub fn current_goal_admission_context() -> Option<GoalAdmissionContext> {
     GOAL_RUNTIME_SCOPE
-        .try_with(|scope| scope.admission_context.read().clone())
+        .try_with(|scope| scope.admission_binding.lock().context.clone())
         .ok()
         .flatten()
 }
@@ -992,17 +1001,18 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
     }
     GOAL_RUNTIME_SCOPE
         .try_with(|scope| {
-            let bound = {
-                let mut admission = scope.admission_context.write();
-                let Some(admission) = admission.as_mut() else {
-                    return false;
-                };
-                match admission.goal_task_id.as_deref() {
-                    Some(existing) => existing == task_id,
-                    None => {
-                        admission.goal_task_id = Some(task_id.to_string());
-                        true
-                    }
+            let mut binding = scope.admission_binding.lock();
+            if binding.reserved_for_admission {
+                return false;
+            }
+            let Some(admission) = binding.context.as_mut() else {
+                return false;
+            };
+            match admission.goal_task_id.as_deref() {
+                Some(existing) => existing == task_id,
+                None => {
+                    admission.goal_task_id = Some(task_id.to_string());
+                    true
                 }
             };
             if bound && let Some(sink) = scope.task_binding_sink.as_ref() {
@@ -1064,11 +1074,12 @@ pub async fn pause_running_goal_for_interruption(task_id: &str) -> Result<()> {
 pub fn ensure_current_goal_task_binding_available() -> Result<()> {
     GOAL_RUNTIME_SCOPE
         .try_with(|scope| {
-            let admission = scope.admission_context.read();
-            let admission = admission
+            let binding = scope.admission_binding.lock();
+            let admission = binding
+                .context
                 .as_ref()
                 .ok_or_else(|| anyhow::Error::msg("goal admission context unavailable"))?;
-            if admission.goal_task_id.is_some() {
+            if binding.reserved_for_admission || admission.goal_task_id.is_some() {
                 anyhow::bail!("goal admission already has an exact live task binding");
             }
             Ok(())
@@ -1079,22 +1090,21 @@ pub fn ensure_current_goal_task_binding_available() -> Result<()> {
 pub fn reserve_current_goal_task_binding() -> Result<GoalTaskBindingReservation> {
     GOAL_RUNTIME_SCOPE
         .try_with(|scope| {
-            {
-                let admission = scope.admission_context.read();
-                let admission = admission
-                    .as_ref()
-                    .ok_or_else(|| anyhow::Error::msg("goal admission context unavailable"))?;
-                if admission.goal_task_id.is_some() {
-                    anyhow::bail!("goal admission already has an exact live task binding");
-                }
+            let mut binding = scope.admission_binding.lock();
+            let admission = binding
+                .context
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("goal admission context unavailable"))?;
+            if admission.goal_task_id.is_some() {
+                anyhow::bail!("goal admission already has an exact live task binding");
             }
-            scope
-                .admission_binding_reserved
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| anyhow::Error::msg("goal admission task binding is reserved"))?;
+            if binding.reserved_for_admission {
+                anyhow::bail!("goal admission task binding is reserved");
+            }
+            binding.reserved_for_admission = true;
             Ok(GoalTaskBindingReservation {
-                admission_context: Arc::clone(&scope.admission_context),
-                reserved: Arc::clone(&scope.admission_binding_reserved),
+                binding: Arc::clone(&scope.admission_binding),
+                task_binding_sink: scope.task_binding_sink.clone(),
                 active: true,
             })
         })
@@ -1106,13 +1116,13 @@ pub fn reserve_current_goal_task_binding() -> Result<GoalTaskBindingReservation>
 /// permit after its durable transition succeeds.
 pub fn current_goal_task_binding_is_reserved() -> bool {
     GOAL_RUNTIME_SCOPE
-        .try_with(|scope| scope.admission_binding_reserved.load(Ordering::Acquire))
+        .try_with(|scope| scope.admission_binding.lock().reserved_for_admission)
         .unwrap_or(false)
 }
 
 pub struct GoalTaskBindingReservation {
-    admission_context: Arc<parking_lot::RwLock<Option<GoalAdmissionContext>>>,
-    reserved: Arc<AtomicBool>,
+    binding: Arc<parking_lot::Mutex<GoalAdmissionBindingState>>,
+    task_binding_sink: Option<GoalTaskBindingSink>,
     active: bool,
 }
 
@@ -1121,21 +1131,29 @@ impl GoalTaskBindingReservation {
         if task_id.is_empty() {
             return;
         }
-        let mut admission = self.admission_context.write();
-        if let Some(admission) = admission.as_mut() {
-            if admission.goal_task_id.is_none() {
-                admission.goal_task_id = Some(task_id);
+        let mut binding = self.binding.lock();
+        let mut bound = false;
+        if binding.reserved_for_admission {
+            if let Some(admission) = binding.context.as_mut() {
+                if admission.goal_task_id.is_none() {
+                    admission.goal_task_id = Some(task_id.clone());
+                    bound = true;
+                }
             }
         }
         self.active = false;
-        self.reserved.store(false, Ordering::Release);
+        binding.reserved_for_admission = false;
+        drop(binding);
+        if bound && let Some(sink) = self.task_binding_sink.as_ref() {
+            sink(&task_id);
+        }
     }
 }
 
 impl Drop for GoalTaskBindingReservation {
     fn drop(&mut self) {
         if self.active {
-            self.reserved.store(false, Ordering::Release);
+            self.binding.lock().reserved_for_admission = false;
         }
     }
 }
@@ -3120,6 +3138,26 @@ mod tests {
     use crate::control_plane::TaskContinuationConversationScope;
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn live_goal_binding_reservation_rejects_competing_binder() {
+        scope_goal_admission_context(Some(GoalAdmissionContext::new("agent-a")), async {
+            let reservation = reserve_current_goal_task_binding()
+                .expect("unbound live task binding can be reserved");
+
+            assert!(
+                !bind_current_goal_task("goal-competing"),
+                "a generic binder cannot steal a model admission reservation"
+            );
+            reservation.bind("goal-admitted".to_string());
+
+            assert_eq!(
+                current_goal_admission_context().and_then(|context| context.goal_task_id),
+                Some("goal-admitted".to_string())
+            );
+        })
+        .await;
+    }
 
     fn configure_test_goal_channel(
         config: &mut Config,
