@@ -9041,6 +9041,7 @@ async fn requeue_abandoned_recovered_continuation(
 struct RecoveredGoalClaim {
     control_plane: zeroclaw_runtime::control_plane::ControlPlaneHandle,
     task_id: Option<String>,
+    retiring: Arc<AtomicBool>,
 }
 
 /// A normal worker's exact goal binding during a channel-component lifetime.
@@ -9088,8 +9089,9 @@ impl Drop for BoundGoalExecutionClaim {
         }
 
         let control_plane = self.control_plane.clone();
+        let retiring = Arc::clone(&self.retiring);
         zeroclaw_spawn::spawn!(async move {
-            let mut claim = RecoveredGoalClaim::new(control_plane, task_id);
+            let mut claim = RecoveredGoalClaim::new(control_plane, task_id, retiring);
             claim.pause_for_unfinished_execution().await;
         });
     }
@@ -9099,10 +9101,12 @@ impl RecoveredGoalClaim {
     fn new(
         control_plane: zeroclaw_runtime::control_plane::ControlPlaneHandle,
         task_id: String,
+        retiring: Arc<AtomicBool>,
     ) -> Self {
         Self {
             control_plane,
             task_id: Some(task_id),
+            retiring,
         }
     }
 
@@ -9122,6 +9126,12 @@ impl RecoveredGoalClaim {
     }
 
     async fn pause_for_unfinished_execution(&mut self) {
+        if self.retiring.load(Ordering::Acquire) {
+            if let Some(task_id) = self.task_id.take() {
+                self.control_plane.retain_recovered_goal_id(task_id);
+            }
+            return;
+        }
         self.pause_until_settled(
             zeroclaw_runtime::control_plane::GoalPauseReason::DaemonRestart,
             zeroclaw_runtime::control_plane::GoalBlockerKind::RestartRecovery,
@@ -9186,9 +9196,10 @@ impl Drop for RecoveredGoalClaim {
             return;
         };
         let control_plane = self.control_plane.clone();
+        let retiring = Arc::clone(&self.retiring);
         if tokio::runtime::Handle::try_current().is_ok() {
             std::mem::drop(zeroclaw_spawn::spawn!(async move {
-                let mut guardian = Self::new(control_plane, task_id);
+                let mut guardian = Self::new(control_plane, task_id, retiring);
                 guardian.pause_for_unfinished_execution().await;
             }));
         }
@@ -11092,7 +11103,11 @@ async fn run_message_dispatch_loop_with_recovery(
         let recovery_claim = recovered_token.as_ref().and_then(|token| {
             zeroclaw_runtime::control_plane::control_plane().map(|control_plane| {
                 control_plane.acknowledge_recovered_goal_id(&token.task_id);
-                RecoveredGoalClaim::new(control_plane.clone(), token.task_id.clone())
+                RecoveredGoalClaim::new(
+                    control_plane.clone(),
+                    token.task_id.clone(),
+                    Arc::clone(&retiring),
+                )
             })
         });
         let recovered_task_id = recovered_token.as_ref().map(|token| token.task_id.as_str());
@@ -30158,7 +30173,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .internal_goal_task_id
             .clone()
             .expect("recovered fixture binds its exact task");
-        let mut claim = RecoveredGoalClaim::new(control_plane.clone(), task_id.clone());
+        let mut claim = RecoveredGoalClaim::new(
+            control_plane.clone(),
+            task_id.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
 
         claim.pause_for_provider_initialization_failure().await;
 
@@ -30201,6 +30220,64 @@ BTC is currently around $65,000 based on latest tool output."#
                 .status,
             zeroclaw_runtime::control_plane::TaskStatus::Running,
             "the handoff does not fabricate a second lifecycle state"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_recovered_worker_transfers_its_exact_goal_binding() {
+        let (_temp, control_plane, message) =
+            recovered_goal_pause_failure_fixture("goal-recovered-handoff").await;
+        let task_id = message
+            .internal_goal_task_id
+            .expect("fixture binds its exact task");
+        let retiring = Arc::new(AtomicBool::new(true));
+        let mut claim = RecoveredGoalClaim::new(
+            control_plane.clone(),
+            task_id.clone(),
+            Arc::clone(&retiring),
+        );
+
+        claim.pause_for_unfinished_execution().await;
+
+        assert_eq!(control_plane.recovered_goal_ids(), vec![task_id.clone()]);
+        assert_eq!(
+            control_plane
+                .store
+                .get(&task_id)
+                .await
+                .expect("read retained goal")
+                .expect("retained goal exists")
+                .status,
+            zeroclaw_runtime::control_plane::TaskStatus::Running,
+            "retirement re-leases the existing task instead of fabricating a pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retiring_recovered_worker_still_pauses_unfinished_execution() {
+        let (_temp, control_plane, message) =
+            recovered_goal_pause_failure_fixture("goal-recovered-nonretiring").await;
+        let task_id = message
+            .internal_goal_task_id
+            .expect("fixture binds its exact task");
+        let mut claim = RecoveredGoalClaim::new(
+            control_plane.clone(),
+            task_id.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        claim.pause_for_unfinished_execution().await;
+
+        assert!(control_plane.recovered_goal_ids().is_empty());
+        assert_eq!(
+            control_plane
+                .store
+                .get(&task_id)
+                .await
+                .expect("read paused goal")
+                .expect("paused goal exists")
+                .status,
+            zeroclaw_runtime::control_plane::TaskStatus::Paused
         );
     }
 
