@@ -1404,6 +1404,7 @@ pub(crate) async fn assemble_owned_execution(
             mcp_registry: None,
             connect_peripherals: false,
             exclude_memory: false,
+            acp_delivery: false,
             list_deferred_mcp_specs: false,
             emit_assembly_logs: true,
         })
