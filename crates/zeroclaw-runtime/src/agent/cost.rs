@@ -567,7 +567,12 @@ pub(crate) async fn record_tool_loop_cost_usage_optional(
     } = goal_accounting_requirements(&ctx).await?;
     let tracker = ctx.tracker();
     if goal_attributed && tracker.is_none() {
-        anyhow::bail!("goal accounting tracker unavailable");
+        // A direct channel continuation may run in the deliberately dormant
+        // usage-only context when ordinary tracking is disabled. Model-issued
+        // goal tools first attach the canonical ledger during their admission
+        // preflight, so this escape hatch cannot bypass their fail-closed
+        // accounting contract.
+        return Ok(None);
     }
     let Some(usage) = usage.filter(|usage| {
         usage
@@ -862,9 +867,9 @@ pub fn ensure_goal_accounting_preflight() -> anyhow::Result<()> {
                 if !ctx.has_exact_goal_task_id() {
                     anyhow::bail!("goal accounting attribution has no active task");
                 }
-                let tracker = ctx
-                    .tracker()
-                    .ok_or_else(|| anyhow::Error::msg("goal accounting tracker unavailable"))?;
+                let Some(tracker) = ctx.tracker() else {
+                    return Ok(());
+                };
                 tracker.ensure_storage_ready().map_err(|error| {
                     anyhow::Error::msg(format!("goal accounting tracker unavailable: {error}"))
                 })?;
