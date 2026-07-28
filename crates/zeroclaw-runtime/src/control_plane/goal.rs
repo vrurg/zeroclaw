@@ -903,6 +903,26 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Verify that this model-tool turn can bind one exact admitted goal task.
+///
+/// The durable task record remains the source of truth. This only guards the
+/// transient task-local binding used by later work in the same turn, and must
+/// run before a model tool performs a durable start or resume transition.
+pub fn ensure_current_goal_task_binding_available() -> Result<()> {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| {
+            let admission = scope.admission_context.read();
+            let admission = admission
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("goal admission context unavailable"))?;
+            if admission.goal_task_id.is_some() {
+                anyhow::bail!("goal admission already has an exact live task binding");
+            }
+            Ok(())
+        })
+        .map_err(|_| anyhow::Error::msg("goal admission context unavailable"))?
+}
+
 /// Durably stop the exact active goal after a provider boundary reports that
 /// its usage cannot be attributed. The task-local admission context supplies
 /// the task id; this never falls back to route or principal lookup.

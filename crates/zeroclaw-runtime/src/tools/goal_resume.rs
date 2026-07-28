@@ -93,6 +93,17 @@ impl Tool for GoalResumeTool {
             });
         }
 
+        let permit = match super::goal_tool_admission::prepare(self.config.as_ref()) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new().into(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+
         let admission = admit_goal_command(
             ctx,
             GoalCommand {
@@ -110,14 +121,7 @@ impl Tool for GoalResumeTool {
             let task_id = admission.task_id.as_deref().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            if !crate::control_plane::bind_current_goal_task(task_id) {
-                anyhow::bail!("goal admission could not bind its exact live task");
-            }
-            crate::agent::cost::enable_current_tool_loop_goal_attribution(
-                self.config.as_ref(),
-                task_id,
-            )?;
-            crate::control_plane::mark_current_goal_turn_for_evaluation();
+            permit.activate(task_id)?;
         }
         let output = goal_resume_tool_output(&admission);
 
@@ -223,6 +227,7 @@ mod tests {
             .with_principal_id(Some(principal));
         let marker = Arc::new(AtomicBool::new(false));
         let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
+        let accounting_after = accounting.clone();
 
         let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -249,6 +254,85 @@ mod tests {
         assert!(
             marker.load(Ordering::Acquire),
             "continued model goal_resume admission must mark this tool loop for goal evaluation"
+        );
+        assert_eq!(
+            accounting_after.exact_goal_task_id().as_deref(),
+            Some(task_id.as_str()),
+            "successful model goal_resume must attribute the following provider call to the exact task"
+        );
+        assert!(accounting_after.goal_attribution_enabled());
+    }
+
+    #[tokio::test]
+    async fn tool_resume_with_existing_live_binding_fails_without_resuming_goal() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        ensure_control_plane();
+        let control_plane = control_plane().unwrap();
+        let task_id = format!("goal-{}", uuid::Uuid::new_v4());
+        let route = format!("route-{}", uuid::Uuid::new_v4());
+        let principal = format!("principal-{}", uuid::Uuid::new_v4());
+        control_plane
+            .goal_store
+            .create_goal(
+                TaskRecord {
+                    id: task_id.clone(),
+                    kind: crate::control_plane::TaskKind::Goal,
+                    agent: agent.clone(),
+                    status: TaskStatus::Paused,
+                    owner_pid: 0,
+                    owner_boot_id: "old-boot".into(),
+                    heartbeat_at: None,
+                    depth: 0,
+                    parent_id: None,
+                    originator_route: Some(route.clone()),
+                    delivered: false,
+                    idem_key: None,
+                    principal_id: Some(principal.clone()),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    finished_at: None,
+                },
+                GoalTaskRecord {
+                    task_id: task_id.clone(),
+                    objective: "remain paused".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: Some(GoalPauseReason::NeedsUserInput),
+                    pause_description: None,
+                    blockers: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.allowed_channel_types = vec!["test-channel".into()];
+        let tool = GoalResumeTool::new(agent.clone(), Arc::new(config));
+        let owner = GoalAdmissionContext::new(agent)
+            .with_channel_type(Some("test-channel".into()))
+            .with_originator_route(Some(route))
+            .with_principal_id(Some(principal))
+            .with_goal_task_id(Some("already-bound".into()));
+
+        let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(crate::agent::cost::ToolLoopCostTrackingContext::usage_only()),
+                scope_goal_admission_context(Some(owner), tool.execute(serde_json::json!({}))),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        assert_eq!(
+            control_plane
+                .store
+                .get(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Paused,
+            "conflicting task-local binding must not resume the durable goal"
         );
     }
 

@@ -104,6 +104,17 @@ impl Tool for GoalStartTool {
             });
         }
 
+        let permit = match super::goal_tool_admission::prepare(self.config.as_ref()) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new().into(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+
         let admission = admit_goal_command(
             ctx,
             GoalCommand {
@@ -121,14 +132,7 @@ impl Tool for GoalStartTool {
             let task_id = admission.task_id.as_deref().ok_or_else(|| {
                 anyhow::Error::msg("continuing goal admission returned no exact task id")
             })?;
-            if !crate::control_plane::bind_current_goal_task(task_id) {
-                anyhow::bail!("goal admission could not bind its exact live task");
-            }
-            crate::agent::cost::enable_current_tool_loop_goal_attribution(
-                self.config.as_ref(),
-                task_id,
-            )?;
-            crate::control_plane::mark_current_goal_turn_for_evaluation();
+            permit.activate(task_id)?;
         }
         let output = goal_start_tool_output(&admission);
 
@@ -293,6 +297,7 @@ mod tests {
             .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
         let marker = Arc::new(AtomicBool::new(false));
         let accounting = crate::agent::cost::ToolLoopCostTrackingContext::usage_only();
+        let accounting_after = accounting.clone();
 
         let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -313,6 +318,104 @@ mod tests {
             marker.load(Ordering::Acquire),
             "continued model goal_start admission must mark this tool loop for goal evaluation"
         );
+        assert!(accounting_after.goal_attribution_enabled());
+        assert!(
+            accounting_after.exact_goal_task_id().is_some(),
+            "successful model goal_start must bind exact task attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_start_without_accounting_context_fails_before_goal_creation() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let (_store, goal_store) = ensure_control_plane();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        let tool = GoalStartTool::new(agent.clone(), Arc::new(config));
+        let owner = GoalAdmissionContext::new(agent.clone())
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
+            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
+
+        let result = scope_goal_admission_context(
+            Some(owner),
+            tool.execute(serde_json::json!({"objective": "must not persist"})),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        assert!(
+            goal_store
+                .latest_active_goal_for_agent(&agent)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed accounting preflight must not create a durable goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_start_with_unavailable_ledger_fails_before_goal_creation() {
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        let (_store, goal_store) = ensure_control_plane();
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("state").join("costs.jsonl")).unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.data_dir = workspace.path().to_path_buf();
+        let tool = GoalStartTool::new(agent.clone(), Arc::new(config));
+        let owner = GoalAdmissionContext::new(agent.clone())
+            .with_channel_type(Some("matrix".into()))
+            .with_originator_route(Some(format!("route-{}", uuid::Uuid::new_v4())))
+            .with_principal_id(Some(format!("principal-{}", uuid::Uuid::new_v4())));
+
+        let result = crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(crate::agent::cost::ToolLoopCostTrackingContext::usage_only()),
+                scope_goal_admission_context(
+                    Some(owner),
+                    tool.execute(serde_json::json!({"objective": "must not persist"})),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        assert!(
+            goal_store
+                .latest_active_goal_for_agent(&agent)
+                .await
+                .unwrap()
+                .is_none(),
+            "failed ledger preflight must not create a durable goal"
+        );
+    }
+
+    fn ensure_control_plane() -> (Arc<dyn TaskRegistry>, Arc<dyn GoalTaskRegistry>) {
+        match control_plane() {
+            Some(control_plane) => (
+                Arc::clone(&control_plane.store),
+                Arc::clone(&control_plane.goal_store),
+            ),
+            None => {
+                let sqlite_store =
+                    Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+                let store: Arc<dyn TaskRegistry> = sqlite_store.clone();
+                let goal_store: Arc<dyn GoalTaskRegistry> = sqlite_store;
+                let _ = init_control_plane(crate::control_plane::ControlPlaneHandle {
+                    store: Arc::clone(&store),
+                    goal_store: Arc::clone(&goal_store),
+                    boot_id: "test-boot".into(),
+                    recovered_goal_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    data_dir_lock: None,
+                });
+                (
+                    Arc::clone(&control_plane().unwrap().store),
+                    Arc::clone(&control_plane().unwrap().goal_store),
+                )
+            }
+        }
     }
 
     #[test]

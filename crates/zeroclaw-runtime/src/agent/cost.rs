@@ -354,6 +354,55 @@ pub fn enable_current_tool_loop_goal_attribution(
         .map_err(|_| anyhow::Error::msg("goal accounting context unavailable"))?
 }
 
+/// Prepared accounting admission for a model-callable goal tool.
+///
+/// This is transient turn state, not a second goal ledger. Preparing it proves
+/// that the current turn has an unbound accounting context and that the
+/// canonical ledger is writable before the tool performs a durable lifecycle
+/// transition. The exact task id is not known until the controller admits the
+/// goal, so activation binds that returned id without re-opening the ledger.
+pub struct PreparedToolLoopGoalAttribution {
+    context: ToolLoopCostTrackingContext,
+}
+
+/// Prepare the current model-tool turn to become goal-owned.
+///
+/// A model-issued start or resume must fail before durable mutation when it
+/// cannot later attribute the following provider call to the canonical ledger.
+pub fn prepare_current_tool_loop_goal_attribution(
+    config: &Config,
+) -> anyhow::Result<PreparedToolLoopGoalAttribution> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(|context| {
+            let context = context
+                .as_ref()
+                .ok_or_else(|| anyhow::Error::msg("goal accounting context unavailable"))?;
+            if context.goal_attribution_enabled() || context.exact_goal_task_id().is_some() {
+                anyhow::bail!("goal accounting attribution is already bound to a task");
+            }
+            context.ensure_goal_usage_ledger(config)?;
+            let tracker = context
+                .tracker()
+                .ok_or_else(|| anyhow::Error::msg("goal accounting tracker unavailable"))?;
+            tracker.ensure_storage_ready().map_err(|error| {
+                anyhow::Error::msg(format!("goal accounting tracker unavailable: {error}"))
+            })?;
+            Ok(PreparedToolLoopGoalAttribution {
+                context: context.clone(),
+            })
+        })
+        .map_err(|_| anyhow::Error::msg("goal accounting context unavailable"))?
+}
+
+impl PreparedToolLoopGoalAttribution {
+    /// Bind the exact controller-returned id after the preflight succeeded.
+    pub fn activate(self, task_id: &str) -> anyhow::Result<()> {
+        self.context.bind_exact_goal_task_id(task_id)?;
+        self.context.enable_goal_attribution();
+        Ok(())
+    }
+}
+
 pub fn current_exact_goal_task_id() -> Option<String> {
     TOOL_LOOP_COST_TRACKING_CONTEXT
         .try_with(|ctx| {
