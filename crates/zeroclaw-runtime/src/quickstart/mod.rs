@@ -9,6 +9,33 @@ use zeroclaw_config::presets::{
 };
 use zeroclaw_config::schema::{Config, WireApi};
 
+/// Store an Anthropic setup token in the profile bound to its provider alias.
+///
+/// The setup-token field is transport-only: an OAuth-mode model entry never
+/// persists it in `config.toml`. Every Quickstart surface must use this helper
+/// so the alias that selects `auth_mode = "oauth"` is also the profile name.
+pub async fn store_anthropic_setup_token(
+    config: &Config,
+    alias: &str,
+    token: &str,
+) -> anyhow::Result<()> {
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("Anthropic setup token cannot be empty");
+    }
+
+    let kind =
+        zeroclaw_providers::auth::anthropic_token::detect_auth_kind(token, Some("authorization"));
+    let metadata = std::collections::HashMap::from([(
+        "auth_kind".to_string(),
+        kind.as_metadata_value().to_string(),
+    )]);
+    zeroclaw_providers::auth::AuthService::from_config(config)
+        .store_model_provider_token("anthropic", alias, token, metadata, true)
+        .await?;
+    Ok(())
+}
+
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
 /// without parsing message strings.
@@ -238,6 +265,20 @@ pub async fn apply_with_surface(
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
+    let setup_token = anthropic_setup_token_from_submission(&submission);
+
+    if matches!(surface, Surface::Web | Surface::Tui)
+        && setup_token.is_some_and(|(_, token)| token.is_empty())
+    {
+        return Err(vec![QuickstartError::for_surface(
+            Some(&ctx),
+            QuickstartStep::ModelProvider,
+            "api_key",
+            "Anthropic setup-token authentication requires a setup token",
+            "cli-quickstart-error-anthropic-setup-token-required",
+            &[],
+        )]);
+    }
 
     ::zeroclaw_log::record!(
         INFO,
@@ -284,6 +325,24 @@ pub async fn apply_with_surface(
             )]);
         }
     };
+
+    // Store the transport-only setup token before committing the config that
+    // selects it. If this fails, the caller retains its previous persisted
+    // configuration rather than landing an OAuth alias with no profile.
+    if let Some((alias, token)) = setup_token.filter(|(_, token)| !token.is_empty()) {
+        store_anthropic_setup_token(config, alias, token)
+            .await
+            .map_err(|err| {
+                vec![QuickstartError::for_surface(
+                    Some(&ctx),
+                    QuickstartStep::ModelProvider,
+                    "api_key",
+                    format!("failed to store Anthropic setup token: {err}"),
+                    "cli-quickstart-error-anthropic-setup-token-store",
+                    &[],
+                )]
+            })?;
+    }
 
     config
         .set_prop_persistent("onboard_state.quickstart_completed", "true")
@@ -793,6 +852,28 @@ const QUICKSTART_ANTHROPIC_AUTH_MODES: &[&str] = &[
     QUICKSTART_AUTH_MODE_API_KEY,
     QUICKSTART_AUTH_MODE_SETUP_TOKEN,
 ];
+
+fn anthropic_setup_token_from_submission(submission: &BuilderSubmission) -> Option<(&str, &str)> {
+    let SelectorChoice::Fresh(choice) = &submission.model_provider else {
+        return None;
+    };
+    let (provider_type, _) = resolve_model_provider_type(&choice.provider_type)?;
+    if provider_type != "anthropic"
+        || !choice
+            .fields
+            .get(QUICKSTART_AUTH_MODE_FIELD)
+            .is_some_and(|mode| {
+                mode.trim()
+                    .eq_ignore_ascii_case(QUICKSTART_AUTH_MODE_SETUP_TOKEN)
+            })
+    {
+        return None;
+    }
+    Some((
+        choice.alias.as_str(),
+        choice.fields.get("api_key").map_or("", String::as_str),
+    ))
+}
 
 fn auth_modes_for(provider_type: &str) -> Option<&'static [&'static str]> {
     match provider_type {
@@ -2774,6 +2855,34 @@ mod tests {
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
         assert_eq!(agent.runtime_profile, "balanced");
+    }
+
+    #[tokio::test]
+    async fn web_setup_token_persists_same_alias_profile_without_inline_key() {
+        let mut submission = fresh_submission("bot");
+        let SelectorChoice::Fresh(choice) = &mut submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        choice.alias = "subscription".to_string();
+        choice.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+        ]);
+
+        let (dir, config) = apply_to_temp(submission).await;
+        let entry = config
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .expect("configured Anthropic alias");
+        assert_eq!(entry.api_key, None);
+        let auth = zeroclaw_providers::auth::AuthService::new(dir.path(), false);
+        let profile = auth
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .expect("load auth profile")
+            .expect("same-alias profile");
+        assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
     }
 
     #[tokio::test]

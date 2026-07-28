@@ -174,7 +174,17 @@ impl AuthService {
         let Some(profile_id) = select_profile_id(&data, &model_provider, profile_override) else {
             return Ok(None);
         };
-        Ok(data.profiles.get(&profile_id).cloned())
+        let Some(profile) = data.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        if profile.model_provider != model_provider {
+            anyhow::bail!(
+                "Profile {profile_id} belongs to model_provider {}, not {}",
+                profile.model_provider,
+                model_provider
+            );
+        }
+        Ok(Some(profile.clone()))
     }
 
     pub async fn get_provider_bearer_token(
@@ -1962,6 +1972,27 @@ mod tests {
             select_profile_id(&data, "openai-codex", None),
             Some(id_active)
         );
+    }
+
+    #[tokio::test]
+    async fn get_profile_rejects_an_explicit_profile_owned_by_another_provider() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        auth.store_model_provider_token(
+            "openai-codex",
+            "default",
+            "token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .await
+        .expect("store profile");
+
+        let error = auth
+            .get_profile("anthropic", Some("openai-codex:default"))
+            .await
+            .expect_err("cross-provider profile lookup must fail closed");
+        assert!(error.to_string().contains("belongs to model_provider"));
     }
 
     #[tokio::test]

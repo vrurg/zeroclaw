@@ -3608,14 +3608,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     );
                 }
 
-                let (provider_name, resolved_entry) = config
+                let (provider_ref, resolved_entry) = config
                     .resolved_model_provider_for_agent(&agent_alias)
-                    .map(|(ty, _alias, entry)| (ty, Some(entry)))
-                    .unwrap_or(("openai", None));
-                let model_provider = zeroclaw::providers::create_model_provider(
-                    provider_name,
-                    resolved_entry.and_then(|e| e.api_key.as_deref()),
-                )?;
+                    .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), Some(entry)))
+                    .unwrap_or_else(|| ("openai".to_string(), None));
+                let model_provider =
+                    zeroclaw_providers::create_model_provider_from_ref(&config, &provider_ref)?;
                 let model_name = resolved_entry
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("default");
@@ -7250,15 +7248,7 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         bail!("Token cannot be empty");
     }
 
-    let kind = auth::anthropic_token::detect_auth_kind(token.trim(), Some("authorization"));
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert(
-        "auth_kind".to_string(),
-        kind.as_metadata_value().to_string(),
-    );
-    auth::AuthService::from_config(config)
-        .store_model_provider_token("anthropic", alias, token.trim(), metadata, true)
-        .await?;
+    zeroclaw_runtime::quickstart::store_anthropic_setup_token(config, alias, &token).await?;
     let path = format!("providers.models.anthropic.{alias}.auth_mode");
     config.set_prop_persistent(&path, "oauth")?;
     Box::pin(config.save_dirty()).await?;

@@ -360,7 +360,10 @@ impl AnthropicModelProvider {
         if Self::is_setup_token(token) {
             AnthropicAuthKind::Authorization
         } else {
-            detect_auth_kind(token, None)
+            // Static credentials preserve the legacy API-key wire contract.
+            // Token-shape inference is reserved for stored OAuth profiles,
+            // whose metadata can explicitly select Authorization.
+            AnthropicAuthKind::ApiKey
         }
     }
 
@@ -410,7 +413,10 @@ impl AnthropicModelProvider {
             .metadata
             .get("auth_kind")
             .and_then(|value| AnthropicAuthKind::from_metadata_value(value))
-            .unwrap_or_else(|| Self::legacy_auth_kind(&token));
+            // Stored profiles predate `auth_kind` metadata. Retain their
+            // token-shape fallback; static `api_key` credentials deliberately
+            // use the separate legacy path above.
+            .unwrap_or_else(|| detect_auth_kind(&token, None));
 
         Ok(ResolvedAnthropicCredential { token, auth_kind })
     }
@@ -2212,6 +2218,31 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn stored_profile_without_auth_kind_retains_jwt_bearer_fallback() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "header.payload.signature",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store legacy profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve legacy profile");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
     async fn static_alias_ignores_available_anthropic_profile() {
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         let auth_service = AuthService::new(state_dir.path(), false);
@@ -2563,6 +2594,35 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_dotted_api_key_uses_x_api_key() {
+        let provider = AnthropicModelProvider::builder("legacy")
+            .credential(Some("a.b.c"))
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve static credential");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::ApiKey);
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/messages"),
+                &credential,
+            )
+            .build()
+            .expect("request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("a.b.c")
+        );
+        assert!(request.headers().get("authorization").is_none());
     }
 
     #[tokio::test]

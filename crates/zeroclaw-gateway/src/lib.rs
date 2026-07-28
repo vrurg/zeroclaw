@@ -628,11 +628,11 @@ pub async fn run_gateway(
         .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
+    let model_provider_name = format!("{boot_family}.{boot_alias}");
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
         match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
-            model_provider_name,
+            &model_provider_name,
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
@@ -649,7 +649,7 @@ pub async fn run_gateway(
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "model_provider": model_provider_name,
+                            "model_provider": &model_provider_name,
                             "alias": boot_alias,
                             "error": format!("{e}"),
                         })),
@@ -675,7 +675,7 @@ pub async fn run_gateway(
             Some(m) => m.to_string(),
             None => match config.resolve_default_model() {
                 Some(m) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": &model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
                      providers.models entry as default. Set \
                      [providers.models.<type>.<alias>] model = \"...\" to silence \
                      this warning.");

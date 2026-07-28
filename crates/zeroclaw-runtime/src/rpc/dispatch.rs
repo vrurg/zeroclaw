@@ -6167,7 +6167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+    async fn quickstart_apply_persists_anthropic_setup_token_before_daemon_reload() {
         use zeroclaw_config::presets::{
             AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
         };
@@ -6192,17 +6192,21 @@ mod tests {
             Some(reload_tx),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        let dispatcher = RpcDispatcher::new(
+            Arc::clone(&ctx),
+            tx,
+            "test-peer-quickstart-reload:pid=1".into(),
+        );
 
         let submission = BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
                 provider_type: "anthropic".into(),
-                alias: "anthropic".into(),
+                alias: "subscription".into(),
                 model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
-                    "sk-test".to_string(),
-                )]),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+                ]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),
@@ -6226,6 +6230,19 @@ mod tests {
             "quickstart/apply result: {result:#?}"
         );
         assert_eq!(result["daemon_restarted"], true);
+        let persisted = ctx.config.read().clone();
+        let entry = persisted
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .expect("TUI apply must create the requested alias");
+        assert_eq!(entry.api_key, None, "setup token must not enter config");
+        let profile = zeroclaw_providers::auth::AuthService::from_config(&persisted)
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .expect("read persisted auth profile")
+            .expect("TUI apply must store the same-alias profile");
+        assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
