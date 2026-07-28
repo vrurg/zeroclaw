@@ -1008,7 +1008,7 @@ pub fn bind_current_goal_task(task_id: &str) -> bool {
             let Some(admission) = binding.context.as_mut() else {
                 return false;
             };
-            match admission.goal_task_id.as_deref() {
+            let bound = match admission.goal_task_id.as_deref() {
                 Some(existing) => existing == task_id,
                 None => {
                     admission.goal_task_id = Some(task_id.to_string());
