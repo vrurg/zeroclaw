@@ -1242,6 +1242,15 @@ pub fn reserve_current_goal_task_binding() -> Result<GoalTaskBindingReservation>
         .map_err(|_| anyhow::Error::msg("goal admission context unavailable"))?
 }
 
+/// Whether a model-tool admission permit exclusively owns the current turn's
+/// exact-goal binding. Controller admission must leave that binding to the
+/// permit after its durable transition succeeds.
+pub fn current_goal_task_binding_is_reserved() -> bool {
+    GOAL_RUNTIME_SCOPE
+        .try_with(|scope| scope.admission_binding_reserved.load(Ordering::Acquire))
+        .unwrap_or(false)
+}
+
 pub struct GoalTaskBindingReservation {
     admission_context: Arc<parking_lot::RwLock<Option<GoalAdmissionContext>>>,
     reserved: Arc<AtomicBool>,
@@ -1250,11 +1259,14 @@ pub struct GoalTaskBindingReservation {
 
 impl GoalTaskBindingReservation {
     pub fn bind(mut self, task_id: String) {
-        debug_assert!(!task_id.is_empty());
+        if task_id.is_empty() {
+            return;
+        }
         let mut admission = self.admission_context.write();
         if let Some(admission) = admission.as_mut() {
-            debug_assert!(admission.goal_task_id.is_none());
-            admission.goal_task_id = Some(task_id);
+            if admission.goal_task_id.is_none() {
+                admission.goal_task_id = Some(task_id);
+            }
         }
         self.active = false;
         self.reserved.store(false, Ordering::Release);

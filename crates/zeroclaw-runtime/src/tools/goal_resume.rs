@@ -97,11 +97,13 @@ impl Tool for GoalResumeTool {
             .unwrap_or_else(|| std::sync::Arc::clone(&self.config));
         let permit = match super::goal_tool_admission::prepare(config.as_ref()) {
             Ok(permit) => permit,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new().into(),
-                    error: Some(error.to_string()),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-goal-resume-error-admission-preflight",
+                    )),
                 });
             }
         };
