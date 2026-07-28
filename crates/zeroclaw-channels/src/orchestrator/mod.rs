@@ -2146,12 +2146,14 @@ fn goal_cost_tracking_context_for_turn(
     context: zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext,
     goal_admission_context: Option<&zeroclaw_runtime::control_plane::GoalAdmissionContext>,
     goal_controller_continuation: bool,
-) -> zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext {
+    config: &zeroclaw_config::schema::Config,
+) -> anyhow::Result<zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext> {
     match goal_admission_context {
         Some(goal_ctx) if goal_controller_continuation => {
-            context.with_goal_admission_context(goal_ctx)
+            context.ensure_goal_usage_ledger(config)?;
+            Ok(context.with_goal_admission_context(goal_ctx))
         }
-        _ => context,
+        _ => Ok(context),
     }
 }
 
@@ -4335,53 +4337,72 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::Goal(command) => {
             let action = command.action;
             let command_objective = command.objective.clone();
-            let goal_admission_context = goal_admission_context_for_message(ctx, msg, &sender_key);
             let goal_config = goal_config_resolver(ctx)();
-            match zeroclaw_runtime::control_plane::admit_goal_command(
-                goal_admission_context,
-                command,
-                goal_config.as_ref(),
-                Some(ctx.agent_cfg.as_ref()),
-            )
-            .await
+            let continues_with_provider = matches!(
+                action,
+                zeroclaw_runtime::control_plane::GoalCommandAction::Start
+                    | zeroclaw_runtime::control_plane::GoalCommandAction::Resume
+                    | zeroclaw_runtime::control_plane::GoalCommandAction::Budget
+            );
+            if continues_with_provider
+                && let Err(error) = zeroclaw_runtime::agent::cost::ensure_goal_usage_ledger_ready(
+                    goal_config.as_ref(),
+                )
             {
-                Ok(admission) => {
-                    let zeroclaw_runtime::control_plane::GoalAdmission {
-                        task_id,
-                        status: _,
-                        message,
-                        continuation_reason,
-                        continue_goal,
-                    } = admission;
-                    if continue_goal && let Some(task_id) = task_id {
-                        let prompt = match action {
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
-                                command_objective
-                                    .map(|objective| GoalContinuationPrompt::Start { objective })
-                            }
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
-                                Some(GoalContinuationPrompt::Resume {
-                                    objective: goal_objective_for_prompt(&task_id).await,
-                                    resume_reason: continuation_reason,
-                                })
-                            }
-                            zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
-                                Some(GoalContinuationPrompt::Budget {
-                                    objective: goal_objective_for_prompt(&task_id).await,
-                                })
-                            }
-                            _ => None,
-                        };
-                        if let Some(prompt) = prompt {
-                            outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
-                        }
-                    }
-                    message
-                }
-                Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                     "channel-goal-command-failed",
                     &[("error", &error.to_string())],
-                ),
+                )
+            } else {
+                let goal_admission_context =
+                    goal_admission_context_for_message(ctx, msg, &sender_key);
+                match zeroclaw_runtime::control_plane::admit_goal_command(
+                    goal_admission_context,
+                    command,
+                    goal_config.as_ref(),
+                    Some(ctx.agent_cfg.as_ref()),
+                )
+                .await
+                {
+                    Ok(admission) => {
+                        let zeroclaw_runtime::control_plane::GoalAdmission {
+                            task_id,
+                            status: _,
+                            message,
+                            continuation_reason,
+                            continue_goal,
+                        } = admission;
+                        if continue_goal && let Some(task_id) = task_id {
+                            let prompt = match action {
+                                zeroclaw_runtime::control_plane::GoalCommandAction::Start => {
+                                    command_objective.map(|objective| {
+                                        GoalContinuationPrompt::Start { objective }
+                                    })
+                                }
+                                zeroclaw_runtime::control_plane::GoalCommandAction::Resume => {
+                                    Some(GoalContinuationPrompt::Resume {
+                                        objective: goal_objective_for_prompt(&task_id).await,
+                                        resume_reason: continuation_reason,
+                                    })
+                                }
+                                zeroclaw_runtime::control_plane::GoalCommandAction::Budget => {
+                                    Some(GoalContinuationPrompt::Budget {
+                                        objective: goal_objective_for_prompt(&task_id).await,
+                                    })
+                                }
+                                _ => None,
+                            };
+                            if let Some(prompt) = prompt {
+                                outcome = RuntimeCommandOutcome::ContinueGoal { task_id, prompt };
+                            }
+                        }
+                        message
+                    }
+                    Err(error) => zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "channel-goal-command-failed",
+                        &[("error", &error.to_string())],
+                    ),
+                }
             }
         }
         ChannelRuntimeCommand::InvalidGoal(raw) => {
@@ -6869,11 +6890,36 @@ async fn process_channel_message_body(
         }));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
     let context = tool_loop_cost_tracking_context(ctx.cost_tracking.clone(), &ctx.agent_alias);
-    let cost_tracking_context = Some(goal_cost_tracking_context_for_turn(
+    let cost_tracking_context = match goal_cost_tracking_context_for_turn(
         context,
         goal_admission_context.as_ref(),
         goal_controller_continuation,
-    ));
+        runtime_defaults.config.as_ref(),
+    ) {
+        Ok(context) => Some(context),
+        Err(error) => {
+            let error_text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-goal-controller-failed",
+                &[("error", &error.to_string())],
+            );
+            send_goal_controller_update(
+                runtime_defaults.config.as_ref(),
+                target_channel.as_ref(),
+                &msg,
+                &error_text,
+            )
+            .await;
+            reconcile_early_ack(
+                ctx.as_ref(),
+                &msg,
+                target_channel.as_ref(),
+                early_ack_task,
+                Some("\u{26A0}\u{FE0F}"),
+            )
+            .await;
+            return ChannelProcessOutcome::Done;
+        }
+    };
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -14063,7 +14109,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
-    use zeroclaw_providers::{ChatMessage, ModelProvider};
+    use zeroclaw_providers::traits::TokenUsage;
+    use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.
     ///
@@ -18329,6 +18376,27 @@ BTC is currently around $65,000 based on latest tool output."#
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let text = self
+                .chat_with_history(request.messages, model, temperature)
+                .await?;
+            Ok(ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
         }
 
         fn supports_vision(&self) -> bool {
@@ -25893,7 +25961,13 @@ BTC is currently around $65,000 based on latest tool output."#
         let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
             .with_agent_alias("agent-a");
 
-        let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
+        let cost_ctx = goal_cost_tracking_context_for_turn(
+            cost_ctx,
+            Some(&goal_ctx),
+            false,
+            &zeroclaw_config::schema::Config::default(),
+        )
+        .unwrap();
 
         assert!(cost_ctx.exact_goal_task_id().is_none());
         assert!(!cost_ctx.goal_attribution_enabled());
@@ -25919,14 +25993,31 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[test]
     fn controller_goal_turn_enables_goal_attribution() {
+        let workspace = TempDir::new().unwrap();
+        let tracker = Arc::new(
+            zeroclaw_runtime::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
         let goal_ctx = zeroclaw_runtime::control_plane::GoalAdmissionContext::new("agent-a")
             .with_originator_route(Some("route-a".into()))
             .with_principal_id(Some("principal-a".into()))
             .with_goal_task_id(Some("goal-a".into()));
-        let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
-            .with_agent_alias("agent-a");
+        let cost_ctx = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+            tracker,
+            Arc::new(HashMap::new()),
+        )
+        .with_agent_alias("agent-a");
 
-        let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true);
+        let cost_ctx = goal_cost_tracking_context_for_turn(
+            cost_ctx,
+            Some(&goal_ctx),
+            true,
+            &zeroclaw_config::schema::Config::default(),
+        )
+        .unwrap();
 
         assert_eq!(cost_ctx.exact_goal_task_id().as_deref(), Some("goal-a"));
         assert!(cost_ctx.goal_attribution_enabled());

@@ -336,6 +336,18 @@ impl ToolLoopCostTrackingContext {
     }
 }
 
+/// Prove that the canonical goal ledger is available before a direct channel
+/// command mutates durable goal state. Ordinary per-turn cost tracking may be
+/// disabled; goal continuation accounting may not be.
+pub fn ensure_goal_usage_ledger_ready(config: &Config) -> anyhow::Result<()> {
+    let tracker =
+        CostTracker::get_or_init_global_goal_usage_ledger(config.cost.clone(), &config.data_dir)
+            .ok_or_else(|| anyhow::Error::msg("goal accounting tracker unavailable"))?;
+    tracker.ensure_storage_ready().map_err(|error| {
+        anyhow::Error::msg(format!("goal accounting tracker unavailable: {error}"))
+    })
+}
+
 /// Enable goal attribution for the current tool loop after a model-callable
 /// goal admission succeeds.
 ///
@@ -567,12 +579,7 @@ pub(crate) async fn record_tool_loop_cost_usage_optional(
     } = goal_accounting_requirements(&ctx).await?;
     let tracker = ctx.tracker();
     if goal_attributed && tracker.is_none() {
-        // A direct channel continuation may run in the deliberately dormant
-        // usage-only context when ordinary tracking is disabled. Model-issued
-        // goal tools first attach the canonical ledger during their admission
-        // preflight, so this escape hatch cannot bypass their fail-closed
-        // accounting contract.
-        return Ok(None);
+        anyhow::bail!("goal accounting tracker unavailable");
     }
     let Some(usage) = usage.filter(|usage| {
         usage
@@ -867,9 +874,9 @@ pub fn ensure_goal_accounting_preflight() -> anyhow::Result<()> {
                 if !ctx.has_exact_goal_task_id() {
                     anyhow::bail!("goal accounting attribution has no active task");
                 }
-                let Some(tracker) = ctx.tracker() else {
-                    return Ok(());
-                };
+                let tracker = ctx
+                    .tracker()
+                    .ok_or_else(|| anyhow::Error::msg("goal accounting tracker unavailable"))?;
                 tracker.ensure_storage_ready().map_err(|error| {
                     anyhow::Error::msg(format!("goal accounting tracker unavailable: {error}"))
                 })?;
