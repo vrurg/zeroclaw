@@ -15,6 +15,7 @@ pub mod goal_human_gate;
 pub mod goal_objective;
 pub mod goal_resume;
 pub mod goal_start;
+mod goal_tool_admission;
 pub mod model_switch;
 pub mod param_options;
 pub mod read_skill;
