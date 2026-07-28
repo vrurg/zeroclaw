@@ -4886,7 +4886,7 @@ fn build_config_block_kit(
             model_options.push(serde_json::json!({
                 "text": { "type": "plain_text", "text": model_id },
                 "value": model_id
-            });
+            }));
         }
     }
 
@@ -7953,7 +7953,7 @@ async fn process_channel_message_body(
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
                 }),
-            }));
+            });
             // Scope this turn's routing handle so concurrent same-agent turns,
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
