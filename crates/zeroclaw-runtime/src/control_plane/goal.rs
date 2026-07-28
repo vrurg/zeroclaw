@@ -2086,7 +2086,10 @@ pub async fn admit_goal_command(
             .await
         }
     }?;
-    if admission.continue_goal && GOAL_RUNTIME_SCOPE.try_with(|_| ()).is_ok() {
+    if admission.continue_goal
+        && GOAL_RUNTIME_SCOPE.try_with(|_| ()).is_ok()
+        && !current_goal_task_binding_is_reserved()
+    {
         let task_id = admission.task_id.as_deref().ok_or_else(|| {
             anyhow::Error::msg("continuing goal admission returned no exact task id")
         })?;
