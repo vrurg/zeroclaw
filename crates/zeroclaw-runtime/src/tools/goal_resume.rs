@@ -105,7 +105,7 @@ impl Tool for GoalResumeTool {
             }
         };
 
-        let admission = admit_goal_command(
+        let admission = match admit_goal_command(
             ctx,
             GoalCommand {
                 action: GoalCommandAction::Resume,
