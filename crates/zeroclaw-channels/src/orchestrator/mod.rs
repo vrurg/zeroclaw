@@ -2155,6 +2155,25 @@ fn goal_cost_tracking_context_for_turn(
     }
 }
 
+fn tool_loop_cost_tracking_context(
+    state: Option<ChannelCostTrackingState>,
+    agent_alias: &str,
+) -> zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext {
+    state.map_or_else(
+        || {
+            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+                .with_agent_alias(agent_alias)
+        },
+        |state| {
+            zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+                state.tracker,
+                state.model_provider_pricing,
+            )
+            .with_agent_alias(state.agent_alias.as_str())
+        },
+    )
+}
+
 async fn goal_objective_for_prompt(task_id: &str) -> String {
     let Some(control_plane) = zeroclaw_runtime::control_plane::control_plane() else {
         return goal_objective_unavailable(task_id, "control plane unavailable");
@@ -6849,18 +6868,12 @@ async fn process_channel_message_body(
             goal_admission_context_for_message(ctx.as_ref(), &msg, &history_key)
         }));
     let goal_turn_evaluation_requested = Arc::new(AtomicBool::new(goal_controller_continuation));
-    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        let context = zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
-            state.tracker,
-            state.model_provider_pricing,
-        )
-        .with_agent_alias(state.agent_alias.as_str());
-        goal_cost_tracking_context_for_turn(
-            context,
-            goal_admission_context.as_ref(),
-            goal_controller_continuation,
-        )
-    });
+    let context = tool_loop_cost_tracking_context(ctx.cost_tracking.clone(), &ctx.agent_alias);
+    let cost_tracking_context = Some(goal_cost_tracking_context_for_turn(
+        context,
+        goal_admission_context.as_ref(),
+        goal_controller_continuation,
+    ));
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -25882,6 +25895,15 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let cost_ctx = goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), false);
 
+        assert!(cost_ctx.exact_goal_task_id().is_none());
+        assert!(!cost_ctx.goal_attribution_enabled());
+    }
+
+    #[test]
+    fn channel_turn_without_ordinary_cost_tracking_keeps_usage_context() {
+        let cost_ctx = tool_loop_cost_tracking_context(None, "agent-a");
+
+        assert_eq!(cost_ctx.agent_alias.as_deref(), Some("agent-a"));
         assert!(cost_ctx.exact_goal_task_id().is_none());
         assert!(!cost_ctx.goal_attribution_enabled());
     }
