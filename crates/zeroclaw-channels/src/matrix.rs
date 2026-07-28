@@ -1799,7 +1799,8 @@ mod inbound {
 
         let mention_required = ctx.config.mention_only && is_group_room(&room).await;
         let display_name = ctx.bot_display_name.read().await;
-        let mention_user_ids = extract_mentions_user_ids(&raw);
+        let (mention_user_ids, mut content) =
+            normalize_inbound_text_content(&ctx.bot_user_id, display_name.as_deref(), &raw, &body);
         if mention_required {
             if !mention::is_mentioned(
                 &ctx.bot_user_id,
@@ -1818,14 +1819,6 @@ mod inbound {
         }
 
         let thread_id = extract_thread_id(&raw);
-        let mut content = mention::strip_leading_command_address(
-            &ctx.bot_user_id,
-            display_name.as_deref(),
-            mention_user_ids.as_deref(),
-            &body,
-        )
-        .unwrap_or(&body)
-        .to_string();
         drop(display_name);
         if ctx_mod::should_prepend_thread_preamble(&content)
             && let Some(tid) = thread_id.as_ref()
@@ -1979,6 +1972,28 @@ mod inbound {
                 .filter_map(|x| x.as_str().map(|s| s.to_string()))
                 .collect(),
         )
+    }
+
+    /// Normalize the one inbound Matrix text event before it enters the
+    /// channel queue. The queue consumer dispatches runtime-owned commands
+    /// before provider/model ingress, so an accepted rich mention must become
+    /// the exact slash-command suffix here.
+    pub(super) fn normalize_inbound_text_content(
+        bot_user_id: &OwnedUserId,
+        bot_display_name: Option<&str>,
+        raw: &RawEvent,
+        body: &str,
+    ) -> (Option<Vec<String>>, String) {
+        let mention_user_ids = extract_mentions_user_ids(raw);
+        let content = mention::strip_leading_command_address(
+            bot_user_id,
+            bot_display_name,
+            mention_user_ids.as_deref(),
+            body,
+        )
+        .unwrap_or(body)
+        .to_string();
+        (mention_user_ids, content)
     }
 
     pub(super) fn resolve_outbound_anchor(
@@ -6241,10 +6256,10 @@ mod tests {
     mod thread_extraction {
         use super::super::inbound::{
             extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
-            resolve_outbound_anchor,
+            normalize_inbound_text_content, resolve_outbound_anchor,
         };
         use matrix_sdk::event_handler::RawEvent;
-        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{OwnedUserId, serde::Raw};
 
         fn raw(json: serde_json::Value) -> RawEvent {
             let raw: Raw<serde_json::Value> = Raw::new(&json).expect("raw");
@@ -6381,6 +6396,27 @@ mod tests {
                 "content": { "msgtype": "m.text", "body": "hi" }
             }));
             assert!(extract_mentions_user_ids(&r).is_none());
+        }
+
+        #[test]
+        fn element_rich_mention_raw_event_normalizes_runtime_goal_commands() {
+            let bot: OwnedUserId = "@goal-bot:example.test".parse().expect("bot id");
+            for command in ["/goal status", "/goal resume"] {
+                let body =
+                    format!("[Goal Bot](https://matrix.to/#/@goal-bot:example.test) {command}");
+                let raw = raw(serde_json::json!({
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": body,
+                        "m.mentions": { "user_ids": ["@goal-bot:example.test"] }
+                    }
+                }));
+
+                let (mentions, normalized) =
+                    normalize_inbound_text_content(&bot, None, &raw, &body);
+                assert_eq!(mentions, Some(vec!["@goal-bot:example.test".to_string()]));
+                assert_eq!(normalized, command);
+            }
         }
     }
 
