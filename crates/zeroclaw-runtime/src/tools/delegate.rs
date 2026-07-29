@@ -636,24 +636,17 @@ impl DelegateTool {
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
-    ) -> anyhow::Result<Box<dyn ModelProvider>> {
-        if let Some(config) = self.root_config.as_deref()
-            && let Some((family, alias)) = model_provider.split_once('.')
-        {
-            let mut options =
-                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
-            if options.zeroclaw_dir.is_none() {
-                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
-            }
-            return zeroclaw_providers::create_model_provider_for_alias(
-                config, family, alias, credential, &options,
-            );
+    ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
+        if let Some(config) = self.root_config.as_deref() {
+            return crate::agent::agent::build_session_model_provider(config, model_provider, None);
         }
-        zeroclaw_providers::create_model_provider_with_options(
+        let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
             credential,
             &self.provider_runtime_options,
-        )
+        )?;
+        let (_, _, model, _) = self.resolve_brain(model_provider);
+        Ok((provider, provider_type.to_string(), model))
     }
 
     async fn memory_for_target_agent(
@@ -1225,7 +1218,7 @@ impl DelegateTool {
 
         // Resolve profile references
         let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
-        let (provider_type, credential, model, temperature) =
+        let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
 
@@ -1268,18 +1261,18 @@ impl DelegateTool {
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+        let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
-            &provider_type,
+            &legacy_provider_type,
             credential.as_deref(),
         ) {
-            Ok(p) => p,
+            Ok(provider) => provider,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                        "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -3670,6 +3663,30 @@ mod tests {
             body
         );
         socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_failing_chat_server(
+        status: u16,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let response = format!(
+                "HTTP/1.1 {status} Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -7750,57 +7767,100 @@ command = "echo hi"
     }
 
     #[tokio::test]
-    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+    async fn delegate_uses_target_configured_provider_fallback() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
+
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["fallback reply"]).await;
         let mut config = Config::default();
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         config.providers.models.custom.insert(
-            "vllm".to_string(),
+            "primary".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
-                    model: Some("Qwen3.6-27B".to_string()),
-                    wire_api: Some(WireApi::Responses),
+                    uri: Some(primary.uri.clone()),
+                    model: Some("primary-model".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
                     ..ModelProviderConfig::default()
                 },
             },
         );
-        config.agents.insert(
-            "target".to_string(),
-            AliasedAgentConfig {
-                model_provider: "custom.vllm".into(),
-                ..AliasedAgentConfig::default()
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(backup.uri.clone()),
+                    model: Some("backup-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
             },
         );
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "review".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for agent in ["caller", "target"] {
+            config.agents.insert(
+                agent.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.primary".into(),
+                    risk_profile: "delegating".into(),
+                    runtime_profile: "review".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+
         let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_root_config(Arc::clone(&config));
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .expect("delegate call completes");
 
-        // Drives the exact build path `run` takes. With root_config + a
-        // dotted model_provider, the alias-aware factory must read the
-        // target's `custom.vllm` entry and honor wire_api = responses.
-        let provider = tool
-            .build_target_provider("custom.vllm", "custom", None)
-            .expect("target provider builds offline");
+        assert!(result.success, "fallback should recover: {result:?}");
         assert_eq!(
-            provider.default_wire_api(),
-            "responses",
-            "delegate must build the target with its declared responses wire API"
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
         );
-
-        let stale = zeroclaw_providers::create_model_provider_with_options(
-            "custom",
-            None,
-            &tool.provider_runtime_options,
-        );
-        let stale_is_responses = stale
-            .map(|p| p.default_wire_api() == "responses")
-            .unwrap_or(false);
+        assert!(result.output.contains("fallback reply"), "{result:?}");
         assert!(
-            !stale_is_responses,
-            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+            result
+                .output
+                .contains("[Agent 'target' (custom/primary-model, agentic)]"),
+            "{result:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+        assert!(
+            !result.output.contains(&primary.uri),
+            "recovered output must not expose the primary error: {result:?}"
         );
     }
 
