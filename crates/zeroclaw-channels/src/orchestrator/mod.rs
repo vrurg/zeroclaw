@@ -19684,6 +19684,27 @@ BTC is currently around $65,000 based on latest tool output."#
             Ok(format!("response-{}", calls.len()))
         }
 
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let text = self
+                .chat_with_history(request.messages, model, temperature)
+                .await?;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
         fn supports_vision(&self) -> bool {
             self.vision
         }
