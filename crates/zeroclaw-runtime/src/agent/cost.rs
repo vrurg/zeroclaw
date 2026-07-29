@@ -425,11 +425,9 @@ impl PreparedToolLoopGoalAttribution {
     /// Bind the exact controller-returned id after the preflight succeeded.
     pub fn activate(mut self, task_id: String) {
         let mut binding = self.context.goal_task_binding.lock();
-        if !task_id.is_empty() {
-            if binding.task_id.is_none() {
-                binding.task_id = Some(task_id);
-                self.context.enable_goal_attribution();
-            }
+        if !task_id.is_empty() && binding.task_id.is_none() {
+            binding.task_id = Some(task_id);
+            self.context.enable_goal_attribution();
         }
         binding.reserved_for_admission = false;
         self.active = false;
