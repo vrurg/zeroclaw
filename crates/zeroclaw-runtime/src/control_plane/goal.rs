@@ -1133,13 +1133,12 @@ impl GoalTaskBindingReservation {
         }
         let mut binding = self.binding.lock();
         let mut bound = false;
-        if binding.reserved_for_admission {
-            if let Some(admission) = binding.context.as_mut() {
-                if admission.goal_task_id.is_none() {
-                    admission.goal_task_id = Some(task_id.clone());
-                    bound = true;
-                }
-            }
+        if binding.reserved_for_admission
+            && let Some(admission) = binding.context.as_mut()
+            && admission.goal_task_id.is_none()
+        {
+            admission.goal_task_id = Some(task_id.clone());
+            bound = true;
         }
         self.active = false;
         binding.reserved_for_admission = false;
