@@ -1801,21 +1801,21 @@ mod inbound {
         let display_name = ctx.bot_display_name.read().await;
         let (mention_user_ids, mut content) =
             normalize_inbound_text_content(&ctx.bot_user_id, display_name.as_deref(), &raw, &body);
-        if mention_required {
-            if !mention::is_mentioned(
+        if mention_required
+            && !mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
                 mention_user_ids.as_deref(),
                 &body,
-            ) {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"sender": sender})),
-                    "matrix: drop unmentioned message from"
-                );
-                return Ok(());
-            }
+            )
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": sender})),
+                "matrix: drop unmentioned message from"
+            );
+            return Ok(());
         }
 
         let thread_id = extract_thread_id(&raw);
