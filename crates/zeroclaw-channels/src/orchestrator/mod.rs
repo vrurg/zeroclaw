@@ -27900,8 +27900,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .with_agent_alias("agent-a");
 
         let data_dir = tempfile::tempdir().unwrap();
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.data_dir = data_dir.path().join("data");
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.path().join("data"),
+            ..Default::default()
+        };
         let cost_ctx =
             goal_cost_tracking_context_for_turn(cost_ctx, Some(&goal_ctx), true, &config)
                 .expect("controller continuation should initialize the goal usage ledger");
