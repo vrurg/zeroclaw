@@ -28967,7 +28967,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
-            Arc::new(DummyModelProvider),
+            Arc::new(HistoryCaptureModelProvider::default()),
             zeroclaw_config::schema::Config::default(),
             zeroclaw_config::schema::AliasedAgentConfig::default(),
             "test-provider",
