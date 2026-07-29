@@ -19696,7 +19696,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Ok(zeroclaw_providers::ChatResponse {
                 text: Some(text),
                 tool_calls: Vec::new(),
-                usage: Some(zeroclaw_providers::TokenUsage {
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
