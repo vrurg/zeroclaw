@@ -919,8 +919,8 @@ mod tests {
     /// A local Ollama-shaped HTTP server stands in for the network so the
     /// recipient's turn completes deterministically without a real model
     /// provider dependency.
-    async fn assert_peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget(
-    ) {
+    async fn assert_peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
+    {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
         use axum::{Json, Router, extract::State, routing::post};
