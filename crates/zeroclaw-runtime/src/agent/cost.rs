@@ -2000,8 +2000,13 @@ mod tests {
 
     #[test]
     fn tool_loop_cost_tracking_context_from_tracker_stamps_given_alias() {
-        // Exercise the explicit local tracker path so this does not depend on
-        // the process-global tracker singleton.
+        // `tool_loop_cost_tracking_context_for_agent` (the builder
+        // `send_message_to_peer.rs` calls for the peer-turn cost scope)
+        // delegates to this function after resolving the process-global
+        // tracker. Exercise it directly with an explicit LOCAL tracker so
+        // this stays flake-free (no global-tracker singleton touched) while
+        // still pinning the alias-stamping contract the per-agent
+        // attribution depends on.
         let workspace = tempfile::TempDir::new().unwrap();
         let tracker = Arc::new(
             CostTracker::new(
