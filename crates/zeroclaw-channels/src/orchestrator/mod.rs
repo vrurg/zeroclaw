@@ -4541,26 +4541,23 @@ async fn process_channel_message_body(
         }
     }
 
-    if let (Some(engine), Some(audit)) = (ctx.sop_engine.as_ref(), ctx.sop_audit.as_ref()) {
-        let wants = engine
-            .lock()
-            .map(|eng| eng.wants_source(zeroclaw_runtime::sop::types::SopTriggerSource::Channel))
-            .unwrap_or(false);
-        if wants {
-            let topic = match &msg.channel_alias {
-                Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
-                _ => msg.channel.clone(),
-            };
-            zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in(
-                engine,
-                audit,
-                zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-                Some(&topic),
-                Some(&msg.content),
-                None,
-            )
-            .await;
-        }
+    if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
+        let topic = match &msg.channel_alias {
+            Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
+            _ => msg.channel.clone(),
+        };
+        zeroclaw_runtime::sop::dispatch::SopIngress::new(
+            ctx.sop_engine.as_ref(),
+            ctx.sop_audit.as_deref(),
+        )
+        .dispatch(
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some(&topic),
+            Some(&msg.content),
+            None,
+            None,
+        )
+        .await;
     }
 
     let history_key = conversation_history_key(&msg);
@@ -6756,48 +6753,19 @@ async fn dispatch_channel_sop_event(
         return false;
     };
 
-    let Some(engine) = router.sop_engine.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP engine is not available"
-        );
-        return true;
-    };
-    let Some(audit) = router.sop_audit.as_ref() else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "channel": msg.channel.as_str(),
-                    "channel_alias": msg.channel_alias.as_deref(),
-                    "topic": topic,
-                })
-            ),
-            "dropping channel SOP event: SOP audit logger is not available"
-        );
-        return true;
-    };
-
-    let event = zeroclaw_runtime::sop::types::SopEvent {
-        source: zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
-        topic: Some(topic.to_string()),
-        payload: Some(msg.content.clone()),
-        timestamp: zeroclaw_runtime::sop::engine::now_iso8601(),
-    };
     let target_sop = channel_sop_target(msg);
-    let results = if let Some(sop_name) = target_sop.as_deref() {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event_to(engine, audit, event, sop_name).await
-    } else {
-        zeroclaw_runtime::sop::dispatch::dispatch_sop_event(engine, audit, event).await
-    };
-    zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+    zeroclaw_runtime::sop::dispatch::SopIngress::new(
+        router.sop_engine.as_ref(),
+        router.sop_audit.as_deref(),
+    )
+    .dispatch(
+        zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+        Some(topic),
+        Some(&msg.content),
+        target_sop.as_deref(),
+        None,
+    )
+    .await;
     true
 }
 
@@ -7276,6 +7244,28 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
+///
+/// One-off callers match on this sentinel instead of the error text so the
+/// builder stays the single source of truth for which ids it resolves; a family
+/// added or removed there changes the fallback automatically.
+#[derive(Debug)]
+struct UnknownChannelId(String);
+
+impl std::fmt::Display for UnknownChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(channel_id) = self;
+        write!(
+            f,
+            "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
+            signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
+            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+        )
+    }
+}
+
+impl std::error::Error for UnknownChannelId {}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -7750,7 +7740,18 @@ fn build_channel_by_id(
             Ok(Arc::new(
                 NextcloudTalkChannel::new_with_proxy(
                     nc.base_url.clone(),
-                    nc.app_token.clone(),
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
                     nc.bot_name.clone().unwrap_or_default(),
                     alias,
                     peer_resolver,
@@ -8074,11 +8075,7 @@ fn build_channel_by_id(
                 anyhow::bail!("Voice Call channel requires the `channel-voice-call` feature");
             }
         }
-        other => anyhow::bail!(
-            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
-            email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
-        ),
+        other => Err(anyhow::Error::new(UnknownChannelId(other.to_string()))),
     }
 }
 
@@ -8092,7 +8089,24 @@ pub async fn send_channel_message(
     // Wrap into the canonical shared handle for the builder; this is a
     // one-shot path so the snapshot is dropped immediately after send.
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let channel = build_channel_by_id(&config_arc, channel_id)?;
+    // The builder gets first refusal so families it already resolves natively
+    // (notably `linq.<alias>`) keep their established route and their own
+    // configuration errors. Only a dotted id the builder does not claim at all
+    // falls through to the announcement dispatcher, which resolves any
+    // `<type>.<alias>` it supports.
+    let channel = match build_channel_by_id(&config_arc, channel_id) {
+        Ok(channel) => channel,
+        Err(err)
+            if channel_id.contains('.') && err.downcast_ref::<UnknownChannelId>().is_some() =>
+        {
+            deliver_announcement(config, channel_id, recipient, None, message)
+                .await
+                .with_context(|| format!("Failed to send message via {channel_id}"))?;
+            println!("Message sent via {channel_id}.");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
@@ -9074,7 +9088,15 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
-                nc.app_token.clone(),
+                nc.resolve_bot_secret().unwrap_or_else(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    None
+                }),
                 nc.bot_name.clone().unwrap_or_default(),
                 alias.clone(),
                 peer_resolver,
@@ -15412,11 +15434,18 @@ BTC is currently around $65,000 based on latest tool output."#
             .await;
         Mock::given(method("POST"))
             .and(body_partial_json(serde_json::json!({"method":"resources/read"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc":"2.0","id":4,"result":{"contents":[
-                    {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
-                ]}
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let id = serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("resources/read request should be JSON")
+                    .get("id")
+                    .cloned()
+                    .expect("resources/read request should carry an id");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "jsonrpc":"2.0","id":id,"result":{"contents":[
+                        {"uri":"file:///handbook.md","mimeType":"text/plain","text":"Pinned handbook body"}
+                    ]}
+                }))
+            })
             .mount(&server)
             .await;
         server
@@ -27555,6 +27584,44 @@ Done."#;
         assert!(
             !preamble.contains("\"thread_id\""),
             "non-webhook cron hint should not emit a thread_id field: {preamble}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-discord")]
+    async fn one_off_send_resolves_dotted_discord_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "discord.governance", "123456789", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.discord.governance] not configured"),
+            "dotted alias should reach named channel resolution; got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-linq")]
+    async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
+        // `linq.<alias>` predates the announcement delegation and is resolved by
+        // the one-off builder itself. Delegating every dotted id would route it
+        // to an arm that does not exist, so assert it still lands on the
+        // builder's own alias lookup rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "linq.governance", "+15550100", "test message")
+            .await
+            .expect_err("unconfigured alias should fail at the builder's linq arm");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Linq alias 'governance' not configured"),
+            "dotted linq id should stay on the one-off builder; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted linq id must not be delegated to deliver_announcement; got: {message}"
         );
     }
 
