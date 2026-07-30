@@ -3690,7 +3690,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     Some(msg) => {
                         let response =
                             zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .simple_chat(&msg, &model_name, Some(final_temperature))
                                 .await?;
                         println!("{response}");
                     }
@@ -3719,7 +3719,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .simple_chat(line.trim(), &model_name, Some(final_temperature))
                                     .await?;
                             println!("{response}");
                         }

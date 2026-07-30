@@ -26028,8 +26028,8 @@ default_temperature = 0.7
         let err = config
             .apply_legacy_save_dirty_outcome(
                 original_dirty_paths.clone(),
-                ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::anyhow!(
-                    "injected directory sync failure"
+                ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::Error::msg(
+                    "injected directory sync failure",
                 )),
             )
             .expect_err("legacy save_dirty must retain its error contract");
