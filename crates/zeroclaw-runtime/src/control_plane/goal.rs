@@ -1747,11 +1747,11 @@ fn ensure_goal_admitted_by_config(
     if ctx.command_surface == CommandSurface::Channel {
         // A missing channel principal would become a wildcard in task-store
         // lookups. Reject it before control-plane access or any task mutation.
-        if !ctx
+        if ctx
             .principal_id
             .as_deref()
             .map(str::trim)
-            .is_some_and(|principal| !principal.is_empty())
+            .is_none_or(|principal| principal.is_empty())
         {
             bail!(
                 "{}",
@@ -3532,6 +3532,7 @@ mod tests {
     fn test_goal_context(agent_alias: impl Into<String>) -> GoalAdmissionContext {
         GoalAdmissionContext::new(agent_alias)
             .with_channel_type(Some("matrix".into()))
+            .with_principal_id(Some("test-operator".into()))
             .with_continuation_context(Some(TaskContinuationContext {
                 channel: "matrix".into(),
                 channel_alias: Some("default".into()),
