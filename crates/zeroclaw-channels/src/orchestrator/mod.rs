@@ -30727,6 +30727,188 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn dispatcher_reloads_resume_one_current_boot_goal_twice() {
+        run_channel_dispatch_test(|| async {
+            ensure_test_control_plane().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let channel: Arc<dyn Channel> = Arc::new(AddressedRecordingChannel {
+                channel_name: Some("telegram".into()),
+                ..Default::default()
+            });
+            let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+                delay: Duration::from_secs(30),
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.config_path.clone_from(&config_path);
+            config.data_dir = tmp.path().join("data");
+            config.goal.enabled = true;
+            config.goal.allowed_channel_types = vec!["telegram".into()];
+            config.goal.verifier.enabled = false;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    "telegram.default",
+                )],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            };
+            config.agents.insert("test-agent".into(), agent.clone());
+            config.channels.telegram.insert(
+                "default".into(),
+                zeroclaw_config::schema::TelegramConfig {
+                    enabled: true,
+                    ..zeroclaw_config::schema::TelegramConfig::default()
+                },
+            );
+            config.save().await.unwrap();
+            let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                provider,
+                config,
+                agent,
+                "test-provider",
+                None,
+            );
+            let router = AgentRouter::single(Arc::clone(&runtime_ctx));
+            let msg = zeroclaw_api::channel::ChannelMessage {
+                id: format!("current-boot-reload-{}", uuid::Uuid::new_v4()),
+                sender: "operator".into(),
+                authenticated_principal: Some("123456".into()),
+                reply_target: "room-1".into(),
+                content: "/goal start survive two dispatcher reloads".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 1,
+                ..Default::default()
+            };
+            let history_key = conversation_history_key(&msg);
+            let admission =
+                goal_admission_context_for_message(runtime_ctx.as_ref(), &msg, &history_key);
+            let route = admission.originator_route.clone();
+            let principal = admission.principal_id.clone();
+            let control_plane =
+                zeroclaw_runtime::control_plane::control_plane().expect("test control plane");
+            let (normal_tx, normal_rx) = tokio::sync::mpsc::channel(1);
+            let (recovery_tx, recovery_rx) = tokio::sync::mpsc::channel(1);
+            let pending: PendingRecoveredGoalsByScope =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let first = tokio::spawn(run_message_dispatch_loop_with_recovery(
+                normal_rx,
+                recovery_rx,
+                router.clone(),
+                1,
+                recovery_tx.downgrade(),
+                Arc::clone(&pending),
+            ));
+            normal_tx.send(msg).await.expect("start current-boot goal");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if !provider_impl.calls.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("normal worker reaches provider");
+            let task_id = zeroclaw_runtime::control_plane::GoalTaskRegistry::latest_active_goal_id_for_context(
+                control_plane.goal_store.as_ref(),
+                "test-agent",
+                route.as_deref(),
+                principal.as_deref(),
+            )
+            .await
+            .expect("query current-boot goal")
+            .expect("current-boot goal exists");
+            drop(normal_tx);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if control_plane.recovered_goal_ids().contains(&task_id) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("retiring dispatcher leases current-boot goal");
+            first.abort();
+            let _ = first.await;
+
+            for expected_calls in [2_usize, 3] {
+                let (next_normal_tx, next_normal_rx) = tokio::sync::mpsc::channel(1);
+                let (next_recovery_tx, next_recovery_rx) = tokio::sync::mpsc::channel(1);
+                let next_pending: PendingRecoveredGoalsByScope =
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let contexts =
+                    HashMap::from([("test-agent".to_string(), Arc::clone(&runtime_ctx))]);
+                enqueue_recovered_goal_continuations_with_control_plane(
+                    &control_plane,
+                    &next_recovery_tx,
+                    &contexts,
+                    vec![task_id.clone()],
+                    &next_pending,
+                )
+                .await
+                .expect("enqueue exact successor continuation");
+                let replacement = tokio::spawn(run_message_dispatch_loop_with_recovery(
+                    next_normal_rx,
+                    next_recovery_rx,
+                    router.clone(),
+                    1,
+                    next_recovery_tx.downgrade(),
+                    Arc::clone(&next_pending),
+                ));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if provider_impl.calls.lock().unwrap().len() >= expected_calls {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("replacement worker reaches provider exactly once");
+                drop(next_normal_tx);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if control_plane.recovered_goal_ids().contains(&task_id) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("retiring replacement re-leases exact task");
+                replacement.abort();
+                let _ = replacement.await;
+            }
+
+            assert_eq!(
+                provider_impl.calls.lock().unwrap().len(),
+                3,
+                "one normal worker and two recovered workers must execute exactly once each"
+            );
+            assert_eq!(
+                control_plane.recovered_goal_ids(),
+                vec![task_id.clone()],
+                "two reloads leave one exact successor lease"
+            );
+            assert_eq!(
+                control_plane
+                    .store
+                    .get(&task_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                zeroclaw_runtime::control_plane::TaskStatus::Running,
+                "reload handoff must not pause or duplicate the durable goal"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn non_retiring_recovered_worker_still_pauses_unfinished_execution() {
         let (_temp, control_plane, message) =
