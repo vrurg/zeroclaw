@@ -106,7 +106,8 @@ impl Tool for GoalStartTool {
 
         let permit = match super::goal_tool_admission::prepare(self.config.as_ref()) {
             Ok(permit) => permit,
-            Err(_error) => {
+            Err(error) => {
+                super::goal_tool_admission::record_failure(Self::NAME, &self.agent_alias, &error);
                 return Ok(ToolResult {
                     success: false,
                     output: String::new().into(),
