@@ -308,6 +308,24 @@ fn queue_apply_handoff(
     }
 }
 
+fn quickstart_success_label(alias: &str, warnings: &[QuickstartWarning]) -> String {
+    let created = crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias)]);
+    let Some(first) = warnings.first() else {
+        return created;
+    };
+
+    let remaining = warnings.len().saturating_sub(1);
+    let suffix = if remaining == 0 {
+        String::new()
+    } else {
+        crate::i18n::t_args(
+            "zc-quickstart-status-more-warnings",
+            &[("count", &remaining.to_string())],
+        )
+    };
+    format!("{created} — {}{suffix}", first.message)
+}
+
 fn typed_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => Some(c),
@@ -2499,13 +2517,7 @@ impl QuickstartPane {
         let label = if self.busy {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
-            let created =
-                crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())]);
-            if let Some(first) = self.last_warnings.first() {
-                format!("{created} — {}", first.message)
-            } else {
-                created
-            }
+            quickstart_success_label(alias, &self.last_warnings)
         } else if let Some(first) = self.last_errors.first() {
             // Name the first actionable field error so the user knows
             // which field is invalid, instead of only a count. The
@@ -3502,6 +3514,29 @@ fn draw_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_setup_status_reports_all_warning_count() {
+        let warnings = vec![
+            QuickstartWarning {
+                step: QuickstartStep::Agent,
+                field: "personality_files".into(),
+                message: "Could not persist SOUL.md".into(),
+            },
+            QuickstartWarning {
+                step: QuickstartStep::Agent,
+                field: "personality_files".into(),
+                message: "Could not persist IDENTITY.md".into(),
+            },
+        ];
+
+        let label = quickstart_success_label("researcher", &warnings);
+        let remaining =
+            crate::i18n::t_args("zc-quickstart-status-more-warnings", &[("count", "1")]);
+
+        assert!(label.contains("Could not persist SOUL.md"));
+        assert!(label.ends_with(&remaining));
+    }
 
     fn field_row(key: &str, value: &str) -> FieldFormRow {
         FieldFormRow {
