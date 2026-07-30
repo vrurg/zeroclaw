@@ -112,6 +112,51 @@ pub struct AppliedAgent {
     pub memory_backend: String,
 }
 
+/// A non-fatal issue discovered after the Quickstart configuration committed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuickstartWarning {
+    pub step: QuickstartStep,
+    pub field: String,
+    pub message: String,
+}
+
+impl QuickstartWarning {
+    fn for_surface(
+        ctx: Option<&RunCtx>,
+        step: QuickstartStep,
+        field: impl Into<String>,
+        fallback: impl Into<String>,
+        key: &str,
+        args: &[(&str, &str)],
+    ) -> Self {
+        let fallback = fallback.into();
+        let message = if matches!(ctx.map(|ctx| ctx.surface), Some(Surface::Cli)) {
+            crate::i18n::get_required_cli_string_with_args(key, args)
+        } else {
+            fallback
+        };
+        Self {
+            step,
+            field: field.into(),
+            message,
+        }
+    }
+}
+
+/// Durable Quickstart result, including non-fatal post-commit warnings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuickstartApplyOutcome {
+    pub agent: AppliedAgent,
+    pub warnings: Vec<QuickstartWarning>,
+}
+
+type StagedAnthropicProfile = (
+    zeroclaw_providers::auth::AuthService,
+    String,
+    zeroclaw_providers::auth::profiles::ProfileBindingSnapshot,
+    zeroclaw_providers::auth::profiles::AuthProfile,
+);
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuickstartStep {
@@ -265,6 +310,18 @@ pub async fn apply_with_surface(
     config: &mut Config,
     surface: Surface,
 ) -> Result<AppliedAgent, Vec<QuickstartError>> {
+    Ok(apply_with_surface_outcome(submission, config, surface)
+        .await?
+        .agent)
+}
+
+/// Apply a Quickstart submission and retain any non-fatal post-commit
+/// warnings for the calling user surface.
+pub async fn apply_with_surface_outcome(
+    submission: BuilderSubmission,
+    config: &mut Config,
+    surface: Surface,
+) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
     let setup_token = anthropic_setup_token_from_submission(&submission);
@@ -417,10 +474,10 @@ pub async fn apply_with_surface(
         ),
         "quickstart: persist start"
     );
-    let write_result = config.save_dirty().await;
+    let write_result = config.save_dirty_with_outcome().await;
     let write_ms = write_started.elapsed().as_millis() as u64;
     match &write_result {
-        Ok(_) => ::zeroclaw_log::record!(
+        Ok(zeroclaw_config::schema::ConfigSaveOutcome::Durable) => ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
@@ -433,6 +490,23 @@ pub async fn apply_with_surface(
                 )),
             "quickstart: persist complete"
         ),
+        Ok(zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(err)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(merge_attrs(
+                        ctx.base_attrs(),
+                        serde_json::json!({
+                            "dirty_path_count": dirty_count,
+                            "elapsed_ms": write_ms,
+                            "error": err.to_string(),
+                            "committed": true,
+                        }),
+                    )),
+                "quickstart: persist committed with durability warning"
+            );
+        }
         Err(err) => ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
@@ -448,43 +522,14 @@ pub async fn apply_with_surface(
             "quickstart: persist failed"
         ),
     }
-    if let Err(err) = write_result {
-        let rollback_error = if let Some((auth_service, alias, snapshot, expected_current)) =
-            staged_profile
-        {
-            auth_service
-                .restore_model_provider_profile("anthropic", &alias, snapshot, &expected_current)
-                .await
-                .err()
-        } else {
-            None
-        };
-        *config = original_config;
-        let detail = match rollback_error {
-            Some(rollback_error) => {
-                format!("{err}; Anthropic setup-token rollback also failed: {rollback_error}")
-            }
-            None => err.to_string(),
-        };
-        let quickstart_error = QuickstartError::for_surface(
-            Some(&ctx),
-            QuickstartStep::Agent,
-            "",
-            detail.clone(),
-            "cli-quickstart-error-persist-config",
-            &[("err", &detail)],
-        );
-        return Err(vec![quickstart_error]);
-    }
+    let mut warnings =
+        reconcile_config_save_outcome(write_result, staged_profile, config, original_config, &ctx)
+            .await?;
 
     // Config landed atomically — now move the staged personality files
     // into place. Any failure here is reported but does not unwind the
     // already-persisted config; the agent is valid without them.
-    let mut commit_errors = Vec::new();
-    commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
-    if !commit_errors.is_empty() {
-        return Err(commit_errors);
-    }
+    commit_personality_files(staged_files, &mut warnings, Some(&ctx));
 
     ::zeroclaw_log::record!(
         INFO,
@@ -500,7 +545,66 @@ pub async fn apply_with_surface(
             )),
         "quickstart: apply complete"
     );
-    Ok(applied)
+    Ok(QuickstartApplyOutcome {
+        agent: applied,
+        warnings,
+    })
+}
+
+async fn reconcile_config_save_outcome(
+    write_result: anyhow::Result<zeroclaw_config::schema::ConfigSaveOutcome>,
+    staged_profile: Option<StagedAnthropicProfile>,
+    config: &mut Config,
+    original_config: Config,
+    ctx: &RunCtx,
+) -> Result<Vec<QuickstartWarning>, Vec<QuickstartError>> {
+    match write_result {
+        Ok(zeroclaw_config::schema::ConfigSaveOutcome::Durable) => Ok(Vec::new()),
+        Ok(zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(err)) => {
+            let detail = err.to_string();
+            Ok(vec![QuickstartWarning::for_surface(
+                Some(ctx),
+                QuickstartStep::Agent,
+                "config",
+                format!(
+                    "Quickstart completed, but config durability could not be confirmed: {detail}"
+                ),
+                "cli-quickstart-warning-config-durability",
+                &[("err", &detail)],
+            )])
+        }
+        Err(err) => {
+            let rollback_error =
+                if let Some((auth_service, alias, snapshot, expected_current)) = staged_profile {
+                    auth_service
+                        .restore_model_provider_profile(
+                            "anthropic",
+                            &alias,
+                            snapshot,
+                            &expected_current,
+                        )
+                        .await
+                        .err()
+                } else {
+                    None
+                };
+            *config = original_config;
+            let detail = match rollback_error {
+                Some(rollback_error) => {
+                    format!("{err}; Anthropic setup-token rollback also failed: {rollback_error}")
+                }
+                None => err.to_string(),
+            };
+            Err(vec![QuickstartError::for_surface(
+                Some(ctx),
+                QuickstartStep::Agent,
+                "",
+                detail.clone(),
+                "cli-quickstart-error-persist-config",
+                &[("err", &detail)],
+            )])
+        }
+    }
 }
 
 pub fn record_dismissed(run_id: &str, surface: Surface, last_step: Option<QuickstartStep>) {
@@ -2046,18 +2150,21 @@ fn apply_personality_files(
 /// already persisted and valid.
 fn commit_personality_files(
     staged: Vec<StagedPersonalityWrite>,
-    errors: &mut Vec<QuickstartError>,
+    warnings: &mut Vec<QuickstartWarning>,
     ctx: Option<&RunCtx>,
 ) {
     for write in staged {
         if let Err(err) = write.tempfile.persist(&write.dest) {
             let path = write.dest.display().to_string();
-            errors.push(QuickstartError::for_surface(
+            warnings.push(QuickstartWarning::for_surface(
                 ctx,
                 QuickstartStep::Agent,
                 "personality_files",
-                format!("could not write `{path}`: {}", err.error),
-                "cli-quickstart-error-personality-write-failed",
+                format!(
+                    "Quickstart completed, but could not write personality file `{path}`: {}",
+                    err.error
+                ),
+                "cli-quickstart-warning-personality-write-failed",
                 &[("path", &path), ("err", &err.error.to_string())],
             ));
         }
@@ -2947,6 +3054,146 @@ mod tests {
                 .get("anthropic")
                 .is_none(),
             "Quickstart alias storage must not change Anthropic's active profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn personality_commit_failure_is_a_successful_setup_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let workspace = config.agent_workspace_dir("bot");
+        std::fs::create_dir_all(workspace.join("SOUL.md")).unwrap();
+
+        let mut submission = fresh_submission("bot");
+        let SelectorChoice::Fresh(choice) = &mut submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        choice.alias = "subscription".to_string();
+        choice.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "synthetic-setup-token".to_string()),
+        ]);
+        submission.agent.personality_files =
+            vec![zeroclaw_config::presets::QuickstartPersonalityFile {
+                filename: "SOUL.md".to_string(),
+                content: "synthetic personality".to_string(),
+            }];
+
+        let outcome = super::apply_with_surface_outcome(submission, &mut config, Surface::Web)
+            .await
+            .expect("personality finalization must not undo durable setup");
+        assert_eq!(outcome.agent.alias, "bot");
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.warnings[0].field, "personality_files");
+        assert!(
+            config.agents.contains_key("bot"),
+            "the in-memory configuration must remain committed"
+        );
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_some(),
+            "the OAuth alias must remain committed"
+        );
+        let profile = zeroclaw_providers::auth::AuthService::from_config(&config)
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .unwrap()
+            .expect("the OAuth profile must remain committed");
+        assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
+    }
+
+    #[tokio::test]
+    async fn committed_config_warning_keeps_oauth_profile_and_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let original_config = config.clone();
+        let mut submission = fresh_submission("bot");
+        let SelectorChoice::Fresh(choice) = &mut submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        choice.alias = "subscription".to_string();
+        choice.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "synthetic-setup-token".to_string()),
+        ]);
+        let mut staged_files = Vec::new();
+        let mut errors = Vec::new();
+        super::apply_into(
+            &mut config,
+            &submission,
+            &mut staged_files,
+            &mut errors,
+            None,
+        );
+        assert!(errors.is_empty(), "setup submission must apply: {errors:?}");
+
+        let auth = zeroclaw_providers::auth::AuthService::from_config(&config);
+        let staged = auth
+            .stage_model_provider_token(
+                "anthropic",
+                "subscription",
+                "synthetic-setup-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let warnings = super::reconcile_config_save_outcome(
+            Ok(
+                zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(
+                    anyhow::anyhow!("injected directory sync failure"),
+                ),
+            ),
+            Some((
+                auth.clone(),
+                "subscription".to_string(),
+                staged.snapshot,
+                staged.staged_profile,
+            )),
+            &mut config,
+            original_config,
+            &super::RunCtx::new(Surface::Web),
+        )
+        .await
+        .expect("a committed config warning must not trigger OAuth rollback");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field, "config");
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_some(),
+            "the committed OAuth alias must remain configured"
+        );
+        let profile = auth
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .unwrap()
+            .expect("the committed OAuth profile must remain stored");
+        assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
+        assert!(
+            auth.load_profiles()
+                .await
+                .unwrap()
+                .active_profiles
+                .get("anthropic")
+                .is_none(),
+            "the committed warning path must not mutate the active profile selector"
         );
     }
 

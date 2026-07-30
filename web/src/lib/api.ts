@@ -1633,6 +1633,12 @@ export interface QuickstartError {
   message: string;
 }
 
+export interface QuickstartWarning {
+  step: string;
+  field: string;
+  message: string;
+}
+
 export type QuickstartValidateResult =
   | { kind: "ok" }
   | { kind: "errors"; errors: QuickstartError[] };
@@ -1655,7 +1661,12 @@ export interface AppliedAgent {
 }
 
 export type QuickstartApplyResult =
-  | { kind: "applied"; agent: AppliedAgent; daemon_restarted: boolean }
+  | {
+      kind: "applied";
+      agent: AppliedAgent;
+      daemon_restarted: boolean;
+      warnings: QuickstartWarning[];
+    }
   | { kind: "errors"; errors: QuickstartError[] };
 
 export function quickstartApply(submission: unknown): Promise<QuickstartApplyResult> {

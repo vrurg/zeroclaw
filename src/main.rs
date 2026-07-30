@@ -1275,7 +1275,7 @@ async fn run_quickstart_cli(
         RISK_PRESETS, SelectorChoice,
     };
     use zeroclaw_runtime::quickstart::{
-        FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
+        FieldSection, QuickstartTypeOption, Surface, apply_with_surface_outcome, field_shape,
         snapshot_state,
     };
 
@@ -2423,8 +2423,15 @@ async fn run_quickstart_cli(
         model_provider.fields.insert("api_key".to_string(), token);
     }
 
-    match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+    match Box::pin(apply_with_surface_outcome(
+        submission,
+        &mut cfg,
+        Surface::Cli,
+    ))
+    .await
+    {
+        Ok(outcome) => {
+            let applied = outcome.agent;
             println!();
             println!(
                 "{}",
@@ -2434,6 +2441,16 @@ async fn run_quickstart_cli(
                     "Quickstart complete."
                 )
             );
+            for warning in outcome.warnings {
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-warning",
+                        &[("message", &warning.message)],
+                        "WARNING: {$message}",
+                    )
+                );
+            }
             if matches!(inline_auth, Some(InlineProviderAuth::Codex)) {
                 let auth = InlineProviderAuth::Codex;
                 Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;

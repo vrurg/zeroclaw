@@ -14,7 +14,9 @@ use directories::UserDirs;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
 use tokio::fs::File;
@@ -654,6 +656,31 @@ pub struct Config {
     #[serde(default)]
     #[nested]
     pub escalation: EscalationConfig,
+}
+
+/// Result of a config replacement that reached the destination path.
+///
+/// A directory fsync can fail after the atomic rename has replaced the old
+/// config. Callers that coordinate another durable resource must preserve that
+/// resource in this case: the new config is already visible at its path, even
+/// though durability could not be confirmed.
+#[derive(Debug)]
+pub enum ConfigSaveOutcome {
+    /// The config replacement and directory metadata sync completed.
+    Durable,
+    /// The replacement completed, but syncing the parent directory failed.
+    CommittedWithDurabilityWarning(anyhow::Error),
+}
+
+impl ConfigSaveOutcome {
+    /// Return the legacy `Result<()>` view used by callers that do not need to
+    /// distinguish an uncommitted write from a post-rename warning.
+    pub fn into_legacy_result(self) -> Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::CommittedWithDurabilityWarning(err) => Err(err),
+        }
+    }
 }
 
 /// Multi-client workspace isolation configuration.
@@ -21115,6 +21142,14 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        self.save_with_outcome().await?.into_legacy_result()
+    }
+
+    /// Save the complete config and report whether a post-rename directory
+    /// sync warning occurred. Most callers should use [`Self::save`]; callers
+    /// coordinating another durable resource can keep that resource when the
+    /// config has already been committed.
+    pub async fn save_with_outcome(&self) -> Result<ConfigSaveOutcome> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -21198,13 +21233,39 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        let original_dirty_paths = self.dirty_paths.clone();
+        let outcome = self.save_dirty_with_outcome().await?;
+        self.apply_legacy_save_dirty_outcome(original_dirty_paths, outcome)
+    }
+
+    fn apply_legacy_save_dirty_outcome(
+        &mut self,
+        original_dirty_paths: std::collections::HashSet<String>,
+        outcome: ConfigSaveOutcome,
+    ) -> Result<()> {
+        match outcome {
+            ConfigSaveOutcome::Durable => Ok(()),
+            ConfigSaveOutcome::CommittedWithDurabilityWarning(err) => {
+                // Preserve the legacy retry contract: `save_dirty()` reports
+                // this as an error, so callers must retain their dirty paths
+                // rather than receiving a silent no-op on retry.
+                self.dirty_paths = original_dirty_paths;
+                Err(err)
+            }
+        }
+    }
+
+    /// Incrementally save dirty paths and report whether a post-rename
+    /// directory sync warning occurred. A returned warning still means the
+    /// new config has replaced the old file and the dirty set is cleared.
+    pub async fn save_dirty_with_outcome(&mut self) -> Result<ConfigSaveOutcome> {
         if self.dirty_paths.is_empty() {
-            return Ok(());
+            return Ok(ConfigSaveOutcome::Durable);
         }
 
         let config_path = self.resolve_config_path_for_save().await?;
         if !config_path.exists() {
-            let result = self.save().await;
+            let result = self.save_with_outcome().await;
             if result.is_ok() {
                 self.clear_dirty();
             }
@@ -21268,9 +21329,9 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
-        write_config_atomically(&config_path, &toml_str).await?;
+        let outcome = write_config_atomically(&config_path, &toml_str).await?;
         self.clear_dirty();
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -21310,8 +21371,24 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+type DirectorySyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
 /// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<ConfigSaveOutcome> {
+    write_config_atomically_with_directory_sync(config_path, toml_str, |parent_dir| {
+        Box::pin(sync_directory(parent_dir))
+    })
+    .await
+}
+
+async fn write_config_atomically_with_directory_sync<F>(
+    config_path: &Path,
+    toml_str: &str,
+    sync_parent_directory: F,
+) -> Result<ConfigSaveOutcome>
+where
+    F: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+{
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -21388,13 +21465,16 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
+    let outcome = match sync_parent_directory(parent_dir).await {
+        Ok(()) => ConfigSaveOutcome::Durable,
+        Err(err) => ConfigSaveOutcome::CommittedWithDurabilityWarning(err),
+    };
 
     if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Write the in-memory value at `dotted` into the doc, or delete the leaf
@@ -25912,6 +25992,50 @@ default_temperature = 0.7
         sync_directory(&dir).await.unwrap();
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn atomic_write_reports_post_rename_directory_sync_failure_as_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let outcome = write_config_atomically_with_directory_sync(
+            &config_path,
+            "schema_version = 2\n",
+            |_| Box::pin(async { anyhow::bail!("injected directory sync failure") }),
+        )
+        .await
+        .expect("rename completed, so the write must report an outcome");
+
+        assert!(matches!(
+            outcome,
+            ConfigSaveOutcome::CommittedWithDurabilityWarning(_)
+        ));
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "a post-rename failure must not be reported as an uncommitted write"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_save_dirty_keeps_retry_paths_after_committed_warning() {
+        let mut config = Config::default();
+        let original_dirty_paths =
+            std::collections::HashSet::from(["agents.bot.model_provider".to_string()]);
+        config.dirty_paths.clear();
+
+        let err = config
+            .apply_legacy_save_dirty_outcome(
+                original_dirty_paths.clone(),
+                ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::anyhow!(
+                    "injected directory sync failure"
+                )),
+            )
+            .expect_err("legacy save_dirty must retain its error contract");
+
+        assert!(err.to_string().contains("injected directory sync failure"));
+        assert_eq!(config.dirty_paths, original_dirty_paths);
     }
 
     #[tokio::test]

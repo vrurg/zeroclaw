@@ -550,6 +550,13 @@ mod tests {
 
                         let tmp = tempfile::tempdir().unwrap();
                         let ctx = test_ctx(tmp.path());
+                        std::fs::create_dir_all(
+                            ctx.config
+                                .read()
+                                .agent_workspace_dir("quickstart_bot")
+                                .join("SOUL.md"),
+                        )
+                        .unwrap();
                         let sock_path = ctx.config.read().data_dir.join("daemon.sock");
                         let cancel = CancellationToken::new();
                         let server_ctx = Arc::clone(&ctx);
@@ -579,7 +586,12 @@ mod tests {
                                 name: "quickstart_bot".into(),
                                 system_prompt: "You are helpful.".into(),
                                 personality_file: None,
-                                personality_files: vec![],
+                                personality_files: vec![
+                                    zeroclaw_config::presets::QuickstartPersonalityFile {
+                                        filename: "SOUL.md".into(),
+                                        content: "synthetic personality".into(),
+                                    },
+                                ],
                             },
                         };
                         let params = QuickstartApplyParams { submission };
@@ -589,7 +601,11 @@ mod tests {
                             .unwrap();
                         let (_frame, result): (_, QuickstartApplyResult) =
                             read_result(&mut reader).await;
-                        assert!(matches!(result, QuickstartApplyResult::Applied { .. }));
+                        let QuickstartApplyResult::Applied { warnings, .. } = result else {
+                            panic!("local RPC Quickstart must report applied success");
+                        };
+                        assert_eq!(warnings.len(), 1);
+                        assert_eq!(warnings[0].field, "personality_files");
 
                         let config = ctx.config.read().clone();
                         let entry = config

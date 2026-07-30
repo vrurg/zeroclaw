@@ -40,7 +40,8 @@ fn masked_secret(buf: &str) -> String {
 
 use crate::client::{
     AppliedAgent, QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor,
-    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
+    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface,
+    QuickstartWarning, RpcClient,
 };
 use crate::theme;
 use crate::widgets::HelpNode;
@@ -1099,6 +1100,7 @@ pub struct QuickstartPane {
     last_step: Option<QuickstartStep>,
     state_snapshot: Option<QuickstartStateResult>,
     last_errors: Vec<QuickstartError>,
+    last_warnings: Vec<QuickstartWarning>,
     applied_alias: Option<String>,
     busy: bool,
     active_modal: Option<Modal>,
@@ -1136,6 +1138,7 @@ impl QuickstartPane {
             last_step: None,
             state_snapshot: None,
             last_errors: Vec::new(),
+            last_warnings: Vec::new(),
             applied_alias: None,
             busy: false,
             active_modal: None,
@@ -2406,8 +2409,9 @@ impl QuickstartPane {
             Ok(QuickstartApplyResult::Applied {
                 agent,
                 daemon_restarted,
+                warnings,
             }) => {
-                self.handle_apply_success(agent, daemon_restarted);
+                self.handle_apply_success(agent, daemon_restarted, warnings);
             }
             Ok(QuickstartApplyResult::Errors { errors }) => {
                 self.last_errors = errors;
@@ -2423,13 +2427,19 @@ impl QuickstartPane {
         self.busy = false;
     }
 
-    fn handle_apply_success(&mut self, agent: AppliedAgent, daemon_restarted: bool) {
+    fn handle_apply_success(
+        &mut self,
+        agent: AppliedAgent,
+        daemon_restarted: bool,
+        warnings: Vec<QuickstartWarning>,
+    ) {
         // A real daemon reload must survive the old connection closing:
         // use the immediate handoff only when the daemon reports that no
         // reconnect is needed.
         self.applied_alias =
             queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
         self.last_errors.clear();
+        self.last_warnings = warnings;
     }
 
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
@@ -2489,7 +2499,13 @@ impl QuickstartPane {
         let label = if self.busy {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
-            crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
+            let created =
+                crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())]);
+            if let Some(first) = self.last_warnings.first() {
+                format!("{created} — {}", first.message)
+            } else {
+                created
+            }
         } else if let Some(first) = self.last_errors.first() {
             // Name the first actionable field error so the user knows
             // which field is invalid, instead of only a count. The
@@ -2524,7 +2540,11 @@ impl QuickstartPane {
         } else {
             crate::i18n::t_args("zc-quickstart-status-hint", &[("chord", "c")])
         };
-        let style = if self.applied_alias.is_some() || can_create {
+        let style = if self.applied_alias.is_some() && !self.last_warnings.is_empty() {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if self.applied_alias.is_some() || can_create {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)

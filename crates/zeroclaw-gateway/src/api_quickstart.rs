@@ -9,8 +9,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
-    AppliedAgent, QuickstartError, QuickstartStep, Surface, apply_with_surface, record_dismissed,
-    validate_only_with_surface,
+    AppliedAgent, QuickstartError, QuickstartStep, QuickstartWarning, Surface,
+    apply_with_surface_outcome, record_dismissed, validate_only_with_surface,
 };
 
 use super::AppState;
@@ -29,6 +29,7 @@ pub enum ApplyResult {
     Applied {
         agent: AppliedAgent,
         daemon_restarted: bool,
+        warnings: Vec<QuickstartWarning>,
     },
     Errors {
         errors: Vec<QuickstartError>,
@@ -116,17 +117,18 @@ pub async fn handle_apply(
         return e.into_response();
     }
     let mut working = state.config.read().clone();
-    let result = apply_with_surface(submission, &mut working, Surface::Web).await;
+    let result = apply_with_surface_outcome(submission, &mut working, Surface::Web).await;
     let body = match result {
-        Ok(agent) => {
+        Ok(outcome) => {
             *state.config.write() = working;
             state
                 .pending_reload
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let reload_signalled = signal_daemon_reload(&state);
             ApplyResult::Applied {
-                agent,
+                agent: outcome.agent,
                 daemon_restarted: reload_signalled,
+                warnings: outcome.warnings,
             }
         }
         Err(errors) => ApplyResult::Errors { errors },
@@ -248,6 +250,11 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["kind"],
             "applied"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["warnings"],
+            serde_json::json!([]),
+            "successful HTTP Quickstart responses preserve the warnings contract"
         );
 
         let config = state.config.read().clone();
@@ -373,6 +380,65 @@ mod tests {
                 .pending_reload
                 .load(std::sync::atomic::Ordering::Relaxed),
             "failed HTTP apply must not request reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_quickstart_personality_failure_returns_applied_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        std::fs::create_dir_all(config.agent_workspace_dir("quickstart_bot").join("SOUL.md"))
+            .unwrap();
+        let state = crate::api::test_state(config);
+        let router = Router::new()
+            .route("/api/quickstart/apply", post(handle_apply))
+            .with_state(state.clone());
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![zeroclaw_config::presets::QuickstartPersonalityFile {
+                    filename: "SOUL.md".into(),
+                    content: "synthetic personality".into(),
+                }],
+            },
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/quickstart/apply")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["kind"], "applied");
+        assert_eq!(body["warnings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["warnings"][0]["field"], "personality_files");
+        assert!(
+            state.config.read().agents.contains_key("quickstart_bot"),
+            "the live gateway configuration must be swapped after durable setup"
         );
     }
 }

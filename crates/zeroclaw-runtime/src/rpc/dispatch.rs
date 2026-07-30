@@ -4500,24 +4500,25 @@ impl RpcDispatcher {
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Clone out of the lock to satisfy `&mut Config`. On success
         // install the mutated snapshot, mirroring the gateway's
-        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
+        // `handle_apply`. `apply_with_surface_outcome` already ran `save_dirty` on
         // the clone, so `save_and_swap_config` performs no second disk
         // write (empty dirty set short-circuits) — just the guarded swap.
         let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface(
+        let result = crate::quickstart::apply_with_surface_outcome(
             req.submission,
             &mut working,
             crate::quickstart::Surface::Tui,
         )
         .await;
         let body = match result {
-            Ok(agent) => {
+            Ok(outcome) => {
                 self.save_and_swap_config(working, &config_write_guard)
                     .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
-                    agent,
+                    agent: outcome.agent,
                     daemon_restarted: reload_signalled,
+                    warnings: outcome.warnings,
                 }
             }
             Err(errors) => QuickstartApplyResult::Errors { errors },
