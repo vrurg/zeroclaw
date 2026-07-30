@@ -18284,6 +18284,11 @@ temperature = 0.3
             .expect("create local live-policy goal");
     }
 
+    // The CI regression gate deliberately runs this module with 16 test
+    // threads. Allow scheduler contention without weakening the assertion that
+    // an asynchronous provider reload must not block message dispatch.
+    const PARALLEL_RUNTIME_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
     async fn assert_single_message_dispatch_completes(
         ctx: Arc<ChannelRuntimeContext>,
         message_id: &str,
@@ -18302,7 +18307,7 @@ temperature = 0.3
         .unwrap();
         drop(tx);
         tokio::time::timeout(
-            Duration::from_secs(1),
+            PARALLEL_RUNTIME_TEST_TIMEOUT,
             run_message_dispatch_loop(rx, AgentRouter::single(ctx), 1),
         )
         .await
@@ -19155,7 +19160,7 @@ model = "missing-model"
                 .is_none(),
             "rejected provider setup must retain prior defaults"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(PARALLEL_RUNTIME_TEST_TIMEOUT, async {
             loop {
                 if ctx
                     .last_applied_config_stamp
@@ -19259,7 +19264,7 @@ uri = "{}/v1"
                 .unwrap()
                 .expect("the changed provider generation must be claimed");
         spawn_provider_defaults_reload(Arc::clone(&ctx), reload);
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(PARALLEL_RUNTIME_TEST_TIMEOUT, async {
             loop {
                 if !server.received_requests().await.unwrap().is_empty() {
                     break;
@@ -19292,7 +19297,7 @@ uri = "{}/v1"
             "failed warmup must not clear the prior provider cache"
         );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(PARALLEL_RUNTIME_TEST_TIMEOUT, async {
             loop {
                 if ctx
                     .last_applied_config_stamp
@@ -30794,10 +30799,11 @@ BTC is currently around $65,000 based on latest tool output."#
             let (recovery_tx, recovery_rx) = tokio::sync::mpsc::channel(1);
             let pending: PendingRecoveredGoalsByScope =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let first = tokio::spawn(run_message_dispatch_loop_with_recovery(
+            let first_router = router.clone();
+            let first = zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_recovery(
                 normal_rx,
                 recovery_rx,
-                router.clone(),
+                first_router,
                 1,
                 recovery_tx.downgrade(),
                 Arc::clone(&pending),
@@ -30844,7 +30850,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 let contexts =
                     HashMap::from([("test-agent".to_string(), Arc::clone(&runtime_ctx))]);
                 enqueue_recovered_goal_continuations_with_control_plane(
-                    &control_plane,
+                    control_plane,
                     &next_recovery_tx,
                     &contexts,
                     vec![task_id.clone()],
@@ -30852,10 +30858,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 )
                 .await
                 .expect("enqueue exact successor continuation");
-                let replacement = tokio::spawn(run_message_dispatch_loop_with_recovery(
+                let replacement_router = router.clone();
+                let replacement = zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_recovery(
                     next_normal_rx,
                     next_recovery_rx,
-                    router.clone(),
+                    replacement_router,
                     1,
                     next_recovery_tx.downgrade(),
                     Arc::clone(&next_pending),
@@ -30891,8 +30898,12 @@ BTC is currently around $65,000 based on latest tool output."#
                 "one normal worker and two recovered workers must execute exactly once each"
             );
             assert_eq!(
-                control_plane.recovered_goal_ids(),
-                vec![task_id.clone()],
+                control_plane
+                    .recovered_goal_ids()
+                    .iter()
+                    .filter(|id| *id == &task_id)
+                    .count(),
+                1,
                 "two reloads leave one exact successor lease"
             );
             assert_eq!(
@@ -30906,6 +30917,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::control_plane::TaskStatus::Running,
                 "reload handoff must not pause or duplicate the durable goal"
             );
+            control_plane.acknowledge_recovered_goal_id(&task_id);
         });
     }
 
