@@ -409,14 +409,15 @@ impl AnthropicModelProvider {
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
         .ok_or_else(Self::missing_credentials_error)?;
-        let auth_kind = profile
-            .metadata
-            .get("auth_kind")
-            .and_then(|value| AnthropicAuthKind::from_metadata_value(value))
+        let auth_kind = match profile.metadata.get("auth_kind") {
             // Stored profiles predate `auth_kind` metadata. Retain their
             // token-shape fallback; static `api_key` credentials deliberately
             // use the separate legacy path above.
-            .unwrap_or_else(|| detect_auth_kind(&token, None));
+            None => detect_auth_kind(&token, None),
+            Some(value) => AnthropicAuthKind::from_metadata_value(value).ok_or_else(|| {
+                anyhow::Error::msg("Anthropic profile has unsupported auth_kind metadata")
+            })?,
+        };
 
         Ok(ResolvedAnthropicCredential { token, auth_kind })
     }
@@ -2240,6 +2241,34 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await
             .expect("resolve legacy profile");
         assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn stored_profile_with_invalid_auth_kind_fails_closed() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "not-a-real-header-kind".to_string(),
+                )]),
+                false,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("invalid stored metadata must not fall back to token inference");
+        assert!(error.to_string().contains("unsupported auth_kind metadata"));
     }
 
     #[tokio::test]

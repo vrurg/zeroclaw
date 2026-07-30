@@ -8,7 +8,8 @@ pub mod xai_oauth;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, ProfileBindingSnapshot,
+    StagedProfileBinding, TokenSet, profile_id,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -49,6 +50,40 @@ impl AuthService {
 
     pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
         self.store.load().await
+    }
+
+    /// Replace one provider/profile token binding and capture the exact state
+    /// it displaced under the same store lock. This never changes the active
+    /// profile selection.
+    pub async fn stage_model_provider_token(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+        token: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<StagedProfileBinding> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let mut profile = AuthProfile::new_token(&model_provider, profile_name, token.to_string());
+        profile.metadata.extend(metadata);
+        self.store.stage_profile_binding(profile).await
+    }
+
+    /// Restore a binding captured by [`stage_model_provider_token`].
+    /// This is intentionally scoped to one profile binding and never changes
+    /// a provider-local active selector, so it cannot overwrite unrelated
+    /// credentials or a concurrent selection change.
+    pub async fn restore_model_provider_profile(
+        &self,
+        model_provider: &str,
+        profile_name: &str,
+        snapshot: ProfileBindingSnapshot,
+        expected_current: &AuthProfile,
+    ) -> Result<()> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        let profile_id = resolve_requested_profile_id(&model_provider, profile_name);
+        self.store
+            .restore_profile_binding(&profile_id, snapshot, expected_current)
+            .await
     }
 
     /// Read-only listing of persisted profile IDs (no decrypt, no migration).

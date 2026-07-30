@@ -31,7 +31,9 @@ pub async fn store_anthropic_setup_token(
         kind.as_metadata_value().to_string(),
     )]);
     zeroclaw_providers::auth::AuthService::from_config(config)
-        .store_model_provider_token("anthropic", alias, token, metadata, true)
+        // An OAuth alias selects its own stored profile. It must not become
+        // Anthropic's global active profile as a side effect of onboarding.
+        .store_model_provider_token("anthropic", alias, token, metadata, false)
         .await?;
     Ok(())
 }
@@ -266,6 +268,9 @@ pub async fn apply_with_surface(
     let ctx = RunCtx::new(surface);
     let started = std::time::Instant::now();
     let setup_token = anthropic_setup_token_from_submission(&submission);
+    // Callers retain this object after an error (notably the CLI path). Keep
+    // the in-memory state aligned with the on-disk rollback contract.
+    let original_config = config.clone();
 
     if matches!(surface, Surface::Web | Surface::Tui)
         && setup_token.is_some_and(|(_, token)| token.is_empty())
@@ -310,11 +315,13 @@ pub async fn apply_with_surface(
                 )),
             "quickstart: apply rejected"
         );
+        *config = original_config;
         return Err(errors);
     }
     let applied = match applied {
         Some(applied) => applied,
         None => {
+            *config = original_config;
             return Err(vec![QuickstartError::for_surface(
                 Some(&ctx),
                 QuickstartStep::Agent,
@@ -326,27 +333,10 @@ pub async fn apply_with_surface(
         }
     };
 
-    // Store the transport-only setup token before committing the config that
-    // selects it. If this fails, the caller retains its previous persisted
-    // configuration rather than landing an OAuth alias with no profile.
-    if let Some((alias, token)) = setup_token.filter(|(_, token)| !token.is_empty()) {
-        store_anthropic_setup_token(config, alias, token)
-            .await
-            .map_err(|err| {
-                vec![QuickstartError::for_surface(
-                    Some(&ctx),
-                    QuickstartStep::ModelProvider,
-                    "api_key",
-                    format!("failed to store Anthropic setup token: {err}"),
-                    "cli-quickstart-error-anthropic-setup-token-store",
-                    &[],
-                )]
-            })?;
-    }
-
     config
         .set_prop_persistent("onboard_state.quickstart_completed", "true")
         .map_err(|err| {
+            *config = original_config.clone();
             vec![QuickstartError::for_surface(
                 Some(&ctx),
                 QuickstartStep::Agent,
@@ -366,6 +356,54 @@ pub async fn apply_with_surface(
         ),
         "quickstart: completion flag flipped"
     );
+
+    // Stage the transport-only token immediately before the config commit.
+    // If the latter fails, compensate the exact profile binding rather than
+    // leaving an OAuth alias's credential behind. The snapshot is limited to
+    // the same profile binding; active-profile selection is deliberately not
+    // part of this transaction.
+    let staged_profile =
+        if let Some((alias, token)) = setup_token.filter(|(_, token)| !token.is_empty()) {
+            let auth_service = zeroclaw_providers::auth::AuthService::from_config(config);
+            let staged = match auth_service
+                .stage_model_provider_token(
+                    "anthropic",
+                    alias,
+                    token,
+                    std::collections::HashMap::from([(
+                        "auth_kind".to_string(),
+                        zeroclaw_providers::auth::anthropic_token::detect_auth_kind(
+                            token,
+                            Some("authorization"),
+                        )
+                        .as_metadata_value()
+                        .to_string(),
+                    )]),
+                )
+                .await
+            {
+                Ok(staged) => staged,
+                Err(err) => {
+                    *config = original_config.clone();
+                    return Err(vec![QuickstartError::for_surface(
+                        Some(&ctx),
+                        QuickstartStep::ModelProvider,
+                        "api_key",
+                        format!("failed to store Anthropic setup token: {err}"),
+                        "cli-quickstart-error-anthropic-setup-token-store",
+                        &[],
+                    )]);
+                }
+            };
+            Some((
+                auth_service,
+                alias.to_string(),
+                staged.snapshot,
+                staged.staged_profile,
+            ))
+        } else {
+            None
+        };
 
     let dirty_count = config.dirty_paths.len();
     let write_started = std::time::Instant::now();
@@ -410,16 +448,34 @@ pub async fn apply_with_surface(
             "quickstart: persist failed"
         ),
     }
-    write_result.map_err(|err| {
-        vec![QuickstartError::for_surface(
+    if let Err(err) = write_result {
+        let rollback_error = if let Some((auth_service, alias, snapshot, expected_current)) =
+            staged_profile
+        {
+            auth_service
+                .restore_model_provider_profile("anthropic", &alias, snapshot, &expected_current)
+                .await
+                .err()
+        } else {
+            None
+        };
+        *config = original_config;
+        let detail = match rollback_error {
+            Some(rollback_error) => {
+                format!("{err}; Anthropic setup-token rollback also failed: {rollback_error}")
+            }
+            None => err.to_string(),
+        };
+        let quickstart_error = QuickstartError::for_surface(
             Some(&ctx),
             QuickstartStep::Agent,
             "",
-            format!("failed to persist config: {err}"),
+            detail.clone(),
             "cli-quickstart-error-persist-config",
-            &[("err", &err.to_string())],
-        )]
-    })?;
+            &[("err", &detail)],
+        );
+        return Err(vec![quickstart_error]);
+    }
 
     // Config landed atomically — now move the staged personality files
     // into place. Any failure here is reported but does not unwind the
@@ -2883,6 +2939,116 @@ mod tests {
             .expect("load auth profile")
             .expect("same-alias profile");
         assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
+        assert!(
+            auth.load_profiles()
+                .await
+                .expect("load profile state")
+                .active_profiles
+                .get("anthropic")
+                .is_none(),
+            "Quickstart alias storage must not change Anthropic's active profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_token_config_write_failure_restores_profile_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let original = std::fs::read_to_string(&config.config_path).unwrap();
+
+        let auth = zeroclaw_providers::auth::AuthService::from_config(&config);
+        auth.store_model_provider_token(
+            "anthropic",
+            "subscription",
+            "existing-token",
+            std::collections::HashMap::new(),
+            false,
+        )
+        .await
+        .expect("store prior profile");
+
+        // `save_dirty` must fail after the profile has been staged but before
+        // it can commit the OAuth alias.
+        std::fs::remove_file(&config.config_path).unwrap();
+        std::fs::create_dir(&config.config_path).unwrap();
+
+        let mut submission = fresh_submission("bot");
+        let SelectorChoice::Fresh(choice) = &mut submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        choice.alias = "subscription".to_string();
+        choice.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "new-setup-token".to_string()),
+        ]);
+
+        let errors = super::apply_with_surface(submission, &mut config, Surface::Cli)
+            .await
+            .expect_err("config write must fail");
+        let error = errors
+            .iter()
+            .find(|error| error.message.contains("persist config"))
+            .expect("CLI persistence error");
+        assert_eq!(
+            error.message.matches("failed to persist config").count(),
+            1,
+            "the localized prefix must not be duplicated"
+        );
+        let profile = auth
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .expect("read restored profile")
+            .expect("prior profile must remain");
+        assert_eq!(profile.token.as_deref(), Some("existing-token"));
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_none()
+        );
+        std::fs::remove_dir(&config.config_path).unwrap();
+        std::fs::write(&config.config_path, original).unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_token_profile_prepare_failure_does_not_change_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state");
+        std::fs::write(&state_path, "not a directory").unwrap();
+        let mut config = Config {
+            config_path: state_path.join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+
+        let mut submission = fresh_submission("bot");
+        let SelectorChoice::Fresh(choice) = &mut submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        choice.alias = "subscription".to_string();
+        choice.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "new-setup-token".to_string()),
+        ]);
+
+        let errors = super::apply(submission, &mut config)
+            .await
+            .expect_err("profile snapshot must fail when its state directory is invalid");
+        assert!(errors.iter().any(|error| error.field == "api_key"));
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_none(),
+            "failed profile preparation must not leave OAuth config in memory"
+        );
     }
 
     #[tokio::test]

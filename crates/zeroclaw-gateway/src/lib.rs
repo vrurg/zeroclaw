@@ -4941,6 +4941,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_gateway_bootstraps_anthropic_oauth_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(zeroclaw_config::schema::AuthMode::OAuth),
+            },
+        );
+        zeroclaw_providers::auth::AuthService::from_config(&config)
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "synthetic-setup-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if handle.is_finished() {
+            let result = handle.await.expect("gateway task did not panic");
+            panic!("gateway bootstrap must construct an OAuth-bound Anthropic alias: {result:?}");
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn production_gateway_router_applies_anthropic_setup_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeroclaw_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.save().await.unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway must accept HTTP before Quickstart apply");
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let body = serde_json::to_vec(&submission).unwrap();
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let request = format!(
+            "POST /api/quickstart/apply HTTP/1.1\r\nHost: {base_url}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("x-content-type-options"),
+            "production gateway middleware must add security headers"
+        );
+        let json = response.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(json).unwrap()["kind"],
+            "applied"
+        );
+
+        let mut reloaded: Config =
+            toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
+                .unwrap();
+        reloaded.config_path = tmp.path().join("config.toml");
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_some_and(|entry| entry.api_key.is_none()),
+            "production router must persist an OAuth alias without an inline token"
+        );
+        assert!(
+            zeroclaw_providers::auth::AuthService::from_config(&reloaded)
+                .get_profile("anthropic", Some("subscription"))
+                .await
+                .unwrap()
+                .is_some(),
+            "production router must persist the matching stored profile"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway must shut down")
+            .expect("gateway task must not panic")
+            .expect("gateway shutdown must be graceful");
+    }
+
+    #[tokio::test]
     async fn run_gateway_uses_external_shutdown_sender() {
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();

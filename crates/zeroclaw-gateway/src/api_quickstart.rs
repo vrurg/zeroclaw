@@ -177,3 +177,202 @@ fn signal_daemon_reload(state: &AppState) -> bool {
 // Per-family alias collection lives in
 // `zeroclaw_runtime::quickstart::snapshot_state` so both transports
 // share one implementation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request, routing::post};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zeroclaw_config::presets::{
+        AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+    };
+
+    #[tokio::test]
+    async fn http_quickstart_apply_persists_anthropic_setup_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer synthetic-setup-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let state = crate::api::test_state(config);
+        let router = Router::new()
+            .route("/api/quickstart/apply", post(handle_apply))
+            .with_state(state.clone());
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                    ("uri".to_string(), server.uri()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/quickstart/apply")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["kind"],
+            "applied"
+        );
+
+        let config = state.config.read().clone();
+        let entry = config
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .expect("HTTP apply must persist the requested alias");
+        assert!(entry.api_key.is_none(), "setup token must not enter config");
+        let profile = zeroclaw_providers::auth::AuthService::from_config(&config)
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .unwrap()
+            .expect("HTTP apply must store the same-alias profile");
+        assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // Reconstruct from the persisted file, rather than the gateway's
+        // in-memory working clone, and exercise the selected OAuth alias.
+        let mut reloaded: zeroclaw_config::schema::Config =
+            toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
+                .unwrap();
+        reloaded.config_path = tmp.path().join("config.toml");
+        let provider =
+            zeroclaw_providers::create_model_provider_from_ref(&reloaded, "anthropic.subscription")
+                .unwrap();
+        let response = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
+            .simple_chat("hello", "claude-sonnet-4-5", None)
+            .await
+            .unwrap();
+        assert_eq!(response, "ok");
+
+        // Use the exact resilient-construction call made by gateway boot.
+        // This makes the provider-selection contract explicit instead of only
+        // proving the direct provider factory path.
+        let entry = reloaded
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .unwrap();
+        zeroclaw_providers::create_resilient_model_provider_from_ref(
+            &reloaded,
+            "anthropic.subscription",
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &reloaded.reliability,
+            &zeroclaw_providers::provider_runtime_options_for_alias(
+                &reloaded,
+                "anthropic",
+                "subscription",
+            ),
+        )
+        .expect("gateway bootstrap must resolve the persisted OAuth alias");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn http_quickstart_apply_failure_does_not_swap_or_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        std::fs::remove_file(&config.config_path).unwrap();
+        std::fs::create_dir(&config.config_path).unwrap();
+        let state = crate::api::test_state(config);
+        let router = Router::new()
+            .route("/api/quickstart/apply", post(handle_apply))
+            .with_state(state.clone());
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/quickstart/apply")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["kind"],
+            "errors"
+        );
+        assert!(
+            state
+                .config
+                .read()
+                .providers
+                .models
+                .find("anthropic", "subscription")
+                .is_none(),
+            "failed HTTP apply must not swap the live configuration"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "failed HTTP apply must not request reload"
+        );
+    }
+}

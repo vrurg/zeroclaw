@@ -23,7 +23,7 @@ pub enum AuthProfileKind {
     Token,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSet {
     pub access_token: String,
     #[serde(default)]
@@ -51,7 +51,7 @@ impl TokenSet {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
     pub model_provider: String,
@@ -132,6 +132,24 @@ pub struct AuthProfilesData {
     pub profiles: BTreeMap<String, AuthProfile>,
 }
 
+/// Exact state for one provider/profile binding, used only to compensate a
+/// failed multi-store operation. It deliberately does not expose a whole
+/// profile-store replacement, so unrelated providers and profiles remain
+/// outside the rollback scope.
+#[derive(Debug, Clone)]
+pub struct ProfileBindingSnapshot {
+    pub profile: Option<AuthProfile>,
+}
+
+/// A single-lock profile write together with the state it displaced. This is
+/// used to compensate a later failure in a separate store without a window in
+/// which another writer can be overwritten before the rollback CAS applies.
+#[derive(Debug, Clone)]
+pub struct StagedProfileBinding {
+    pub snapshot: ProfileBindingSnapshot,
+    pub staged_profile: AuthProfile,
+}
+
 impl Default for AuthProfilesData {
     fn default() -> Self {
         Self {
@@ -166,6 +184,63 @@ impl AuthProfilesStore {
     pub async fn load(&self) -> Result<AuthProfilesData> {
         let _lock = self.acquire_lock().await?;
         self.load_locked().await
+    }
+
+    /// Replace one profile binding and capture the state it displaced while
+    /// holding the same store lock. This write never changes active selection.
+    pub async fn stage_profile_binding(
+        &self,
+        mut profile: AuthProfile,
+    ) -> Result<StagedProfileBinding> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+        let snapshot = ProfileBindingSnapshot {
+            profile: data.profiles.get(&profile.id).cloned(),
+        };
+
+        profile.updated_at = Utc::now();
+        if let Some(existing) = &snapshot.profile {
+            profile.created_at = existing.created_at;
+        }
+        data.profiles.insert(profile.id.clone(), profile.clone());
+        data.updated_at = Utc::now();
+        self.save_locked(&data).await?;
+
+        Ok(StagedProfileBinding {
+            snapshot,
+            staged_profile: profile,
+        })
+    }
+
+    /// Restore exactly one profile only when it still contains the staged
+    /// value. The active selector is deliberately not restored: a staged
+    /// alias-bound write never changes it, and replacing it could erase a
+    /// concurrent operator choice.
+    pub async fn restore_profile_binding(
+        &self,
+        profile_id: &str,
+        snapshot: ProfileBindingSnapshot,
+        expected_current: &AuthProfile,
+    ) -> Result<()> {
+        let _lock = self.acquire_lock().await?;
+        let mut data = self.load_locked().await?;
+
+        if data.profiles.get(profile_id) != Some(expected_current) {
+            anyhow::bail!(
+                "refusing auth-profile rollback because the binding changed concurrently"
+            );
+        }
+
+        match snapshot.profile {
+            Some(profile) => {
+                data.profiles.insert(profile_id.to_string(), profile);
+            }
+            None => {
+                data.profiles.remove(profile_id);
+            }
+        }
+        data.updated_at = Utc::now();
+        self.save_locked(&data).await
     }
 
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
@@ -775,6 +850,45 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_to_overwrite_a_concurrent_profile_update() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let id = profile_id("anthropic", "subscription");
+
+        let previous = AuthProfile::new_token("anthropic", "subscription", "old".into());
+        store.upsert_profile(previous, false).await.unwrap();
+        let staged = store
+            .stage_profile_binding(AuthProfile::new_token(
+                "anthropic",
+                "subscription",
+                "staged".into(),
+            ))
+            .await
+            .unwrap();
+        store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "concurrent".into()),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .restore_profile_binding(&id, staged.snapshot, &staged.staged_profile)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("changed concurrently"));
+
+        let data = store.load().await.unwrap();
+        assert_eq!(
+            data.profiles
+                .get(&id)
+                .and_then(|profile| profile.token.as_deref()),
+            Some("concurrent")
+        );
     }
 
     #[tokio::test]

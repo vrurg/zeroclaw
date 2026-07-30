@@ -650,6 +650,7 @@ cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
 cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
 cli-quickstart-next-agent-command = {"  "}zeroclaw agent -a {$alias}  # chat with this agent in your terminal
 cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-agent-not-created-disk-state-uncertain = Your agent was not created. The config was not saved, but the Anthropic credential rollback failed; inspect the stored profile before retrying.
 cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
 cli-quickstart-pick-preset = Pick a preset
 cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
