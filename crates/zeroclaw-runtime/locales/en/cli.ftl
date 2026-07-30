@@ -1117,6 +1117,7 @@ goal-command-error-disabled = Goal mode is disabled by `goal.enabled = false`.
 goal-command-error-agent-disabled = Goal mode is disabled for this agent.
 goal-command-error-surface-disabled = Goal mode is not allowed on command surface `{$surface}`.
 goal-command-error-channel-type-missing = Goal mode channel admission requires a trusted channel type, but channel type is unavailable.
+goal-command-error-channel-principal-missing = Goal mode channel admission requires an authenticated channel identity.
 goal-command-error-channel-disabled = Goal mode is not allowed on channel type `{$channel_type}`.
 goal-command-error-channel-binding-disabled = Goal mode is not available on this configured `{$channel_type}` channel.
 goal-command-error-active-goal-exists = Goal `{$task_id}` is already active for this route and principal.

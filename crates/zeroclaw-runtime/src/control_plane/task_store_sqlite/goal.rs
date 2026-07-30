@@ -958,6 +958,7 @@ mod tests {
             channel_alias: Some("main".into()),
             reply_target: "chat-1".into(),
             sender: "alice".into(),
+            transport_principal: Some("alice-id".into()),
             thread_ts: None,
             interruption_scope_id: Some("scope-1".into()),
             conversation_scope:

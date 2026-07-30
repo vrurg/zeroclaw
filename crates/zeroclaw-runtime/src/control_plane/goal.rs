@@ -1745,6 +1745,19 @@ fn ensure_goal_admitted_by_config(
         );
     }
     if ctx.command_surface == CommandSurface::Channel {
+        // A missing channel principal would become a wildcard in task-store
+        // lookups. Reject it before control-plane access or any task mutation.
+        if !ctx
+            .principal_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|principal| !principal.is_empty())
+        {
+            bail!(
+                "{}",
+                msg("goal-command-error-channel-principal-missing", &[])
+            );
+        }
         let Some(channel_type) = ctx
             .channel_type
             .as_deref()
@@ -3524,6 +3537,7 @@ mod tests {
                 channel_alias: Some("default".into()),
                 reply_target: "test-room".into(),
                 sender: "test-operator".into(),
+                transport_principal: Some("test-operator".into()),
                 thread_ts: None,
                 interruption_scope_id: None,
                 conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -3747,6 +3761,7 @@ mod tests {
                     channel_alias: Some("default".into()),
                     reply_target: format!("room:{task_id}"),
                     sender: "operator".into(),
+                    transport_principal: Some("operator".into()),
                     thread_ts: None,
                     interruption_scope_id: Some(format!("scope:{task_id}")),
                     conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -4311,6 +4326,19 @@ mod tests {
     }
 
     #[test]
+    fn channel_goal_admission_rejects_missing_authenticated_principal() {
+        let ctx = test_goal_context("agent-a")
+            .with_command_surface(CommandSurface::Channel)
+            .with_principal_id(None);
+        let config = test_config();
+
+        let err =
+            ensure_goal_admitted_by_config(&ctx, &config, config.agent("agent-a")).unwrap_err();
+
+        assert!(err.to_string().contains("authenticated channel identity"));
+    }
+
+    #[test]
     fn goal_command_visibility_uses_every_live_channel_policy_gate() {
         let config = test_config();
         let visible = |candidate: &Config| {
@@ -4562,6 +4590,7 @@ mod tests {
                 channel_alias: Some("default".into()),
                 reply_target: "room".into(),
                 sender: "operator".into(),
+                transport_principal: Some("operator".into()),
                 thread_ts: None,
                 interruption_scope_id: None,
                 conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -6242,6 +6271,7 @@ mod tests {
             channel_alias: Some("work".into()),
             reply_target: "!room:example.org".into(),
             sender: "@operator:example.org".into(),
+            transport_principal: Some("@operator:example.org".into()),
             thread_ts: Some("$root".into()),
             interruption_scope_id: Some("$root".into()),
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -6399,6 +6429,7 @@ mod tests {
             channel_alias: Some("main".into()),
             reply_target: "!room:example".into(),
             sender: "@alice:example".into(),
+            transport_principal: Some("@alice:example".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -6488,6 +6519,7 @@ mod tests {
             channel_alias: None,
             reply_target: "!room:example".into(),
             sender: "@alice:example".into(),
+            transport_principal: Some("@alice:example".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -6529,6 +6561,7 @@ mod tests {
             channel_alias: None,
             reply_target: "!room:example".into(),
             sender: "@mallory:example".into(),
+            transport_principal: Some("@mallory:example".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -6998,6 +7031,7 @@ mod tests {
             channel_alias: Some("work".into()),
             reply_target: "!room:example.org".into(),
             sender: "@operator:example.org".into(),
+            transport_principal: Some("@operator:example.org".into()),
             thread_ts: Some("$root".into()),
             interruption_scope_id: Some("$root".into()),
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
@@ -7187,6 +7221,7 @@ mod tests {
             channel_alias: Some("work".into()),
             reply_target: "!room:example.org".into(),
             sender: "@operator:example.org".into(),
+            transport_principal: Some("@operator:example.org".into()),
             thread_ts: Some("$root".into()),
             interruption_scope_id: Some("$root".into()),
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,

@@ -92,7 +92,7 @@ pub(crate) fn goal_approval_binding_from_admission(
     };
     let recipient = context.reply_target.trim();
     let canonical_principal = admission.principal_id.as_deref().unwrap_or("").trim();
-    let transport_principal = context.sender.trim();
+    let transport_principal = context.transport_principal.as_deref().unwrap_or("").trim();
     if channel.is_empty()
         || recipient.is_empty()
         || canonical_principal.is_empty()
@@ -571,6 +571,7 @@ mod tests {
             channel_alias: None,
             reply_target: "durable-recipient".into(),
             sender: "original-sender".into(),
+            transport_principal: Some("durable-principal".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -619,6 +620,7 @@ mod tests {
             channel_alias: Some("primary".into()),
             reply_target: "durable-room".into(),
             sender: "original-sender".into(),
+            transport_principal: Some("immutable-owner".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -634,8 +636,33 @@ mod tests {
                 channel: "matrix.primary".into(),
                 recipient: "durable-room".into(),
                 canonical_principal: "principal-a".into(),
-                transport_principal: "original-sender".into(),
+                transport_principal: "immutable-owner".into(),
             })
+        );
+    }
+
+    #[test]
+    fn goal_binding_rejects_legacy_continuation_without_immutable_principal() {
+        let continuation = crate::control_plane::TaskContinuationContext {
+            channel: "matrix".into(),
+            channel_alias: None,
+            reply_target: "durable-room".into(),
+            sender: "mutable-display-name".into(),
+            transport_principal: None,
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope:
+                crate::control_plane::TaskContinuationConversationScope::ReplyTarget,
+        };
+        let admission = crate::control_plane::GoalAdmissionContext::new("agent")
+            .with_goal_task_id(Some("goal-1".into()))
+            .with_principal_id(Some("principal-a".into()))
+            .with_continuation_context(Some(continuation));
+
+        assert_eq!(
+            goal_approval_binding_from_admission(&admission),
+            GoalApprovalBindingState::DenyOnly,
+            "a delayed goal approval must not authorize a mutable sender label"
         );
     }
 

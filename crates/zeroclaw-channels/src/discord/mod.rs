@@ -2519,6 +2519,7 @@ impl Channel for DiscordChannel {
 
                                         let channel_msg = ChannelMessage {
                                             id: format!("discord_interaction_{interaction_id}"),
+                                            authenticated_principal: Some(user_id.clone()),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
                                             content,
@@ -2709,6 +2710,7 @@ impl Channel for DiscordChannel {
                                                     let channel_msg = ChannelMessage {
                                                         id: format!("discord_sopgate_{interaction_id}"),
                                                         sender: user_id.clone(),
+                                                        authenticated_principal: Some(user_id.clone()),
                                                         reply_target: interaction_channel.clone(),
                                                         content: format!("{choice} {reference}"),
                                                         channel: "discord".to_string(),
@@ -2813,6 +2815,7 @@ impl Channel for DiscordChannel {
                                                     let channel_msg = ChannelMessage {
                                                         id: format!("discord_sopgate_{interaction_id}"),
                                                         sender: user_id.clone(),
+                                                        authenticated_principal: Some(user_id.clone()),
                                                         reply_target: interaction_channel.clone(),
                                                         content: text,
                                                         channel: "discord".to_string(),
@@ -2943,6 +2946,7 @@ impl Channel for DiscordChannel {
                                         // through the interaction followup.
                                         let channel_msg = ChannelMessage {
                                             id: format!("discord_interaction_{interaction_id}"),
+                                            authenticated_principal: Some(user_id.clone()),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
                                             content,
@@ -3317,6 +3321,7 @@ impl Channel for DiscordChannel {
                             format!("discord_{message_id}")
                         },
                         sender: author_id.to_string(),
+                        authenticated_principal: Some(author_id.to_string()),
                         reply_target: if channel_id.is_empty() {
                             author_id.to_string()
                         } else {

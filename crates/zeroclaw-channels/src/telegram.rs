@@ -2113,6 +2113,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
+            authenticated_principal: sender_id,
             reply_target,
             content,
             channel: "telegram".into(),
@@ -2276,6 +2277,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
+            authenticated_principal: sender_id,
             reply_target,
             content,
             channel: "telegram".into(),
@@ -2547,6 +2549,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
+            authenticated_principal: sender_id,
             reply_target,
             content,
             channel: "telegram".into(),
@@ -4194,17 +4197,9 @@ Ensure only one `zeroclaw` process is using this bot token."
 impl TelegramChannel {
     fn callback_principal(callback: &serde_json::Value) -> String {
         let from = callback.get("from").unwrap_or(&serde_json::Value::Null);
-        let username = from
-            .get("username")
-            .and_then(serde_json::Value::as_str)
-            .filter(|name| !name.is_empty());
-        username
-            .map(str::to_owned)
-            .or_else(|| {
-                from.get("id")
-                    .and_then(serde_json::Value::as_i64)
-                    .map(|id| id.to_string())
-            })
+        from.get("id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())
             .unwrap_or_default()
     }
 
@@ -8340,6 +8335,14 @@ mod tests {
         )]);
         assert!(take_pending_approval(&mut pending, "approval", "other").is_none());
         assert!(pending.contains_key("approval"));
+    }
+
+    #[test]
+    fn callback_principal_uses_numeric_id_not_mutable_username() {
+        let callback = serde_json::json!({
+            "from": { "id": 42, "username": "renamed_user" }
+        });
+        assert_eq!(TelegramChannel::callback_principal(&callback), "42");
     }
 
     #[test]

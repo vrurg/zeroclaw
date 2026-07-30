@@ -1286,28 +1286,35 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 fn legacy_goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    let sender = msg.sender.trim();
-    if sender.is_empty() {
-        return None;
-    }
+    let principal = goal_authenticated_principal(msg)?;
     Some(sanitize_session_key(&format!(
         "{}_{}",
         channel_scope(msg),
-        sender
+        principal
     )))
+}
+
+/// Return the platform-authenticated identity that owns a channel goal.
+///
+/// The adapter that parsed the inbound event creates this projection. `sender`
+/// is presentation/history data and must never authorize durable goal access.
+fn goal_authenticated_principal(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<&str> {
+    msg.authenticated_principal
+        .as_deref()
+        .map(str::trim)
+        .filter(|principal| !principal.is_empty())
 }
 
 /// Collision-safe principal identity for goal ownership. This is deliberately
 /// separate from the sanitizer-backed session key because task visibility is a
 /// security boundary, not a filesystem-name convenience.
 fn goal_principal_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    (!msg.sender.trim().is_empty()).then(|| {
-        canonical_goal_identity(&[
-            msg.channel.as_str(),
-            msg.channel_alias.as_deref().unwrap_or(""),
-            msg.sender.as_str(),
-        ])
-    })
+    let principal = goal_authenticated_principal(msg)?;
+    Some(canonical_goal_identity(&[
+        msg.channel.as_str(),
+        msg.channel_alias.as_deref().unwrap_or(""),
+        principal,
+    ]))
 }
 
 fn goal_task_conversation_scope(
@@ -1344,10 +1351,20 @@ fn goal_continuation_context_from_message(
         channel_alias: msg.channel_alias.clone(),
         reply_target: msg.reply_target.clone(),
         sender: msg.sender.clone(),
+        transport_principal: goal_transport_principal(msg),
         thread_ts: msg.thread_ts.clone(),
         interruption_scope_id: msg.interruption_scope_id.clone(),
         conversation_scope: goal_task_conversation_scope(msg.conversation_scope),
     }
+}
+
+/// Select the authorization identity persisted for a delayed goal approval.
+///
+/// Only adapters that explicitly project an authenticated platform identity
+/// can use delayed goal approvals. Unknown, legacy, and nick-based channels
+/// fail closed rather than treating presentation data as authorization.
+fn goal_transport_principal(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    goal_authenticated_principal(msg).map(str::to_owned)
 }
 
 /// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
@@ -2310,6 +2327,7 @@ fn synthetic_goal_message_from(
         msg.timestamp,
     );
     next.channel_alias = msg.channel_alias.clone();
+    next.authenticated_principal = msg.authenticated_principal.clone();
     next.thread_ts = msg.thread_ts.clone();
     next.interruption_scope_id = msg.interruption_scope_id.clone();
     next.subject = msg.subject.clone();
@@ -2340,6 +2358,7 @@ fn recovered_goal_continuation_message(
         unix_timestamp_secs(),
     );
     msg.channel_alias = context.channel_alias;
+    msg.authenticated_principal = context.transport_principal;
     msg.thread_ts = context.thread_ts;
     msg.interruption_scope_id = context.interruption_scope_id;
     msg.conversation_scope = goal_channel_conversation_scope(context.conversation_scope);
@@ -2416,9 +2435,12 @@ fn goal_admission_context_for_message(
     zeroclaw_runtime::control_plane::GoalAdmissionContext::new(ctx.agent_alias.as_ref().clone())
         .with_command_surface(CommandSurface::Channel)
         .with_channel_type(Some(goal_channel_type(msg.channel.as_str()).to_string()))
-        .with_originator_route(Some(goal_trusted_route(msg)))
+        .with_originator_route(goal_trusted_route(msg))
         .with_principal_id(goal_principal_id(msg))
-        .with_legacy_identity(Some(history_key.to_string()), legacy_goal_principal_id(msg))
+        .with_legacy_identity(
+            goal_legacy_history_key(msg).or_else(|| Some(history_key.to_string())),
+            legacy_goal_principal_id(msg),
+        )
         .with_goal_task_id(
             msg.internal_goal_task_id
                 .clone()
@@ -2429,18 +2451,26 @@ fn goal_admission_context_for_message(
 
 /// Collision-safe control-plane identity. Unlike session-key sanitization this
 /// preserves every raw trusted component with explicit boundaries.
-fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    canonical_goal_identity(&[
+fn goal_trusted_route(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    let principal = goal_authenticated_principal(msg)?;
+    Some(canonical_goal_identity(&[
         msg.channel.as_str(),
         msg.channel_alias.as_deref().unwrap_or(""),
-        msg.sender.as_str(),
+        principal,
         msg.reply_target.as_str(),
         msg.thread_ts.as_deref().unwrap_or(""),
         match msg.conversation_scope {
             zeroclaw_api::channel::ChannelConversationScope::Sender => "sender",
             zeroclaw_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
         },
-    ])
+    ]))
+}
+
+/// Rebuild the pre-presentation legacy history key from the raw platform ID.
+fn goal_legacy_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
+    let mut legacy = msg.clone();
+    legacy.sender = goal_authenticated_principal(msg)?.to_owned();
+    Some(conversation_history_key(&legacy))
 }
 
 fn canonical_goal_identity(parts: &[&str]) -> String {
@@ -16268,6 +16298,7 @@ temperature = 0.3
                         channel_alias: Some("default".into()),
                         reply_target: format!("room:{task_id}"),
                         sender: "operator".into(),
+                        transport_principal: Some("operator".into()),
                         thread_ts: None,
                         interruption_scope_id: Some(format!("scope:{task_id}")),
                         conversation_scope: zeroclaw_runtime::control_plane::
@@ -20090,6 +20121,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let msg = zeroclaw_api::channel::ChannelMessage {
                 id: "goal-resume-1".into(),
                 sender: "operator".into(),
+                authenticated_principal: Some("operator".into()),
                 reply_target: "room-1".into(),
                 content: "@zeroclaw /goal resume blocker fixed, retry now".into(),
                 channel: "telegram".into(),
@@ -20097,7 +20129,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 ..Default::default()
             };
-            let route = goal_trusted_route(&msg);
+            let route = goal_trusted_route(&msg).expect("test message has principal");
             let principal = goal_principal_id(&msg);
             let control_plane = zeroclaw_runtime::control_plane::control_plane().unwrap();
             control_plane
@@ -20243,6 +20275,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let msg = zeroclaw_api::channel::ChannelMessage {
                 id: "goal-start-policy-cutover".into(),
                 sender: "operator".into(),
+                authenticated_principal: Some("123456".into()),
                 reply_target: "room-1".into(),
                 content: "/goal start keep working until revoked".into(),
                 channel: "telegram".into(),
@@ -20487,6 +20520,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let start = zeroclaw_api::channel::ChannelMessage {
             id: format!("goal-start-{unique}"),
             sender: format!("operator-{unique}"),
+            authenticated_principal: Some(format!("operator-{unique}")),
             reply_target: format!("room-{unique}"),
             content: "/goal start remain resumable after interruption".into(),
             channel: "telegram".into(),
@@ -20494,7 +20528,7 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             ..Default::default()
         };
-        let route = goal_trusted_route(&start);
+        let route = goal_trusted_route(&start).expect("test message has principal");
         let principal = goal_principal_id(&start);
         let interrupt = zeroclaw_api::channel::ChannelMessage {
             id: format!("interrupt-{unique}"),
@@ -26365,9 +26399,11 @@ BTC is currently around $65,000 based on latest tool output."#
     fn goal_trusted_route_does_not_collide_when_history_sanitization_does() {
         let mut first =
             zeroclaw_api::channel::ChannelMessage::new("one", "a:b", "room", "x", "matrix", 1);
+        first.authenticated_principal = Some("principal:a:b".into());
         first.reply_target = "r-c".into();
         let mut second = first.clone();
         second.sender = "a b".into();
+        second.authenticated_principal = Some("principal:a b".into());
         assert_eq!(
             conversation_history_key(&first),
             conversation_history_key(&second)
@@ -27330,17 +27366,19 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn goal_principal_includes_sender_even_when_wecom_route_groups_room() {
+    fn goal_principal_uses_explicit_identity_even_when_wecom_route_groups_room() {
         let mut alice = zeroclaw_api::channel::ChannelMessage {
             channel: "wecom_ws".into(),
             channel_alias: Some("bot".into()),
             reply_target: "group--room".into(),
             sender: "alice".into(),
+            authenticated_principal: Some("alice-id".into()),
             conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
             ..Default::default()
         };
         let mut bob = alice.clone();
         bob.sender = "bob".into();
+        bob.authenticated_principal = Some("bob-id".into());
 
         assert_eq!(
             conversation_history_key(&alice),
@@ -27349,6 +27387,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_ne!(goal_principal_id(&alice), goal_principal_id(&bob));
 
         alice.sender = " ".into();
+        alice.authenticated_principal = None;
         assert!(goal_principal_id(&alice).is_none());
     }
 
@@ -28098,6 +28137,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: Some("work".into()),
             reply_target: "town-square".into(),
             sender: "@zeroclaw".into(),
+            transport_principal: Some("@zeroclaw".into()),
             thread_ts: Some("thread-1".into()),
             interruption_scope_id: Some("scope-1".into()),
             conversation_scope:
@@ -28117,6 +28157,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(msg.channel_alias, context.channel_alias);
         assert_eq!(msg.reply_target, context.reply_target);
         assert_eq!(msg.sender, context.sender);
+        assert_eq!(msg.authenticated_principal, context.transport_principal);
         assert_eq!(msg.thread_ts, context.thread_ts);
         assert_eq!(msg.interruption_scope_id, context.interruption_scope_id);
         assert_eq!(
@@ -28126,6 +28167,66 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(msg.content.contains("daemon restarted"));
         assert!(msg.content.contains("finish the restart smoke"));
         assert!(!msg.content.contains("last_state"));
+    }
+
+    #[test]
+    fn synthetic_goal_continuation_preserves_authenticated_principal() {
+        let original = zeroclaw_api::channel::ChannelMessage {
+            id: "message-1".into(),
+            sender: "renamed-operator".into(),
+            authenticated_principal: Some("U123".into()),
+            reply_target: "room-1".into(),
+            content: "/goal resume".into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+
+        let continuation = synthetic_goal_message_from(
+            &original,
+            "message-1:goal:1".into(),
+            "continue goal".into(),
+        );
+
+        assert_eq!(continuation.authenticated_principal, Some("U123".into()));
+        assert_eq!(
+            goal_principal_id(&continuation),
+            goal_principal_id(&original)
+        );
+    }
+
+    #[test]
+    fn goal_identity_requires_explicit_authenticated_principals() {
+        let slack = zeroclaw_api::channel::ChannelMessage {
+            channel: "slack".into(),
+            sender: "shared-display-name".into(),
+            ..Default::default()
+        };
+        assert_eq!(goal_transport_principal(&slack), None);
+        assert_eq!(goal_principal_id(&slack), None);
+        assert_eq!(goal_trusted_route(&slack), None);
+
+        let telegram = zeroclaw_api::channel::ChannelMessage {
+            channel: "telegram".into(),
+            sender: "renamed-user".into(),
+            authenticated_principal: Some("42".into()),
+            ..Default::default()
+        };
+        assert_eq!(goal_transport_principal(&telegram).as_deref(), Some("42"));
+        assert!(goal_principal_id(&telegram).is_some());
+
+        let mut matrix = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            sender: "@owner:example.test".into(),
+            ..Default::default()
+        };
+        assert_eq!(goal_transport_principal(&matrix), None);
+
+        matrix.authenticated_principal = Some("@owner:example.test".into());
+        assert_eq!(
+            goal_transport_principal(&matrix).as_deref(),
+            Some("@owner:example.test")
+        );
     }
 
     #[tokio::test]
@@ -28441,6 +28542,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel_alias: None,
                     reply_target: "room-a".into(),
                     sender: "user-a".into(),
+                    transport_principal: Some("user-a".into()),
                     thread_ts: None,
                     interruption_scope_id: None,
                     conversation_scope: zeroclaw_runtime::control_plane::
@@ -28520,6 +28622,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: None,
             reply_target: "room-a".into(),
             sender: "user-a".into(),
+            transport_principal: Some("user-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -28610,6 +28713,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: None,
             reply_target: "room-a".into(),
             sender: "user-a".into(),
+            transport_principal: Some("user-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -28648,6 +28752,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: None,
             reply_target: "room-a".into(),
             sender: "user-a".into(),
+            transport_principal: Some("user-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -28658,7 +28763,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "survive provider initialization failure".into(),
             continuation.clone(),
         );
-        let trusted_route = goal_trusted_route(&message);
+        let trusted_route = goal_trusted_route(&message).expect("recovery preserves principal");
         let trusted_principal = goal_principal_id(&message);
         handle
             .goal_store
@@ -28809,6 +28914,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: None,
             reply_target: "room-a".into(),
             sender: "user-a".into(),
+            transport_principal: Some("user-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -28918,6 +29024,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_alias: None,
             reply_target,
             sender: "user-a".into(),
+            transport_principal: Some("user-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope:
@@ -28941,7 +29048,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     heartbeat_at: None,
                     depth: 0,
                     parent_id: None,
-                    originator_route: Some(goal_trusted_route(&message)),
+                    originator_route: goal_trusted_route(&message),
                     delivered: false,
                     idem_key: None,
                     principal_id: goal_principal_id(&message),
@@ -31134,6 +31241,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
+                authenticated_principal: None,
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -32897,6 +33005,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
+                authenticated_principal: None,
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),

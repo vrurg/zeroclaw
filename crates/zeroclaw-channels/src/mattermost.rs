@@ -1348,6 +1348,7 @@ impl MattermostChannel {
         Some(ChannelMessage {
             id: format!("mattermost_{id}"),
             sender: user_id.to_string(),
+            authenticated_principal: Some(user_id.to_string()),
             reply_target,
             content,
             channel: "mattermost".to_string(),

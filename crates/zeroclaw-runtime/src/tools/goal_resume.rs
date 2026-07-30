@@ -190,6 +190,7 @@ mod tests {
             channel_alias: Some("default".into()),
             reply_target: "room-a".into(),
             sender: "operator-a".into(),
+            transport_principal: Some("operator-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,
