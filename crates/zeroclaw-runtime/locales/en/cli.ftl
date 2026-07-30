@@ -1047,9 +1047,36 @@ goal-command-restart-recovery-reason-missing-goal-extension = missing goal exten
 goal-command-restart-recovery-reason-read-goal-extension-failed = failed to read goal extension record
 goal-command-restart-recovery-reason-channel-unavailable = channel unavailable
 goal-command-restart-recovery-reason-queue-unavailable = continuation queue unavailable
-goal-command-status = 📊 Goal `{$task_id}` is {$status}: {$objective}. {$budget}
-goal-command-status-paused = ⏸️ Goal `{$task_id}` is {$status}: {$objective} (reason: {$reason}). {$budget}
-goal-command-status-paused-blocked = ⏸️ Goal `{$task_id}` is {$status}: {$objective} (reason: {$reason}; blocked by: {$blockers}). {$budget}
+goal-command-status =
+    📊 Goal `{$task_id}` is {$status}.
+
+    Objective:
+    {$objective}
+
+    {$budget}
+goal-command-status-paused =
+    ⏸️ Goal `{$task_id}` is {$status}.
+
+    Objective:
+    {$objective}
+
+    Pause reason:
+    {$reason}
+
+    {$budget}
+goal-command-status-paused-blocked =
+    ⏸️ Goal `{$task_id}` is {$status}.
+
+    Objective:
+    {$objective}
+
+    Pause reason:
+    {$reason}
+
+    Blockers:
+    {$blockers}
+
+    {$budget}
 goal-command-blocker-summary-item = {$kind}: {$message}
 goal-status-running = running
 goal-status-paused = paused

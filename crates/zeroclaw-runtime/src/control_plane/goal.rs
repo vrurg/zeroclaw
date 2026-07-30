@@ -3593,6 +3593,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_status_separates_objective_from_a_long_agent_declared_blocker() {
+        let fixture = create_running_goal_fixture("ship the declared-blocker formatting fix").await;
+        let blocker = "BLOCKED: operator approval is required before this goal can continue.\n\nDetails: this text is deliberately long enough to resemble a separate report.";
+        assert!(
+            fixture
+                .goal_store
+                .pause_running_goal_task(
+                    &fixture.task_id,
+                    GoalPauseState {
+                        reason: GoalPauseReason::NeedsUserInput,
+                        description: Some(blocker.into()),
+                        blockers: vec![GoalBlocker {
+                            kind: GoalBlockerKind::NeedsUserInput,
+                            message: blocker.into(),
+                            payload: Some(serde_json::json!({
+                                "source": "agent_declared_blocker",
+                            })),
+                        }],
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let status = admit_goal_command(
+            fixture.ctx,
+            parse_goal_command("/goal status").unwrap(),
+            &test_config(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(status.message.contains(
+            "Objective:\nship the declared-blocker formatting fix\n\nPause reason:\nneeds user input"
+        ));
+        assert!(status.message.contains(
+            "Blockers:\nuser input: BLOCKED: operator approval is required before this goal can continue."
+        ));
+        assert!(status.message.contains("\n\nBudget:"));
+    }
+
+    #[tokio::test]
     async fn disabled_goal_mode_rejects_start_but_retains_exact_lifecycle_controls() {
         let _ = global_test_stores();
         let config = test_config();
