@@ -56,13 +56,6 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     /// Tool names removed from this specific turn before model/tool execution.
     pub excluded_tools: &'a [String],
-    /// Configured rendering policy for copies emitted to logs and UI events.
-    ///
-    /// Raw tool arguments remain untouched for execution, receipts, and
-    /// model-loop history. `None` is reserved for configless test/subturn
-    /// callers and uses the secure default policy.
-    #[allow(dead_code)] // Used by the secure direct-dispatch fallback.
-    pub leak_detection: Option<&'a LeakDetectionConfig>,
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
@@ -174,7 +167,7 @@ pub struct ToolExecutionOutcome {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
-#[allow(dead_code)] // Retained as the secure fallback for callers without preparation.
+#[cfg(test)]
 pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -186,10 +179,9 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
-    let default_leak_detection = LeakDetectionConfig::default();
-    let leak_detection = dispatch.leak_detection.unwrap_or(&default_leak_detection);
+    let leak_detection = LeakDetectionConfig::default();
     let presentation_arguments =
-        scrub_tool_arguments_for_presentation(&call_arguments, leak_detection);
+        scrub_tool_arguments_for_presentation(&call_arguments, &leak_detection);
     execute_one_tool_with_presentation(
         call_name,
         &call_arguments,
@@ -926,7 +918,6 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
-                leak_detection: None,
                 model_switch_callback: None,
             },
             &meta,
@@ -957,7 +948,6 @@ mod tests {
             tools_registry: &tools,
             activated_tools: None,
             excluded_tools: &[],
-            leak_detection: None,
             model_switch_callback: None,
         };
         let meta = super::super::turn::TurnMeta {
@@ -993,7 +983,6 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(RawArgumentRecordingTool {
             received: Arc::clone(&received),
         })];
-        let leak_detection = zeroclaw_config::schema::LeakDetectionConfig::default();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
         let raw_arguments = serde_json::json!({
             "summary": "operator approval requires sk_test_1234567890abcdefghijklmnop",
@@ -1014,7 +1003,6 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
-                leak_detection: Some(&leak_detection),
                 model_switch_callback: None,
             },
             &meta,
@@ -1077,7 +1065,6 @@ mod tests {
                 tools_registry: &tools,
                 activated_tools: None,
                 excluded_tools: &[],
-                leak_detection: Some(&leak_detection),
                 model_switch_callback: None,
             },
             &meta,
@@ -1151,7 +1138,6 @@ mod tests {
                 tools_registry: &[], // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
-                leak_detection: None,
                 model_switch_callback: None,
             },
             &meta,
@@ -1208,7 +1194,6 @@ mod tests {
                 tools_registry: &[],
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
-                leak_detection: None,
                 model_switch_callback: None,
             },
             &meta,

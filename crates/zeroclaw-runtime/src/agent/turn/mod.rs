@@ -915,7 +915,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
-                        leak_detection: Some(ctx.leak_detection),
                         model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_parallel(
@@ -934,7 +933,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         tools_registry,
                         activated_tools,
                         excluded_tools,
-                        leak_detection: Some(ctx.leak_detection),
                         model_switch_callback: model_switch_callback.as_ref(),
                     };
                     execute_tools_sequential(
