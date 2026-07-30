@@ -1997,4 +1997,30 @@ mod tests {
             "a replacement goal must not capture usage from the admitted task"
         );
     }
+
+    #[test]
+    fn tool_loop_cost_tracking_context_from_tracker_stamps_given_alias() {
+        // Exercise the explicit local tracker path so this does not depend on
+        // the process-global tracker singleton.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+
+        let ctx = tool_loop_cost_tracking_context_from_tracker(
+            &Config::default(),
+            "peer-recipient",
+            tracker,
+        );
+
+        assert_eq!(ctx.agent_alias, Some("peer-recipient".to_string()));
+    }
 }
