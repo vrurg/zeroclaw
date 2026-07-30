@@ -260,6 +260,11 @@ pub struct TaskContinuationContext {
     pub reply_target: String,
     /// Original sender identity for history scope and user-visible routing.
     pub sender: String,
+    /// Authenticated immutable transport principal for authorization-sensitive
+    /// callbacks. Older continuation rows omit it and therefore fail closed
+    /// for delayed goal approvals rather than falling back to `sender`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_principal: Option<String>,
     /// Channel-native thread/topic id when the transport supports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_ts: Option<String>,

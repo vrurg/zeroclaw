@@ -97,7 +97,8 @@ impl Tool for GoalResumeTool {
             .unwrap_or_else(|| std::sync::Arc::clone(&self.config));
         let permit = match super::goal_tool_admission::prepare(config.as_ref()) {
             Ok(permit) => permit,
-            Err(_error) => {
+            Err(error) => {
+                super::goal_tool_admission::record_failure(Self::NAME, &self.agent_alias, &error);
                 return Ok(ToolResult {
                     success: false,
                     output: String::new().into(),
@@ -190,6 +191,7 @@ mod tests {
             channel_alias: Some("default".into()),
             reply_target: "room-a".into(),
             sender: "operator-a".into(),
+            transport_principal: Some("operator-a".into()),
             thread_ts: None,
             interruption_scope_id: None,
             conversation_scope: TaskContinuationConversationScope::ReplyTarget,

@@ -235,6 +235,10 @@ pub struct ChannelMessage {
     pub id: String,
     /// Channel-native sender identity.
     pub sender: String,
+    /// Authenticated immutable platform principal for authorization-sensitive
+    /// channel flows such as delayed goal approvals. Presentation names remain
+    /// in [`Self::sender`] and must never substitute for this value.
+    pub authenticated_principal: Option<String>,
     /// Channel-native reply target such as room id, channel id, or direct-chat
     /// target.
     pub reply_target: String,

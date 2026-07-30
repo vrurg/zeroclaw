@@ -3356,6 +3356,7 @@ impl SlackChannel {
         Some(ChannelMessage {
             id: format!("slack_{channel_id}_{ts}_action"),
             sender: user.to_string(),
+            authenticated_principal: Some(user.to_string()),
             reply_target: channel_id.to_string(),
             content: command,
             channel: "slack".to_string(),
@@ -3607,9 +3608,8 @@ impl SlackChannel {
                             .pointer("/payload/user/id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
-                        let principal = self.resolve_sender_identity(user_id).await;
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(pending) = take_pending_approval(&mut map, &token, &principal) {
+                        if let Some(pending) = take_pending_approval(&mut map, &token, user_id) {
                             let _ = pending.sender.send(response);
                         }
                         continue;
@@ -3693,6 +3693,7 @@ impl SlackChannel {
                                     let cancel_msg = ChannelMessage {
                                         id: format!("slack_{item_channel}_{item_ts}_cancel"),
                                         sender,
+                                        authenticated_principal: Some(user.to_string()),
                                         reply_target: item_channel.to_string(),
                                         content: "/stop".to_string(),
                                         channel: "slack".to_string(),
@@ -3804,7 +3805,7 @@ impl SlackChannel {
                 if let Some((token, response)) = crate::util::parse_approval_reply(&normalized_text)
                 {
                     let mut map = self.pending_approvals.lock().await;
-                    if let Some(pending) = take_pending_approval(&mut map, &token, &sender) {
+                    if let Some(pending) = take_pending_approval(&mut map, &token, user) {
                         let _ = pending.sender.send(response);
                         continue;
                     }
@@ -3815,6 +3816,7 @@ impl SlackChannel {
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
                     sender,
+                    authenticated_principal: Some(user.to_string()),
                     reply_target: channel_id.clone(),
                     content: normalized_text,
                     channel: "slack".to_string(),
@@ -4987,8 +4989,7 @@ impl Channel for SlackChannel {
                             crate::util::parse_approval_reply(&normalized_text)
                         {
                             let mut map = self.pending_approvals.lock().await;
-                            if let Some(pending) = take_pending_approval(&mut map, &token, &sender)
-                            {
+                            if let Some(pending) = take_pending_approval(&mut map, &token, user) {
                                 let _ = pending.sender.send(response);
                                 continue;
                             }
@@ -4997,6 +4998,7 @@ impl Channel for SlackChannel {
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender,
+                            authenticated_principal: Some(user.to_string()),
                             reply_target: channel_id.clone(),
                             content: normalized_text,
                             channel: "slack".to_string(),
@@ -5095,7 +5097,7 @@ impl Channel for SlackChannel {
                         crate::util::parse_approval_reply(&normalized_text)
                     {
                         let mut map = self.pending_approvals.lock().await;
-                        if let Some(pending) = take_pending_approval(&mut map, &token, &sender) {
+                        if let Some(pending) = take_pending_approval(&mut map, &token, user) {
                             let _ = pending.sender.send(response);
                             continue;
                         }
@@ -5104,6 +5106,7 @@ impl Channel for SlackChannel {
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{thread_channel_id}_{reply_ts}"),
                         sender,
+                        authenticated_principal: Some(user.to_string()),
                         reply_target: thread_channel_id.clone(),
                         content: normalized_text,
                         channel: "slack".to_string(),
@@ -6939,6 +6942,21 @@ mod tests {
             },
         )]);
         assert!(take_pending_approval(&mut pending, "token", "other").is_none());
+        assert!(pending.contains_key("token"));
+    }
+
+    #[test]
+    fn bound_approval_matches_immutable_user_id_not_shared_display_name() {
+        let (tx, _rx) = oneshot::channel();
+        let mut pending = HashMap::from([(
+            "token".to_string(),
+            PendingApproval {
+                sender: tx,
+                expected_principal: Some("U-OWNER".to_string()),
+            },
+        )]);
+
+        assert!(take_pending_approval(&mut pending, "token", "U-OTHER").is_none());
         assert!(pending.contains_key("token"));
     }
 

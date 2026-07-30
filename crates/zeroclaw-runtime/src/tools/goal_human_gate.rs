@@ -649,6 +649,7 @@ mod tests {
             channel_alias: None,
             reply_target: route.to_string(),
             sender: principal.to_string(),
+            transport_principal: Some(principal.to_string()),
             thread_ts: Some("thread-a".into()),
             interruption_scope_id: None,
             conversation_scope:

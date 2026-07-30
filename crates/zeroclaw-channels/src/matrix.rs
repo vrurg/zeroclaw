@@ -1959,6 +1959,7 @@ mod inbound {
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
             sender: sender.to_string(),
+            authenticated_principal: Some(sender.to_string()),
             reply_target: room.room_id().to_string(),
             content,
             channel: "matrix".to_string(),
