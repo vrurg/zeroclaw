@@ -763,7 +763,9 @@ mod tests {
         // Vacuity control: outside of any scope (as the detached spawn body
         // ran before this fix), the real consumer must be a no-op — this
         // proves the scope-install below is load-bearing, not incidental.
-        let unscoped = record_tool_loop_cost_usage("mock-provider", "test-model", &usage);
+        let unscoped = record_tool_loop_cost_usage("mock-provider", "test-model", &usage)
+            .await
+            .expect("unscoped cost accounting");
         assert!(
             unscoped.is_none(),
             "record_tool_loop_cost_usage must be a no-op with no cost context scoped"
@@ -785,7 +787,11 @@ mod tests {
         let recorded = deliver_peer_turn_with_cost_scope(
             Some(cost_ctx),
             Some(Arc::clone(&turn_usage)),
-            async { record_tool_loop_cost_usage("mock-provider", "test-model", &usage) },
+            async {
+                record_tool_loop_cost_usage("mock-provider", "test-model", &usage)
+                    .await
+                    .expect("scoped cost accounting")
+            },
         )
         .await;
 
@@ -861,7 +867,11 @@ mod tests {
         let sender_usage = deliver_peer_turn_with_cost_scope(
             Some(sender_ctx),
             Some(Arc::new(Mutex::new(TurnUsage::default()))),
-            async { record_tool_loop_cost_usage("mock-provider", "test-model", &usage) },
+            async {
+                record_tool_loop_cost_usage("mock-provider", "test-model", &usage)
+                    .await
+                    .expect("sender cost accounting")
+            },
         )
         .await;
         assert!(
@@ -871,7 +881,7 @@ mod tests {
 
         let budget_result =
             deliver_peer_turn_with_cost_scope(Some(capped_ctx), Some(capped_turn_usage), async {
-                enforce_tool_loop_budget()
+                enforce_tool_loop_budget().await
             })
             .await;
 
@@ -1079,7 +1089,9 @@ mod tests {
             ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()))
                 .with_agent_alias("unrelated-agent");
         let budget_result = TOOL_LOOP_COST_TRACKING_CONTEXT
-            .scope(Some(unrelated_ctx), async { enforce_tool_loop_budget() })
+            .scope(Some(unrelated_ctx), async {
+                enforce_tool_loop_budget().await
+            })
             .await;
         assert!(
             budget_result.is_err(),
