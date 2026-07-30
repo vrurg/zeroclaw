@@ -1084,7 +1084,9 @@ mod tests {
             ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()))
                 .with_agent_alias("unrelated-agent");
         let budget_result = TOOL_LOOP_COST_TRACKING_CONTEXT
-            .scope(Some(unrelated_ctx), async { enforce_tool_loop_budget().await })
+            .scope(Some(unrelated_ctx), async {
+                enforce_tool_loop_budget().await
+            })
             .await;
         assert!(
             budget_result.is_err(),
