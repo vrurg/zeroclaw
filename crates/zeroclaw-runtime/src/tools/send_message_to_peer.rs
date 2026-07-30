@@ -472,6 +472,30 @@ mod tests {
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::schema::AliasedAgentConfig;
 
+    /// Runs a deeply nested peer-turn regression on an explicit worker stack.
+    /// Hosted test workers use a smaller default stack than this end-to-end
+    /// fixture requires; production peer delivery is unchanged.
+    fn run_peer_turn_test<F, MakeFuture>(make_future: MakeFuture)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+        MakeFuture: FnOnce() -> F + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-peer-turn-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build peer turn test runtime");
+                runtime.block_on(make_future());
+            })
+            .expect("spawn peer turn test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     #[test]
     fn description_stays_channel_agnostic() {
         let mut config = Config::default();
@@ -895,9 +919,7 @@ mod tests {
     /// A local Ollama-shaped HTTP server stands in for the network so the
     /// recipient's turn completes deterministically without a real model
     /// provider dependency.
-    #[tokio::test]
-    async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
-    {
+    async fn assert_peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget() {
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
         use axum::{Json, Router, extract::State, routing::post};
@@ -1095,5 +1117,14 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget() {
+        run_peer_turn_test(|| {
+            Box::pin(
+                assert_peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget(),
+            )
+        });
     }
 }
