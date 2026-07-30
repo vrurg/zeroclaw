@@ -3047,12 +3047,12 @@ mod tests {
             .expect("same-alias profile");
         assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
         assert!(
-            auth.load_profiles()
+            !auth
+                .load_profiles()
                 .await
                 .expect("load profile state")
                 .active_profiles
-                .get("anthropic")
-                .is_none(),
+                .contains_key("anthropic"),
             "Quickstart alias storage must not change Anthropic's active profile"
         );
     }
@@ -3155,7 +3155,7 @@ mod tests {
         let warnings = super::reconcile_config_save_outcome(
             Ok(
                 zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(
-                    anyhow::anyhow!("injected directory sync failure"),
+                    anyhow::Error::msg("injected directory sync failure"),
                 ),
             ),
             Some((
@@ -3187,12 +3187,12 @@ mod tests {
             .expect("the committed OAuth profile must remain stored");
         assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
         assert!(
-            auth.load_profiles()
+            !auth
+                .load_profiles()
                 .await
                 .unwrap()
                 .active_profiles
-                .get("anthropic")
-                .is_none(),
+                .contains_key("anthropic"),
             "the committed warning path must not mutate the active profile selector"
         );
     }
