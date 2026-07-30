@@ -1189,6 +1189,32 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
+        let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
+            let result = self
+                .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
+                .await;
+            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+            (result, fallback)
+        })
+        .await;
+
+        let mut result = result?;
+        if result.success && fallback.is_some() {
+            let warning =
+                crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+            result.output = format!("{}\n\n{warning}", result.output.as_str()).into();
+        }
+        Ok(result)
+    }
+
+    async fn execute_sync_with_admission_inner(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -3668,6 +3694,13 @@ mod tests {
     async fn start_failing_chat_server(
         status: u16,
     ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        start_failing_chat_server_with_error(status, "synthetic primary failure").await
+    }
+
+    async fn start_failing_chat_server_with_error(
+        status: u16,
+        error_message: &'static str,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3678,12 +3711,29 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let _request = read_http_request(&mut socket).await;
             request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let body = format!(r#"{{"error":{{"message":"{error_message}"}}}}"#);
             let response = format!(
                 "HTTP/1.1 {status} Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_slow_chat_server(
+        delay: Duration,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
         });
 
         (LocalChatServer { uri, _task: task }, requests)
@@ -7766,16 +7816,17 @@ command = "echo hi"
         );
     }
 
-    #[tokio::test]
-    async fn delegate_uses_target_configured_provider_fallback() {
+    fn fallback_delegate_config(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+    ) -> Arc<Config> {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
             RiskProfileConfig, RuntimeProfileConfig,
         };
 
-        let (primary, primary_requests) = start_failing_chat_server(503).await;
-        let backup = start_final_chat_server(vec!["fallback reply"]).await;
         let mut config = Config::default();
         config.reliability.provider_retries = 0;
         config.reliability.provider_backoff_ms = 1;
@@ -7783,7 +7834,7 @@ command = "echo hi"
             "primary".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some(primary.uri.clone()),
+                    uri: Some(primary_uri),
                     model: Some("primary-model".to_string()),
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "custom.backup",
@@ -7796,8 +7847,10 @@ command = "echo hi"
             "backup".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some(backup.uri.clone()),
-                    model: Some("backup-model".to_string()),
+                    uri: Some(backup_uri),
+                    // This deliberately matches the primary model. The two aliases
+                    // still represent distinct configured candidates.
+                    model: Some("primary-model".to_string()),
                     ..ModelProviderConfig::default()
                 },
             },
@@ -7814,7 +7867,7 @@ command = "echo hi"
         config.runtime_profiles.insert(
             "review".to_string(),
             RuntimeProfileConfig {
-                agentic: true,
+                agentic,
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -7830,19 +7883,58 @@ command = "echo hi"
             );
         }
 
-        let config = Arc::new(config);
+        Arc::new(config)
+    }
+
+    fn fallback_delegate_tool(config: Arc<Config>, workspace_dir: Option<PathBuf>) -> DelegateTool {
         let caller_policy =
             Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
         let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
-            .with_root_config(Arc::clone(&config))
+            .with_root_config(config.clone())
             .with_caller_alias("caller")
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone());
 
-        let result = tool
-            .execute(json!({"agent": "target", "prompt": "respond"}))
-            .await
-            .expect("delegate call completes");
+        match workspace_dir {
+            Some(workspace_dir) => tool.with_workspace_dir(workspace_dir),
+            None => tool,
+        }
+    }
+
+    fn assert_generic_fallback_warning(output: &str, primary_uri: &str) {
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert_eq!(
+            output.matches(&warning).count(),
+            1,
+            "recovered delegate result must include exactly one generic warning: {output:?}"
+        );
+        assert!(
+            !output.contains(primary_uri),
+            "recovered output must not expose the primary endpoint: {output:?}"
+        );
+        assert!(
+            !output.contains("synthetic primary failure"),
+            "recovered output must not expose provider error details: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_fallback_warning_is_local_to_synchronous_call() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["fallback reply"]).await;
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
 
         assert!(result.success, "fallback should recover: {result:?}");
         assert_eq!(
@@ -7851,6 +7943,11 @@ command = "echo hi"
             "the controlled primary must be attempted exactly once"
         );
         assert!(result.output.contains("fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
         assert!(
             result
                 .output
@@ -7858,9 +7955,296 @@ command = "echo hi"
             "{result:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["non-agentic fallback reply"]).await;
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
         assert!(
-            !result.output.contains(&primary.uri),
-            "recovered output must not expose the primary error: {result:?}"
+            result.output.contains("non-agentic fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["background fallback reply"]).await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let (start, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let start = tool
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "respond",
+                        "background": true,
+                    }))
+                    .await
+                    .expect("background delegate starts");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (start, outer_fallback)
+            })
+            .await;
+
+        assert!(start.success, "background start failed: {start:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "background delegate fallback must not leak into its parent scope: {outer_fallback:?}"
+        );
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let result = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(result.status, BackgroundTaskStatus::Completed, "{result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        let output = result.output.as_deref().expect("completed output");
+        assert!(output.contains("background fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(output, &primary.uri);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["parallel fallback reply"]).await;
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"parallel": ["target"], "prompt": "respond"}))
+                    .await
+                    .expect("parallel delegate completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "parallel delegate fallback must not leak into the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("parallel fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn delegate_returns_ordered_aggregate_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "backup failure marker").await;
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(!result.success, "exhaustion must be terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal error must not carry output: {result:?}"
+        );
+        assert!(
+            outer_fallback.is_none(),
+            "failed delegation must not leave recovery metadata in the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let error = result.error.expect("terminal delegate error");
+        let primary_index = error
+            .find("primary failure marker")
+            .expect("aggregate includes the primary failure: {error}");
+        let backup_index = error
+            .find("backup failure marker")
+            .expect("aggregate includes the fallback failure: {error}");
+        assert!(
+            primary_index < backup_index,
+            "aggregate must retain configured candidate order: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal errors must remain errors rather than recovery warnings: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
+        let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let mut config =
+            (*fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false)).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .delegation_timeout_secs = Some(1);
+        let tool = fallback_delegate_tool(Arc::new(config), None);
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .expect("delegate call completes");
+
+        assert!(!result.success, "timeout must remain terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "timeout must not carry output: {result:?}"
+        );
+        let error = result.error.expect("timeout error");
+        assert_eq!(error, "Agent 'target' timed out after 1s");
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "outer timeout must not be converted into fallback exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_exposes_aggregate_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "background primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "background backup failure marker").await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let start = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "respond",
+                "background": true,
+            }))
+            .await
+            .expect("background delegate starts");
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let persisted = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(
+            persisted.status,
+            BackgroundTaskStatus::Failed,
+            "{persisted:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let persisted_error = persisted
+            .error
+            .as_deref()
+            .expect("persisted failure detail");
+        let primary_index = persisted_error
+            .find("background primary failure marker")
+            .expect("persisted aggregate includes the primary failure");
+        let backup_index = persisted_error
+            .find("background backup failure marker")
+            .expect("persisted aggregate includes the fallback failure");
+        assert!(
+            primary_index < backup_index,
+            "persisted aggregate must retain configured candidate order: {persisted_error}"
+        );
+
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .expect("check_result completes");
+        assert!(
+            !result.success,
+            "terminal background failure is not success: {result:?}"
+        );
+        let error = result
+            .error
+            .expect("caller receives background failure detail");
+        let primary_index = error
+            .find("background primary failure marker")
+            .expect("check_result aggregate includes the primary failure");
+        let backup_index = error
+            .find("background backup failure marker")
+            .expect("check_result aggregate includes the fallback failure");
+        assert!(
+            primary_index < backup_index,
+            "check_result aggregate must retain configured candidate order: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal background errors must not become recovery warnings: {error}"
         );
     }
 

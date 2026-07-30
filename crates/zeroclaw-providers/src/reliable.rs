@@ -71,13 +71,14 @@ struct ProviderFallbackRecord {
 }
 
 impl ProviderFallbackRecord {
-    fn new_if_recovered(
+    fn new_if_true_fallback(
         requested_provider: &str,
         requested_model: &str,
         actual_provider: &str,
         actual_model: &str,
+        used_later_candidate: bool,
     ) -> Option<Self> {
-        if requested_provider == actual_provider && requested_model == actual_model {
+        if !used_later_candidate && requested_model == actual_model {
             return None;
         }
 
@@ -1044,8 +1045,8 @@ impl ModelProvider for ReliableModelProvider {
         // Each iteration: attempt one (model_provider, model) call. On success, return
         // immediately. On non-retryable error, break to next model_provider. On
         // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
@@ -1079,6 +1080,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || self
                                     .model_providers
                                     .first()
@@ -1091,12 +1094,15 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
+                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
                                     primary,
                                     model,
                                     provider_name,
                                     served_model,
-                                );
+                                    model_index != 0 || provider_index != 0,
+                                ) {
+                                    record.record();
+                                }
                             }
                             return Ok(resp);
                         }
@@ -1243,8 +1249,8 @@ impl ModelProvider for ReliableModelProvider {
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
@@ -1278,6 +1284,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1291,12 +1299,15 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
+                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
                                     primary,
                                     model,
                                     provider_name,
                                     served_model,
-                                );
+                                    model_index != 0 || provider_index != 0,
+                                ) {
+                                    record.record();
+                                }
                             }
                             return Ok(resp);
                         }
@@ -1492,8 +1503,8 @@ impl ModelProvider for ReliableModelProvider {
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
@@ -1528,6 +1539,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1541,12 +1554,15 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
+                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
                                     primary,
                                     model,
                                     provider_name,
                                     served_model,
-                                );
+                                    model_index != 0 || provider_index != 0,
+                                ) {
+                                    record.record();
+                                }
                             }
                             return Ok(resp);
                         }
@@ -1698,8 +1714,8 @@ impl ModelProvider for ReliableModelProvider {
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
@@ -1739,6 +1755,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1752,12 +1770,15 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
+                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
                                     primary,
                                     model,
                                     provider_name,
                                     served_model,
-                                );
+                                    model_index != 0 || provider_index != 0,
+                                ) {
+                                    record.record();
+                                }
                             }
                             return Ok(resp);
                         }
@@ -1923,7 +1944,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -1948,7 +1969,7 @@ impl ModelProvider for ReliableModelProvider {
                 .unwrap_or(model)
                 .to_string();
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -1956,6 +1977,7 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
             );
 
             let req = ChatRequest {
@@ -2007,7 +2029,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2028,7 +2050,7 @@ impl ModelProvider for ReliableModelProvider {
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2036,6 +2058,7 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
             );
 
             // For streaming, we attempt once and propagate errors
@@ -2089,7 +2112,7 @@ impl ModelProvider for ReliableModelProvider {
         // Try each model_provider/model combination for streaming with history.
         // Mirrors stream_chat_with_system but delegates to the underlying
         // model_provider's stream_chat_with_history, preserving the full conversation.
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2108,7 +2131,7 @@ impl ModelProvider for ReliableModelProvider {
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2116,6 +2139,7 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
             );
 
             let stream = model_provider.stream_chat_with_history(
@@ -5207,6 +5231,85 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retry_on_same_candidate_does_not_record_fallback_info() {
+        scope_provider_fallback(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&calls),
+                        fail_until_attempt: 1,
+                        response: "recovered on retry",
+                        error: "503 Service Unavailable",
+                    }),
+                )],
+                1,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("same candidate retry recovers");
+
+            assert_eq!(response, "recovered on retry");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "retrying the exact candidate must not be reported as fallback"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn later_duplicate_candidate_records_fallback_info() {
+        scope_provider_fallback(async {
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: usize::MAX,
+                            response: "unused",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "recovered on later duplicate",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("later duplicate candidate recovers");
+
+            assert_eq!(response, "recovered on later duplicate");
+            let fallback = take_last_provider_fallback()
+                .expect("later configured candidate must be reported as fallback");
+            assert_eq!(fallback.requested_provider, "duplicate");
+            assert_eq!(fallback.actual_provider, "duplicate");
+            assert_eq!(fallback.requested_model, "test-model");
+            assert_eq!(fallback.actual_model, "test-model");
         })
         .await;
     }

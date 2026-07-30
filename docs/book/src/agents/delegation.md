@@ -173,10 +173,13 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 ### `delegate`: output strings the model sees
 
-Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+The literal outputs below are sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+The provider-recovery warning is localized through the
+`delegate-provider-fallback-warning` Fluent key; its English rendering is shown
+where relevant.
 
-1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`.
-2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
+1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`. When the target recovers through a configured provider fallback, the output also ends with the localized provider-recovery warning. In English: `Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.` The warning belongs to the delegated result; it must not be presented as a fallback of the calling agent. It intentionally omits rejected-provider error details. Retrying the same configured candidate does not produce this warning; reaching a later configured candidate does, even when its provider and model labels match the first candidate.
+2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`. If every configured provider candidate fails, `<wrapped error>` is Reliable's ordered, sanitized aggregate of those attempts; it remains an error, not a recovery warning.
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
    ```text
@@ -184,10 +187,10 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
    task_id: <uuid>
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
    ```
-   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`.
+   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`. A completed task that recovered through a configured provider fallback stores the same generic recovery warning in its `output`; retrieve it with `check_result` or `await_sessions`.
 5. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
 6. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
-7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
+7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. A recovered target keeps its generic fallback warning inside its own block. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
 8. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 9. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 10. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
