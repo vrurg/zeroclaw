@@ -3750,6 +3750,64 @@ mod tests {
         (LocalChatServer { uri, _task: task }, requests)
     }
 
+    async fn start_primary_failure_then_final_chat_server()
+    -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut first_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            first_socket.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut second_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut second_socket,
+                serde_json::json!({
+                    "choices": [{"message": {"content": "final primary reply"}}]
+                }),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut socket,
+                chat_completion_tool_call(
+                    "echo_tool",
+                    "fallback_tool",
+                    serde_json::json!({"value": "ping"}),
+                ),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
     async fn start_slow_chat_server(
         delay: Duration,
     ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
@@ -8001,6 +8059,43 @@ command = "echo hi"
         assert!(
             outer_fallback.is_none(),
             "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_attributes_final_primary_response_after_earlier_fallback() {
+        let (primary, primary_requests) = start_primary_failure_then_final_chat_server().await;
+        let (backup, backup_requests) = start_tool_call_chat_server().await;
+        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the primary must be retried on the post-tool model request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the backup must serve only the tool-call response"
+        );
+        assert!(result.output.contains("final primary reply"), "{result:?}");
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !result.output.contains(&warning),
+            "a final primary response must not carry stale fallback attribution: {result:?}"
+        );
+        assert!(
+            !result.output.contains("custom.backup"),
+            "the final primary response must not be labeled as backup-served: {result:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
     }

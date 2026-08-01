@@ -59,6 +59,20 @@ pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttri
         .flatten()
 }
 
+/// Record the fallback that served the current successful provider request, or
+/// clear stale attribution when the primary served it.
+///
+/// A fallback scope can span an agentic tool loop, which issues several model
+/// requests. The caller-visible result must describe the request that produced
+/// the final response, not an earlier request that only produced a tool call.
+fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) {
+    if let Some(record) = record {
+        record.record();
+    } else {
+        let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Run the given future within a provider-fallback scope.
 /// Both `record_provider_fallback` (inside ReliableModelProvider) and
 /// `take_last_provider_fallback` (post-loop channel code) must execute
@@ -154,9 +168,7 @@ where
                     let mut recorded = recorded;
                     match &event {
                         Ok(value) if !saw_error && !recorded && is_final(value) => {
-                            if let Some(record) = &fallback_record {
-                                record.record();
-                            }
+                            record_successful_provider_fallback(fallback_record.as_ref());
                             recorded = true;
                         }
                         Err(_) => {
@@ -170,11 +182,8 @@ where
                     ))
                 }
                 None => {
-                    if !saw_error
-                        && !recorded
-                        && let Some(record) = &fallback_record
-                    {
-                        record.record();
+                    if !saw_error && !recorded {
+                        record_successful_provider_fallback(fallback_record.as_ref());
                     }
                     None
                 }
@@ -1161,7 +1170,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                                     primary_provider,
                                     model,
                                     provider_name,
@@ -1169,9 +1178,10 @@ impl ModelProvider for ReliableModelProvider {
                                     model_index != 0 || provider_index != 0,
                                     primary,
                                     entry.candidate_name(),
-                                ) {
-                                    record.record();
-                                }
+                                );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1373,7 +1383,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                                     primary_provider,
                                     model,
                                     provider_name,
@@ -1381,9 +1391,10 @@ impl ModelProvider for ReliableModelProvider {
                                     model_index != 0 || provider_index != 0,
                                     primary,
                                     entry.candidate_name(),
-                                ) {
-                                    record.record();
-                                }
+                                );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1635,7 +1646,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                                     primary_provider,
                                     model,
                                     provider_name,
@@ -1643,9 +1654,10 @@ impl ModelProvider for ReliableModelProvider {
                                     model_index != 0 || provider_index != 0,
                                     primary,
                                     entry.candidate_name(),
-                                ) {
-                                    record.record();
-                                }
+                                );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1858,7 +1870,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                                     primary_provider,
                                     model,
                                     provider_name,
@@ -1866,9 +1878,10 @@ impl ModelProvider for ReliableModelProvider {
                                     model_index != 0 || provider_index != 0,
                                     primary,
                                     entry.candidate_name(),
-                                ) {
-                                    record.record();
-                                }
+                                );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -5336,6 +5349,61 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn later_primary_success_clears_stale_fallback_attribution() {
+        scope_provider_fallback(async {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let backup_calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "primary".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&primary_calls),
+                            fail_until_attempt: 1,
+                            response: "final primary response",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "backup".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&backup_calls),
+                            fail_until_attempt: 0,
+                            response: "tool-call response",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            assert_eq!(
+                model_provider
+                    .simple_chat("first", "test-model", Some(0.0))
+                    .await
+                    .expect("fallback recovers the first request"),
+                "tool-call response"
+            );
+            assert_eq!(
+                model_provider
+                    .simple_chat("second", "test-model", Some(0.0))
+                    .await
+                    .expect("primary recovers for the second request"),
+                "final primary response"
+            );
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "the final primary request must clear fallback attribution"
+            );
         })
         .await;
     }
