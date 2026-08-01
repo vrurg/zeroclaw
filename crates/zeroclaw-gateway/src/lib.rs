@@ -5316,6 +5316,7 @@ mod tests {
         let observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6642,6 +6643,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6738,6 +6740,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6890,6 +6893,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -7733,6 +7737,7 @@ mod tests {
 
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7820,6 +7825,7 @@ mod tests {
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7981,6 +7987,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
             temperature: None,
