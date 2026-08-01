@@ -5735,18 +5735,18 @@ async fn process_channel_message_body(
 
             // Append a footer when the response was served by a different model_provider family.
             // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref() {
-                if fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider) {
-                    delivered_response.push_str("\n\n---\n");
-                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                        "channel-runtime-fallback-footer",
-                        &[
-                            ("requested", fb.requested_provider.as_str()),
-                            ("actual", fb.actual_provider.as_str()),
-                            ("model", fb.actual_model.as_str()),
-                        ],
-                    ));
-                }
+            if let Some(fb) = fallback_info.as_ref()
+                && fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider)
+            {
+                delivered_response.push_str("\n\n---\n");
+                delivered_response.push_str(&channel_runtime_cli_string_with_args(
+                    "channel-runtime-fallback-footer",
+                    &[
+                        ("requested", fb.requested_provider.as_str()),
+                        ("actual", fb.actual_provider.as_str()),
+                        ("model", fb.actual_model.as_str()),
+                    ],
+                ));
             }
 
             ::zeroclaw_log::record!(
