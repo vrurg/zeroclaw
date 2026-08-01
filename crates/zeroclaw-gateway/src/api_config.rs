@@ -2538,6 +2538,7 @@ mod tests {
             Arc::new(zeroclaw_memory::NoneMemory::new("api-config-test"));
         AppState {
             config: Arc::new(RwLock::new(config)),
+            quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,

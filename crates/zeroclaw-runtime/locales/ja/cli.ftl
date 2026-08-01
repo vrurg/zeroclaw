@@ -584,6 +584,7 @@ cli-quickstart-error-completion-flag = quickstart-completed の切り替えに�
 cli-quickstart-error-persist-config = 設定の保存に失敗しました: {$err}
 cli-quickstart-warning = 警告: {$message}
 cli-quickstart-warning-config-durability = Quickstart は完了しましたが、設定の永続性を確認できませんでした: {$err}
+cli-quickstart-warning-anthropic-profile-durability = Quickstart は完了しましたが、Anthropic 認証情報の永続性を確認できませんでした: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` は `<type>.<alias>` 参照ではありません
 cli-quickstart-error-no-configured-path = `{$path}` は設定されていません
 cli-quickstart-error-provider-required = プロバイダータイプ、エイリアス、モデルが必要です

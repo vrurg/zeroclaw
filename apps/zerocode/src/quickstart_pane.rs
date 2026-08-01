@@ -292,18 +292,21 @@ fn synth_enter() -> KeyEvent {
 fn queue_apply_handoff(
     reconnect_state: &crate::app::SharedReconnectState,
     alias: String,
+    notice: Option<String>,
     daemon_restarted: bool,
 ) -> Option<String> {
     let Ok(mut guard) = reconnect_state.lock() else {
         return None;
     };
     if daemon_restarted {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect(
-            alias.clone(),
-        ));
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect {
+            alias: alias.clone(),
+            notice,
+        });
         Some(alias)
     } else {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::Immediate(alias));
+        guard.pending_quickstart_chat =
+            Some(crate::app::PendingQuickstartChat::Immediate { alias, notice });
         None
     }
 }
@@ -2454,8 +2457,10 @@ impl QuickstartPane {
         // A real daemon reload must survive the old connection closing:
         // use the immediate handoff only when the daemon reports that no
         // reconnect is needed.
+        let notice =
+            (!warnings.is_empty()).then(|| quickstart_success_label(&agent.alias, &warnings));
         self.applied_alias =
-            queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
+            queue_apply_handoff(&self.reconnect_state, agent.alias, notice, daemon_restarted);
         self.last_errors.clear();
         self.last_warnings = warnings;
     }
@@ -4000,15 +4005,21 @@ mod tests {
             crate::app::CrossReconnectState::default(),
         ));
 
-        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), true);
+        let applied_alias = queue_apply_handoff(
+            &state,
+            "agent-a".into(),
+            Some("created with warning".into()),
+            true,
+        );
         let guard = state.lock().unwrap();
 
         assert_eq!(applied_alias.as_deref(), Some("agent-a"));
         assert_eq!(
             guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::AfterReconnect(
-                "agent-a".into()
-            ))
+            Some(crate::app::PendingQuickstartChat::AfterReconnect {
+                alias: "agent-a".into(),
+                notice: Some("created with warning".into()),
+            })
         );
     }
 
@@ -4018,15 +4029,21 @@ mod tests {
             crate::app::CrossReconnectState::default(),
         ));
 
-        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), false);
+        let applied_alias = queue_apply_handoff(
+            &state,
+            "agent-a".into(),
+            Some("created with warning".into()),
+            false,
+        );
         let guard = state.lock().unwrap();
 
         assert!(applied_alias.is_none());
         assert_eq!(
             guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::Immediate(
-                "agent-a".into()
-            ))
+            Some(crate::app::PendingQuickstartChat::Immediate {
+                alias: "agent-a".into(),
+                notice: Some("created with warning".into()),
+            })
         );
     }
 

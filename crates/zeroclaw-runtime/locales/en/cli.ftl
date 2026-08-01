@@ -667,6 +667,7 @@ cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$er
 cli-quickstart-error-persist-config = failed to persist config: {$err}
 cli-quickstart-warning = WARNING: {$message}
 cli-quickstart-warning-config-durability = Quickstart completed, but config durability could not be confirmed: {$err}
+cli-quickstart-warning-anthropic-profile-durability = Quickstart completed, but Anthropic credential durability could not be confirmed: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
 cli-quickstart-error-no-configured-path = no `{$path}` configured
 cli-quickstart-error-provider-required = provider type, alias, and model are required

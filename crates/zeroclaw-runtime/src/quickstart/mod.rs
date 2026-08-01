@@ -155,6 +155,7 @@ type StagedAnthropicProfile = (
     String,
     zeroclaw_providers::auth::profiles::ProfileBindingSnapshot,
     zeroclaw_providers::auth::profiles::AuthProfile,
+    zeroclaw_providers::auth::profiles::ProfileSaveOutcome,
 );
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -457,6 +458,7 @@ pub async fn apply_with_surface_outcome(
                 alias.to_string(),
                 staged.snapshot,
                 staged.staged_profile,
+                staged.save_outcome,
             ))
         } else {
             None
@@ -558,11 +560,32 @@ async fn reconcile_config_save_outcome(
     original_config: Config,
     ctx: &RunCtx,
 ) -> Result<Vec<QuickstartWarning>, Vec<QuickstartError>> {
+    let mut warnings = Vec::new();
+    if let Some((
+        _,
+        _,
+        _,
+        _,
+        zeroclaw_providers::auth::profiles::ProfileSaveOutcome::CommittedWithDurabilityWarning(err),
+    )) = staged_profile.as_ref()
+    {
+        let detail = err.to_string();
+        warnings.push(QuickstartWarning::for_surface(
+            Some(ctx),
+            QuickstartStep::ModelProvider,
+            "api_key",
+            format!(
+                "Quickstart completed, but Anthropic credential durability could not be confirmed: {detail}"
+            ),
+            "cli-quickstart-warning-anthropic-profile-durability",
+            &[("err", &detail)],
+        ));
+    }
     match write_result {
-        Ok(zeroclaw_config::schema::ConfigSaveOutcome::Durable) => Ok(Vec::new()),
+        Ok(zeroclaw_config::schema::ConfigSaveOutcome::Durable) => Ok(warnings),
         Ok(zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(err)) => {
             let detail = err.to_string();
-            Ok(vec![QuickstartWarning::for_surface(
+            warnings.push(QuickstartWarning::for_surface(
                 Some(ctx),
                 QuickstartStep::Agent,
                 "config",
@@ -571,23 +594,25 @@ async fn reconcile_config_save_outcome(
                 ),
                 "cli-quickstart-warning-config-durability",
                 &[("err", &detail)],
-            )])
+            ));
+            Ok(warnings)
         }
         Err(err) => {
-            let rollback_error =
-                if let Some((auth_service, alias, snapshot, expected_current)) = staged_profile {
-                    auth_service
-                        .restore_model_provider_profile(
-                            "anthropic",
-                            &alias,
-                            snapshot,
-                            &expected_current,
-                        )
-                        .await
-                        .err()
-                } else {
-                    None
-                };
+            let rollback_error = if let Some((auth_service, alias, snapshot, expected_current, _)) =
+                staged_profile
+            {
+                auth_service
+                    .restore_model_provider_profile(
+                        "anthropic",
+                        &alias,
+                        snapshot,
+                        &expected_current,
+                    )
+                    .await
+                    .err()
+            } else {
+                None
+            };
             *config = original_config;
             let detail = match rollback_error {
                 Some(rollback_error) => {
@@ -3163,6 +3188,7 @@ mod tests {
                 "subscription".to_string(),
                 staged.snapshot,
                 staged.staged_profile,
+                staged.save_outcome,
             )),
             &mut config,
             original_config,
@@ -3194,6 +3220,57 @@ mod tests {
                 .active_profiles
                 .contains_key("anthropic"),
             "the committed warning path must not mutate the active profile selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_profile_warning_is_returned_without_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        let original_config = config.clone();
+        let auth = zeroclaw_providers::auth::AuthService::from_config(&config);
+        let staged = auth
+            .stage_model_provider_token(
+                "anthropic",
+                "subscription",
+                "synthetic-setup-token",
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let warnings = super::reconcile_config_save_outcome(
+            Ok(zeroclaw_config::schema::ConfigSaveOutcome::Durable),
+            Some((
+                auth.clone(),
+                "subscription".to_string(),
+                staged.snapshot,
+                staged.staged_profile,
+                zeroclaw_providers::auth::profiles::ProfileSaveOutcome::CommittedWithDurabilityWarning(
+                    anyhow::Error::msg("injected directory sync failure"),
+                ),
+            )),
+            &mut config,
+            original_config,
+            &super::RunCtx::new(Surface::Web),
+        )
+        .await
+        .expect("a committed profile warning must not trigger OAuth rollback");
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].field, "api_key");
+        assert_eq!(
+            auth.get_profile("anthropic", Some("subscription"))
+                .await
+                .unwrap()
+                .expect("the committed OAuth profile must remain stored")
+                .token
+                .as_deref(),
+            Some("synthetic-setup-token")
         );
     }
 

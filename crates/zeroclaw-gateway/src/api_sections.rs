@@ -1261,6 +1261,7 @@ mod tests {
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
         AppState {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            quickstart_config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,

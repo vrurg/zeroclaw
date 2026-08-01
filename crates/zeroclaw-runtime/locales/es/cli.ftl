@@ -584,6 +584,7 @@ cli-quickstart-error-completion-flag = no se pudo cambiar quickstart-completed: 
 cli-quickstart-error-persist-config = no se pudo persistir la configuración: {$err}
 cli-quickstart-warning = ADVERTENCIA: {$message}
 cli-quickstart-warning-config-durability = Quickstart se completó, pero no se pudo confirmar la durabilidad de la configuración: {$err}
+cli-quickstart-warning-anthropic-profile-durability = Quickstart se completó, pero no se pudo confirmar la durabilidad de las credenciales de Anthropic: {$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` no es una referencia `<type>.<alias>`
 cli-quickstart-error-no-configured-path = no hay `{$path}` configurado
 cli-quickstart-error-provider-required = se requieren tipo de proveedor, alias y modelo

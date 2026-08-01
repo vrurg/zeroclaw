@@ -583,6 +583,7 @@ cli-quickstart-error-completion-flag = 无法切换 quickstart-completed：{$err
 cli-quickstart-error-persist-config = 无法持久化配置：{$err}
 cli-quickstart-warning = 警告：{$message}
 cli-quickstart-warning-config-durability = Quickstart 已完成，但无法确认配置的持久性：{$err}
+cli-quickstart-warning-anthropic-profile-durability = Quickstart 已完成，但无法确认 Anthropic 凭据的持久性：{$err}
 cli-quickstart-error-not-type-alias-ref = `{$reference}` 不是 `<type>.<alias>` 引用
 cli-quickstart-error-no-configured-path = 未配置 `{$path}`
 cli-quickstart-error-provider-required = 必须填写提供方类型、别名和模型

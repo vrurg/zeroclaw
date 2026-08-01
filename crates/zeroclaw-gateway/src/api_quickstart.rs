@@ -7,6 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
     AppliedAgent, QuickstartError, QuickstartStep, QuickstartWarning, Surface,
@@ -116,6 +117,9 @@ pub async fn handle_apply(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
+    let _transaction_guard = Arc::clone(&state.quickstart_config_write_lock)
+        .lock_owned()
+        .await;
     let mut working = state.config.read().clone();
     let result = apply_with_surface_outcome(submission, &mut working, Surface::Web).await;
     let body = match result {
@@ -238,24 +242,71 @@ mod tests {
                 personality_files: vec![],
             },
         };
-        let request = Request::builder()
-            .method("POST")
-            .uri("/api/quickstart/apply")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&submission).unwrap()))
-            .unwrap();
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["kind"],
-            "applied"
+        let mut second_submission = submission.clone();
+        let SelectorChoice::Fresh(second_provider) = &mut second_submission.model_provider else {
+            panic!("test submission must create a provider");
+        };
+        second_provider.alias = "subscription_two".into();
+        second_provider
+            .fields
+            .insert("api_key".into(), "synthetic-setup-token-two".into());
+        second_submission.agent.name = "quickstart_bot_two".into();
+
+        // Hold a prior transaction open to prove the HTTP handler does not
+        // clone config until it owns the cross-await Quickstart transaction.
+        // With the historical clone-before-lock ordering, both requests would
+        // take the same stale snapshot here and the later swap would erase the
+        // first agent/alias after this guard is released.
+        let held_transaction = Arc::clone(&state.quickstart_config_write_lock)
+            .lock_owned()
+            .await;
+        let first_router = router.clone();
+        let mut first_apply = zeroclaw_spawn::spawn!(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/quickstart/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+                .unwrap();
+            first_router.oneshot(request).await.unwrap()
+        });
+        let second_router = router.clone();
+        let mut second_apply = zeroclaw_spawn::spawn!(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/quickstart/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&second_submission).unwrap()))
+                .unwrap();
+            second_router.oneshot(request).await.unwrap()
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut first_apply)
+                .await
+                .is_err(),
+            "the first concurrent Quickstart request must wait for the current transaction"
         );
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["warnings"],
-            serde_json::json!([]),
-            "successful HTTP Quickstart responses preserve the warnings contract"
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second_apply)
+                .await
+                .is_err(),
+            "the second concurrent Quickstart request must wait before cloning config"
         );
+        drop(held_transaction);
+        for response in [first_apply.await.unwrap(), second_apply.await.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["kind"], "applied",
+                "concurrent apply response must be successful: {body}"
+            );
+            assert_eq!(
+                body["warnings"],
+                serde_json::json!([]),
+                "successful HTTP Quickstart responses preserve the warnings contract"
+            );
+        }
 
         let config = state.config.read().clone();
         let entry = config
@@ -264,12 +315,38 @@ mod tests {
             .find("anthropic", "subscription")
             .expect("HTTP apply must persist the requested alias");
         assert!(entry.api_key.is_none(), "setup token must not enter config");
+        assert!(
+            config.agents.contains_key("quickstart_bot"),
+            "the later request must not erase the first request's agent"
+        );
+        assert!(
+            config
+                .providers
+                .models
+                .find("anthropic", "subscription_two")
+                .is_some(),
+            "the later request must start from the first request's committed config"
+        );
+        assert!(
+            config.agents.contains_key("quickstart_bot_two"),
+            "the second concurrent request must persist its agent"
+        );
         let profile = zeroclaw_providers::auth::AuthService::from_config(&config)
             .get_profile("anthropic", Some("subscription"))
             .await
             .unwrap()
             .expect("HTTP apply must store the same-alias profile");
         assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
+        assert_eq!(
+            zeroclaw_providers::auth::AuthService::from_config(&config)
+                .get_profile("anthropic", Some("subscription_two"))
+                .await
+                .unwrap()
+                .expect("HTTP apply must store the second same-alias profile")
+                .token
+                .as_deref(),
+            Some("synthetic-setup-token-two")
+        );
         assert!(
             state
                 .pending_reload
@@ -282,6 +359,14 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
                 .unwrap();
         reloaded.config_path = tmp.path().join("config.toml");
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("anthropic", "subscription_two")
+                .is_some(),
+            "persisted config must retain both concurrent applies"
+        );
         let provider =
             zeroclaw_providers::create_model_provider_from_ref(&reloaded, "anthropic.subscription")
                 .unwrap();
