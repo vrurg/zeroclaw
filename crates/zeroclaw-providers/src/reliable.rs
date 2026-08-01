@@ -15,23 +15,44 @@ use std::time::{Duration, Instant};
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
-    /// ModelProvider that was originally requested.
+    /// ModelProvider family that was originally requested.
     pub requested_provider: String,
     /// Model that was originally requested.
     pub requested_model: String,
-    /// ModelProvider that actually served the request.
+    /// ModelProvider family that actually served the request.
     pub actual_provider: String,
     /// Model that actually served the request.
     pub actual_model: String,
 }
 
+/// Fallback metadata for a caller that needs exact configured-candidate
+/// provenance in addition to the stable provider-family display fields.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackAttribution {
+    /// Stable provider/model record for channel and direct-agent notices.
+    pub fallback: ProviderFallbackInfo,
+    /// Exact configured candidate that was requested before fallback.
+    pub requested_candidate: String,
+    /// Exact configured candidate that served the recovered request.
+    pub actual_candidate: String,
+}
+
 tokio::task_local! {
-    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackAttribution>>;
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
 /// Must be called within a `scope_provider_fallback` scope.
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+        .map(|attribution| attribution.fallback)
+}
+
+/// Take fallback metadata including the exact configured candidates.
+pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttribution> {
     PROVIDER_FALLBACK
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
@@ -52,13 +73,19 @@ fn record_provider_fallback(
     requested_model: &str,
     actual_provider: &str,
     actual_model: &str,
+    requested_candidate: &str,
+    actual_candidate: &str,
 ) {
     let _ = PROVIDER_FALLBACK.try_with(|cell| {
-        *cell.borrow_mut() = Some(ProviderFallbackInfo {
-            requested_provider: requested_provider.to_string(),
-            requested_model: requested_model.to_string(),
-            actual_provider: actual_provider.to_string(),
-            actual_model: actual_model.to_string(),
+        *cell.borrow_mut() = Some(ProviderFallbackAttribution {
+            fallback: ProviderFallbackInfo {
+                requested_provider: requested_provider.to_string(),
+                requested_model: requested_model.to_string(),
+                actual_provider: actual_provider.to_string(),
+                actual_model: actual_model.to_string(),
+            },
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         });
     });
 }
@@ -68,6 +95,8 @@ struct ProviderFallbackRecord {
     requested_model: String,
     actual_provider: String,
     actual_model: String,
+    requested_candidate: String,
+    actual_candidate: String,
 }
 
 impl ProviderFallbackRecord {
@@ -77,6 +106,8 @@ impl ProviderFallbackRecord {
         actual_provider: &str,
         actual_model: &str,
         used_later_candidate: bool,
+        requested_candidate: &str,
+        actual_candidate: &str,
     ) -> Option<Self> {
         if !used_later_candidate && requested_model == actual_model {
             return None;
@@ -87,6 +118,8 @@ impl ProviderFallbackRecord {
             requested_model: requested_model.to_string(),
             actual_provider: actual_provider.to_string(),
             actual_model: actual_model.to_string(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         })
     }
 
@@ -96,6 +129,8 @@ impl ProviderFallbackRecord {
             &self.requested_model,
             &self.actual_provider,
             &self.actual_model,
+            &self.requested_candidate,
+            &self.actual_candidate,
         );
     }
 }
@@ -744,6 +779,11 @@ impl ReliableModelProviderEntryProvider {
 
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
+    /// Exact configured candidate identity used for fallback attribution.
+    ///
+    /// This deliberately differs from `display_name`: two aliases can share a
+    /// provider family and model while still being distinct fallback candidates.
+    candidate_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
 }
@@ -754,8 +794,24 @@ impl ReliableModelProviderEntry {
         cooldown_key: impl Into<String>,
         provider: Box<dyn ModelProvider>,
     ) -> Self {
+        let display_name = display_name.into();
+        Self {
+            candidate_name: display_name.clone(),
+            display_name,
+            cooldown_key: cooldown_key.into(),
+            provider: ReliableModelProviderEntryProvider::Direct(provider),
+        }
+    }
+
+    pub(crate) fn new_with_candidate(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        candidate_name: impl Into<String>,
+        provider: Box<dyn ModelProvider>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
+            candidate_name: candidate_name.into(),
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
@@ -772,9 +828,11 @@ impl ReliableModelProviderEntry {
         pinned_model: &str,
         inner: Box<dyn ModelProvider>,
     ) -> Self {
+        let cooldown_key = cooldown_key.into();
         Self {
             display_name: display_name.into(),
-            cooldown_key: cooldown_key.into(),
+            candidate_name: cooldown_key.clone(),
+            cooldown_key,
             provider: ReliableModelProviderEntryProvider::Pinned(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
@@ -788,6 +846,10 @@ impl ReliableModelProviderEntry {
     /// the entry is model-pinned, otherwise the requested model unchanged.
     fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
         self.provider.served_model(requested_model)
+    }
+
+    fn candidate_name(&self) -> &str {
+        &self.candidate_name
     }
 
     fn provider(&self) -> &dyn ModelProvider {
@@ -1092,14 +1154,21 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
                                 if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
-                                    primary,
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
                                     model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 ) {
                                     record.record();
                                 }
@@ -1297,14 +1366,21 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
                                 if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
-                                    primary,
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
                                     model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 ) {
                                     record.record();
                                 }
@@ -1552,14 +1628,21 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
                                 if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
-                                    primary,
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
                                     model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 ) {
                                     record.record();
                                 }
@@ -1768,14 +1851,21 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
                                 if let Some(record) = ProviderFallbackRecord::new_if_true_fallback(
-                                    primary,
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
                                     model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 ) {
                                     record.record();
                                 }
@@ -1978,6 +2068,11 @@ impl ModelProvider for ReliableModelProvider {
                 provider_name,
                 &served_model,
                 provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             let req = ChatRequest {
@@ -2059,6 +2154,11 @@ impl ModelProvider for ReliableModelProvider {
                 provider_name,
                 &served_model,
                 provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             // For streaming, we attempt once and propagate errors
@@ -2140,6 +2240,11 @@ impl ModelProvider for ReliableModelProvider {
                 provider_name,
                 &served_model,
                 provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             let stream = model_provider.stream_chat_with_history(

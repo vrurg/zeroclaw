@@ -1194,16 +1194,44 @@ impl DelegateTool {
             let result = self
                 .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
                 .await;
-            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
             (result, fallback)
         })
         .await;
 
         let mut result = result?;
-        if result.success && fallback.is_some() {
+        if result.success
+            && let Some(fallback) = fallback
+        {
+            let agentic = self
+                .agents
+                .get(agent_name)
+                .is_some_and(|config| self.resolve_agentic(&config.runtime_profile));
             let warning =
                 crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
-            result.output = format!("{}\n\n{warning}", result.output.as_str()).into();
+            let header_key = if agentic {
+                "delegate-provider-fallback-header-agentic"
+            } else {
+                "delegate-provider-fallback-header"
+            };
+            let header = crate::i18n::get_required_cli_string_with_args(
+                header_key,
+                &[
+                    ("agent", agent_name),
+                    ("requested_provider", &fallback.requested_candidate),
+                    ("requested_model", &fallback.fallback.requested_model),
+                    ("actual_provider", &fallback.actual_candidate),
+                    ("actual_model", &fallback.fallback.actual_model),
+                ],
+            );
+            // Successful delegate results are always headed by one generated line. Re-rendering
+            // it here keeps the caller-visible provenance accurate without exposing rejected
+            // provider diagnostics, endpoints, or credentials.
+            let rendered = result
+                .output
+                .split_once('\n')
+                .map_or(result.output.as_str(), |(_, rendered)| rendered);
+            result.output = format!("{header}\n{rendered}\n\n{warning}").into();
         }
         Ok(result)
     }
@@ -4570,7 +4598,6 @@ mod tests {
         assert_stored_for_target_only(&fixture, "background-key").await;
     }
 
-    #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Parallel fan-out gets its own coverage because each spawned worker
         // rebuilds a delegate tool instance before entering the agentic loop.
@@ -7918,6 +7945,31 @@ command = "echo hi"
         );
     }
 
+    fn assert_explicit_fallback_attribution(output: &str, agentic: bool) {
+        let header_key = if agentic {
+            "delegate-provider-fallback-header-agentic"
+        } else {
+            "delegate-provider-fallback-header"
+        };
+        let header = crate::i18n::get_required_cli_string_with_args(
+            header_key,
+            &[
+                ("agent", "target"),
+                ("requested_provider", "custom.primary"),
+                ("requested_model", "primary-model"),
+                ("actual_provider", "custom.backup"),
+                // The same model proves this is exact candidate attribution, not a model switch.
+                ("actual_model", "primary-model"),
+            ],
+        );
+        assert_eq!(
+            output.matches(&header).count(),
+            1,
+            "recovered output must identify the requested and served candidates exactly once: \
+             {output:?}"
+        );
+    }
+
     #[tokio::test]
     async fn delegate_fallback_warning_is_local_to_synchronous_call() {
         let (primary, primary_requests) = start_failing_chat_server(503).await;
@@ -7944,15 +7996,10 @@ command = "echo hi"
         );
         assert!(result.output.contains("fallback reply"), "{result:?}");
         assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
         assert!(
             outer_fallback.is_none(),
             "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
-        );
-        assert!(
-            result
-                .output
-                .contains("[Agent 'target' (custom/primary-model, agentic)]"),
-            "{result:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
     }
@@ -7986,6 +8033,7 @@ command = "echo hi"
             "{result:?}"
         );
         assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), false);
         assert!(
             outer_fallback.is_none(),
             "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
@@ -8037,6 +8085,7 @@ command = "echo hi"
         let output = result.output.as_deref().expect("completed output");
         assert!(output.contains("background fallback reply"), "{result:?}");
         assert_generic_fallback_warning(output, &primary.uri);
+        assert_explicit_fallback_attribution(output, true);
         assert!(result.error.is_none(), "{result:?}");
     }
 
@@ -8073,6 +8122,7 @@ command = "echo hi"
             "{result:?}"
         );
         assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
         assert!(result.error.is_none(), "{result:?}");
     }
 
