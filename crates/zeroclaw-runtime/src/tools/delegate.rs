@@ -4598,6 +4598,7 @@ mod tests {
         assert_stored_for_target_only(&fixture, "background-key").await;
     }
 
+    #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Parallel fan-out gets its own coverage because each spawned worker
         // rebuilds a delegate tool instance before entering the agentic loop.
