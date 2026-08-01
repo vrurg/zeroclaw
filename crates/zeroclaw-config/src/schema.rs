@@ -3937,21 +3937,14 @@ fn default_goal_allowed_command_surfaces() -> Vec<String> {
 }
 
 fn default_goal_allowed_channel_types() -> Vec<String> {
-    // Keep this aligned with in-tree channels that expose
-    // `Channel::self_addressed_mention()`. The channel implementation owns the
-    // platform-native address shape; goal admission only decides whether that
-    // channel family is allowed to use the shared command path.
-    [
-        "discord",
-        "irc",
-        "matrix",
-        "mattermost",
-        "slack",
-        "telegram",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    // Keep this aligned with in-tree channel families that expose both a
+    // platform-native address and an immutable authenticated principal. The
+    // channel implementation owns those facts; goal admission only decides
+    // whether that channel family is allowed to use the shared command path.
+    ["discord", "matrix", "mattermost", "slack", "telegram"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn validate_goal_config(goal: &GoalConfig) -> Result<()> {
@@ -24351,26 +24344,23 @@ enabled = false
     }
 
     #[test]
-    async fn goal_config_defaults_allow_mention_capable_channels() {
+    async fn goal_config_defaults_allow_authenticated_goal_channels() {
         let goal = Config::default().goal;
         assert!(
             !goal.enabled,
             "goal mode must remain opt-in while the feature is experimental"
         );
         let allowed = goal.allowed_channel_types;
-        for channel_type in [
-            "discord",
-            "irc",
-            "matrix",
-            "mattermost",
-            "slack",
-            "telegram",
-        ] {
+        for channel_type in ["discord", "matrix", "mattermost", "slack", "telegram"] {
             assert!(
                 allowed.iter().any(|candidate| candidate == channel_type),
                 "{channel_type} should be allowed by default"
             );
         }
+        assert!(
+            !allowed.iter().any(|candidate| candidate == "irc"),
+            "IRC must remain transport-only for goals until it can provide an immutable authenticated principal"
+        );
         assert!(
             !allowed.iter().any(|candidate| candidate == "channel"),
             "command surface names must not appear in the channel-type allowlist"

@@ -4581,6 +4581,19 @@ mod tests {
     }
 
     #[test]
+    fn default_goal_policy_rejects_irc_even_with_a_claimed_principal() {
+        let config = test_config();
+        let irc = test_goal_context("agent-a")
+            .with_channel_type(Some("irc".into()))
+            .with_principal_id(Some("claimed-irc-identity".into()));
+
+        let err =
+            ensure_goal_admitted_by_config(&irc, &config, config.agent("agent-a")).unwrap_err();
+
+        assert!(err.to_string().contains("channel type `irc`"));
+    }
+
+    #[test]
     fn live_policy_binding_revokes_global_agent_surface_and_channel_scopes() {
         let agent = "agent-a";
         let binding = ActiveGoalControlBinding {
