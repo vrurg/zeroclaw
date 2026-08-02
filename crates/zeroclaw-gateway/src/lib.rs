@@ -571,6 +571,7 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    quickstart_config: Option<zeroclaw_runtime::quickstart::QuickstartConfigState>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -587,7 +588,10 @@ pub async fn run_gateway(
              Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
-    let config_state = Arc::new(RwLock::new(config.clone()));
+    let quickstart_config = quickstart_config.unwrap_or_else(|| {
+        zeroclaw_runtime::quickstart::QuickstartConfigState::new(config.clone())
+    });
+    let config_state = quickstart_config.config();
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
@@ -1553,7 +1557,7 @@ pub async fn run_gateway(
 
     let state = AppState {
         config: config_state,
-        quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        quickstart_config_write_lock: quickstart_config.write_lock(),
         model_provider,
         model,
         temperature,
@@ -4859,7 +4863,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4915,7 +4931,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4957,7 +4985,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5018,7 +5058,19 @@ mod tests {
             .unwrap();
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if handle.is_finished() {
@@ -5061,6 +5113,7 @@ mod tests {
                 config,
                 None,
                 Some(reload_controls),
+                None,
                 None,
                 None,
                 None,
@@ -5189,6 +5242,7 @@ mod tests {
                 config,
                 None,
                 Some(reload_controls),
+                None,
                 None,
                 None,
                 None,

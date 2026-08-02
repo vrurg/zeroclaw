@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zeroclaw_config::presets::BuilderSubmission;
 use zeroclaw_runtime::quickstart::{
-    AppliedAgent, QuickstartError, QuickstartStep, QuickstartWarning, Surface,
-    apply_with_surface_outcome, record_dismissed, validate_only_with_surface,
+    AppliedAgent, QuickstartError, QuickstartStep, QuickstartWarning, Surface, record_dismissed,
+    validate_only_with_surface,
 };
 
 use super::AppState;
@@ -117,14 +117,13 @@ pub async fn handle_apply(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-    let _transaction_guard = Arc::clone(&state.quickstart_config_write_lock)
-        .lock_owned()
-        .await;
-    let mut working = state.config.read().clone();
-    let result = apply_with_surface_outcome(submission, &mut working, Surface::Web).await;
+    let quickstart_config = zeroclaw_runtime::quickstart::QuickstartConfigState::from_parts(
+        Arc::clone(&state.config),
+        Arc::clone(&state.quickstart_config_write_lock),
+    );
+    let result = quickstart_config.apply(submission, Surface::Web).await;
     let body = match result {
         Ok(outcome) => {
-            *state.config.write() = working;
             state
                 .pending_reload
                 .store(true, std::sync::atomic::Ordering::Relaxed);

@@ -4494,26 +4494,15 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
-        // Serializes with every other config-mutating handler for the whole
-        // clone-apply-save-swap below, so the install on success can't race
-        // a concurrent config write (see `ctx.config_write_lock`).
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        // Clone out of the lock to satisfy `&mut Config`. On success
-        // install the mutated snapshot, mirroring the gateway's
-        // `handle_apply`. `apply_with_surface_outcome` already ran `save_dirty` on
-        // the clone, so `save_and_swap_config` performs no second disk
-        // write (empty dirty set short-circuits) — just the guarded swap.
-        let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface_outcome(
-            req.submission,
-            &mut working,
-            crate::quickstart::Surface::Tui,
-        )
-        .await;
+        let quickstart_config = crate::quickstart::QuickstartConfigState::from_parts(
+            Arc::clone(&self.ctx.config),
+            Arc::clone(&self.ctx.config_write_lock),
+        );
+        let result = quickstart_config
+            .apply(req.submission, crate::quickstart::Surface::Tui)
+            .await;
         let body = match result {
             Ok(outcome) => {
-                self.save_and_swap_config(working, &config_write_guard)
-                    .await?;
                 let reload_signalled = self.signal_daemon_reload();
                 QuickstartApplyResult::Applied {
                     agent: outcome.agent,

@@ -1,5 +1,8 @@
 //! Quickstart apply path.
 
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use zeroclaw_config::helpers::kebab_to_snake;
@@ -8,6 +11,62 @@ use zeroclaw_config::presets::{
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::{Config, WireApi};
+
+/// Canonical config state for await-spanning Quickstart writes in one daemon.
+///
+/// Web and RPC/TUI must use the same instance: both persist credentials and
+/// config while awaiting I/O, so independent snapshots or mutexes can let a
+/// later successful submission erase an earlier one.
+#[derive(Clone)]
+pub struct QuickstartConfigState {
+    config: Arc<RwLock<Config>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl QuickstartConfigState {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Reconstruct shared state from the daemon-owned config and transaction lock.
+    ///
+    /// Callers must pass the paired handles for the same daemon instance. This
+    /// permits boundary adapters such as Web and RPC/TUI to share one complete
+    /// Quickstart transaction without holding the synchronous config lock over
+    /// persistence awaits.
+    pub fn from_parts(
+        config: Arc<RwLock<Config>>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self { config, write_lock }
+    }
+
+    pub fn config(&self) -> Arc<RwLock<Config>> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.write_lock)
+    }
+
+    /// Apply and commit one Quickstart submission while owning the shared
+    /// config transaction. The lock is acquired before cloning and held until
+    /// the persisted working copy replaces the shared live state.
+    pub async fn apply(
+        &self,
+        submission: BuilderSubmission,
+        surface: Surface,
+    ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+        let _transaction_guard = Arc::clone(&self.write_lock).lock_owned().await;
+        let mut working = self.config.read().clone();
+        let outcome = apply_with_surface_outcome(submission, &mut working, surface).await?;
+        *self.config.write() = working;
+        Ok(outcome)
+    }
+}
 
 /// Store an Anthropic setup token in the profile bound to its provider alias.
 ///
@@ -3079,6 +3138,112 @@ mod tests {
                 .active_profiles
                 .contains_key("anthropic"),
             "Quickstart alias storage must not change Anthropic's active profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_quickstart_state_preserves_web_and_tui_setup_submissions() {
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let state = QuickstartConfigState::new(config);
+
+        let mut web_submission = fresh_submission("web_bot");
+        let SelectorChoice::Fresh(web_provider) = &mut web_submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        web_provider.alias = "web_subscription".to_string();
+        web_provider.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "synthetic-web-token".to_string()),
+        ]);
+
+        let mut tui_submission = fresh_submission("tui_bot");
+        let SelectorChoice::Fresh(tui_provider) = &mut tui_submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        tui_provider.alias = "tui_subscription".to_string();
+        tui_provider.fields = std::collections::HashMap::from([
+            ("auth_mode".to_string(), "setup_token".to_string()),
+            ("api_key".to_string(), "synthetic-tui-token".to_string()),
+        ]);
+
+        // Hold the shared transaction lock first, so both surface tasks prove
+        // they wait before cloning the configuration they will persist.
+        let held_transaction = state.write_lock().lock_owned().await;
+        let web_state = state.clone();
+        let mut web_task =
+            zeroclaw_spawn::spawn!(
+                async move { web_state.apply(web_submission, Surface::Web).await }
+            );
+        let tui_state = state.clone();
+        let mut tui_task =
+            zeroclaw_spawn::spawn!(
+                async move { tui_state.apply(tui_submission, Surface::Tui).await }
+            );
+        assert!(
+            timeout(Duration::from_millis(50), &mut web_task)
+                .await
+                .is_err(),
+            "Web Quickstart must wait for the shared transaction"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), &mut tui_task)
+                .await
+                .is_err(),
+            "TUI Quickstart must wait for the shared transaction"
+        );
+        drop(held_transaction);
+
+        web_task
+            .await
+            .expect("Web Quickstart task must complete")
+            .expect("Web Quickstart submission must apply");
+        tui_task
+            .await
+            .expect("TUI Quickstart task must complete")
+            .expect("TUI Quickstart submission must apply");
+
+        let in_memory = state.config().read().clone();
+        let reloaded = reload(&dir);
+        for config in [&in_memory, &reloaded] {
+            assert!(config.agents.contains_key("web_bot"));
+            assert!(config.agents.contains_key("tui_bot"));
+            assert!(
+                config
+                    .providers
+                    .models
+                    .find("anthropic", "web_subscription")
+                    .is_some()
+            );
+            assert!(
+                config
+                    .providers
+                    .models
+                    .find("anthropic", "tui_subscription")
+                    .is_some()
+            );
+        }
+        let auth = zeroclaw_providers::auth::AuthService::new(dir.path(), false);
+        assert_eq!(
+            auth.get_profile("anthropic", Some("web_subscription"))
+                .await
+                .unwrap()
+                .and_then(|profile| profile.token),
+            Some("synthetic-web-token".to_string())
+        );
+        assert_eq!(
+            auth.get_profile("anthropic", Some("tui_subscription"))
+                .await
+                .unwrap()
+                .and_then(|profile| profile.token),
+            Some("synthetic-tui-token".to_string())
         );
     }
 

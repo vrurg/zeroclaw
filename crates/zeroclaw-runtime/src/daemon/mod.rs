@@ -334,6 +334,11 @@ pub async fn run(
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
 
+    // Web and RPC/TUI Quickstart both mutate the same persisted config and
+    // profile store. One daemon-owned handle makes their await-spanning
+    // transactions serialize against the same live snapshot.
+    let quickstart_config = crate::quickstart::QuickstartConfigState::new(config.clone());
+
     let channels_cancel = tokio_util::sync::CancellationToken::new();
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
@@ -351,6 +356,7 @@ pub async fn run(
             reload_tx: reload_tx.clone(),
         };
         let gateway_tui_registry = tui_registry.clone();
+        let gateway_quickstart_config = quickstart_config.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
             "gateway",
@@ -363,6 +369,7 @@ pub async fn run(
                 let tx = gateway_event_tx.clone();
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
+                let quickstart_config = gateway_quickstart_config.clone();
                 let start = gateway_start.clone();
                 async move {
                     start(
@@ -372,6 +379,7 @@ pub async fn run(
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
+                        Some(quickstart_config),
                     )
                     .await
                 }
@@ -540,8 +548,8 @@ pub async fn run(
         };
 
         Some(std::sync::Arc::new(RpcContext {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: quickstart_config.config(),
+            config_write_lock: quickstart_config.write_lock(),
             sessions,
             session_backend,
             memory: rpc_memory,
@@ -2820,7 +2828,13 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry| {
+            move |host,
+                  port,
+                  config,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _quickstart_config| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -2888,7 +2902,13 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg| {
+            move |_host,
+                  _port,
+                  _config,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _quickstart_config| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)
