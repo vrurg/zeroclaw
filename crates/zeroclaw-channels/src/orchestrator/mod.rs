@@ -1742,13 +1742,25 @@ impl InFlightPreRegistration {
     }
 }
 
-fn cancel_in_flight_chain(state: &InFlightSenderTaskState, cause: InFlightCancellationCause) {
+async fn interrupt_in_flight_chain(
+    state: &InFlightSenderTaskState,
+    cause: InFlightCancellationCause,
+) -> Result<()> {
     let mut current = Some(state);
     while let Some(state) = current {
+        let goal_task_id = state
+            .goal_task_id
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(task_id) = goal_task_id {
+            zeroclaw_runtime::control_plane::pause_running_goal_for_interruption(&task_id).await?;
+        }
         state.completion.set_cancellation_cause(cause);
         state.cancellation.cancel();
         current = state.predecessor.as_deref();
     }
+    Ok(())
 }
 
 fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -9054,6 +9066,7 @@ async fn pre_register_in_flight_before_permit(
         predecessor: predecessor.as_ref().map(Arc::clone),
     };
     active.insert(sender_scope_key, state.clone());
+    drop(active);
     let registration = InFlightRegistration::new(state);
 
     match predecessor {
@@ -9064,7 +9077,19 @@ async fn pre_register_in_flight_before_permit(
                     .with_attrs(::serde_json::json!({"sender": msg.sender})),
                 "interrupting previous in-flight request for sender"
             );
-            cancel_in_flight_chain(&predecessor, InFlightCancellationCause::NewerInput);
+            if let Err(error) =
+                interrupt_in_flight_chain(&predecessor, InFlightCancellationCause::NewerInput).await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"sender": msg.sender, "error": error.to_string()})
+                        ),
+                    "Retained predecessor because its durable goal could not be paused"
+                );
+            }
             InFlightPreRegistration::Queued {
                 registration,
                 predecessor,
@@ -11422,13 +11447,40 @@ async fn run_message_dispatch_loop_with_recovery(
                 true
             };
             let previous = if recovered_stop_committed {
-                in_flight_by_sender.lock().await.remove(&scope_key)
+                in_flight_by_sender.lock().await.get(&scope_key).cloned()
             } else {
                 None
             };
             let reply = if let Some(state) = previous {
-                cancel_in_flight_chain(&state, InFlightCancellationCause::StopCommand);
-                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
+                match interrupt_in_flight_chain(&state, InFlightCancellationCause::StopCommand)
+                    .await
+                {
+                    Ok(()) => {
+                        let mut active = in_flight_by_sender.lock().await;
+                        if active
+                            .get(&scope_key)
+                            .is_some_and(|current| current.task_id == state.task_id)
+                        {
+                            active.remove(&scope_key);
+                        }
+                        zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
+                    }
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Refused stop because the durable goal could not be paused"
+                        );
+                        zeroclaw_runtime::i18n::get_required_cli_string(
+                            "channel-runtime-stop-goal-pause-failed",
+                        )
+                    }
+                }
             } else if recovered_task_id.is_some() && recovered_stop_committed {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {

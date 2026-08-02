@@ -947,6 +947,9 @@ channel-runtime-malformed-tool-output = I generated an internal tool-call format
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-stop-goal-pause-failed = The active goal could not be paused, so its worker was not stopped.
+goal-interruption-pause-description = Goal execution was interrupted by newer input or an explicit stop request.
+goal-interruption-blocker = Resume the goal when the current control-surface context is ready.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
