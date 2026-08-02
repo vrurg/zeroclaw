@@ -22369,6 +22369,7 @@ BTC is currently around $65,000 based on latest tool output."#
     struct DelayedHistoryCaptureModelProvider {
         delay: Duration,
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        call_started: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
     }
 
     #[async_trait::async_trait]
@@ -22398,6 +22399,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 calls.push(snapshot);
                 calls.len()
             };
+            if let Some(call_started) = &self.call_started {
+                let _ = call_started.send(call_index);
+            }
             tokio::time::sleep(self.delay).await;
             Ok(format!("response-{call_index}"))
         }
@@ -26114,6 +26118,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            call_started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -26286,6 +26291,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            call_started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -26457,6 +26463,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            call_started: None,
         });
 
         let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
@@ -30853,9 +30860,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel_name: Some("telegram".into()),
                 ..Default::default()
             });
+            let (call_started_tx, mut call_started_rx) = tokio::sync::mpsc::unbounded_channel();
             let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
                 delay: Duration::from_secs(30),
                 calls: std::sync::Mutex::new(Vec::new()),
+                call_started: Some(call_started_tx),
             });
             let provider: Arc<dyn ModelProvider> = provider_impl.clone();
             let mut config = zeroclaw_config::schema::Config::default();
@@ -30921,12 +30930,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ));
             normal_tx.send(msg).await.expect("start current-boot goal");
             tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if !provider_impl.calls.lock().unwrap().is_empty() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
+                assert_eq!(call_started_rx.recv().await, Some(1));
             })
             .await
             .expect("normal worker reaches provider");
@@ -30979,12 +30983,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     Arc::clone(&next_pending),
                 ));
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if provider_impl.calls.lock().unwrap().len() >= expected_calls {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
+                    assert_eq!(call_started_rx.recv().await, Some(expected_calls));
                 })
                 .await
                 .expect("replacement worker reaches provider exactly once");
