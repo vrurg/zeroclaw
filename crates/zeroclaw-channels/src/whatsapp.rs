@@ -163,9 +163,10 @@ impl WhatsAppChannel {
         let mut cleanup =
             PendingApprovalCleanup::new(Arc::clone(&PENDING_APPROVALS), token.clone());
 
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\\nTool: {}\\nArgs: {}\\n\\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
         );
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
             cleanup.remove_and_disarm().await;
