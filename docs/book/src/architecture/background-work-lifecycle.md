@@ -1,6 +1,6 @@
 # Background work lifecycle
 
-ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode defines a related target contract that is not yet wired end to end.
+ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode is an experimental related control plane with trusted channel admission and durable execution; unsupported command surfaces and channels remain outside that path.
 
 Use this page when a change adds scheduled or autonomous work, introduces a wait or approval state, changes cancellation or restart behavior, or connects child work to an owning task. The first design question is not "how does it run in the background?" but "which subsystem owns its lifecycle?"
 
@@ -45,11 +45,11 @@ Under a booted daemon, delegate and subagent producers also write task rows to t
 
 Current delegate and subagent rows populate agent, status, owner PID and boot ID, depth, and timestamps. They leave heartbeat, parent task, route, and principal absent. Startup recovery marks prior-boot running rows `lost`; `timed_out` applies only to producers that emit stale heartbeats, which these producers do not currently do. The task row makes an interrupted child visible but does not recreate its execution.
 
-## Goal-mode target contract
+## Goal-mode control plane
 
-[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the future authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. The repository contains goal storage and control-plane APIs, but production goal admission and execution are not yet wired end to end.
+[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) makes the task control plane authoritative for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. Production goal admission and execution are wired for trusted channel ingress. Goal mode remains experimental: only configured channel types with an immutable authenticated principal are admitted, while unsupported command surfaces and channels such as IRC remain outside the goal-command path.
 
-A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
+A background path may participate in goal mode only when it preserves the owning goal relationship and reports terminal state and model usage back to it. Other background work remains ordinary background execution rather than goal-mode execution.
 
 ## Change checklist
 

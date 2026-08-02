@@ -54,7 +54,7 @@ enabled = false
 channel_status_updates = true
 restart_recovery = "last_state"
 allowed_command_surfaces = ["channel"]
-allowed_channel_types = ["discord", "irc", "matrix", "mattermost", "slack", "telegram"]
+allowed_channel_types = ["discord", "matrix", "mattermost", "slack", "telegram"]
 token_budget = 50000
 cost_budget_usd = 2.50
 approval_deny_behavior = "pause"
@@ -78,8 +78,10 @@ command surface wired in this branch slice; `web` and `tui` are reserved for
 future parser/admission wiring.
 `allowed_channel_types` applies when the surface is `channel`; values are bare
 channel types such as `matrix` or `telegram`, not aliases like
-`matrix.default`. The default includes in-tree channels that expose a canonical
-self-addressed mention for the transitional shared command-ingress path.
+`matrix.default`. The default includes channel families that supply an
+immutable authenticated principal to the shared command-ingress path. IRC
+remains transport-only for goal commands until it has a supported sender
+authentication contract.
 
 These gates are live revocation boundaries, not start-only admission hints.
 Applying a configuration that disables goal mode globally, disables it for an
