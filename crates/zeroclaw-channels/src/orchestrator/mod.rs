@@ -1006,6 +1006,64 @@ fn current_in_flight_goal_task() -> Option<String> {
         .flatten()
 }
 
+async fn reconcile_cancelled_in_flight_goal() {
+    reconcile_cancelled_in_flight_goal_with(
+        Duration::from_millis(100),
+        Duration::from_secs(5),
+        |task_id| async move {
+            zeroclaw_runtime::control_plane::pause_running_goal_for_interruption(&task_id).await
+        },
+    )
+    .await;
+}
+
+async fn reconcile_cancelled_in_flight_goal_with<F, Fut>(
+    retry_delay: Duration,
+    max_retry_delay: Duration,
+    pause: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let Some(task_id) = current_in_flight_goal_task() else {
+        return;
+    };
+    reconcile_cancelled_goal_with_retry(task_id, retry_delay, max_retry_delay, pause).await;
+}
+
+async fn reconcile_cancelled_goal_with_retry<F, Fut>(
+    task_id: String,
+    mut retry_delay: Duration,
+    max_retry_delay: Duration,
+    mut pause: F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    loop {
+        match pause(task_id.clone()).await {
+            Ok(()) => return,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"task_id": task_id, "error": error.to_string()})
+                        ),
+                    "Cancelled goal worker could not reconcile durable execution ownership; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = next_reconciliation_retry_delay(retry_delay, max_retry_delay);
+            }
+        }
+    }
+}
+
+fn next_reconciliation_retry_delay(current: Duration, maximum: Duration) -> Duration {
+    current.saturating_mul(2).min(maximum)
+}
+
 fn current_in_flight_goal_task_is(task_id: &str) -> bool {
     IN_FLIGHT_GOAL_TASK
         .try_with(|bound| {
@@ -1037,6 +1095,52 @@ async fn goal_worker_binding_is_available_to_continuation_admission() {
             assert_eq!(current_in_flight_goal_task().as_deref(), Some("goal-a"));
         })
         .await;
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn bind_vs_cancel_reconciliation_retries_until_durable_pause_succeeds() {
+    let bound = Arc::new(std::sync::Mutex::new(None));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_task_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    IN_FLIGHT_GOAL_TASK
+        .scope(Arc::clone(&bound), async {
+            bind_current_in_flight_goal_task("goal-late-binding");
+            let attempts_for_pause = Arc::clone(&attempts);
+            let observed_for_pause = Arc::clone(&observed_task_ids);
+            reconcile_cancelled_in_flight_goal_with(
+                Duration::ZERO,
+                Duration::ZERO,
+                move |task_id| {
+                    let attempts = Arc::clone(&attempts_for_pause);
+                    let observed = Arc::clone(&observed_for_pause);
+                    async move {
+                        observed
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .push(task_id);
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            anyhow::bail!("injected transient pause failure");
+                        }
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        })
+        .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *observed_task_ids
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        vec![
+            "goal-late-binding".to_string(),
+            "goal-late-binding".to_string()
+        ]
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -8319,6 +8423,7 @@ async fn process_channel_message_body(
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
+            reconcile_cancelled_in_flight_goal().await;
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8780,6 +8885,7 @@ async fn process_channel_message_body(
             if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e)
                 || cancellation_token.is_cancelled()
             {
+                reconcile_cancelled_in_flight_goal().await;
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
