@@ -1575,6 +1575,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = Vec::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
+        let mut rejected_attempt_usage = None;
 
         for current_model in &models {
             for entry in &self.model_providers {
@@ -1594,8 +1595,9 @@ impl ModelProvider for ReliableModelProvider {
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             if is_empty_completion(&resp) {
+                                accumulate_usage(&mut rejected_attempt_usage, resp.usage.as_ref());
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -1616,6 +1618,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 break;
                             }
+                            combine_response_usage(&mut resp, rejected_attempt_usage.take());
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
@@ -1770,6 +1773,10 @@ impl ModelProvider for ReliableModelProvider {
                     "Exhausted retries, trying next model_provider/model"
                 );
             }
+        }
+
+        if let Some(usage) = rejected_attempt_usage {
+            return Err(ReliableRejectedCompletionUsage { usage, failures }.into());
         }
 
         anyhow::bail!(
@@ -2648,6 +2655,26 @@ mod tests {
                 reasoning_content: None,
             })
         }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: (attempt > 0).then(|| "recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for UsageEmptyThenTextMock {
@@ -2883,6 +2910,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retry_preserves_usage_from_rejected_empty_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let response = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("second attempt succeeds");
+
+        let usage = response.usage.expect("combined usage is retained");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

@@ -1359,13 +1359,17 @@ impl DelegateTool {
         result: anyhow::Result<String>,
     ) -> ToolResult {
         match result {
-            Ok(response) if response.trim().is_empty() => ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
-                )),
-            },
+            Ok(response)
+                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+            {
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
+                    )),
+                }
+            }
             Ok(response) => ToolResult {
                 success: true,
                 output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
@@ -4953,6 +4957,24 @@ mod tests {
         let error = result.error.as_deref().unwrap_or_default();
         assert!(error.contains("invalid semantic completion"), "{error}");
         assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok("<think>internal reasoning</think>".to_string()),
+        );
+
+        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
     }
 
     #[tokio::test]
