@@ -12508,6 +12508,24 @@ fn no_real_time_channels_message() -> &'static str {
     "No real-time channels configured. Run `zeroclaw quickstart` to set one up."
 }
 
+/// Display-ready `channel doctor` lines for every dangling
+/// `peer_groups.<name>.channel` reference.
+///
+/// The diagnostic is derived from `Config::collect_warnings()` (the single
+/// source of truth for the `peer_group_channel_dangling` class) rather than a
+/// second peer-group validator, so the channel-doctor surface stays in lockstep
+/// with the general doctor and gateway config API. Returns an empty vector when
+/// there are no dangling references. Kept separate from the health-check loop so
+/// it can also run on the early-return path where no real-time channel is active.
+fn peer_group_dangling_warning_lines(config: &Config) -> Vec<String> {
+    config
+        .collect_warnings()
+        .into_iter()
+        .filter(|w| w.code == "peer_group_channel_dangling")
+        .map(|w| format!("  ⚠️  peer group   {}", w.message))
+        .collect()
+}
+
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
@@ -12566,12 +12584,31 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if channels.is_empty() {
+        // Surface dangling peer-group channel references even when no
+        // real-time channel is active — the general doctor and gateway API
+        // already expose this via `Config::collect_warnings()`, so the
+        // `channel doctor` path should report the same diagnostic.
+        let dangling = { peer_group_dangling_warning_lines(&config_arc.read()) };
+        if !dangling.is_empty() {
+            println!("🩺 ZeroClaw Channel Doctor");
+            println!();
+            for line in &dangling {
+                println!("{line}");
+            }
+            println!();
+        }
         println!("{}", no_real_time_channels_message());
         return Ok(());
     }
 
     println!("🩺 ZeroClaw Channel Doctor");
     println!();
+
+    // Report dangling peer-group channel references alongside health results,
+    // derived from the shared `Config::collect_warnings()` source of truth.
+    for line in peer_group_dangling_warning_lines(&config_arc.read()) {
+        println!("{line}");
+    }
 
     let mut healthy = 0_u32;
     let mut unhealthy = 0_u32;
@@ -14294,6 +14331,70 @@ mod tests {
         assert!(
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn channel_doctor_surfaces_dangling_peer_group_channel_warning() {
+        // The dangling `peer_groups.<name>.channel` diagnostic belongs on the
+        // `zeroclaw channel doctor` path, not only the general doctor.
+        // `doctor_channels()` reaches the user through
+        // `peer_group_dangling_warning_lines`, which is derived from the shared
+        // `Config::collect_warnings()` source of truth (no second validator).
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+
+        let mut config = Config::default();
+        // A dangling reference: `telegram.typo` names no configured
+        // `[channels.telegram.typo]` block.
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.typo".into(),
+                ..Default::default()
+            },
+        );
+
+        let lines = super::peer_group_dangling_warning_lines(&config);
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one dangling peer-group warning expected: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("peer group") && lines[0].contains("peer_groups.ops.channel"),
+            "warning line must name the offending peer group and path: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("telegram.typo"),
+            "warning line must echo the dangling reference: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn channel_doctor_silent_when_no_dangling_peer_group_ref() {
+        // Control: a peer group whose channel resolves to a configured block
+        // must not produce a dangling warning on the channel-doctor path.
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram.work".into(),
+                ..Default::default()
+            },
+        );
+
+        let lines = super::peer_group_dangling_warning_lines(&config);
+        assert!(
+            lines.is_empty(),
+            "no dangling warning expected for a resolvable ref: {lines:?}"
         );
     }
 
