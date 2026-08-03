@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_api::model_provider::StreamEvent;
+use zeroclaw_api::model_provider::{StreamError, StreamEvent};
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
@@ -132,6 +132,33 @@ pub(crate) async fn consume_provider_streaming_response(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
                 );
+                if let StreamError::TerminalCompletion(reason) = err {
+                    // A terminal provider reason such as `max_tokens` means
+                    // the response is known to be incomplete. Do not let the
+                    // generic stream-retry path replace already forwarded
+                    // text, but retain that text through the established
+                    // interrupted-after-output contract.
+                    if visible_event_output || !outcome.forwarded_visible_text.is_empty() {
+                        let partial_text = if forwarded_text.is_empty() {
+                            outcome.forwarded_visible_text.clone()
+                        } else {
+                            forwarded_text
+                        };
+                        return Err(StreamInterruptedAfterOutput {
+                            partial_text,
+                            message: format!("model_provider stream incomplete: {reason}"),
+                        }
+                        .into());
+                    }
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage: outcome.usage,
+                        }
+                        .into());
+                    }
+                    return Err(anyhow::Error::new(reason));
+                }
+
                 let message = format!("model_provider stream error: {err}");
                 if visible_event_output {
                     // Persist only what the consumer actually saw
@@ -295,6 +322,8 @@ mod tests {
 
     struct EmptyStreamProvider;
 
+    struct ErrorAfterTextProvider;
+
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -318,6 +347,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ErrorAfterTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ErrorAfterTextProvider"
         }
     }
 
@@ -419,6 +461,47 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for ErrorAfterTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "partial response",
+                ))),
+                Err(StreamError::Http("connection interrupted".to_string())),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -472,6 +555,33 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "provider stream completed without final text or tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_after_visible_text_preserves_the_partial_without_fallback_signal() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let err = consume_provider_streaming_response(
+            &ErrorAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect_err("visible partial output must become an interrupted outcome");
+
+        let interrupted = err
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("visible output must suppress a replacement fallback");
+        assert_eq!(interrupted.partial_text, "partial response");
+        assert!(interrupted.message.contains("connection interrupted"));
+        assert!(
+            matches!(event_rx.recv().await, Some(TurnEvent::Chunk { delta }) if delta == "partial response")
         );
     }
 }

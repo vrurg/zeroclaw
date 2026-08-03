@@ -532,17 +532,19 @@ mod streaming_fallback_tests {
     use futures_util::stream::BoxStream;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::StreamEvent;
+    use zeroclaw_api::model_provider::{StreamError, StreamEvent, TerminalCompletionError};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
 
     struct EmptyStreamThenTextProvider {
         non_stream_calls: AtomicUsize,
+        terminal_incomplete: bool,
     }
 
     struct PreExecutedToolThenEmptyProvider {
         non_stream_calls: AtomicUsize,
+        terminal_incomplete: bool,
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -603,14 +605,20 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::Usage(TokenUsage {
-                    input_tokens: Some(10),
-                    output_tokens: Some(5),
-                    cached_input_tokens: None,
-                })),
-                Ok(StreamEvent::Final),
-            ]))
+            if self.terminal_incomplete {
+                Box::pin(futures_util::stream::iter(vec![Err(
+                    StreamError::TerminalCompletion(TerminalCompletionError::OutputTokenLimit),
+                )]))
+            } else {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    })),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
         }
     }
 
@@ -652,7 +660,7 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![
+            let mut events = vec![
                 Ok(StreamEvent::PreExecutedToolCall {
                     name: "provider_tool".to_string(),
                     args: "{}".to_string(),
@@ -661,8 +669,15 @@ mod streaming_fallback_tests {
                     name: "provider_tool".to_string(),
                     output: "completed".to_string(),
                 }),
-                Ok(StreamEvent::Final),
-            ]))
+            ];
+            if self.terminal_incomplete {
+                events.push(Err(StreamError::TerminalCompletion(
+                    TerminalCompletionError::OutputTokenLimit,
+                )));
+            } else {
+                events.push(Ok(StreamEvent::Final));
+            }
+            Box::pin(futures_util::stream::iter(events))
         }
     }
 
@@ -670,6 +685,7 @@ mod streaming_fallback_tests {
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: false,
         };
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -727,6 +743,7 @@ mod streaming_fallback_tests {
     async fn pre_executed_tool_empty_stream_never_replays_request() {
         let provider = PreExecutedToolThenEmptyProvider {
             non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: false,
         };
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -771,5 +788,104 @@ mod streaming_fallback_tests {
             0,
             "replaying after provider-executed tool work could repeat side effects"
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_without_visible_output_uses_non_streaming_fallback() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: true,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch succeeds");
+        let response = outcome
+            .chat_result
+            .expect("a no-output stream failure uses the normal one-shot fallback");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            1,
+            "the existing one-shot fallback may replace output that was never visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_incomplete_stream_never_replays_request() {
+        let provider = PreExecutedToolThenEmptyProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            terminal_incomplete: true,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the provider outcome")
+        .chat_result
+        .expect_err("provider-executed tool work without a final response must fail");
+
+        assert!(error.to_string().contains("provider-executed tools"));
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 0);
     }
 }

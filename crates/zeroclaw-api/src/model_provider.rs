@@ -360,6 +360,27 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Reason a provider completed a response that must not be treated as a final answer.
+///
+/// These are successful provider protocol terminal states, not transport failures. They
+/// intentionally stay distinct from [`StreamError::Http`] so callers can avoid retrying
+/// a request that has already exhausted its output budget or reached a policy terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalCompletionError {
+    /// The provider exhausted the configured output-token budget.
+    #[error("response incomplete: output token limit reached")]
+    OutputTokenLimit,
+    /// The provider stopped because its context window was exhausted while generating.
+    #[error("response incomplete: model context window reached")]
+    ContextWindow,
+    /// The provider paused a long-running turn that requires an explicit continuation.
+    #[error("response incomplete: provider paused the turn")]
+    PausedTurn,
+    /// The provider stopped generation with a refusal rather than a usable completion.
+    #[error("response incomplete: provider refused the request")]
+    Refusal,
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -375,8 +396,33 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// The provider reached a terminal state that does not yield a complete answer.
+    #[error(transparent)]
+    TerminalCompletion(#[from] TerminalCompletionError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Returns the structured terminal-completion failure carried by an error.
+///
+/// Both streaming and non-streaming provider paths use this helper so retry,
+/// fallback, and delivery layers do not infer terminal state from error text.
+pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
+    error
+        .downcast_ref::<TerminalCompletionError>()
+        .copied()
+        .or_else(|| {
+            error
+                .downcast_ref::<StreamError>()
+                .and_then(|stream_error| {
+                    if let StreamError::TerminalCompletion(reason) = stream_error {
+                        Some(*reason)
+                    } else {
+                        None
+                    }
+                })
+        })
 }
 
 /// Structured error returned when a requested capability is not supported.

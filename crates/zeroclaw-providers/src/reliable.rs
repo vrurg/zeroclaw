@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::model_provider::terminal_completion_error;
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -200,6 +201,13 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // An output-limited, paused, or refused response is a completed provider
+    // protocol state. Repeating the identical request cannot repair it, but
+    // the outer provider/model fallback chain may still select a viable path.
+    if terminal_completion_error(err).is_some() {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -304,6 +312,13 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    // A provider can report context exhaustion while generating its response.
+    // That is a terminal incomplete completion, not an input-overflow signal
+    // for history trimming.
+    if terminal_completion_error(err).is_some() {
+        return false;
+    }
+
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -461,6 +476,28 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
+
+    if let Some(reason) = terminal_completion_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "incomplete_completion",
+            phase: "response_delivery",
+            hint: match reason {
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit => {
+                    "increase output budget or use a fallback model"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::ContextWindow => {
+                    "use a fallback model with more available context"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn => {
+                    "continue the paused turn or use a fallback model"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
+                    "use a fallback model or revise the request"
+                }
+            },
+            endpoint,
+        };
+    }
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
@@ -2704,6 +2741,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct TerminalCompletionMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyThenTextMock {
         async fn chat_with_system(
@@ -2941,6 +2982,36 @@ mod tests {
 
         fn alias(&self) -> &str {
             "ThinkOnlyThenTextMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalCompletionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(
+                ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+            ))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalCompletionMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalCompletionMock"
         }
     }
 
@@ -3708,6 +3779,46 @@ mod tests {
 
         assert_eq!(result.text.as_deref(), Some("recovered by fallback"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_incomplete_completion_skips_retry_and_uses_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalCompletionMock {
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let result = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("fallback should recover a terminal incomplete completion");
+
+        assert_eq!(result, "recovered by fallback");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "a terminal reason is not retryable against the same candidate"
+        );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
