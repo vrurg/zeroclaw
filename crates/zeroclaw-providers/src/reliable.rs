@@ -3,6 +3,7 @@ use super::dispatch::ProviderDispatch;
 use super::stream_guard::AbortOnDrop;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+    TokenUsage,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -717,6 +718,34 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 
 fn is_empty_text_completion(text: &str) -> bool {
     text.trim().is_empty()
+}
+
+fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let accumulated = total.get_or_insert_with(TokenUsage::default);
+    for (target, value) in [
+        (&mut accumulated.input_tokens, usage.input_tokens),
+        (&mut accumulated.output_tokens, usage.output_tokens),
+        (
+            &mut accumulated.cached_input_tokens,
+            usage.cached_input_tokens,
+        ),
+    ] {
+        if let Some(value) = value {
+            *target = Some(target.unwrap_or(0).saturating_add(value));
+        }
+    }
+}
+
+fn combine_response_usage(response: &mut ChatResponse, prior_attempts: Option<TokenUsage>) {
+    let Some(prior_attempts) = prior_attempts else {
+        return;
+    };
+    let mut combined = Some(prior_attempts);
+    accumulate_usage(&mut combined, response.usage.as_ref());
+    response.usage = combined;
 }
 
 enum ReliableModelProviderEntryProvider {
@@ -1737,6 +1766,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = Vec::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
+        let mut rejected_attempt_usage = None;
 
         for current_model in &models {
             for entry in &self.model_providers {
@@ -1761,8 +1791,9 @@ impl ModelProvider for ReliableModelProvider {
                         .chat(req, current_model, temperature)
                         .await
                     {
-                        Ok(resp) => {
+                        Ok(mut resp) => {
                             if is_empty_completion(&resp) {
+                                accumulate_usage(&mut rejected_attempt_usage, resp.usage.as_ref());
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
@@ -1783,6 +1814,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 break;
                             }
+                            combine_response_usage(&mut resp, rejected_attempt_usage.take());
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
@@ -2518,6 +2550,10 @@ mod tests {
         response: &'static str,
     }
 
+    struct UsageEmptyThenTextMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyThenTextMock {
         async fn chat_with_system(
@@ -2545,6 +2581,52 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyThenTextMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for UsageEmptyThenTextMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: (attempt > 0).then(|| "recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UsageEmptyThenTextMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UsageEmptyThenTextMock"
         }
     }
 
@@ -2593,6 +2675,40 @@ mod tests {
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("recovered"));
         // One empty completion + one successful re-roll.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_retry_preserves_usage_from_rejected_empty_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let response = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect("second attempt succeeds");
+
+        let usage = response.usage.expect("combined usage is retained");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

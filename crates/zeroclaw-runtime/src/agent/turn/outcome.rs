@@ -54,6 +54,38 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
 
+/// A stream completed without a final response after the provider reported
+/// tool work it had already executed. Replaying the request could repeat those
+/// side effects, so this bypasses the normal non-streaming fallback.
+#[derive(Debug)]
+pub(crate) struct StreamPreExecutedToolsWithoutFinalResponse {
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model_provider stream ended without final text after provider-executed tools")
+    }
+}
+
+impl std::error::Error for StreamPreExecutedToolsWithoutFinalResponse {}
+
+/// A completed stream that contains neither final text nor native tool calls.
+/// Its reported usage survives the error boundary so retries and fallback do
+/// not hide already-billed provider work from turn cost accounting.
+#[derive(Debug)]
+pub(crate) struct StreamSemanticEmptyCompletion {
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for StreamSemanticEmptyCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model_provider stream returned an invalid semantic completion: no final text or tool calls")
+    }
+}
+
+impl std::error::Error for StreamSemanticEmptyCompletion {}
+
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,

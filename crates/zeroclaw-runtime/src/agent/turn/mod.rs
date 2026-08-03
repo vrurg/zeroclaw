@@ -735,6 +735,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if response.is_semantically_empty_terminal() {
+                if let Some(usage) = response.usage.as_ref() {
+                    crate::agent::cost::record_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        usage,
+                    );
+                }
                 anyhow::bail!(
                     "model_provider returned an invalid semantic completion: no final text or tool calls"
                 );

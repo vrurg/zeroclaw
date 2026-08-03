@@ -3,10 +3,13 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
-use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
+use super::outcome::{
+    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
+    StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::cost::{check_tool_loop_budget, record_tool_loop_cost_usage};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -186,6 +189,19 @@ pub(crate) async fn call_provider(
                 })
             }
             Err(stream_err)
+                if stream_err
+                    .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+                    .is_some() =>
+            {
+                if let Some(usage) = stream_err
+                    .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+                    .and_then(|error| error.usage.as_ref())
+                {
+                    record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                }
+                Err(stream_err)
+            }
+            Err(stream_err)
                 if is_tool_loop_cancelled(&stream_err)
                     || stream_err
                         .downcast_ref::<StreamInterruptedAfterOutput>()
@@ -194,6 +210,12 @@ pub(crate) async fn call_provider(
                 Err(stream_err)
             }
             Err(stream_err) => {
+                let discarded_usage = stream_err
+                    .downcast_ref::<StreamSemanticEmptyCompletion>()
+                    .and_then(|error| error.usage.as_ref());
+                if let Some(usage) = discarded_usage {
+                    record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -489,6 +511,10 @@ mod payload_capture_tests {
 mod streaming_fallback_tests {
     use super::super::context::TurnCtx;
     use super::*;
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
@@ -497,9 +523,13 @@ mod streaming_fallback_tests {
     use zeroclaw_api::model_provider::StreamEvent;
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::ModelProvider;
-    use zeroclaw_providers::traits::{StreamOptions, StreamResult};
+    use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
 
     struct EmptyStreamThenTextProvider {
+        non_stream_calls: AtomicUsize,
+    }
+
+    struct PreExecutedToolThenEmptyProvider {
         non_stream_calls: AtomicUsize,
     }
 
@@ -510,6 +540,16 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "EmptyStreamThenTextProvider"
+        }
+    }
+
+    impl Attributable for PreExecutedToolThenEmptyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "PreExecutedToolThenEmptyProvider"
         }
     }
 
@@ -551,13 +591,129 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                })),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for PreExecutedToolThenEmptyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not be requested".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::PreExecutedToolCall {
+                    name: "provider_tool".to_string(),
+                    args: "{}".to_string(),
+                }),
+                Ok(StreamEvent::PreExecutedToolResult {
+                    name: "provider_tool".to_string(),
+                    output: "completed".to_string(),
+                }),
+                Ok(StreamEvent::Final),
+            ]))
         }
     }
 
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("stream failure is recovered by one non-streaming request");
+        let response = outcome.chat_result.expect("fallback response succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn pre_executed_tool_empty_stream_never_replays_request() {
+        let provider = PreExecutedToolThenEmptyProvider {
             non_stream_calls: AtomicUsize::new(0),
         };
         let observer = NoopObserver;
@@ -583,7 +739,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let outcome = call_provider(
+        let error = call_provider(
             &ctx,
             &provider,
             "test-model",
@@ -593,10 +749,15 @@ mod streaming_fallback_tests {
             0,
         )
         .await
-        .expect("stream failure is recovered by one non-streaming request");
-        let response = outcome.chat_result.expect("fallback response succeeds");
+        .expect("dispatch returns the provider outcome")
+        .chat_result
+        .expect_err("provider-executed tool work without final text must fail");
 
-        assert_eq!(response.text.as_deref(), Some("fallback response"));
-        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        assert!(error.to_string().contains("provider-executed tools"));
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "replaying after provider-executed tool work could repeat side effects"
+        );
     }
 }

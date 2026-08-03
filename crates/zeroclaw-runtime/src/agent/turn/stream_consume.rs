@@ -1,7 +1,10 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
-use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
+use super::outcome::{
+    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+};
 use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -23,6 +26,7 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) forwarded_visible_text: String,
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
 pub(crate) async fn consume_provider_streaming_response(
@@ -155,6 +159,7 @@ pub(crate) async fn consume_provider_streaming_response(
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
                     .entry(name.clone())
@@ -172,6 +177,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
                     .and_then(|ids| ids.pop_front())
@@ -259,9 +265,16 @@ pub(crate) async fn consume_provider_streaming_response(
                 })),
             "model_provider stream completed without final text or tool calls"
         );
-        anyhow::bail!(
-            "model_provider stream returned an invalid semantic completion: no final text or tool calls"
-        );
+        if outcome.saw_pre_executed_tool_activity {
+            return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                usage: outcome.usage,
+            }
+            .into());
+        }
+        return Err(StreamSemanticEmptyCompletion {
+            usage: outcome.usage,
+        }
+        .into());
     }
 
     Ok(outcome)

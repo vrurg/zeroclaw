@@ -174,8 +174,32 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        self.text_or_empty().trim().is_empty() && self.tool_calls.is_empty()
+        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
     }
+}
+
+/// Remove inline `<think>...</think>` reasoning before terminal-response
+/// classification or user-visible parsing.
+///
+/// An unclosed opening tag suppresses the remainder so partial reasoning never
+/// becomes final output.
+pub fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    loop {
+        if let Some(start) = remaining.find("<think>") {
+            result.push_str(&remaining[..start]);
+            if let Some(end) = remaining[start..].find("</think>") {
+                remaining = &remaining[start + end + "</think>".len()..];
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result.trim().to_string()
 }
 
 /// Request payload for model_provider chat calls.
@@ -894,6 +918,18 @@ mod turn_order_tests {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: Some("internal reasoning".to_string()),
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
+        let response = ChatResponse {
+            text: Some("<think>internal reasoning</think>".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
         };
 
         assert!(response.is_semantically_empty_terminal());
