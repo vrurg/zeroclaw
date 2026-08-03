@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
+use zeroclaw_providers::{
+    ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
+};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -47,15 +49,53 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        let resp = ProviderDispatch::from_ref(self.model_provider)
-            .chat(request, self.model, self.temperature)
-            .await?;
-        // Record spend immediately after the call (before any caller-side output
-        // validation) so a downstream failure still counts the provider usage.
-        if let Some(usage) = resp.usage.as_ref() {
-            crate::agent::cost::record_tool_loop_cost_usage(self.provider_name, self.model, usage);
+        let result = ProviderDispatch::from_ref(self.model_provider)
+            .chat_accounted(request, self.model, self.temperature)
+            .await;
+
+        match result {
+            Ok(accounted) => {
+                // Rejected attempts were billed, but did not supply the accepted
+                // response. Record them first without updating context-window
+                // fill; the accepted response below remains its sole source.
+                if let Some(usage) = accounted.rejected_attempt_usage.as_ref() {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        self.provider_name,
+                        self.model,
+                        usage,
+                    );
+                }
+                // Record accepted spend immediately after the call (before any
+                // caller-side output validation) so downstream failure still
+                // counts it without folding in rejected Reliable attempts.
+                if let Some(usage) = accounted.response.usage.as_ref() {
+                    crate::agent::cost::record_tool_loop_cost_usage(
+                        self.provider_name,
+                        self.model,
+                        usage,
+                    );
+                }
+                Ok(accounted.response)
+            }
+            Err(error) => {
+                // Accounted dispatch carries rejected usage on failures in the
+                // typed Reliable error chain. Keep the original error intact so
+                // terminal-cause classification remains the provider's source
+                // of truth.
+                if let Some(usage) = error.chain().find_map(|cause| {
+                    cause
+                        .downcast_ref::<ReliableRejectedCompletionUsage>()
+                        .map(|rejected| &rejected.usage)
+                }) {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        self.provider_name,
+                        self.model,
+                        usage,
+                    );
+                }
+                Err(error)
+            }
         }
-        Ok(resp)
     }
 }
 
@@ -175,11 +215,15 @@ mod run_model_query_tests {
     use super::ResolvedModelAccess;
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::TokenUsage;
-    use zeroclaw_providers::{ChatMessage, ModelProvider};
+    use zeroclaw_providers::{ChatMessage, ModelProvider, ReliableRejectedCompletionUsage};
 
     /// Provider stub returning a fixed reply WITH token usage, so the seam's
     /// cost-recording path has something to record.
@@ -224,6 +268,54 @@ mod run_model_query_tests {
         }
         fn alias(&self) -> &str {
             "usage-provider"
+        }
+    }
+
+    struct SemanticEmptyThenTextProvider {
+        calls: Arc<AtomicUsize>,
+        persist_empty: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptyThenTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let rejected = self.persist_empty || attempt == 0;
+            Ok(ChatResponse {
+                text: (!rejected).then(|| "recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(if rejected { 5 } else { 7 }),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for SemanticEmptyThenTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "semantic-empty-test"
         }
     }
 
@@ -281,5 +373,100 @@ mod run_model_query_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
         assert_eq!(recorded.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_separates_rejected_reliable_usage_from_context_fill() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_string(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::clone(&calls),
+                    persist_empty: false,
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let messages = [ChatMessage::user("hi")];
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                ResolvedModelAccess {
+                    model_provider: &reliable,
+                    provider_name: "reliable",
+                    model: "test-model",
+                    temperature: None,
+                }
+                .run_model_query(ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                })
+                .await
+            })
+            .await
+            .expect("the second Reliable attempt succeeds");
+
+        assert_eq!(
+            response.usage.expect("accepted usage").output_tokens,
+            Some(7)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 160);
+        assert_eq!(recorded.output_tokens, 12);
+        assert_eq!(recorded.last_input_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_records_rejected_reliable_usage_on_exhaustion() {
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "primary".to_string(),
+                Box::new(SemanticEmptyThenTextProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    persist_empty: true,
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = [ChatMessage::user("hi")];
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                ResolvedModelAccess {
+                    model_provider: &reliable,
+                    provider_name: "reliable",
+                    model: "test-model",
+                    temperature: None,
+                }
+                .run_model_query(ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                })
+                .await
+                .expect_err("semantic-empty exhaustion must fail")
+            })
+            .await;
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableRejectedCompletionUsage>())
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 80);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 0);
     }
 }
