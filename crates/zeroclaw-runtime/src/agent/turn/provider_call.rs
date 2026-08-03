@@ -9,16 +9,19 @@ use super::outcome::{
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::{check_tool_loop_budget, record_tool_loop_cost_usage};
+use crate::agent::cost::{check_tool_loop_budget, record_rejected_tool_loop_cost_usage};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{
+    AccountedChatResponse, ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch,
+};
 
 pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
+    pub(crate) rejected_attempt_usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
     pub(crate) streamed_visible_text: String,
@@ -181,11 +184,14 @@ pub(crate) async fn call_provider(
                 } else {
                     Some(streamed.reasoning_content)
                 };
-                Ok(zeroclaw_providers::ChatResponse {
-                    text: Some(streamed.response_text),
-                    tool_calls: streamed.tool_calls,
-                    usage: streamed.usage,
-                    reasoning_content,
+                Ok(AccountedChatResponse {
+                    response: zeroclaw_providers::ChatResponse {
+                        text: Some(streamed.response_text),
+                        tool_calls: streamed.tool_calls,
+                        usage: streamed.usage,
+                        reasoning_content,
+                    },
+                    rejected_attempt_usage: None,
                 })
             }
             Err(stream_err)
@@ -197,7 +203,7 @@ pub(crate) async fn call_provider(
                     .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
                     .and_then(|error| error.usage.as_ref())
                 {
-                    record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                    record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
                 }
                 Err(stream_err)
             }
@@ -214,7 +220,7 @@ pub(crate) async fn call_provider(
                     .downcast_ref::<StreamSemanticEmptyCompletion>()
                     .and_then(|error| error.usage.as_ref());
                 if let Some(usage) = discarded_usage {
-                    record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                    record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
                 }
                 ::zeroclaw_log::record!(
                     WARN,
@@ -231,7 +237,7 @@ pub(crate) async fn call_provider(
                 );
                 {
                     let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-                    let chat_future = dispatcher.chat(
+                    let chat_future = dispatcher.chat_accounted(
                         ChatRequest {
                             messages: prepared_messages,
                             tools: request_tools,
@@ -258,7 +264,7 @@ pub(crate) async fn call_provider(
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-        let chat_future = dispatcher.chat(
+        let chat_future = dispatcher.chat_accounted(
             ChatRequest {
                 messages: prepared_messages,
                 tools: request_tools,
@@ -308,8 +314,14 @@ pub(crate) async fn call_provider(
         }
     };
 
+    let (chat_result, rejected_attempt_usage) = match chat_result {
+        Ok(accounted) => (Ok(accounted.response), accounted.rejected_attempt_usage),
+        Err(error) => (Err(error), None),
+    };
+
     Ok(ProviderCallOutcome {
         chat_result,
+        rejected_attempt_usage,
         streamed_live_deltas,
         streamed_protocol_suppressed,
         streamed_visible_text,

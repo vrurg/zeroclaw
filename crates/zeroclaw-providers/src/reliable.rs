@@ -30,6 +30,33 @@ tokio::task_local! {
     static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
 }
 
+tokio::task_local! {
+    static RELIABLE_REJECTED_ATTEMPT_USAGE: RefCell<Option<TokenUsage>>;
+}
+
+/// Run a provider call while retaining billed usage from rejected Reliable
+/// attempts separately from the accepted response's context usage.
+pub async fn scope_reliable_rejected_usage<F: std::future::Future>(
+    future: F,
+) -> (F::Output, Option<TokenUsage>) {
+    RELIABLE_REJECTED_ATTEMPT_USAGE
+        .scope(RefCell::new(None), async {
+            let output = future.await;
+            let usage = RELIABLE_REJECTED_ATTEMPT_USAGE.with(|cell| cell.borrow_mut().take());
+            (output, usage)
+        })
+        .await
+}
+
+/// Record rejected Reliable-attempt usage in the active accounting scope.
+/// Returns `false` when the caller did not request separate accounting, so
+/// legacy direct trait callers retain their existing aggregate response usage.
+pub(crate) fn record_rejected_attempt_usage(usage: TokenUsage) -> bool {
+    RELIABLE_REJECTED_ATTEMPT_USAGE
+        .try_with(|cell| accumulate_usage(&mut cell.borrow_mut(), Some(&usage)))
+        .is_ok()
+}
+
 /// Take (consume) the last model_provider fallback info, if any.
 /// Must be called within a `scope_provider_fallback` scope.
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
@@ -1678,7 +1705,11 @@ impl ModelProvider for ReliableModelProvider {
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
-                            combine_response_usage(&mut resp, rejected_attempt_usage.take());
+                            if let Some(usage) = rejected_attempt_usage.take()
+                                && !record_rejected_attempt_usage(usage.clone())
+                            {
+                                combine_response_usage(&mut resp, Some(usage));
+                            }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
@@ -1910,7 +1941,11 @@ impl ModelProvider for ReliableModelProvider {
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
-                            combine_response_usage(&mut resp, rejected_attempt_usage.take());
+                            if let Some(usage) = rejected_attempt_usage.take()
+                                && !record_rejected_attempt_usage(usage.clone())
+                            {
+                                combine_response_usage(&mut resp, Some(usage));
+                            }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
@@ -3015,6 +3050,76 @@ mod tests {
         let usage = response.usage.expect("combined usage is retained");
         assert_eq!(usage.input_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn accounted_chat_keeps_rejected_usage_out_of_accepted_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let accounted = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect("second attempt succeeds");
+
+        let accepted = accounted.response.usage.expect("accepted usage");
+        assert_eq!(accepted.input_tokens, Some(10));
+        assert_eq!(accepted.output_tokens, Some(5));
+        let rejected = accounted
+            .rejected_attempt_usage
+            .expect("rejected usage sidecar");
+        assert_eq!(rejected.input_tokens, Some(10));
+        assert_eq!(rejected.output_tokens, Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn accounted_chat_with_tools_keeps_rejected_usage_out_of_accepted_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let accounted = ProviderDispatch::from_ref(&model_provider)
+            .chat_with_tools_accounted(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("second attempt succeeds");
+
+        let accepted = accounted.response.usage.expect("accepted usage");
+        assert_eq!(accepted.input_tokens, Some(10));
+        assert_eq!(accepted.output_tokens, Some(5));
+        let rejected = accounted
+            .rejected_attempt_usage
+            .expect("rejected usage sidecar");
+        assert_eq!(rejected.input_tokens, Some(10));
+        assert_eq!(rejected.output_tokens, Some(5));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
