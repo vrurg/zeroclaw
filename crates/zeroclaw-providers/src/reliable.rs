@@ -3200,7 +3200,11 @@ mod tests {
             .await
             .expect_err("untruncatable context error must fail");
 
-        assert!(error.to_string().contains("cannot be reduced further"));
+        assert!(
+            error
+                .to_string()
+                .contains("without breaking message/tool pairing")
+        );
         let rejected = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
@@ -3242,7 +3246,11 @@ mod tests {
             .await
             .expect_err("untruncatable context error must fail");
 
-        assert!(error.to_string().contains("cannot be reduced further"));
+        assert!(
+            error
+                .to_string()
+                .contains("without breaking message/tool pairing")
+        );
         let rejected = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
