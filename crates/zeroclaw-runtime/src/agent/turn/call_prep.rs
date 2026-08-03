@@ -5,7 +5,7 @@
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
-use super::events::{StreamDelta, emit_tool_call_pair};
+use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
@@ -255,6 +255,7 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         // ── Progress: tool start ────────────────────────────
+        send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
         let stream_call = ctx.on_delta.map(|_| StreamToolCall {
             arguments: Arc::new(tool_args.clone()),
             tool_role: crate::agent::tool_execution::find_tool(tools_registry, &tool_name)
@@ -432,10 +433,11 @@ mod tests {
         .await;
 
         let mut roles = Vec::new();
-        for _ in 0..2 {
+        while roles.len() < 2 {
             match rx.recv().await.expect("start and completion events") {
                 StreamDelta::ToolStart { tool_role, .. }
                 | StreamDelta::ToolComplete { tool_role, .. } => roles.push(tool_role),
+                StreamDelta::Lifecycle(_) => {}
                 other => panic!("expected a tool event, got {other:?}"),
             }
         }

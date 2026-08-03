@@ -3,7 +3,7 @@
 
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
-use super::events::StreamDelta;
+use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use zeroclaw_tool_call_parser::ParsedToolCall;
@@ -66,6 +66,7 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         // ── Progress: tool completion ───────────────────────
+        send_progress(ctx.on_delta, ProgressEvent::Planning).await;
         if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
             let secs = outcome.duration.as_secs();
             ::zeroclaw_log::record!(

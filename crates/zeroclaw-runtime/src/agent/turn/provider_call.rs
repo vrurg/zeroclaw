@@ -2,7 +2,7 @@
 //! streaming/non-streaming chat dispatch.
 
 use super::context::TurnCtx;
-use super::events::{StreamDelta, thinking_status_text};
+use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
 use super::outcome::{StreamInterruptedAfterOutput, ToolLoopCancelled, is_tool_loop_cancelled};
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -31,6 +31,7 @@ pub(crate) async fn announce_llm_request(
     iteration: usize,
 ) -> Instant {
     // ── Progress: LLM thinking ────────────────────────────
+    send_progress(ctx.on_delta, ProgressEvent::WaitingOnModel).await;
     if ctx.draft_reasoning == StreamReasoningMode::Status
         && let Some(tx) = ctx.on_delta
     {
@@ -297,7 +298,7 @@ pub(crate) async fn call_provider(
 #[cfg(test)]
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
-    use super::super::events::{StreamDelta, thinking_status_text};
+    use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
     use super::announce_llm_request;
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
@@ -382,6 +383,13 @@ mod payload_capture_tests {
             }
             drop(tx);
             assert!(
+                matches!(
+                    rx.recv().await,
+                    Some(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel))
+                ),
+                "{mode:?} must emit typed lifecycle progress"
+            );
+            assert!(
                 rx.recv().await.is_none(),
                 "{mode:?} must not emit the static Thinking status line"
             );
@@ -396,6 +404,10 @@ mod payload_capture_tests {
         drop(tx);
         assert!(matches!(
             rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel))
+        ));
+        assert!(matches!(
+            rx.recv().await,
             Some(StreamDelta::Status(text)) if text == thinking_status_text(0)
         ));
 
@@ -406,6 +418,10 @@ mod payload_capture_tests {
             let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
         }
         drop(tx);
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel))
+        ));
         assert!(matches!(
             rx.recv().await,
             Some(StreamDelta::Status(text)) if text == thinking_status_text(3)

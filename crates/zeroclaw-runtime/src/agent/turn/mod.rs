@@ -31,8 +31,8 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
-    DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, StreamDelta,
-    THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
+    DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
+    StreamDelta, THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
     thinking_status_round, thinking_status_text,
 };
 pub use execution::{
@@ -777,6 +777,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &e,
                     iteration,
                     event_tx.as_ref(),
+                    on_delta.as_ref(),
                     observer,
                     context_token_budget,
                 )

@@ -965,11 +965,12 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
-    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, REASONING_FULL_PREFIX, ResolvedAgentExecution,
-    ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta,
-    THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled, drain_steering_messages,
-    is_model_switch_requested, is_thinking_status_text, is_tool_loop_cancelled, run_tool_call_loop,
-    scrub_credentials, thinking_status_label_round, thinking_status_round, thinking_status_text,
+    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
+    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -2364,6 +2365,7 @@ pub async fn run(
                     use std::io::Write;
                     while let Some(event) = delta_rx.recv().await {
                         match event {
+                            StreamDelta::Lifecycle(_) => {}
                             StreamDelta::Status(text) => {
                                 if is_tty {
                                     let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
@@ -9849,7 +9851,9 @@ This is an example, not an invocation."#;
                 StreamDelta::Reasoning(text) => {
                     !text.contains("private chain of thought") && !text.contains("<think>")
                 }
-                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => true,
+                StreamDelta::ToolStart { .. }
+                | StreamDelta::ToolComplete { .. }
+                | StreamDelta::Lifecycle(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -9944,7 +9948,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -10038,7 +10042,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11037,7 +11041,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -11512,7 +11516,7 @@ This is an example, not an invocation."#;
         let mut visible_deltas = String::new();
         while let Some(delta) = rx.recv().await {
             match delta {
-                StreamDelta::Status(_) => {}
+                StreamDelta::Status(_) | StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -13854,6 +13858,7 @@ Let me check the result."#;
                 StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
                     d.legacy_status().unwrap_or_default()
                 }
+                StreamDelta::Lifecycle(_) => String::new(),
             })
             .collect();
 

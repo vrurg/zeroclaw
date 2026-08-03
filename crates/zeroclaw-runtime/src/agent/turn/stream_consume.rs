@@ -531,6 +531,7 @@ mod tests {
             match delta {
                 StreamDelta::Text(text) => assert_eq!(text, "final"),
                 StreamDelta::Status(text) => assert!(!text.contains("first second")),
+                StreamDelta::Lifecycle(_) => {}
                 StreamDelta::Reasoning(text) => {
                     panic!("status mode must not emit raw reasoning: {text}")
                 }

@@ -9,6 +9,7 @@ use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use zeroclaw_api::attribution::Role;
+pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying live model text to draft surfaces.
@@ -95,6 +96,8 @@ pub enum StreamDelta {
     },
     /// Provider reasoning text. Channel surfaces must opt in before rendering.
     Reasoning(String),
+    /// Typed, non-sensitive agent lifecycle progress.
+    Lifecycle(ProgressEvent),
 }
 
 impl StreamDelta {
@@ -120,8 +123,16 @@ impl StreamDelta {
                 *success,
                 error.as_deref(),
             )),
-            Self::Text(_) | Self::Status(_) | Self::Reasoning(_) => None,
+            Self::Text(_) | Self::Status(_) | Self::Reasoning(_) | Self::Lifecycle(_) => None,
         }
+    }
+}
+
+/// Send a typed lifecycle state through the draft stream without exposing tool
+/// names, arguments, prompts, provider output, or error details.
+pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Lifecycle(event)).await;
     }
 }
 

@@ -5166,7 +5166,7 @@ fn matrix_progress_text(
         StreamDelta::Reasoning(text) => Some(matrix_scrub_progress_text(&format!(
             "{REASONING_FULL_PREFIX}{text}"
         ))),
-        StreamDelta::Text(_) => None,
+        StreamDelta::Text(_) | StreamDelta::Lifecycle(_) => None,
     }
 }
 
@@ -6119,13 +6119,10 @@ async fn process_channel_message_body(
                 stop_matrix_single_message_typing_scope(scope).await;
             }
             match channel
-                .send_draft(
-                    &SendMessage::new(
-                        zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
-                        &msg.reply_target,
-                    )
-                    .in_thread(msg.thread_ts.clone()),
-                )
+                .send_draft(&SendMessage::reply_to(
+                    &msg,
+                    zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+                ))
                 .await
             {
                 Ok(id) => id,
@@ -6183,6 +6180,22 @@ async fn process_channel_message_body(
                     let mut accumulated = String::new();
                     while let Some(event) = rx.recv().await {
                         match event {
+                            StreamDelta::Lifecycle(event) => {
+                                if let Err(e) = channel
+                                    .update_draft_lifecycle(&reply_target, &draft_id, event)
+                                    .await
+                                {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                                        "Draft lifecycle update failed"
+                                    );
+                                }
+                            }
                             StreamDelta::Status(text) => {
                                 let visible = strip_think_tags_inline(&text);
                                 if let Err(e) = channel
@@ -6275,6 +6288,22 @@ async fn process_channel_message_body(
     } else {
         None
     };
+
+    // Give draft-capable channels stable lifecycle signals before model work.
+    // Matrix single-message keeps its transcript path and ignores these typed
+    // chrome events; other channels decide how to render or rate-limit them.
+    if let Some(tx) = delta_tx.as_ref() {
+        let _ = tx
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::Received,
+            ))
+            .await;
+        let _ = tx
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::Planning,
+            ))
+            .await;
+    }
 
     // Preserve the existing typing task placement and lifecycle for all other
     // modes. Matrix single-message has already completed its short typing
@@ -15576,7 +15605,10 @@ api_key = "anthropic-key"
         final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
+        progress_messages: tokio::sync::Mutex<Vec<String>>,
+        lifecycle_events: tokio::sync::Mutex<Vec<zeroclaw_runtime::agent::loop_::ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
+        cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
         delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
         stall_start_typing: bool,
         stall_stop_typing: bool,
@@ -15601,7 +15633,10 @@ api_key = "anthropic-key"
                 final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
+                progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
+                cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
                 delivery_events: tokio::sync::Mutex::new(Vec::new()),
                 stall_start_typing: false,
                 stall_stop_typing: false,
@@ -15985,6 +16020,34 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}:{text}"));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push(format!("{recipient}:{message_id}"));
+            Ok(())
+        }
+
+        async fn update_draft_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn update_draft_lifecycle(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: zeroclaw_runtime::agent::loop_::ProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.lifecycle_events.lock().await.push(event);
             Ok(())
         }
     }
