@@ -4849,7 +4849,7 @@ mod tests {
                 test_security(),
             ))])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
         let result = tool
             .execute_agentic(
                 "agentic",

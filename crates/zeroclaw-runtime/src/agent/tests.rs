@@ -883,7 +883,7 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn turn_handles_empty_text_response() {
+async fn turn_rejects_empty_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
@@ -893,12 +893,15 @@ async fn turn_handles_empty_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("empty terminal response must fail");
+    assert!(err.to_string().contains("invalid semantic completion"));
 }
 
 #[tokio::test]
-async fn turn_handles_none_text_response() {
+async fn turn_rejects_none_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
@@ -908,9 +911,11 @@ async fn turn_handles_none_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("missing terminal text must fail");
+    assert!(err.to_string().contains("invalid semantic completion"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
