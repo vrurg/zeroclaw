@@ -812,6 +812,8 @@ channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-
 channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
 channel-runtime-agent-scope-rejected = 发送者 `{ $sender }` 无权在 agent `{ $agent }` 上执行 `/model --agent`。请改用 `/model --user { $model }`（仅本次会话生效），或请管理员将 peer group 的 `admin_for_agent_scope` 设为 `true` 并将你列为成员。
 channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
+channel-runtime-no-reply-refused = 🚫 我无法处理该请求。
+channel-runtime-no-reply-failed = ⚠️ 我无法完成该请求。
 channel-runtime-current-model-status =
     当前 model_provider：`{ $provider }`
     当前模型：`{ $model }`

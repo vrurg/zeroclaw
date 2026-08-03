@@ -831,10 +831,10 @@ impl LarkChannel {
         let card =
             build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         let body = serde_json::json!({
             "receive_id": recipient,
-            "receive_id_type": "chat_id",
+            "receive_id_type": lark_receive_id_type_for(recipient),
             "msg_type": "interactive",
             "content": serde_json::to_string(&card)?,
         });
@@ -1104,8 +1104,12 @@ impl LarkChannel {
         format!("{}/bot/v3/info", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, receive_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages?receive_id_type={}",
+            self.api_base(),
+            lark_receive_id_type_for(receive_id)
+        )
     }
 
     /// PATCH endpoint for updating the content of a previously-sent message
@@ -2420,7 +2424,7 @@ impl LarkChannel {
             "msg_type": media.msg_type,
             "content": media.content.to_string(),
         });
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
         self.send_json_with_token_refresh(&url, token, &body, "media send")
             .await
     }
@@ -2692,7 +2696,7 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
         let (text_content, raw_markers) = super::util::parse_attachment_markers(&message.content);
         let markers = raw_markers
             .into_iter()
@@ -3007,7 +3011,7 @@ impl Channel for LarkChannel {
             LARK_CARD_MARKDOWN_MAX_BYTES,
         );
         let body = build_interactive_card_body(&message.recipient, &placeholder);
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
         let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
             Ok(r) => r,
@@ -3119,7 +3123,7 @@ impl Channel for LarkChannel {
         self.patch_card_content(message_id, first).await?;
 
         if chunks.len() > 1 {
-            let url = self.send_message_url();
+            let url = self.send_message_url(recipient);
             for chunk in &chunks[1..] {
                 let body = build_interactive_card_body(recipient, chunk);
                 self.send_json_with_token_refresh(&url, &mut token, &body, "finalize_draft chunk")
@@ -3882,6 +3886,18 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             text: result,
             mentioned_open_ids,
         })
+    }
+}
+
+fn lark_receive_id_type_for(receive_id: &str) -> &'static str {
+    if receive_id.starts_with("ou_") {
+        "open_id"
+    } else if receive_id.starts_with("on_") {
+        "union_id"
+    } else if receive_id.contains('@') {
+        "email"
+    } else {
+        "chat_id"
     }
 }
 
