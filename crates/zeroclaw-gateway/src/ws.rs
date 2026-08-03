@@ -1559,8 +1559,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+    #[test]
+    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+        // This production-shaped fixture exceeds the Linux test harness's
+        // default stack; isolate only this test instead of weakening CI-wide
+        // stack limits or dropping the real WebSocket boundary coverage.
+        std::thread::Builder::new()
+            .name("ws-empty-terminal-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner() {
         // This is a real WebSocket upgrade and a real agent built from live
         // config. The local Anthropic-shaped server completes an empty SSE
         // response, then returns an empty non-stream fallback, exercising the

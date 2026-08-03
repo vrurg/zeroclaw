@@ -785,10 +785,10 @@ fn reliable_terminal_error(
 
     match rejected_attempt_usage {
         Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage { usage, failures }),
-        None => anyhow::anyhow!(
+        None => anyhow::Error::msg(format!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
-        ),
+        )),
     }
 }
 
