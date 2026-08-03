@@ -31,7 +31,7 @@ pub mod traits;
 pub mod vision_override;
 
 pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
-pub use reliable::ReliableRejectedCompletionUsage;
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 

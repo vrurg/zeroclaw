@@ -742,6 +742,56 @@ impl std::fmt::Display for ReliableRejectedCompletionUsage {
 
 impl std::error::Error for ReliableRejectedCompletionUsage {}
 
+/// The final candidate attempt completed successfully at the transport layer
+/// but supplied neither usable text nor a native tool call. This remains typed
+/// independently from optional rejected-attempt usage so delivery layers can
+/// classify the actual terminal failure without guessing from accounting data.
+#[derive(Debug)]
+pub struct ReliableSemanticEmptyCompletion {
+    failures: Vec<String>,
+    rejected_usage: Option<ReliableRejectedCompletionUsage>,
+}
+
+impl std::fmt::Display for ReliableSemanticEmptyCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "All model_providers/models failed. Attempts:\n{}",
+            self.failures.join("\n")
+        )
+    }
+}
+
+impl std::error::Error for ReliableSemanticEmptyCompletion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.rejected_usage
+            .as_ref()
+            .map(|usage| usage as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn reliable_terminal_error(
+    failures: Vec<String>,
+    rejected_attempt_usage: Option<TokenUsage>,
+    final_cause_is_semantic_empty: bool,
+) -> anyhow::Error {
+    if final_cause_is_semantic_empty {
+        return anyhow::Error::new(ReliableSemanticEmptyCompletion {
+            failures: failures.clone(),
+            rejected_usage: rejected_attempt_usage
+                .map(|usage| ReliableRejectedCompletionUsage { usage, failures }),
+        });
+    }
+
+    match rejected_attempt_usage {
+        Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage { usage, failures }),
+        None => anyhow::anyhow!(
+            "All model_providers/models failed. Attempts:\n{}",
+            failures.join("\n")
+        ),
+    }
+}
+
 fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
     let Some(usage) = usage else {
         return;
@@ -1107,6 +1157,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut final_cause_is_semantic_empty = false;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1150,6 +1201,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_cause_is_semantic_empty = true;
                                 break;
                             }
                             let served_model = entry.served_model(current_model);
@@ -1177,6 +1229,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
                             if is_context_window_exceeded(&e) {
@@ -1302,10 +1355,11 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(reliable_terminal_error(
+            failures,
+            None,
+            final_cause_is_semantic_empty,
+        ))
     }
 
     async fn chat_with_history(
@@ -1316,6 +1370,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1357,6 +1412,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_cause_is_semantic_empty = true;
                                 break;
                             }
                             let served_model = entry.served_model(current_model);
@@ -1385,6 +1441,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -1515,10 +1572,11 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(reliable_terminal_error(
+            failures,
+            None,
+            final_cause_is_semantic_empty,
+        ))
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
@@ -1573,6 +1631,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -1616,6 +1675,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_cause_is_semantic_empty = true;
                                 break;
                             }
                             combine_response_usage(&mut resp, rejected_attempt_usage.take());
@@ -1645,6 +1705,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -1782,14 +1843,11 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        if let Some(usage) = rejected_attempt_usage {
-            return Err(ReliableRejectedCompletionUsage { usage, failures }.into());
-        }
-
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(reliable_terminal_error(
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+        ))
     }
 
     async fn chat(
@@ -1800,6 +1858,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -1848,6 +1907,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_cause_is_semantic_empty = true;
                                 break;
                             }
                             combine_response_usage(&mut resp, rejected_attempt_usage.take());
@@ -1877,6 +1937,7 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -2018,14 +2079,11 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        if let Some(usage) = rejected_attempt_usage {
-            return Err(ReliableRejectedCompletionUsage { usage, failures }.into());
-        }
-
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(reliable_terminal_error(
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+        ))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -2867,6 +2925,33 @@ mod tests {
         )
     }
 
+    fn semantic_empty_then_provider_error_reliable() -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        empty_until_attempt: usize::MAX,
+                        response: "never",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
     #[tokio::test]
     async fn chat_retries_empty_completion_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2962,8 +3047,15 @@ mod tests {
             .expect_err("persistent semantic-empty responses must fail");
 
         let rejected = error
-            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
             .expect("rejected usage must survive exhaustion");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "the final semantic-empty cause must remain typed alongside usage"
+        );
         assert_eq!(rejected.usage.input_tokens, Some(20));
         assert_eq!(rejected.usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -3005,8 +3097,15 @@ mod tests {
 
         assert!(error.to_string().contains("cannot be reduced further"));
         let rejected = error
-            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
             .expect("rejected usage must survive the early context exit");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later context failure supersedes an earlier semantic-empty attempt"
+        );
         assert_eq!(rejected.usage.input_tokens, Some(10));
         assert_eq!(rejected.usage.output_tokens, Some(5));
     }
@@ -3040,8 +3139,15 @@ mod tests {
 
         assert!(error.to_string().contains("cannot be reduced further"));
         let rejected = error
-            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
             .expect("rejected usage must survive the early context exit");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later context failure supersedes an earlier semantic-empty attempt"
+        );
         assert_eq!(rejected.usage.input_tokens, Some(10));
         assert_eq!(rejected.usage.output_tokens, Some(5));
     }
@@ -3257,51 +3363,195 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("semantic-empty chat result must fail");
         assert!(
-            provider
-                .chat(
-                    ChatRequest {
-                        messages: &messages,
-                        tools: None,
-                        thinking: None,
-                    },
-                    "test",
-                    Some(0.0),
-                )
-                .await
-                .is_err()
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty tool result must fail");
         assert!(
-            provider
-                .chat_with_tools(&messages, &[], "test", Some(0.0))
-                .await
-                .is_err()
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty history result must fail");
         assert!(
-            provider
-                .chat_with_history(&messages, "test", Some(0.0))
-                .await
-                .is_err()
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty system result must fail");
         assert!(
-            provider
-                .chat_with_system(None, "hello", "test", Some(0.0))
-                .await
-                .is_err()
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn every_reliable_chat_entrypoint_uses_the_later_provider_failure_cause() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("the later provider failure must fail chat");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_tools(&messages, &tools, "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_tools");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_history");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_system");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+    }
+
+    fn assert_later_provider_failure_supersedes_semantic_empty(error: &anyhow::Error) {
+        assert!(
+            error
+                .to_string()
+                .contains("upstream terminal provider failure"),
+            "the final provider failure must be retained: {error:#}"
+        );
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later provider failure must supersede the semantic-empty marker: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_provider_failure_keeps_rejected_usage_without_a_semantic_empty_marker() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "test",
+            Some(0.0),
+        )
+        .await
+        .expect_err("the later provider failure must fail chat");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+        assert_rejected_usage_survives(&error);
+
+        let error = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .chat_with_tools(&messages, &tools, "test", Some(0.0))
+        .await
+        .expect_err("the later provider failure must fail chat_with_tools");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+        assert_rejected_usage_survives(&error);
+    }
+
+    fn assert_rejected_usage_survives(error: &anyhow::Error) {
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive the later provider failure");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
     }
 
     #[tokio::test]

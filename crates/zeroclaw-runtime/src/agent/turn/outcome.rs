@@ -64,7 +64,7 @@ pub(crate) struct StreamPreExecutedToolsWithoutFinalResponse {
 
 impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&pre_executed_tools_without_final_response_message(None))
+        f.write_str("provider stream ended after provider-executed tools without a final response")
     }
 }
 
@@ -80,7 +80,7 @@ pub(crate) struct StreamSemanticEmptyCompletion {
 
 impl std::fmt::Display for StreamSemanticEmptyCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&semantic_empty_terminal_completion_message(None))
+        f.write_str("provider stream completed without final text or tool calls")
     }
 }
 
@@ -94,7 +94,7 @@ pub(crate) struct SemanticEmptyTerminalCompletion;
 
 impl std::fmt::Display for SemanticEmptyTerminalCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&semantic_empty_terminal_completion_message(None))
+        f.write_str("provider completed without final text or tool calls")
     }
 }
 
@@ -105,6 +105,7 @@ pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
     err.chain().any(|source| {
         source.is::<SemanticEmptyTerminalCompletion>()
             || source.is::<StreamSemanticEmptyCompletion>()
+            || source.is::<zeroclaw_providers::ReliableSemanticEmptyCompletion>()
     })
 }
 
@@ -216,6 +217,55 @@ mod tests {
     fn is_tool_loop_cancelled_unrelated_error_returns_false() {
         let err = anyhow::Error::msg("some other error");
         assert!(!is_tool_loop_cancelled(&err));
+    }
+
+    #[test]
+    fn terminal_completion_diagnostics_are_stable_english() {
+        let direct = SemanticEmptyTerminalCompletion;
+        let stream = StreamSemanticEmptyCompletion { usage: None };
+        let provider_tools = StreamPreExecutedToolsWithoutFinalResponse { usage: None };
+
+        assert_eq!(
+            direct.to_string(),
+            "provider completed without final text or tool calls"
+        );
+        assert_eq!(
+            stream.to_string(),
+            "provider stream completed without final text or tool calls"
+        );
+        assert_eq!(
+            provider_tools.to_string(),
+            "provider stream ended after provider-executed tools without a final response"
+        );
+    }
+
+    #[test]
+    fn semantic_empty_cause_uses_the_fluent_delivery_projection() {
+        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+        assert!(is_semantic_empty_terminal_completion(&error));
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some("The model provider returned an invalid semantic completion.".to_string())
+        );
+    }
+
+    #[test]
+    fn disk_catalog_override_changes_delivery_not_the_diagnostic() {
+        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+        let disk_override =
+            "cli-agent-error-invalid-semantic-completion = Réponse terminale invalide.\n";
+        let delivered = crate::i18n::get_disk_override_cli_string_for_test(
+            "fr",
+            disk_override,
+            "cli-agent-error-invalid-semantic-completion",
+            &[],
+        );
+
+        assert_eq!(delivered, "Réponse terminale invalide.");
+        assert_eq!(
+            error.to_string(),
+            "provider completed without final text or tool calls"
+        );
     }
 
     #[test]

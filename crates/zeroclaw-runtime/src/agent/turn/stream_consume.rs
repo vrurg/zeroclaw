@@ -471,7 +471,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            crate::agent::semantic_empty_terminal_completion_message(None)
+            "provider stream completed without final text or tool calls"
         );
     }
 }

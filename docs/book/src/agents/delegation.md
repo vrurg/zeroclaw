@@ -85,7 +85,7 @@ What CAN be made deterministic is **availability**: tools that aren't in the par
 
 What's verifiable end-to-end:
 
-1. The literal output strings the tool returns to the model on each path (success, refusal, failure). Quoted verbatim below, sourced from `tools/spawn_subagent.rs` and `tools/delegate.rs`.
+1. Protocol-owned tool output and refusal strings are literal Rust contracts. User-visible failure delivery is a Fluent catalog contract: the English source is named below, and non-English deployments render the same key differently.
 2. The literal config knobs that change behavior (`allowed_tools`, `max_delegation_depth`, etc.).
 3. The structured tracing span shape that scopes everything emitted during the child run.
 
@@ -175,7 +175,9 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 User-visible failure strings are localized Fluent messages. Their English source
 of truth is `crates/zeroclaw-runtime/locales/en/cli.ftl`; examples below show
-the current English catalog values, not a wire-level string contract.
+the current English catalog values, not a wire-level string contract. The
+remaining listed strings are protocol/tool outputs unless this section labels
+them as Fluent keys.
 
 1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by a non-empty target agent response.
 2. A terminal empty response is a synchronous failure: its error field uses

@@ -899,7 +899,7 @@ async fn turn_rejects_empty_text_response() {
         .expect_err("empty terminal response must fail");
     assert_eq!(
         err.to_string(),
-        crate::agent::semantic_empty_terminal_completion_message(None)
+        "provider completed without final text or tool calls"
     );
 }
 
@@ -920,7 +920,7 @@ async fn turn_rejects_none_text_response() {
         .expect_err("missing terminal text must fail");
     assert_eq!(
         err.to_string(),
-        crate::agent::semantic_empty_terminal_completion_message(None)
+        "provider completed without final text or tool calls"
     );
 }
 
@@ -953,7 +953,10 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
         .await
         .expect_err("think-only terminal response must fail");
 
-    assert!(error.to_string().contains("invalid semantic completion"));
+    assert_eq!(
+        error.to_string(),
+        "provider completed without final text or tool calls"
+    );
     let recorded = *turn_usage.lock();
     assert_eq!(recorded.input_tokens, 10);
     assert_eq!(recorded.output_tokens, 5);
