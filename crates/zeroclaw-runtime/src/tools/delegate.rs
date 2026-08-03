@@ -45,9 +45,10 @@ async fn active_goal_task_id_from_cost_context() -> anyhow::Result<Option<String
     if !ctx.goal_attribution_enabled() {
         return Ok(None);
     }
-    let agent_alias = ctx.agent_alias.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("goal state lookup is missing agent identity")
-    })?;
+    let agent_alias = ctx
+        .agent_alias
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("goal state lookup is missing agent identity"))?;
     let Some(control_plane) = crate::control_plane::control_plane() else {
         return Err(anyhow::anyhow!("goal control plane unavailable"));
     };
@@ -1424,7 +1425,7 @@ impl Tool for DelegateTool {
             {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(crate::i18n::get_required_tool_string(
                         "tool-delegate-error-background-goal-context",
                     )),

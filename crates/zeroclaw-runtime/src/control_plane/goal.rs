@@ -638,6 +638,12 @@ pub struct GoalAdmissionContext {
     pub originator_route: Option<String>,
     /// Authenticated principal that originated the command, when available.
     pub principal_id: Option<String>,
+    /// Legacy sanitizer-derived route supplied only as migration evidence.
+    pub legacy_originator_route: Option<String>,
+    /// Legacy sanitizer-derived principal supplied only as migration evidence.
+    pub legacy_principal_id: Option<String>,
+    /// Exact task bound by trusted goal-control plumbing when available.
+    pub goal_task_id: Option<String>,
     /// Minimal durable channel context needed to resume after restart.
     ///
     /// The context itself is persisted by the goal store. The rest of this
@@ -714,6 +720,9 @@ impl GoalAdmissionContext {
             channel_type: None,
             originator_route: None,
             principal_id: None,
+            legacy_originator_route: None,
+            legacy_principal_id: None,
+            goal_task_id: None,
             continuation_context: None,
         }
     }
@@ -739,6 +748,23 @@ impl GoalAdmissionContext {
     #[must_use]
     pub fn with_principal_id(mut self, principal_id: Option<String>) -> Self {
         self.principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_legacy_identity(
+        mut self,
+        originator_route: Option<String>,
+        principal_id: Option<String>,
+    ) -> Self {
+        self.legacy_originator_route = originator_route;
+        self.legacy_principal_id = principal_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_goal_task_id(mut self, goal_task_id: Option<String>) -> Self {
+        self.goal_task_id = goal_task_id;
         self
     }
 
@@ -2140,14 +2166,13 @@ async fn resolve_goal_task(
     ctx: &GoalAdmissionContext,
     task_id: Option<String>,
 ) -> Result<TaskRecord> {
-    if let Some(task_id) = task_id.as_deref() {
+    if let Some(task_id) = ctx.goal_task_id.as_deref().or(task_id.as_deref()) {
         let task = store
             .get(task_id)
             .await
             .with_context(|| msg("goal-command-error-lookup-failed", &[]))?
             .with_context(|| msg("goal-command-error-not-found", &[("task_id", task_id)]))?;
-        ensure_goal_visible(&task, ctx)?;
-        return Ok(task);
+        return ensure_goal_visible_or_rebind(goal_store, task, ctx).await;
     }
 
     let task = goal_store
