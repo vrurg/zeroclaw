@@ -484,3 +484,119 @@ mod payload_capture_tests {
         zeroclaw_log::clear_broadcast_hook();
     }
 }
+
+#[cfg(test)]
+mod streaming_fallback_tests {
+    use super::super::context::TurnCtx;
+    use super::*;
+    use crate::observability::NoopObserver;
+    use async_trait::async_trait;
+    use futures_util::stream::BoxStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::StreamEvent;
+    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_providers::ModelProvider;
+    use zeroclaw_providers::traits::{StreamOptions, StreamResult};
+
+    struct EmptyStreamThenTextProvider {
+        non_stream_calls: AtomicUsize,
+    }
+
+    impl Attributable for EmptyStreamThenTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "EmptyStreamThenTextProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyStreamThenTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("fallback response".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_empty_stream_uses_one_non_streaming_fallback() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("stream failure is recovered by one non-streaming request");
+        let response = outcome.chat_result.expect("fallback response succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+    }
+}

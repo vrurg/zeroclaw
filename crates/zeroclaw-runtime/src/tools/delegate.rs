@@ -1344,26 +1344,39 @@ impl DelegateTool {
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            &provider_type,
+            &model,
+            result,
+        ))
+    }
 
-                Ok(ToolResult {
-                    success: true,
-                    output:
-                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
-                            .into(),
-                    error: None,
-                })
-            }
-            Err(e) => Ok(ToolResult {
+    fn render_non_agentic_result(
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        result: anyhow::Result<String>,
+    ) -> ToolResult {
+        match result {
+            Ok(response) if response.trim().is_empty() => ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
+                )),
+            },
+            Ok(response) => ToolResult {
+                success: true,
+                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                    .into(),
+                error: None,
+            },
+            Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+            },
         }
     }
 }
@@ -2696,22 +2709,21 @@ impl DelegateTool {
         .await;
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
-                    "[Empty response]".to_string()
-                } else {
-                    response
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    )
-                    .into(),
-                    error: None,
-                })
-            }
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
+                )),
+            }),
+            Ok(Ok(response)) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                )
+                .into(),
+                error: None,
+            }),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -4925,6 +4937,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_rejects_empty_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok(" \n\t".to_string()),
+        );
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_terminal_completion() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &EmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenEmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
     async fn execute_agentic_forwards_receipt_scope_into_subagent_loop() {
         use crate::agent::tool_receipts::{
             ReceiptGenerator, ReceiptScope, TOOL_LOOP_RECEIPT_CONTEXT,
@@ -5149,6 +5242,10 @@ mod tests {
 
     struct FinalOnlyModelProvider;
 
+    struct EmptyTerminalModelProvider;
+
+    struct ToolThenEmptyTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -5185,6 +5282,108 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: Some("reasoning only".to_string()),
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenEmptyTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: Some("reasoning only".to_string()),
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenEmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolThenEmptyTerminalModelProvider"
         }
     }
 

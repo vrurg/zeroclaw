@@ -247,6 +247,23 @@ pub(crate) async fn consume_provider_streaming_response(
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
 
+    if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "has_reasoning": !outcome.reasoning_content.trim().is_empty(),
+                    "protocol_suppressed": outcome.suppressed_protocol,
+                })),
+            "model_provider stream completed without final text or tool calls"
+        );
+        anyhow::bail!(
+            "model_provider stream returned an invalid semantic completion: no final text or tool calls"
+        );
+    }
+
     Ok(outcome)
 }
 
@@ -263,6 +280,8 @@ mod tests {
 
     struct ToolThenTextProvider;
 
+    struct EmptyStreamProvider;
+
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -273,6 +292,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "ToolThenTextProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyStreamProvider"
         }
     }
 
@@ -338,6 +370,42 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for EmptyStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -370,5 +438,24 @@ mod tests {
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_completed_stream_without_text_or_tool_calls() {
+        let err = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a semantically empty stream must not complete successfully");
+
+        assert!(err.to_string().contains("invalid semantic completion"));
     }
 }

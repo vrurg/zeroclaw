@@ -729,6 +729,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        // Reliable providers classify this before retries and fallback. Keep
+        // the turn-level guard for direct/unwrapped providers: a transport
+        // success with no final text and no tool calls cannot complete a turn.
+        // This runs before response-success telemetry and history mutation.
+        let chat_result = chat_result.and_then(|response| {
+            if response.is_semantically_empty_terminal() {
+                anyhow::bail!(
+                    "model_provider returned an invalid semantic completion: no final text or tool calls"
+                );
+            }
+            Ok(response)
+        });
+
         let (
             response_text,
             parsed_text,

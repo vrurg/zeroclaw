@@ -166,6 +166,16 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+
+    /// True when this response cannot make progress or complete a turn.
+    ///
+    /// Reasoning content is intentionally excluded: it may need to be
+    /// round-tripped to a provider, but it is not a user-visible final answer.
+    /// A response containing one or more tool calls remains valid even when
+    /// its text is empty.
+    pub fn is_semantically_empty_terminal(&self) -> bool {
+        self.text_or_empty().trim().is_empty() && self.tool_calls.is_empty()
+    }
 }
 
 /// Request payload for model_provider chat calls.
@@ -875,7 +885,48 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::ChatMessage;
+    use super::{ChatMessage, ChatResponse, ToolCall};
+
+    #[test]
+    fn semantic_empty_terminal_ignores_reasoning_content() {
+        let response = ChatResponse {
+            text: Some("  \n".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: Some("internal reasoning".to_string()),
+        };
+
+        assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn text_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn tool_only_response_is_not_semantically_empty() {
+        let response = ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
+    }
 
     #[test]
     fn drops_leading_assistant_tool_call_before_first_user() {

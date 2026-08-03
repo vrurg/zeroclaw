@@ -712,12 +712,11 @@ fn push_failure(
 }
 
 fn is_empty_completion(resp: &ChatResponse) -> bool {
-    resp.text_or_empty().trim().is_empty()
-        && resp.tool_calls.is_empty()
-        && resp
-            .reasoning_content
-            .as_deref()
-            .is_none_or(|r| r.trim().is_empty())
+    resp.is_semantically_empty_terminal()
+}
+
+fn is_empty_text_completion(text: &str) -> bool {
+    text.trim().is_empty()
 }
 
 enum ReliableModelProviderEntryProvider {
@@ -965,8 +964,8 @@ impl ReliableModelProvider {
 
     /// Shared tail of the empty-completion retry path used by every chat method:
     /// record the empty attempt, warn, sleep the current backoff, then double it
-    /// (capped). The caller keeps the emptiness check (it differs per return
-    /// type) and the `continue`. See [`is_empty_completion`].
+    /// (capped). The caller owns the response-shape check and either retries
+    /// or records its final failed attempt. See [`is_empty_completion`].
     async fn backoff_after_empty_completion(
         &self,
         failures: &mut Vec<String>,
@@ -974,6 +973,22 @@ impl ReliableModelProvider {
         model: &str,
         attempt: u32,
         backoff_ms: &mut u64,
+    ) {
+        self.record_empty_completion_failure(failures, provider_name, model, attempt, true);
+        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+    }
+
+    /// Record an invalid but HTTP-successful provider response. The retry
+    /// loops use this as an ordinary failure so that exhaustion advances to
+    /// fallback instead of returning a successful blank turn.
+    fn record_empty_completion_failure(
+        &self,
+        failures: &mut Vec<String>,
+        provider_name: &str,
+        model: &str,
+        attempt: u32,
+        retrying: bool,
     ) {
         push_failure(
             failures,
@@ -993,12 +1008,14 @@ impl ReliableModelProvider {
                     "model_provider": provider_name,
                     "model": model,
                     "attempt": attempt + 1,
-                    "backoff_ms": *backoff_ms
+                    "retrying": retrying,
                 })),
-            "Empty completion; retrying"
+            if retrying {
+                "Empty completion; retrying"
+            } else {
+                "Empty completion; retries exhausted"
+            }
         );
-        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
-        *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
     }
 }
 
@@ -1063,18 +1080,26 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`).
-                            if attempt < self.max_retries && resp.trim().is_empty() {
-                                self.backoff_after_empty_completion(
+                            if is_empty_text_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
                                     current_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                break;
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -1262,18 +1287,26 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`).
-                            if attempt < self.max_retries && resp.trim().is_empty() {
-                                self.backoff_after_empty_completion(
+                            if is_empty_text_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
                                     current_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                break;
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -1511,19 +1544,26 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`;
-                            // see `is_empty_completion`).
-                            if attempt < self.max_retries && is_empty_completion(&resp) {
-                                self.backoff_after_empty_completion(
+                            if is_empty_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
                                     current_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                break;
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -1722,19 +1762,26 @@ impl ModelProvider for ReliableModelProvider {
                         .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`;
-                            // see `is_empty_completion`).
-                            if attempt < self.max_retries && is_empty_completion(&resp) {
-                                self.backoff_after_empty_completion(
+                            if is_empty_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
                                     current_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                break;
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -2501,6 +2548,22 @@ mod tests {
         }
     }
 
+    fn persistent_empty_reliable(calls: Arc<AtomicUsize>) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls,
+                    empty_until_attempt: usize::MAX,
+                    response: "never",
+                }),
+            )],
+            0,
+            1,
+        )
+    }
+
     #[tokio::test]
     async fn chat_retries_empty_completion_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2613,7 +2676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_persistent_empty_returns_blank_without_error() {
+    async fn chat_persistent_empty_returns_aggregated_error() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -2635,15 +2698,114 @@ mod tests {
             tools: None,
             thinking: None,
         };
-        // Exhausting the empty re-rolls returns the last (blank) response rather
-        // than erroring — strictly never worse than the pre-fix behavior.
+        let err = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .expect_err("an exhausted empty completion must not be returned as success");
+        assert!(
+            err.to_string()
+                .contains("All model_providers/models failed")
+        );
+        assert!(err.to_string().contains("empty_response"));
+        // Initial attempt + max_retries (2) re-rolls = 3 calls.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn every_reliable_chat_entrypoint_rejects_persistent_empty_completion() {
+        let messages = vec![ChatMessage::user("hello")];
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        assert!(
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        assert!(
+            provider
+                .chat_with_tools(&messages, &[], "test", Some(0.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        assert!(
+            provider
+                .chat_with_history(&messages, "test", Some(0.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        assert!(
+            provider
+                .chat_with_system(None, "hello", "test", Some(0.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_persistent_empty_falls_back_to_next_provider() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&primary_calls),
+                        empty_until_attempt: usize::MAX,
+                        response: "never",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
         let result = model_provider
             .chat(request, "test", Some(0.0))
             .await
-            .unwrap();
-        assert_eq!(result.text.as_deref(), Some(""));
-        // Initial attempt + max_retries (2) re-rolls = 3 calls.
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+            .expect("fallback should recover an exhausted empty completion");
+
+        assert_eq!(result.text.as_deref(), Some("recovered by fallback"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

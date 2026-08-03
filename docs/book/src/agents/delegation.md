@@ -175,8 +175,8 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 
-1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`.
-2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
+1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by a non-empty target agent response.
+2. A terminal empty response is a synchronous failure: the error field begins with `Agent '<target>' failed: model_provider returned an invalid semantic completion`.
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
    ```text
