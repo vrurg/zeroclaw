@@ -173,10 +173,15 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 ### `delegate`: output strings the model sees
 
-Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+User-visible failure strings are localized Fluent messages. Their English source
+of truth is `crates/zeroclaw-runtime/locales/en/cli.ftl`; examples below show
+the current English catalog values, not a wire-level string contract.
 
 1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by a non-empty target agent response.
-2. A terminal empty response is a synchronous failure: the error field begins with `Agent '<target>' failed: model_provider returned an invalid semantic completion`.
+2. A terminal empty response is a synchronous failure: its error field uses
+   `cli-delegate-error-invalid-semantic-completion`, with `agent_name` set to
+   the target. In English: `Agent '<target>' failed: model provider returned an
+   invalid semantic completion.`
 3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
 4. Background spawn success: output is the three-line literal
    ```text

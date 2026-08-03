@@ -469,6 +469,9 @@ mod tests {
         .await
         .expect_err("a semantically empty stream must not complete successfully");
 
-        assert!(err.to_string().contains("invalid semantic completion"));
+        assert_eq!(
+            err.to_string(),
+            crate::agent::semantic_empty_terminal_completion_message(None)
+        );
     }
 }

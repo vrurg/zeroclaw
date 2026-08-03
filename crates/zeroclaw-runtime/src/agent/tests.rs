@@ -897,7 +897,10 @@ async fn turn_rejects_empty_text_response() {
         .turn("hi")
         .await
         .expect_err("empty terminal response must fail");
-    assert!(err.to_string().contains("invalid semantic completion"));
+    assert_eq!(
+        err.to_string(),
+        crate::agent::semantic_empty_terminal_completion_message(None)
+    );
 }
 
 #[tokio::test]
@@ -915,7 +918,10 @@ async fn turn_rejects_none_text_response() {
         .turn("hi")
         .await
         .expect_err("missing terminal text must fail");
-    assert!(err.to_string().contains("invalid semantic completion"));
+    assert_eq!(
+        err.to_string(),
+        crate::agent::semantic_empty_terminal_completion_message(None)
+    );
 }
 
 #[tokio::test]

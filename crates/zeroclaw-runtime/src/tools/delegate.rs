@@ -33,10 +33,12 @@ fn current_tool_loop_session_key() -> Option<String> {
 }
 
 fn invalid_semantic_completion_error(agent_name: &str) -> String {
-    crate::i18n::get_required_cli_string_with_args(
-        "cli-delegate-error-invalid-semantic-completion",
-        &[("agent_name", agent_name)],
-    )
+    crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
+}
+
+fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -1384,7 +1386,7 @@ impl DelegateTool {
             Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+                error: Some(delegate_failure_error(agent_name, &e)),
             },
         }
     }
@@ -2734,7 +2736,7 @@ impl DelegateTool {
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                error: Some(delegate_failure_error(agent_name, &e)),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -4523,6 +4525,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
+        let server = start_final_chat_server(vec![""]).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "return a final answer",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "{background:?}"
+        );
+        assert!(background.output.is_none(), "{background:?}");
+        assert_eq!(
+            background.error.as_deref(),
+            Some(invalid_semantic_completion_error("target").as_str()),
+            "{background:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Parallel fan-out gets its own coverage because each spawned worker
         // rebuilds a delegate tool instance before entering the agentic loop.
@@ -4958,7 +4998,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 
@@ -4977,7 +5017,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
     }
 
     #[tokio::test]
@@ -5007,7 +5047,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 

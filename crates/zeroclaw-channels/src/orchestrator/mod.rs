@@ -6223,7 +6223,15 @@ async fn process_channel_message_body(
                 if let Some(channel) = target_channel.as_ref() {
                     let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
                         .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
+                        .unwrap_or_else(|| {
+                            if let Some(message) =
+                                zeroclaw_runtime::agent::terminal_completion_error_message(&e, None)
+                            {
+                                format!("⚠️ Error: {}", message)
+                            } else {
+                                format!("⚠️ Error: {safe_error}")
+                            }
+                        });
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.

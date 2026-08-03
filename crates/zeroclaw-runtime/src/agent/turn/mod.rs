@@ -42,6 +42,10 @@ pub use outcome::{
     is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub use outcome::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -742,9 +746,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         usage,
                     );
                 }
-                anyhow::bail!(
-                    "model_provider returned an invalid semantic completion: no final text or tool calls"
-                );
+                return Err(anyhow::Error::new(outcome::SemanticEmptyTerminalCompletion));
             }
             Ok(response)
         });

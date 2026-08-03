@@ -64,7 +64,7 @@ pub(crate) struct StreamPreExecutedToolsWithoutFinalResponse {
 
 impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("model_provider stream ended without final text after provider-executed tools")
+        f.write_str(&pre_executed_tools_without_final_response_message(None))
     }
 }
 
@@ -80,11 +80,69 @@ pub(crate) struct StreamSemanticEmptyCompletion {
 
 impl std::fmt::Display for StreamSemanticEmptyCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("model_provider stream returned an invalid semantic completion: no final text or tool calls")
+        f.write_str(&semantic_empty_terminal_completion_message(None))
     }
 }
 
 impl std::error::Error for StreamSemanticEmptyCompletion {}
+
+/// A non-streaming provider response that cannot complete a turn because it
+/// exposes neither a final answer nor a tool call. Keep this typed through the
+/// turn boundary so delivery adapters do not infer it from English diagnostics.
+#[derive(Debug)]
+pub(crate) struct SemanticEmptyTerminalCompletion;
+
+impl std::fmt::Display for SemanticEmptyTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&semantic_empty_terminal_completion_message(None))
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalCompletion {}
+
+/// Whether a turn error has the canonical semantic-empty terminal reason.
+pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        source.is::<SemanticEmptyTerminalCompletion>()
+            || source.is::<StreamSemanticEmptyCompletion>()
+    })
+}
+
+/// Render the canonical user-facing failure at a delivery boundary.
+pub fn semantic_empty_terminal_completion_message(agent_name: Option<&str>) -> String {
+    match agent_name {
+        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+            "cli-delegate-error-invalid-semantic-completion",
+            &[("agent_name", agent_name)],
+        ),
+        None => crate::i18n::get_required_cli_string("cli-agent-error-invalid-semantic-completion"),
+    }
+}
+
+fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -> String {
+    match agent_name {
+        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+            "cli-delegate-error-incomplete-after-provider-tools",
+            &[("agent_name", agent_name)],
+        ),
+        None => {
+            crate::i18n::get_required_cli_string("cli-agent-error-incomplete-after-provider-tools")
+        }
+    }
+}
+
+/// Map typed terminal-delivery failures to their Fluent user-facing message.
+pub fn terminal_completion_error_message(
+    err: &anyhow::Error,
+    agent_name: Option<&str>,
+) -> Option<String> {
+    if is_semantic_empty_terminal_completion(err) {
+        return Some(semantic_empty_terminal_completion_message(agent_name));
+    }
+    err.chain()
+        .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
+        .then(|| pre_executed_tools_without_final_response_message(agent_name))
+}
 
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
