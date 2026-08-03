@@ -785,6 +785,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
+                if let Some(rejected) =
+                    e.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                {
+                    crate::agent::cost::record_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        &rejected.usage,
+                    );
+                }
                 record_llm_failure(&ctx, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,

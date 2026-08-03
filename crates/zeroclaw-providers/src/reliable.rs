@@ -717,8 +717,30 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 }
 
 fn is_empty_text_completion(text: &str) -> bool {
-    text.trim().is_empty()
+    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
 }
+
+/// A Reliable chat request exhausted its candidates after receiving rejected
+/// semantic completions. The provider-reported usage is retained so the turn
+/// loop can account for work that was billed even though no response was
+/// accepted.
+#[derive(Debug)]
+pub struct ReliableRejectedCompletionUsage {
+    pub usage: TokenUsage,
+    failures: Vec<String>,
+}
+
+impl std::fmt::Display for ReliableRejectedCompletionUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "All model_providers/models failed. Attempts:\n{}",
+            self.failures.join("\n")
+        )
+    }
+}
+
+impl std::error::Error for ReliableRejectedCompletionUsage {}
 
 fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
     let Some(usage) = usage else {
@@ -1975,6 +1997,10 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
+        if let Some(usage) = rejected_attempt_usage {
+            return Err(ReliableRejectedCompletionUsage { usage, failures }.into());
+        }
+
         anyhow::bail!(
             "All model_providers/models failed. Attempts:\n{}",
             failures.join("\n")
@@ -2554,6 +2580,14 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct UsagePersistentEmptyMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct ThinkOnlyThenTextMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyThenTextMock {
         async fn chat_with_system(
@@ -2627,6 +2661,84 @@ mod tests {
 
         fn alias(&self) -> &str {
             "UsageEmptyThenTextMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for UsagePersistentEmptyMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UsagePersistentEmptyMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UsagePersistentEmptyMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkOnlyThenTextMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if attempt == 0 {
+                "<think>internal reasoning</think>".to_string()
+            } else {
+                "recovered".to_string()
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkOnlyThenTextMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkOnlyThenTextMock"
         }
     }
 
@@ -2713,6 +2825,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_exhausted_empty_completions_retain_rejected_usage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsagePersistentEmptyMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let error = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("persistent semantic-empty responses must fail");
+
+        let rejected = error
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .expect("rejected usage must survive exhaustion");
+        assert_eq!(rejected.usage.input_tokens, Some(20));
+        assert_eq!(rejected.usage.output_tokens, Some(10));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn chat_with_tools_retries_empty_completion_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -2762,6 +2910,69 @@ mod tests {
             .unwrap();
         assert_eq!(result, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_retries_think_only_text_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(ThinkOnlyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let result = model_provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect("think-only text must retry through the Reliable path");
+
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_falls_back_after_think_only_text() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: 0,
+                        response: "<think>internal reasoning</think>",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let result = model_provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect("think-only text must advance to provider fallback");
+
+        assert_eq!(result, "from fallback");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
