@@ -158,6 +158,39 @@ impl ProviderDispatch {
         .boxed()
     }
 
+    /// Stream chat while preserving provider-owned terminal policy internally.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let attribution = zeroclaw_log::attribution_span!(&*self.inner);
+        let _attribution_enter = attribution.enter();
+        let model_scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            model = %model,
+        );
+        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        drop(scope);
+        drop(_attribution_enter);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            let _enter = model_scope.enter();
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
+        })
+        .boxed()
+    }
+
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -388,6 +421,39 @@ impl<'a> ProviderDispatchRef<'a> {
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
             inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
+    }
+
+    /// Stream chat while preserving provider-owned terminal policy internally.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let attribution = zeroclaw_log::attribution_span!(self.inner);
+        let _attribution_enter = attribution.enter();
+        let model_scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            model = %model,
+        );
+        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        drop(scope);
+        drop(_attribution_enter);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            let _enter = model_scope.enter();
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }

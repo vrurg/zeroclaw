@@ -61,6 +61,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {}
 #[derive(Debug)]
 pub(crate) struct StreamTerminalCompletion {
     pub(crate) failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+    pub(crate) policy: zeroclaw_providers::TerminalCompletionPolicy,
     pub(crate) failed_candidate: Option<zeroclaw_api::model_provider::StreamProviderAttempt>,
 }
 

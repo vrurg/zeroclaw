@@ -21,7 +21,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -1333,10 +1333,15 @@ impl DelegateTool {
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
-        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let model_access = ResolvedModelAccess {
+            model_provider: &*model_provider,
+            provider_name: &provider_type,
+            model: &model,
+            temperature,
+        };
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            model_access.run_text_query(system_prompt_ref, &full_prompt),
         )
         .await;
 

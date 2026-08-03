@@ -452,6 +452,18 @@ mod tests {
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Test-only stand-in for an edge provider such as Anthropic: the
+            // policy is published while terminal-aware dispatch constructs the
+            // stream, then consumed when its terminal error is polled.
+            let terminal_policy_slot = crate::terminal::capture_terminal_policy_slot();
+            crate::terminal::publish_terminal_policy(
+                &terminal_policy_slot,
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                crate::terminal::TerminalCompletionPolicy::new(
+                    crate::terminal::TerminalRecoveryDisposition::NextCandidate,
+                    crate::terminal::TerminalUsageChargeability::Billable,
+                ),
+            );
             futures_util::stream::iter(vec![Err(
                 zeroclaw_api::model_provider::StreamError::TerminalCompletion(
                     zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit.into(),
@@ -830,6 +842,101 @@ mod tests {
         );
         assert_eq!(fallback.call_count(), 1);
         assert_eq!(fallback.last_model(), "served-model");
+    }
+
+    #[tokio::test]
+    async fn terminal_aware_router_stream_preserves_reliable_candidate_for_fallback() {
+        let skipped = Arc::new(MockModelProvider::new("skipped response"));
+        let primary_stream_calls = Arc::new(AtomicUsize::new(0));
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback = Arc::new(MockModelProvider::new("fallback response"));
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![
+                (
+                    // Production pinned entries may share a provider-family
+                    // display name. The first is intentionally not streamable
+                    // so the terminal stream comes from the later duplicate.
+                    "anthropic".to_string(),
+                    Box::new(Arc::clone(&skipped)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "anthropic".to_string(),
+                    Box::new(TerminalStreamModelProvider {
+                        stream_calls: Arc::clone(&primary_stream_calls),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "anthropic".to_string(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "reliable".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "terminal".to_string(),
+                Route {
+                    provider_name: "reliable".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let dispatcher = ProviderDispatch::from_ref(&router);
+        let mut stream = dispatcher.stream_chat_terminal_aware(
+            request,
+            "hint:terminal",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not complete successfully");
+        let terminal = crate::terminal_completion_context(&error)
+            .expect("terminal-aware dispatch preserves the provider outcome");
+        let failed_candidate = terminal
+            .failed_candidate()
+            .expect("Reliable candidate identity survives Router and dispatch");
+
+        let response = dispatcher
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:terminal",
+                Some(0.0),
+                Some(failed_candidate),
+            )
+            .await
+            .expect("fallback after the exact candidate succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(
+            skipped.call_count(),
+            0,
+            "fallback must not restart at an earlier duplicate display name"
+        );
+        assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.call_count(), 1);
     }
 
     #[tokio::test]

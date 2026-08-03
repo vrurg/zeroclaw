@@ -796,23 +796,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                if let Some(terminal) =
-                    zeroclaw_api::model_provider::terminal_completion_failure(&e)
-                {
-                    if let Some(usage) = terminal.usage.as_ref() {
-                        crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                            ctx.provider_name,
-                            ctx.model,
-                            usage,
-                        );
-                    }
-                } else if let Some(rejected) = e.chain().find_map(|cause| {
-                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                }) {
+                if let Some(usage) = zeroclaw_providers::reliable_rejected_completion_usage(&e) {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         ctx.provider_name,
                         ctx.model,
-                        &rejected.usage,
+                        usage,
+                    );
+                } else if let Some(terminal) =
+                    zeroclaw_api::model_provider::terminal_completion_failure(&e)
+                    && zeroclaw_providers::terminal_completion_context(&e)
+                        .map(zeroclaw_providers::TerminalCompletionContext::policy)
+                        .unwrap_or_else(|| {
+                            zeroclaw_providers::default_terminal_policy(terminal.reason)
+                        })
+                        .usage_chargeability()
+                        == zeroclaw_providers::TerminalUsageChargeability::Billable
+                    && let Some(usage) = terminal.usage.as_ref()
+                {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        usage,
                     );
                 }
                 record_llm_failure(&ctx, llm_started_at, iteration, &e);

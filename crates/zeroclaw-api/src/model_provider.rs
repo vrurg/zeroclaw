@@ -35,14 +35,12 @@ impl ChatMessage {
             content: content.into(),
         }
     }
-
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
         }
     }
-
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
@@ -483,13 +481,15 @@ pub enum StreamError {
 /// Both streaming and non-streaming provider paths use this helper so retry,
 /// fallback, and delivery layers do not infer terminal state from error text.
 pub fn terminal_completion_failure(error: &anyhow::Error) -> Option<&TerminalCompletionFailure> {
-    error
-        .downcast_ref::<TerminalCompletionFailure>()
-        .or_else(|| {
-            error
-                .downcast_ref::<StreamError>()?
-                .terminal_completion_failure()
-        })
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalCompletionFailure>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<StreamError>()?
+                    .terminal_completion_failure()
+            })
+    })
 }
 
 pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
@@ -799,18 +799,17 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 
     /// Continue a no-output streaming failure with a non-streaming request.
     ///
-    /// Most providers have no inner candidate chain, so the default preserves
-    /// the existing fallback behavior. Composite providers can use
-    /// `failed_candidate` to continue after a terminal stream failure instead
-    /// of replaying the candidate that already stopped.
+    /// Only composite providers that can authenticate `failed_candidate` may
+    /// continue. The default fails closed so a terminal response is never
+    /// replayed against the same provider.
     async fn chat_after_stream_failure(
         &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: Option<f64>,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
         _failed_candidate: Option<&StreamProviderAttempt>,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat(request, model, temperature).await
+        anyhow::bail!("cannot continue terminal stream failure without an exact candidate chain")
     }
 
     /// Whether model_provider supports native tool calls over API.
@@ -1084,7 +1083,20 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::{ChatMessage, ChatResponse, ToolCall};
+    use super::{
+        ChatMessage, ChatResponse, TerminalCompletionError, TerminalCompletionFailure, ToolCall,
+    };
+
+    #[test]
+    fn terminal_completion_failure_retains_two_field_literal_contract() {
+        let TerminalCompletionFailure { reason, usage } = TerminalCompletionFailure {
+            reason: TerminalCompletionError::OutputTokenLimit,
+            usage: None,
+        };
+
+        assert_eq!(reason, TerminalCompletionError::OutputTokenLimit);
+        assert!(usage.is_none());
+    }
 
     #[test]
     fn semantic_empty_terminal_ignores_reasoning_content() {

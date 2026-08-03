@@ -10,7 +10,9 @@ use super::outcome::{
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::{check_tool_loop_budget, record_rejected_tool_loop_cost_usage};
+use crate::agent::cost::{
+    check_tool_loop_budget, record_rejected_tool_loop_cost_usage, record_tool_loop_cost_usage,
+};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -224,10 +226,50 @@ pub(crate) async fn call_provider(
             }
             Err(stream_err) => {
                 if let Some(terminal) = stream_err.downcast_ref::<StreamTerminalCompletion>() {
-                    if let Some(usage) = terminal.failure.usage.as_ref() {
+                    if terminal.policy.recovery()
+                        == zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
+                    {
+                        // This error short-circuits `run_tool_call_loop`
+                        // before its response-error branch. Charge the
+                        // rejected attempt here, exactly once, rather than
+                        // losing provider-reported billable usage.
+                        if terminal.policy.usage_chargeability()
+                            == zeroclaw_providers::TerminalUsageChargeability::Billable
+                            && let Some(usage) = terminal.failure.usage.as_ref()
+                        {
+                            record_rejected_tool_loop_cost_usage(
+                                ctx.provider_name,
+                                ctx.model,
+                                usage,
+                            );
+                        }
+                        return Err(stream_err);
+                    }
+                    let Some(failed_candidate) = terminal.failed_candidate.clone() else {
+                        // A terminal recovery must advance from the exact
+                        // streamed candidate. This error likewise bypasses
+                        // the outer response-error branch, so preserve its
+                        // billable rejected usage before returning it.
+                        if terminal.policy.usage_chargeability()
+                            == zeroclaw_providers::TerminalUsageChargeability::Billable
+                            && let Some(usage) = terminal.failure.usage.as_ref()
+                        {
+                            record_rejected_tool_loop_cost_usage(
+                                ctx.provider_name,
+                                ctx.model,
+                                usage,
+                            );
+                        }
+                        return Err(stream_err);
+                    };
+                    if terminal.policy.usage_chargeability()
+                        == zeroclaw_providers::TerminalUsageChargeability::Billable
+                        && let Some(usage) = terminal.failure.usage.as_ref()
+                    {
+                        // Recovery hides the terminal error from the turn
+                        // loop, so this layer owns its rejected usage.
                         record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
                     }
-                    let failed_candidate = terminal.failed_candidate.clone();
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -253,7 +295,7 @@ pub(crate) async fn call_provider(
                         },
                         active_model,
                         ctx.temperature,
-                        failed_candidate.as_ref(),
+                        Some(&failed_candidate),
                     );
                     if let Some(token) = ctx.cancellation_token {
                         tokio::select! {
@@ -590,6 +632,7 @@ mod streaming_fallback_tests {
     struct EmptyStreamThenTextProvider {
         non_stream_calls: Arc<AtomicUsize>,
         terminal_incomplete: bool,
+        terminal_reason: TerminalCompletionError,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -659,7 +702,7 @@ mod streaming_fallback_tests {
             if self.terminal_incomplete {
                 Box::pin(futures_util::stream::iter(vec![Err(
                     StreamError::TerminalCompletion(TerminalCompletionFailure::new(
-                        TerminalCompletionError::OutputTokenLimit,
+                        self.terminal_reason,
                         Some(TokenUsage {
                             input_tokens: Some(10),
                             output_tokens: Some(5),
@@ -748,6 +791,7 @@ mod streaming_fallback_tests {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             terminal_incomplete: false,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
         };
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -854,10 +898,11 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
-    async fn incomplete_stream_without_visible_output_uses_non_streaming_fallback() {
+    async fn incomplete_stream_without_candidate_identity_never_replays() {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             terminal_incomplete: true,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
         };
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -884,7 +929,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let outcome = TOOL_LOOP_TURN_USAGE
+        let result = TOOL_LOOP_TURN_USAGE
             .scope(
                 Some(Arc::clone(&turn_usage)),
                 TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -900,21 +945,79 @@ mod streaming_fallback_tests {
                     ),
                 ),
             )
-            .await
-            .expect("dispatch succeeds");
-        let response = outcome
-            .chat_result
-            .expect("a no-output stream failure uses the normal one-shot fallback");
-
-        assert_eq!(response.text.as_deref(), Some("fallback response"));
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a terminal stream without candidate identity must fail"),
+        };
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(TerminalCompletionError::OutputTokenLimit)
+        );
         assert_eq!(
             provider.non_stream_calls.load(Ordering::Relaxed),
-            1,
-            "the existing one-shot fallback may replace output that was never visible"
+            0,
+            "missing identity must not replay the same provider"
         );
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "a rejected terminal attempt must not become accepted context fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_stream_without_visible_output_never_replays_request() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: true,
+            terminal_reason: TerminalCompletionError::PausedTurn,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let result = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("paused streams require an explicit continuation"),
+        };
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(TerminalCompletionError::PausedTurn)
+        );
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
