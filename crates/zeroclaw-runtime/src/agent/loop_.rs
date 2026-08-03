@@ -1130,6 +1130,30 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Project a typed terminal-completion failure only at the direct CLI boundary.
+///
+/// The typed error's `Display` remains the stable diagnostic used by provider
+/// and runtime telemetry. CLI delivery is the presentation boundary, where the
+/// corresponding Fluent message is required instead.
+fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error {
+    let Some(user_message) = crate::agent::terminal_completion_error_message(&error, None) else {
+        return error;
+    };
+    let diagnostic = error.to_string();
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": diagnostic,
+                "error_key": "terminal_completion",
+            })),
+        "CLI agent turn failed"
+    );
+    anyhow::Error::msg(user_message)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1999,7 +2023,7 @@ pub async fn run(
 
                             continue;
                         }
-                        return Err(e);
+                        return Err(project_cli_terminal_completion_error(e));
                     }
                 }
             }
@@ -2662,7 +2686,8 @@ pub async fn run(
                                 }
                             }
 
-                            eprintln!("\nError: {e}\n");
+                            let error = project_cli_terminal_completion_error(e);
+                            eprintln!("\nError: {error}\n");
                             break String::new();
                         }
                     }
@@ -4087,6 +4112,25 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn direct_cli_terminal_completion_projection_localizes_delivery() {
+        let error =
+            anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion);
+        let diagnostic = error.to_string();
+
+        let projected = super::project_cli_terminal_completion_error(error);
+
+        assert_eq!(
+            projected.to_string(),
+            crate::agent::semantic_empty_terminal_completion_message(None),
+            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+        );
+        assert_eq!(
+            diagnostic, "provider completed without final text or tool calls",
+            "the diagnostic supplied to the CLI boundary must remain stable for telemetry"
+        );
     }
 
     struct NonVisionModelProvider {

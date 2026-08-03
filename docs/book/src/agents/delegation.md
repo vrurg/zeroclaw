@@ -85,7 +85,7 @@ What CAN be made deterministic is **availability**: tools that aren't in the par
 
 What's verifiable end-to-end:
 
-1. Protocol-owned tool output and refusal strings are literal Rust contracts. User-visible failure delivery is a Fluent catalog contract: the English source is named below, and non-English deployments render the same key differently.
+1. Protocol-owned tool output and refusal strings are literal Rust contracts. User-visible terminal-completion failure delivery is a Fluent catalog contract: the English source is named below, and a non-English catalog or disk override that defines the same key may render it differently.
 2. The literal config knobs that change behavior (`allowed_tools`, `max_delegation_depth`, etc.).
 3. The structured tracing span shape that scopes everything emitted during the child run.
 
