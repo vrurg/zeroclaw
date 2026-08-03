@@ -767,6 +767,16 @@ mod tests {
             ),
             ("channel-runtime-request-timeout", &[][..], [].as_slice()),
             (
+                "channel-runtime-no-reply-refused",
+                &[][..],
+                ["🚫"].as_slice(),
+            ),
+            (
+                "channel-runtime-no-reply-failed",
+                &[][..],
+                ["⚠️"].as_slice(),
+            ),
+            (
                 "channel-runtime-current-model-status",
                 &[("provider", "openai.default"), ("model", "gpt-test")][..],
                 ["openai.default", "gpt-test"].as_slice(),

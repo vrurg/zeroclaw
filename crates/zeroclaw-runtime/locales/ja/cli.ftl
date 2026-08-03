@@ -813,6 +813,8 @@ channel-runtime-model-empty = モデル ID は空にできません。`/model <m
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-no-reply-refused = 🚫 そのリクエストにはお応えできません。
+channel-runtime-no-reply-failed = ⚠️ そのリクエストを完了できませんでした。
 channel-runtime-current-model-status =
     現在の model_provider: `{ $provider }`
     現在のモデル: `{ $model }`

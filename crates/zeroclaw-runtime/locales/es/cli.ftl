@@ -813,6 +813,8 @@ channel-runtime-model-empty = El ID del modelo no puede estar vacío. Usa `/mode
 channel-runtime-model-switched = Modelo cambiado a `{ $model }` (model_provider: `{ $provider }`). Contexto conservado.
 channel-runtime-agent-scope-rejected = El remitente `{ $sender }` no está autorizado para `/model --agent` en el agente `{ $agent }`. Usa `/model --user { $model }` para una anulación solo de la sesión, o pide a un administrador que marque un grupo de pares con `admin_for_agent_scope = true` contigo como miembro.
 channel-runtime-request-timeout = ⚠️ La solicitud agotó el tiempo de espera mientras se esperaba al modelo. Inténtalo de nuevo.
+channel-runtime-no-reply-refused = 🚫 No puedo ayudarte con esa solicitud.
+channel-runtime-no-reply-failed = ⚠️ No pude completar esa solicitud.
 channel-runtime-current-model-status =
     model_provider actual: `{ $provider }`
     Modelo actual: `{ $model }`
