@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use zeroclaw_api::model_provider::terminal_completion_error;
+use zeroclaw_api::model_provider::{
+    StreamCandidateFailure, StreamProviderAttempt, terminal_completion_error,
+    terminal_completion_failure,
+};
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -33,6 +36,13 @@ tokio::task_local! {
 
 tokio::task_local! {
     static RELIABLE_REJECTED_ATTEMPT_USAGE: RefCell<Option<TokenUsage>>;
+}
+
+tokio::task_local! {
+    /// Candidate selected by the immediately preceding stream. The explicit
+    /// `chat_after_stream_failure` input is scoped here only while reusing the
+    /// regular Reliable chat loop, so no retry state escapes the request.
+    static STREAM_FALLBACK_AFTER: Option<StreamProviderAttempt>;
 }
 
 /// Run a provider call while retaining billed usage from rejected Reliable
@@ -1930,10 +1940,24 @@ impl ModelProvider for ReliableModelProvider {
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
+        let mut resume_after = STREAM_FALLBACK_AFTER.try_with(Clone::clone).ok().flatten();
 
         for current_model in &models {
             for entry in &self.model_providers {
                 let provider_name = entry.display_name.as_str();
+                if let Some(candidate) = resume_after.as_ref() {
+                    if *current_model != candidate.model {
+                        anyhow::bail!(
+                            "stream fallback candidate {} for model {} was not found in Reliable chain",
+                            candidate.provider_name,
+                            candidate.model
+                        );
+                    }
+                    if provider_name == candidate.provider_name {
+                        resume_after = None;
+                    }
+                    continue;
+                }
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
                     Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
@@ -2010,6 +2034,12 @@ impl ModelProvider for ReliableModelProvider {
                         }
                         Err(e) => {
                             final_cause_is_semantic_empty = false;
+                            if let Some(terminal) = terminal_completion_failure(&e) {
+                                accumulate_usage(
+                                    &mut rejected_attempt_usage,
+                                    terminal.usage.as_ref(),
+                                );
+                            }
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -2158,6 +2188,24 @@ impl ModelProvider for ReliableModelProvider {
         ))
     }
 
+    async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        let Some(failed_candidate) = failed_candidate else {
+            return self.chat(request, model, temperature).await;
+        };
+        STREAM_FALLBACK_AFTER
+            .scope(
+                Some(failed_candidate.clone()),
+                self.chat(request, model, temperature),
+            )
+            .await
+    }
+
     fn supports_streaming(&self) -> bool {
         self.model_providers
             .iter()
@@ -2226,6 +2274,10 @@ impl ModelProvider for ReliableModelProvider {
                 options,
             );
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+            let attempt = StreamProviderAttempt {
+                provider_name: provider_clone.clone(),
+                model: current_model.clone(),
+            };
 
             let handle = ::zeroclaw_spawn::spawn!(async move {
                 let mut stream = stream;
@@ -2233,6 +2285,12 @@ impl ModelProvider for ReliableModelProvider {
                     if let Err(ref e) = event {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
                     }
+                    let event = event.map_err(|source| {
+                        super::traits::StreamError::CandidateFailure(StreamCandidateFailure {
+                            attempt: attempt.clone(),
+                            source: Box::new(source),
+                        })
+                    });
                     if tx.send(event).await.is_err() {
                         break;
                     }
@@ -2745,6 +2803,11 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct TerminalStreamCandidateMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyThenTextMock {
         async fn chat_with_system(
@@ -3012,6 +3075,61 @@ mod tests {
 
         fn alias(&self) -> &str {
             "TerminalCompletionMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalStreamCandidateMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("primary replay".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(
+                ::zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    ::zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        Some(TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            cached_input_tokens: None,
+                        }),
+                    ),
+                ),
+            )])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalStreamCandidateMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalStreamCandidateMock"
         }
     }
 
@@ -3818,6 +3936,81 @@ mod tests {
             primary_calls.load(Ordering::SeqCst),
             1,
             "a terminal reason is not retryable against the same candidate"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_fallback_continues_after_the_candidate_that_stopped() {
+        let primary_stream_calls = Arc::new(AtomicUsize::new(0));
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalStreamCandidateMock {
+                        stream_calls: Arc::clone(&primary_stream_calls),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            model_provider.stream_chat(request, "test", Some(0.0), StreamOptions::new(true));
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not be final");
+        assert_eq!(
+            error
+                .terminal_completion_failure()
+                .map(|failure| failure.reason),
+            Some(::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit)
+        );
+        let failed_candidate = error
+            .failed_candidate()
+            .cloned()
+            .expect("Reliable stream error identifies its selected candidate");
+
+        let response = model_provider
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                Some(&failed_candidate),
+            )
+            .await
+            .expect("fallback after the selected candidate succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("recovered by fallback"));
+        assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_chat_calls.load(Ordering::SeqCst),
+            0,
+            "the terminal stream candidate must not be replayed non-streaming"
         );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }

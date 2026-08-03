@@ -3,7 +3,8 @@
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
     StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
-    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
+    StreamTerminalCompletion, ToolLoopCancelled,
 };
 use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -11,7 +12,7 @@ use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
-use zeroclaw_api::model_provider::{StreamError, StreamEvent};
+use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
@@ -132,7 +133,7 @@ pub(crate) async fn consume_provider_streaming_response(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
                 );
-                if let StreamError::TerminalCompletion(reason) = err {
+                if let Some(failure) = err.terminal_completion_failure().cloned() {
                     // A terminal provider reason such as `max_tokens` means
                     // the response is known to be incomplete. Do not let the
                     // generic stream-retry path replace already forwarded
@@ -146,20 +147,42 @@ pub(crate) async fn consume_provider_streaming_response(
                         };
                         return Err(StreamInterruptedAfterOutput {
                             partial_text,
-                            message: format!("model_provider stream incomplete: {reason}"),
+                            message: format!(
+                                "model_provider stream incomplete: {}",
+                                failure.reason
+                            ),
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
                         }
                         .into());
                     }
                     if outcome.saw_pre_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
-                            usage: outcome.usage,
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
                         }
                         .into());
                     }
-                    return Err(anyhow::Error::new(reason));
+                    return Err(StreamTerminalCompletion {
+                        failure,
+                        failed_candidate: err.failed_candidate().cloned(),
+                    }
+                    .into());
                 }
 
                 let message = format!("model_provider stream error: {err}");
+                if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
+                    return Err(StreamInterruptedAfterOutput {
+                        partial_text: forwarded_text,
+                        message,
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
+                if outcome.saw_pre_executed_tool_activity {
+                    return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -168,6 +191,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
+                        usage: outcome.usage,
                     }
                     .into());
                 }
@@ -312,7 +336,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
-    use zeroclaw_api::model_provider::StreamChunk;
+    use zeroclaw_api::model_provider::{StreamChunk, StreamError};
     use zeroclaw_providers::ToolCall;
     use zeroclaw_providers::traits::{
         ChatResponse, ProviderCapabilities, StreamOptions, StreamResult,

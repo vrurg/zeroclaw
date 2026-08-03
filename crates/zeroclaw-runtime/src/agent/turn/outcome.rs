@@ -44,6 +44,7 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
     pub(crate) message: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
@@ -53,6 +54,27 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 }
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
+
+/// A no-output stream reached a provider-declared terminal incomplete state.
+/// The candidate metadata is transient: it lets a composite provider continue
+/// after the candidate that stopped instead of replaying it.
+#[derive(Debug)]
+pub(crate) struct StreamTerminalCompletion {
+    pub(crate) failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+    pub(crate) failed_candidate: Option<zeroclaw_api::model_provider::StreamProviderAttempt>,
+}
+
+impl std::fmt::Display for StreamTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+
+impl std::error::Error for StreamTerminalCompletion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those

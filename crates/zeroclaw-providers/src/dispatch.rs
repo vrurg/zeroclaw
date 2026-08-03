@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::stream::{self, StreamExt as _};
 use zeroclaw_api::model_provider::{
     ChatMessage, ChatRequest, ChatResponse, ModelInfo, ModelProvider, StreamEvent, StreamOptions,
-    StreamResult,
+    StreamProviderAttempt, StreamResult,
 };
 
 /// A successful response plus billed usage from Reliable attempts that were
@@ -79,6 +79,51 @@ impl ProviderDispatch {
         let (response, rejected_attempt_usage) =
             crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
                 .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
+    /// Wrap the inner provider's candidate-aware stream fallback chat call.
+    pub async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_after_stream_failure(
+                    request,
+                    model,
+                    temperature,
+                    failed_candidate,
+                )
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Like [`Self::chat_after_stream_failure`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_after_stream_failure_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_after_stream_failure(request, model, temperature, failed_candidate),
+        )
+        .await;
         response.map(|response| AccountedChatResponse {
             response,
             rejected_attempt_usage,
@@ -272,6 +317,51 @@ impl<'a> ProviderDispatchRef<'a> {
         let (response, rejected_attempt_usage) =
             crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
                 .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
+    /// Wrap the inner provider's candidate-aware stream fallback chat call.
+    pub async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_after_stream_failure(
+                    request,
+                    model,
+                    temperature,
+                    failed_candidate,
+                )
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Like [`Self::chat_after_stream_failure`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_after_stream_failure_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_after_stream_failure(request, model, temperature, failed_candidate),
+        )
+        .await;
         response.map(|response| AccountedChatResponse {
             response,
             rejected_attempt_usage,

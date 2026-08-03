@@ -9,7 +9,7 @@ use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::model_provider::TerminalCompletionError;
+use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
 use zeroclaw_api::tool::ToolSpec;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
@@ -746,7 +746,7 @@ impl AnthropicModelProvider {
 
     fn parse_native_response(
         response: NativeChatResponse,
-    ) -> Result<ProviderChatResponse, TerminalCompletionError> {
+    ) -> Result<ProviderChatResponse, TerminalCompletionFailure> {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
@@ -862,7 +862,7 @@ impl AnthropicModelProvider {
                     })),
                 "Anthropic response reached an incomplete terminal state"
             );
-            return Err(error);
+            return Err(TerminalCompletionFailure::new(error, parsed.usage.clone()));
         }
 
         Ok(parsed)
@@ -1193,7 +1193,7 @@ impl AnthropicModelProvider {
                             "stream: message_stop"
                         );
                     }
-                    if input_tokens.is_some()
+                    let usage = if input_tokens.is_some()
                         || output_tokens.is_some()
                         || cached_input_tokens.is_some()
                         || cache_creation_input_tokens.is_some()
@@ -1206,16 +1206,23 @@ impl AnthropicModelProvider {
                                 .saturating_add(cache_read)
                                 .saturating_add(cache_create),
                         );
-                        let _ = tx
-                            .send(Ok(StreamEvent::Usage(TokenUsage {
-                                input_tokens: normalized_input,
-                                output_tokens,
-                                cached_input_tokens,
-                            })))
-                            .await;
+                        Some(TokenUsage {
+                            input_tokens: normalized_input,
+                            output_tokens,
+                            cached_input_tokens,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(usage) = usage.as_ref() {
+                        let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
                     }
                     if let Some(error) = terminal_completion_error {
-                        let _ = tx.send(Err(StreamError::TerminalCompletion(error))).await;
+                        let _ = tx
+                            .send(Err(StreamError::TerminalCompletion(
+                                TerminalCompletionFailure::new(error, usage),
+                            )))
+                            .await;
                     } else {
                         let _ = tx.send(Ok(StreamEvent::Final)).await;
                     }
@@ -1933,14 +1940,14 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut saw_partial = false;
         let mut saw_final = false;
-        let mut terminal_error = None;
+        let mut terminal_failure = None;
         while let Ok(Some(event)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match event {
                 Ok(StreamEvent::TextDelta(text)) if text.delta == "partial" => saw_partial = true,
                 Ok(StreamEvent::Final) => saw_final = true,
-                Err(StreamError::TerminalCompletion(reason)) => terminal_error = Some(reason),
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
                 Ok(_) | Err(_) => {}
             }
         }
@@ -1950,10 +1957,16 @@ data: {\"type\":\"message_stop\"}\n\n";
             "partial text remains observable to the runtime"
         );
         assert!(!saw_final, "max_tokens must not become a complete response");
+        let terminal_failure = terminal_failure.expect("max_tokens must carry a terminal failure");
         assert_eq!(
-            terminal_error,
-            Some(TerminalCompletionError::OutputTokenLimit)
+            terminal_failure.reason,
+            TerminalCompletionError::OutputTokenLimit
         );
+        let usage = terminal_failure
+            .usage
+            .expect("terminal stream failure retains reported usage");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -3208,15 +3221,18 @@ data: {\"type\":\"message_stop\"}\n\n";
             let resp: NativeChatResponse = serde_json::from_value(serde_json::json!({
                 "stop_reason": stop_reason,
                 "content": [{"type": "text", "text": "partial"}],
+                "usage": {"input_tokens": 10, "output_tokens": 4},
             }))
             .expect("fixture must deserialize");
 
-            assert_eq!(
-                AnthropicModelProvider::parse_native_response(resp)
-                    .expect_err("incomplete terminal response must fail"),
-                expected,
-                "stop_reason={stop_reason}"
-            );
+            let failure = AnthropicModelProvider::parse_native_response(resp)
+                .expect_err("incomplete terminal response must fail");
+            assert_eq!(failure.reason, expected, "stop_reason={stop_reason}");
+            let usage = failure
+                .usage
+                .expect("native terminal failure retains reported usage");
+            assert_eq!(usage.input_tokens, Some(10));
+            assert_eq!(usage.output_tokens, Some(4));
         }
     }
 
