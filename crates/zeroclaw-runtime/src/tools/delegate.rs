@@ -32,6 +32,13 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
+fn invalid_semantic_completion_error(agent_name: &str) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-delegate-error-invalid-semantic-completion",
+        &[("agent_name", agent_name)],
+    )
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -1365,9 +1372,7 @@ impl DelegateTool {
                 ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
-                    )),
+                    error: Some(invalid_semantic_completion_error(agent_name)),
                 }
             }
             Ok(response) => ToolResult {
@@ -2716,9 +2721,7 @@ impl DelegateTool {
             Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "Agent '{agent_name}' failed: model_provider returned an invalid semantic completion"
-                )),
+                error: Some(invalid_semantic_completion_error(agent_name)),
             }),
             Ok(Ok(response)) => Ok(ToolResult {
                 success: true,

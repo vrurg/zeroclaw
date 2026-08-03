@@ -1667,13 +1667,20 @@ impl ModelProvider for ReliableModelProvider {
                                     &error_detail,
                                     None,
                                 );
-                                anyhow::bail!(
+                                let context_error = format!(
                                     "Request exceeds model context window and cannot be reduced without \
                                      breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
                                 );
+                                if let Some(usage) = rejected_attempt_usage {
+                                    return Err(anyhow::Error::new(
+                                        ReliableRejectedCompletionUsage { usage, failures },
+                                    )
+                                    .context(context_error));
+                                }
+                                anyhow::bail!("{context_error}");
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1892,13 +1899,20 @@ impl ModelProvider for ReliableModelProvider {
                                     &error_detail,
                                     None,
                                 );
-                                anyhow::bail!(
+                                let context_error = format!(
                                     "Request exceeds model context window and cannot be reduced without \
                                      breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
                                      of tools/skills, or enabling compact_context in config. Attempts:\n{}",
                                     failures.join("\n")
                                 );
+                                if let Some(usage) = rejected_attempt_usage {
+                                    return Err(anyhow::Error::new(
+                                        ReliableRejectedCompletionUsage { usage, failures },
+                                    )
+                                    .context(context_error));
+                                }
+                                anyhow::bail!("{context_error}");
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2591,6 +2605,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct ContextWindowErrorMock;
+
     struct ThinkOnlyThenTextMock {
         calls: Arc<AtomicUsize>,
     }
@@ -2721,6 +2737,26 @@ mod tests {
                 reasoning_content: None,
             })
         }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for UsagePersistentEmptyMock {
@@ -2734,6 +2770,52 @@ mod tests {
 
         fn alias(&self) -> &str {
             "UsagePersistentEmptyMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ContextWindowErrorMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("input exceeds the context window")
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("input exceeds the context window")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ContextWindowErrorMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ContextWindowErrorMock"
         }
     }
 
@@ -2885,6 +2967,83 @@ mod tests {
         assert_eq!(rejected.usage.input_tokens, Some(20));
         assert_eq!(rejected.usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_preserves_rejected_usage_on_untruncatable_context_error() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ("context".into(), Box::new(ContextWindowErrorMock)),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+
+        let error = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("untruncatable context error must fail");
+
+        assert!(error.to_string().contains("cannot be reduced further"));
+        let rejected = error
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .expect("rejected usage must survive the early context exit");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_preserves_rejected_usage_on_untruncatable_context_error() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ("context".into(), Box::new(ContextWindowErrorMock)),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = model_provider
+            .chat_with_tools(&messages, &tools, "test", Some(0.0))
+            .await
+            .expect_err("untruncatable context error must fail");
+
+        assert!(error.to_string().contains("cannot be reduced further"));
+        let rejected = error
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .expect("rejected usage must survive the early context exit");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
     }
 
     #[tokio::test]
