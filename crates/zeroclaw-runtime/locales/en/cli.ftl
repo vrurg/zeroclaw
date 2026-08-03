@@ -1064,6 +1064,10 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-delegate-error-output-token-limit = Agent '{$agent_name}' failed: the provider reached its output token limit before completing the response.
+cli-delegate-error-context-window = Agent '{$agent_name}' failed: the provider reached its context window before completing the response.
+cli-delegate-error-paused-turn = Agent '{$agent_name}' failed: the provider paused the turn before completing the response.
+cli-delegate-error-refusal = Agent '{$agent_name}' failed: the provider refused before completing the response.
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}

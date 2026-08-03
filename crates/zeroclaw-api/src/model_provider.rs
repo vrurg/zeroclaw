@@ -426,6 +426,10 @@ impl std::error::Error for TerminalCompletionFailure {
 pub struct StreamProviderAttempt {
     pub provider_name: String,
     pub model: String,
+    /// Exact candidate position within the composite provider that emitted this
+    /// transient failure context. Display names are diagnostic and need not be
+    /// unique, so the owning composite uses this position for continuation.
+    pub candidate_index: usize,
 }
 
 /// Wraps an inner stream error with the composite candidate that produced it.

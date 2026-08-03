@@ -1784,6 +1784,12 @@ impl ModelProvider for ReliableModelProvider {
                         }
                         Err(e) => {
                             final_cause_is_semantic_empty = false;
+                            if let Some(terminal) = terminal_completion_failure(&e) {
+                                accumulate_usage(
+                                    &mut rejected_attempt_usage,
+                                    terminal.usage.as_ref(),
+                                );
+                            }
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
@@ -1943,7 +1949,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut resume_after = STREAM_FALLBACK_AFTER.try_with(Clone::clone).ok().flatten();
 
         for current_model in &models {
-            for entry in &self.model_providers {
+            for (candidate_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if let Some(candidate) = resume_after.as_ref() {
                     if *current_model != candidate.model {
@@ -1953,7 +1959,7 @@ impl ModelProvider for ReliableModelProvider {
                             candidate.model
                         );
                     }
-                    if provider_name == candidate.provider_name {
+                    if candidate_index == candidate.candidate_index {
                         resume_after = None;
                     }
                     continue;
@@ -2227,7 +2233,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for entry in &self.model_providers {
+        for (candidate_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2277,6 +2283,7 @@ impl ModelProvider for ReliableModelProvider {
             let attempt = StreamProviderAttempt {
                 provider_name: provider_clone.clone(),
                 model: current_model.clone(),
+                candidate_index,
             };
 
             let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -2803,6 +2810,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct TerminalCompletionUsageMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     struct TerminalStreamCandidateMock {
         stream_calls: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
@@ -3075,6 +3086,53 @@ mod tests {
 
         fn alias(&self) -> &str {
             "TerminalCompletionMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalCompletionUsageMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(
+                ::zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                    ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                    Some(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    }),
+                ),
+            ))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalCompletionUsageMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalCompletionUsageMock"
         }
     }
 
@@ -3941,6 +3999,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_with_tools_terminal_failure_usage_survives_fallback_recovery() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalCompletionUsageMock {
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("fallback should recover a terminal incomplete completion");
+
+        assert_eq!(response.text.as_deref(), Some("recovered by fallback"));
+        let usage = response.usage.expect("rejected attempt usage is retained");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_terminal_failure_usage_survives_exhaustion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(TerminalCompletionUsageMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let error = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect_err("terminal incomplete completion must fail after all candidates");
+
+        let rejected = error
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .expect("rejected usage must survive exhaustion");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn terminal_stream_fallback_continues_after_the_candidate_that_stopped() {
         let primary_stream_calls = Arc::new(AtomicUsize::new(0));
         let primary_chat_calls = Arc::new(AtomicUsize::new(0));
@@ -4011,6 +4138,89 @@ mod tests {
             primary_chat_calls.load(Ordering::SeqCst),
             0,
             "the terminal stream candidate must not be replayed non-streaming"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_fallback_skips_the_exact_duplicate_named_candidate() {
+        let stopped_stream_calls = Arc::new(AtomicUsize::new(0));
+        let stopped_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "anthropic".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        empty_until_attempt: 0,
+                        response: "earlier duplicate must stay skipped",
+                    }),
+                ),
+                (
+                    "anthropic".into(),
+                    Box::new(TerminalStreamCandidateMock {
+                        stream_calls: Arc::clone(&stopped_stream_calls),
+                        chat_calls: Arc::clone(&stopped_chat_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by exact fallback",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "test",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not complete successfully");
+        let failed_candidate = error
+            .failed_candidate()
+            .cloned()
+            .expect("Reliable identifies the exact failed candidate");
+
+        let response = model_provider
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                Some(&failed_candidate),
+            )
+            .await
+            .expect("fallback after exact candidate succeeds");
+
+        assert_eq!(
+            response.text.as_deref(),
+            Some("recovered by exact fallback")
+        );
+        assert_eq!(stopped_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stopped_chat_calls.load(Ordering::SeqCst),
+            0,
+            "the duplicate-named terminal candidate must not be replayed"
         );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
