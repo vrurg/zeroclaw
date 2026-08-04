@@ -1074,6 +1074,10 @@ cli-delegate-error-output-token-limit = Agent '{$agent_name}' failed: the provid
 cli-delegate-error-context-window = Agent '{$agent_name}' failed: the provider reached its context window before completing the response.
 cli-delegate-error-paused-turn = Agent '{$agent_name}' failed: the provider paused the turn before completing the response.
 cli-delegate-error-refusal = Agent '{$agent_name}' failed: the provider refused before completing the response.
+cli-agent-error-output-token-limit = The provider reached its output token limit before completing the response.
+cli-agent-error-context-window = The provider reached its context window before completing the response.
+cli-agent-error-paused-turn = The provider paused the turn before completing the response.
+cli-agent-error-refusal = The provider refused before completing the response.
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}

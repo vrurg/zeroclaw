@@ -155,6 +155,37 @@ fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -
     }
 }
 
+fn terminal_reason_message(
+    reason: zeroclaw_api::model_provider::TerminalCompletionError,
+    agent_name: Option<&str>,
+) -> String {
+    let (agent_key, delegate_key) = match reason {
+        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit => (
+            "cli-agent-error-output-token-limit",
+            "cli-delegate-error-output-token-limit",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::ContextWindow => (
+            "cli-agent-error-context-window",
+            "cli-delegate-error-context-window",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn => (
+            "cli-agent-error-paused-turn",
+            "cli-delegate-error-paused-turn",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
+            ("cli-agent-error-refusal", "cli-delegate-error-refusal")
+        }
+    };
+
+    match agent_name {
+        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+            delegate_key,
+            &[("agent_name", agent_name)],
+        ),
+        None => crate::i18n::get_required_cli_string(agent_key),
+    }
+}
+
 /// Map typed terminal-delivery failures to their Fluent user-facing message.
 pub fn terminal_completion_error_message(
     err: &anyhow::Error,
@@ -162,6 +193,9 @@ pub fn terminal_completion_error_message(
 ) -> Option<String> {
     if is_semantic_empty_terminal_completion(err) {
         return Some(semantic_empty_terminal_completion_message(agent_name));
+    }
+    if let Some(reason) = zeroclaw_api::model_provider::terminal_completion_error(err) {
+        return Some(terminal_reason_message(reason, agent_name));
     }
     err.chain()
         .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
@@ -269,6 +303,73 @@ mod tests {
         assert_eq!(
             terminal_completion_error_message(&error, None),
             Some("The model provider returned an invalid semantic completion.".to_string())
+        );
+    }
+
+    #[test]
+    fn native_terminal_reasons_use_direct_and_delegate_fluent_messages() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let cases = [
+            (
+                TerminalCompletionError::OutputTokenLimit,
+                "The provider reached its output token limit before completing the response.",
+                "Agent 'reviewer' failed: the provider reached its output token limit before completing the response.",
+            ),
+            (
+                TerminalCompletionError::ContextWindow,
+                "The provider reached its context window before completing the response.",
+                "Agent 'reviewer' failed: the provider reached its context window before completing the response.",
+            ),
+            (
+                TerminalCompletionError::PausedTurn,
+                "The provider paused the turn before completing the response.",
+                "Agent 'reviewer' failed: the provider paused the turn before completing the response.",
+            ),
+            (
+                TerminalCompletionError::Refusal,
+                "The provider refused before completing the response.",
+                "Agent 'reviewer' failed: the provider refused before completing the response.",
+            ),
+        ];
+
+        for (reason, direct, delegate) in cases {
+            let error = anyhow::Error::new(TerminalCompletionFailure::from(reason));
+
+            assert_eq!(
+                terminal_completion_error_message(&error, None).as_deref(),
+                Some(direct)
+            );
+            assert_eq!(
+                terminal_completion_error_message(&error, Some("reviewer")).as_deref(),
+                Some(delegate)
+            );
+            assert_eq!(error.to_string(), reason.to_string());
+        }
+    }
+
+    #[test]
+    fn streamed_terminal_reason_uses_fluent_delivery_projection() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let error = anyhow::Error::new(StreamTerminalCompletion {
+            failure: TerminalCompletionFailure::from(TerminalCompletionError::OutputTokenLimit),
+            policy: zeroclaw_providers::default_terminal_policy(
+                TerminalCompletionError::OutputTokenLimit,
+            ),
+            failed_candidate: None,
+        });
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The provider reached its output token limit before completing the response."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            error.to_string(),
+            "response incomplete: output token limit reached"
         );
     }
 
