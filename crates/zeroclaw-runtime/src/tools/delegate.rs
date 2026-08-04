@@ -7906,14 +7906,19 @@ command = "echo hi"
         primary_uri: String,
         backup_uri: String,
         agentic: bool,
-    ) -> Arc<Config> {
+    ) -> (Arc<Config>, TempDir) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
             RiskProfileConfig, RuntimeProfileConfig,
         };
 
-        let mut config = Config::default();
+        let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
         config.reliability.provider_retries = 0;
         config.reliability.provider_backoff_ms = 1;
         config.providers.models.custom.insert(
@@ -7969,7 +7974,7 @@ command = "echo hi"
             );
         }
 
-        Arc::new(config)
+        (Arc::new(config), temp_dir)
     }
 
     fn fallback_delegate_tool(config: Arc<Config>, workspace_dir: Option<PathBuf>) -> DelegateTool {
@@ -8033,7 +8038,8 @@ command = "echo hi"
     async fn delegate_fallback_warning_is_local_to_synchronous_call() {
         let (primary, primary_requests) = start_failing_chat_server(503).await;
         let backup = start_final_chat_server(vec!["fallback reply"]).await;
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, None);
 
         let (result, outer_fallback) =
@@ -8067,7 +8073,8 @@ command = "echo hi"
     async fn agentic_delegate_attributes_final_primary_response_after_earlier_fallback() {
         let (primary, primary_requests) = start_primary_failure_then_final_chat_server().await;
         let (backup, backup_requests) = start_tool_call_chat_server().await;
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, None)
             .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
@@ -8104,7 +8111,8 @@ command = "echo hi"
     async fn non_agentic_delegate_preserves_generic_fallback_warning() {
         let (primary, primary_requests) = start_failing_chat_server(503).await;
         let backup = start_final_chat_server(vec!["non-agentic fallback reply"]).await;
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
         let tool = fallback_delegate_tool(config, None);
 
         let (result, outer_fallback) =
@@ -8142,7 +8150,8 @@ command = "echo hi"
         let (primary, primary_requests) = start_failing_chat_server(503).await;
         let backup = start_final_chat_server(vec!["background fallback reply"]).await;
         let workspace = TempDir::new().expect("temporary workspace");
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
 
         let (start, outer_fallback) =
@@ -8189,7 +8198,8 @@ command = "echo hi"
     async fn parallel_delegate_preserves_generic_fallback_warning() {
         let (primary, primary_requests) = start_failing_chat_server(503).await;
         let backup = start_final_chat_server(vec!["parallel fallback reply"]).await;
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, None);
 
         let (result, outer_fallback) =
@@ -8228,7 +8238,8 @@ command = "echo hi"
             start_failing_chat_server_with_error(503, "primary failure marker").await;
         let (backup, backup_requests) =
             start_failing_chat_server_with_error(503, "backup failure marker").await;
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, None);
 
         let (result, outer_fallback) =
@@ -8283,8 +8294,9 @@ command = "echo hi"
     async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
         let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
         let (backup, backup_requests) = start_failing_chat_server(503).await;
-        let mut config =
-            (*fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false)).clone();
+        let (fixture_config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let mut config = (*fixture_config).clone();
         config
             .runtime_profiles
             .get_mut("review")
@@ -8318,7 +8330,8 @@ command = "echo hi"
         let (backup, backup_requests) =
             start_failing_chat_server_with_error(503, "background backup failure marker").await;
         let workspace = TempDir::new().expect("temporary workspace");
-        let config = fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
         let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
 
         let start = tool
