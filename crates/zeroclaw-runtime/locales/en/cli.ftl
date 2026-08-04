@@ -1078,6 +1078,8 @@ cli-agent-error-output-token-limit = The provider reached its output token limit
 cli-agent-error-context-window = The provider reached its context window before completing the response.
 cli-agent-error-paused-turn = The provider paused the turn before completing the response.
 cli-agent-error-refusal = The provider refused before completing the response.
+cli-delegate-error-invalid-terminal-reason = Agent '{$agent_name}' failed: the provider ended with an invalid terminal response state.
+cli-agent-error-invalid-terminal-reason = The provider ended with an invalid terminal response state.
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}

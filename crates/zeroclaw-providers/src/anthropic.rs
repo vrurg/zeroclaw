@@ -738,18 +738,74 @@ impl AnthropicModelProvider {
     /// former advances the tool loop and the latter is caller-directed. The
     /// remaining mapped states need explicit terminal handling and
     /// must never be returned as a successful final answer.
-    fn terminal_completion_error(stop_reason: &str) -> Option<TerminalCompletionError> {
+    fn terminal_completion_error(stop_reason: Option<&str>) -> Option<TerminalCompletionError> {
         match stop_reason {
-            "max_tokens" => Some(TerminalCompletionError::OutputTokenLimit),
-            "model_context_window_exceeded" => Some(TerminalCompletionError::ContextWindow),
-            "pause_turn" => Some(TerminalCompletionError::PausedTurn),
-            "refusal" => Some(TerminalCompletionError::Refusal),
-            _ => None,
+            Some("end_turn" | "stop_sequence" | "tool_use") => None,
+            Some("max_tokens") => Some(TerminalCompletionError::OutputTokenLimit),
+            Some("model_context_window_exceeded") => Some(TerminalCompletionError::ContextWindow),
+            Some("pause_turn") => Some(TerminalCompletionError::PausedTurn),
+            Some("refusal") => Some(TerminalCompletionError::Refusal),
+            _ => Some(TerminalCompletionError::InvalidTerminalReason),
         }
     }
 
+    fn terminal_completion_policy(
+        error: TerminalCompletionError,
+        replay_safe: bool,
+    ) -> TerminalCompletionPolicy {
+        let recovery = match error {
+            TerminalCompletionError::PausedTurn
+            | TerminalCompletionError::InvalidTerminalReason => {
+                TerminalRecoveryDisposition::NoReplay
+            }
+            TerminalCompletionError::OutputTokenLimit
+            | TerminalCompletionError::ContextWindow
+            | TerminalCompletionError::Refusal
+                if replay_safe =>
+            {
+                TerminalRecoveryDisposition::NextCandidate
+            }
+            TerminalCompletionError::OutputTokenLimit
+            | TerminalCompletionError::ContextWindow
+            | TerminalCompletionError::Refusal => TerminalRecoveryDisposition::NoReplay,
+        };
+        let usage_chargeability = if error == TerminalCompletionError::Refusal && replay_safe {
+            TerminalUsageChargeability::Informational
+        } else {
+            TerminalUsageChargeability::Billable
+        };
+        TerminalCompletionPolicy::new(recovery, usage_chargeability)
+    }
+
+    fn streaming_usage(
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cached_input_tokens: Option<u64>,
+        cache_creation_input_tokens: Option<u64>,
+    ) -> Option<TokenUsage> {
+        if input_tokens.is_none()
+            && output_tokens.is_none()
+            && cached_input_tokens.is_none()
+            && cache_creation_input_tokens.is_none()
+        {
+            return None;
+        }
+
+        Some(TokenUsage {
+            input_tokens: Some(
+                input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(cached_input_tokens.unwrap_or(0))
+                    .saturating_add(cache_creation_input_tokens.unwrap_or(0)),
+            ),
+            output_tokens,
+            cached_input_tokens,
+        })
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> anyhow::Result<ProviderChatResponse> {
-        let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
+        let stop_reason = response.stop_reason.as_deref();
+        let diagnostic_stop_reason = stop_reason.unwrap_or("missing");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
         let mut text_parts = Vec::new();
@@ -838,7 +894,7 @@ impl AnthropicModelProvider {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "provider": "anthropic",
-                        "stop_reason": stop_reason,
+                        "stop_reason": diagnostic_stop_reason,
                         "content_block_count": content_block_count,
                         "content_block_types": content_block_types,
                         "native_tool_call_count": parsed.tool_calls.len(),
@@ -863,25 +919,6 @@ impl AnthropicModelProvider {
                     )
                 });
             let replay_safe = parsed.text.is_none() && !has_tool_activity;
-            let recovery = match error {
-                TerminalCompletionError::PausedTurn => TerminalRecoveryDisposition::NoReplay,
-                TerminalCompletionError::OutputTokenLimit
-                | TerminalCompletionError::ContextWindow
-                | TerminalCompletionError::Refusal
-                    if replay_safe =>
-                {
-                    TerminalRecoveryDisposition::NextCandidate
-                }
-                TerminalCompletionError::OutputTokenLimit
-                | TerminalCompletionError::ContextWindow
-                | TerminalCompletionError::Refusal => TerminalRecoveryDisposition::NoReplay,
-            };
-            let usage_chargeability = if error == TerminalCompletionError::Refusal && replay_safe {
-                // Anthropic documents a pre-output refusal as informational.
-                TerminalUsageChargeability::Informational
-            } else {
-                TerminalUsageChargeability::Billable
-            };
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -889,7 +926,7 @@ impl AnthropicModelProvider {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "provider": "anthropic",
-                        "terminal_reason": stop_reason,
+                        "terminal_reason": diagnostic_stop_reason,
                         "content_block_count": content_block_count,
                         "content_block_types": content_block_types,
                         "native_tool_call_count": parsed.tool_calls.len(),
@@ -899,7 +936,7 @@ impl AnthropicModelProvider {
             );
             return Err(terminal_completion_context_error(
                 TerminalCompletionFailure::new(error, parsed.usage.clone()),
-                TerminalCompletionPolicy::new(recovery, usage_chargeability),
+                Self::terminal_completion_policy(error, replay_safe),
             ));
         }
 
@@ -1048,6 +1085,14 @@ impl AnthropicModelProvider {
                             })),
                         "stream: SSE read error — aborting stream"
                     );
+                    if let Some(usage) = Self::streaming_usage(
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    ) {
+                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                    }
                     let _ = tx
                         .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
                         .await;
@@ -1063,6 +1108,14 @@ impl AnthropicModelProvider {
             let event: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
                 Err(error) => {
+                    if let Some(usage) = Self::streaming_usage(
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    ) {
+                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                    }
                     let _ = tx.send(Err(StreamError::Json(error))).await;
                     return;
                 }
@@ -1205,13 +1258,11 @@ impl AnthropicModelProvider {
                     let stop_reason = event
                         .get("delta")
                         .and_then(|d| d.get("stop_reason"))
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("none");
-                    if stop_reason != "none" {
-                        terminal_completion_error = Self::terminal_completion_error(stop_reason);
-                        if collect_debug_metadata {
-                            last_stop_reason = Some(stop_reason.to_string());
-                        }
+                        .and_then(|s| s.as_str());
+                    if let Some(stop_reason) = stop_reason {
+                        terminal_completion_error =
+                            Self::terminal_completion_error(Some(stop_reason));
+                        last_stop_reason = Some(stop_reason.to_string());
                     }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
@@ -1222,7 +1273,7 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
-                    if stop_reason == "max_tokens" {
+                    if stop_reason == Some("max_tokens") {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1234,7 +1285,7 @@ impl AnthropicModelProvider {
                             "response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
                     } else {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": stop_reason, "output_tokens": observed_output})), "stream: message_delta");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": stop_reason.unwrap_or("missing"), "output_tokens": observed_output})), "stream: message_delta");
                     }
                 }
                 "message_stop" => {
@@ -1253,60 +1304,28 @@ impl AnthropicModelProvider {
                             "stream: message_stop"
                         );
                     }
-                    let usage = if input_tokens.is_some()
-                        || output_tokens.is_some()
-                        || cached_input_tokens.is_some()
-                        || cache_creation_input_tokens.is_some()
-                    {
-                        let uncached = input_tokens.unwrap_or(0);
-                        let cache_read = cached_input_tokens.unwrap_or(0);
-                        let cache_create = cache_creation_input_tokens.unwrap_or(0);
-                        let normalized_input = Some(
-                            uncached
-                                .saturating_add(cache_read)
-                                .saturating_add(cache_create),
-                        );
-                        Some(TokenUsage {
-                            input_tokens: normalized_input,
-                            output_tokens,
-                            cached_input_tokens,
-                        })
-                    } else {
-                        None
-                    };
+                    let usage = Self::streaming_usage(
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    );
                     if let Some(usage) = usage.as_ref() {
                         let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
                     }
-                    if let Some(error) = terminal_completion_error {
-                        let recovery = match error {
-                            TerminalCompletionError::PausedTurn => {
-                                TerminalRecoveryDisposition::NoReplay
-                            }
-                            TerminalCompletionError::OutputTokenLimit
-                            | TerminalCompletionError::ContextWindow
-                            | TerminalCompletionError::Refusal
-                                if !saw_server_tool_activity && !saw_client_tool_activity =>
-                            {
-                                TerminalRecoveryDisposition::NextCandidate
-                            }
-                            TerminalCompletionError::OutputTokenLimit
-                            | TerminalCompletionError::ContextWindow
-                            | TerminalCompletionError::Refusal => {
-                                TerminalRecoveryDisposition::NoReplay
-                            }
-                        };
-                        let usage_chargeability = if error == TerminalCompletionError::Refusal
-                            && !saw_server_tool_activity
-                            && !saw_client_tool_activity
-                        {
-                            TerminalUsageChargeability::Informational
-                        } else {
-                            TerminalUsageChargeability::Billable
-                        };
+                    let error = terminal_completion_error.or_else(|| {
+                        last_stop_reason
+                            .is_none()
+                            .then_some(TerminalCompletionError::InvalidTerminalReason)
+                    });
+                    if let Some(error) = error {
                         crate::terminal::publish_terminal_policy(
                             &terminal_policy_slot,
                             error,
-                            TerminalCompletionPolicy::new(recovery, usage_chargeability),
+                            Self::terminal_completion_policy(
+                                error,
+                                !saw_server_tool_activity && !saw_client_tool_activity,
+                            ),
                         );
                         let _ = tx
                             .send(Err(StreamError::TerminalCompletion(
@@ -1324,6 +1343,14 @@ impl AnthropicModelProvider {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
+                    if let Some(usage) = Self::streaming_usage(
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                    ) {
+                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                    }
                     let _ = tx
                         .send(Err(StreamError::ModelProvider(msg.to_string())))
                         .await;
@@ -1333,6 +1360,40 @@ impl AnthropicModelProvider {
             }
         }
 
+        if let Some(error) = terminal_completion_error {
+            let usage = Self::streaming_usage(
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            );
+            if let Some(usage) = usage.as_ref() {
+                let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
+            }
+            crate::terminal::publish_terminal_policy(
+                &terminal_policy_slot,
+                error,
+                Self::terminal_completion_policy(
+                    error,
+                    !saw_server_tool_activity && !saw_client_tool_activity,
+                ),
+            );
+            let _ = tx
+                .send(Err(StreamError::TerminalCompletion(
+                    TerminalCompletionFailure::new(error, usage),
+                )))
+                .await;
+            return;
+        }
+
+        if let Some(usage) = Self::streaming_usage(
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        ) {
+            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+        }
         crate::stream_guard::finish_sse_stream(tx, false, "message_stop").await;
     }
 }
@@ -2279,12 +2340,14 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
         let mut saw_final = false;
+        let mut usage = None;
         let mut last_err = None;
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match ev {
                 Ok(StreamEvent::Final) => saw_final = true,
+                Ok(StreamEvent::Usage(observed)) => usage = Some(observed),
                 Err(e) => last_err = Some(e),
                 Ok(_) => {}
             }
@@ -2295,6 +2358,43 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
             "expected truncation error, got: {err:?}"
         );
+        assert_eq!(
+            usage.and_then(|usage| usage.output_tokens),
+            Some(1),
+            "parser failures after usage must retain observed output tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_after_known_terminal_reason_preserves_typed_incomplete_outcome() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "missing message_stop must not be a clean completion"
+        );
+        let failure = failure.expect("known terminal state must survive a truncated stream");
+        assert_eq!(failure.reason, TerminalCompletionError::OutputTokenLimit);
+        assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(4));
     }
 
     #[tokio::test]
@@ -2349,16 +2449,24 @@ data: {\"type\":\"message_stop\"}\n\n";
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
         let mut saw_usage = false;
+        let mut terminal_failure = None;
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
-            if matches!(ev, Ok(StreamEvent::Usage(_))) {
-                saw_usage = true;
+            match ev {
+                Ok(StreamEvent::Usage(_)) => saw_usage = true,
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
+                Ok(_) | Err(_) => {}
             }
         }
         assert!(
             !saw_usage,
             "must not emit Usage when provider sent no usage frames"
+        );
+        assert_eq!(
+            terminal_failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason),
+            "message_stop without a recognized reason must not become Final"
         );
     }
 
@@ -3341,6 +3449,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn native_response_parses_usage() {
         let json = r#"{
+            "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "Hello"}],
             "usage": {"input_tokens": 300, "output_tokens": 75}
         }"#;
@@ -3354,6 +3463,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn native_response_sums_all_three_anthropic_input_buckets() {
         let json = r#"{
+            "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "ok"}],
             "usage": {
                 "input_tokens": 1,
@@ -3381,7 +3491,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn native_response_parses_without_usage() {
-        let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
+        let json = r#"{"stop_reason":"end_turn","content": [{"type": "text", "text": "Hello"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp).expect("valid response");
         assert!(result.usage.is_none());
@@ -3427,6 +3537,42 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .expect("native terminal failure retains reported usage");
             assert_eq!(usage.input_tokens, Some(10));
             assert_eq!(usage.output_tokens, Some(4));
+        }
+    }
+
+    #[test]
+    fn native_response_rejects_missing_or_unknown_terminal_stop_reason() {
+        for stop_reason in [None, Some("future_terminal_state")] {
+            let mut response = serde_json::json!({
+                "content": [{"type": "text", "text": "untrusted final"}],
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            });
+            if let Some(stop_reason) = stop_reason {
+                response["stop_reason"] = stop_reason.into();
+            }
+            let response: NativeChatResponse =
+                serde_json::from_value(response).expect("fixture must deserialize");
+
+            let error = AnthropicModelProvider::parse_native_response(response)
+                .expect_err("unknown terminal completion must fail");
+            let context = crate::terminal::terminal_completion_context(&error)
+                .expect("terminal failure must preserve policy");
+            assert_eq!(
+                context.failure().reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+            assert_eq!(
+                context.policy().recovery(),
+                TerminalRecoveryDisposition::NoReplay
+            );
+            assert_eq!(
+                context
+                    .failure()
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens),
+                Some(4)
+            );
         }
     }
 
@@ -3477,6 +3623,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // bytes the model returned. Any mutation — including trim() — breaks
         // signature validation on replay in a multi-turn tool-use conversation.
         let json = r#"{
+            "stop_reason": "end_turn",
             "content": [
                 {
                     "type": "thinking",
@@ -3503,6 +3650,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[test]
     fn native_response_drops_empty_thinking_blocks() {
         let json = r#"{
+            "stop_reason": "end_turn",
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
                 {"type": "text", "text": "hello"}

@@ -2,7 +2,7 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
+    StreamCancelledAfterOutput, StreamFailureWithoutOutput, StreamInterruptedAfterOutput,
     StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
     StreamTerminalCompletion, ToolLoopCancelled,
 };
@@ -219,7 +219,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     .into());
                 }
-                return Err(anyhow::Error::msg(message));
+                return Err(StreamFailureWithoutOutput {
+                    message,
+                    usage: outcome.usage,
+                }
+                .into());
             }
         };
         match event {
@@ -370,6 +374,8 @@ mod tests {
 
     struct EmptyStreamProvider;
 
+    struct UsageThenErrorProvider;
+
     struct ErrorAfterTextProvider;
 
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
@@ -395,6 +401,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UsageThenErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "UsageThenErrorProvider"
         }
     }
 
@@ -510,6 +529,49 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelProvider for UsageThenErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                })),
+                Err(StreamError::Http("connection interrupted".to_string())),
+            ]))
+        }
+    }
+
+    #[async_trait]
     impl ModelProvider for ErrorAfterTextProvider {
         async fn chat_with_system(
             &self,
@@ -603,6 +665,35 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "provider stream completed without final text or tool calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_without_output_retains_reported_usage() {
+        let err = consume_provider_streaming_response(
+            &UsageThenErrorProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a no-output stream error must fail");
+
+        let failure = err
+            .downcast_ref::<StreamFailureWithoutOutput>()
+            .expect("the usage-bearing stream failure must stay typed");
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(4)
         );
     }
 

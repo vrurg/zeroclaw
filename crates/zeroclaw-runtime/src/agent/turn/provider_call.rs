@@ -4,9 +4,9 @@
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::outcome::{
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion, StreamTerminalCompletion, ToolLoopCancelled,
-    is_tool_loop_cancelled,
+    StreamFailureWithoutOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
+    StreamTerminalCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -309,7 +309,12 @@ pub(crate) async fn call_provider(
                 } else {
                     let discarded_usage = stream_err
                         .downcast_ref::<StreamSemanticEmptyCompletion>()
-                        .and_then(|error| error.usage.as_ref());
+                        .and_then(|error| error.usage.as_ref())
+                        .or_else(|| {
+                            stream_err
+                                .downcast_ref::<StreamFailureWithoutOutput>()
+                                .and_then(|error| error.usage.as_ref())
+                        });
                     if let Some(usage) = discarded_usage {
                         record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
                     }
@@ -633,6 +638,7 @@ mod streaming_fallback_tests {
     struct EmptyStreamThenTextProvider {
         non_stream_calls: Arc<AtomicUsize>,
         terminal_incomplete: bool,
+        ordinary_stream_error: bool,
         terminal_reason: TerminalCompletionError,
     }
 
@@ -711,6 +717,15 @@ mod streaming_fallback_tests {
                         }),
                     )),
                 )]))
+            } else if self.ordinary_stream_error {
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    })),
+                    Err(StreamError::Http("connection interrupted".to_string())),
+                ]))
             } else {
                 Box::pin(futures_util::stream::iter(vec![
                     Ok(StreamEvent::Usage(TokenUsage {
@@ -792,6 +807,7 @@ mod streaming_fallback_tests {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             terminal_incomplete: false,
+            ordinary_stream_error: false,
             terminal_reason: TerminalCompletionError::OutputTokenLimit,
         };
         let observer = NoopObserver;
@@ -844,6 +860,76 @@ mod streaming_fallback_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn generic_no_output_stream_error_records_usage_before_fallback() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: Arc::new(AtomicUsize::new(0)),
+            terminal_incomplete: false,
+            ordinary_stream_error: true,
+            terminal_reason: TerminalCompletionError::OutputTokenLimit,
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("generic stream failure is recovered by one non-streaming request");
+
+        assert_eq!(
+            outcome
+                .chat_result
+                .expect("fallback response succeeds")
+                .text
+                .as_deref(),
+            Some("fallback response")
+        );
+        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "rejected usage must not become accepted context fill"
+        );
     }
 
     #[tokio::test]
@@ -903,6 +989,7 @@ mod streaming_fallback_tests {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             terminal_incomplete: true,
+            ordinary_stream_error: false,
             terminal_reason: TerminalCompletionError::OutputTokenLimit,
         };
         let observer = NoopObserver;
@@ -974,6 +1061,7 @@ mod streaming_fallback_tests {
         let provider = EmptyStreamThenTextProvider {
             non_stream_calls: Arc::new(AtomicUsize::new(0)),
             terminal_incomplete: true,
+            ordinary_stream_error: false,
             terminal_reason: TerminalCompletionError::PausedTurn,
         };
         let observer = NoopObserver;

@@ -129,7 +129,9 @@ impl TerminalCompletionPolicy {
 #[must_use]
 pub const fn default_terminal_policy(reason: TerminalCompletionError) -> TerminalCompletionPolicy {
     let recovery = match reason {
-        TerminalCompletionError::PausedTurn => TerminalRecoveryDisposition::NoReplay,
+        TerminalCompletionError::PausedTurn | TerminalCompletionError::InvalidTerminalReason => {
+            TerminalRecoveryDisposition::NoReplay
+        }
         TerminalCompletionError::OutputTokenLimit
         | TerminalCompletionError::ContextWindow
         | TerminalCompletionError::Refusal => TerminalRecoveryDisposition::NextCandidate,

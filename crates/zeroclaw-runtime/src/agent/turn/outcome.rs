@@ -109,6 +109,23 @@ impl std::fmt::Display for StreamSemanticEmptyCompletion {
 
 impl std::error::Error for StreamSemanticEmptyCompletion {}
 
+/// A stream failed before exposing output, after the provider reported usage.
+/// Keep that usage through the recovery boundary so the fallback cannot hide
+/// a billed failed attempt.
+#[derive(Debug)]
+pub(crate) struct StreamFailureWithoutOutput {
+    pub(crate) message: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for StreamFailureWithoutOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamFailureWithoutOutput {}
+
 /// A non-streaming provider response that cannot complete a turn because it
 /// exposes neither a final answer nor a tool call. Keep this typed through the
 /// turn boundary so delivery adapters do not infer it from English diagnostics.
@@ -175,6 +192,10 @@ fn terminal_reason_message(
         zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
             ("cli-agent-error-refusal", "cli-delegate-error-refusal")
         }
+        zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason => (
+            "cli-agent-error-invalid-terminal-reason",
+            "cli-delegate-error-invalid-terminal-reason",
+        ),
     };
 
     match agent_name {
@@ -330,6 +351,11 @@ mod tests {
                 TerminalCompletionError::Refusal,
                 "The provider refused before completing the response.",
                 "Agent 'reviewer' failed: the provider refused before completing the response.",
+            ),
+            (
+                TerminalCompletionError::InvalidTerminalReason,
+                "The provider ended with an invalid terminal response state.",
+                "Agent 'reviewer' failed: the provider ended with an invalid terminal response state.",
             ),
         ];
 

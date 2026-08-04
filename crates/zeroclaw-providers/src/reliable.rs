@@ -508,6 +508,9 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
                     "use a fallback model or revise the request"
                 }
+                zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason => {
+                    "retry later or contact the provider operator"
+                }
             },
             endpoint,
         };

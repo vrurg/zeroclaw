@@ -377,6 +377,9 @@ pub enum TerminalCompletionError {
     /// The provider stopped generation with a refusal rather than a usable completion.
     #[error("response incomplete: provider refused the request")]
     Refusal,
+    /// The provider ended a response without a recognized terminal reason.
+    #[error("response incomplete: provider returned an invalid terminal reason")]
+    InvalidTerminalReason,
 }
 
 /// A terminal provider outcome together with the usage billed before that
