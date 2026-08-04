@@ -475,6 +475,19 @@ impl Channel for PacedChannel {
         self.inner.request_approval(recipient, request).await
     }
 
+    /// Must be forwarded explicitly: without this the trait default would call
+    /// [`Channel::request_approval`] on the *wrapper* and relabel the inner
+    /// channel's synthesized timeout deny as an operator decision.
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.inner
+            .request_approval_attributed(recipient, request)
+            .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,
