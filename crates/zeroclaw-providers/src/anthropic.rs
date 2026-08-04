@@ -1035,6 +1035,30 @@ impl AnthropicModelProvider {
         Self::parse_anthropic_sse_from_reader(reader, tx, terminal_policy_slot).await;
     }
 
+    /// Emit a provider terminal outcome without letting a later SSE failure
+    /// replace the terminal reason already reported by Anthropic.
+    async fn emit_terminal_completion_failure(
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        terminal_policy_slot: &Option<std::sync::Arc<crate::terminal::TerminalPolicySlot>>,
+        error: TerminalCompletionError,
+        usage: Option<TokenUsage>,
+        replay_safe: bool,
+    ) {
+        if let Some(usage) = usage.as_ref() {
+            let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
+        }
+        crate::terminal::publish_terminal_policy(
+            terminal_policy_slot,
+            error,
+            Self::terminal_completion_policy(error, replay_safe),
+        );
+        let _ = tx
+            .send(Err(StreamError::TerminalCompletion(
+                TerminalCompletionFailure::new(error, usage),
+            )))
+            .await;
+    }
+
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
     /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
     async fn parse_anthropic_sse_from_reader<R>(
@@ -1085,17 +1109,29 @@ impl AnthropicModelProvider {
                             })),
                         "stream: SSE read error — aborting stream"
                     );
-                    if let Some(usage) = Self::streaming_usage(
+                    let usage = Self::streaming_usage(
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
                         cache_creation_input_tokens,
-                    ) {
-                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
-                    }
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                    );
+                    if let Some(error) = terminal_completion_error {
+                        Self::emit_terminal_completion_failure(
+                            tx,
+                            &terminal_policy_slot,
+                            error,
+                            usage,
+                            !saw_server_tool_activity && !saw_client_tool_activity,
+                        )
                         .await;
+                    } else {
+                        if let Some(usage) = usage {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
+                        let _ = tx
+                            .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
+                            .await;
+                    }
                     return;
                 }
             };
@@ -1108,15 +1144,27 @@ impl AnthropicModelProvider {
             let event: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
                 Err(error) => {
-                    if let Some(usage) = Self::streaming_usage(
+                    let usage = Self::streaming_usage(
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
                         cache_creation_input_tokens,
-                    ) {
-                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                    );
+                    if let Some(terminal_error) = terminal_completion_error {
+                        Self::emit_terminal_completion_failure(
+                            tx,
+                            &terminal_policy_slot,
+                            terminal_error,
+                            usage,
+                            !saw_server_tool_activity && !saw_client_tool_activity,
+                        )
+                        .await;
+                    } else {
+                        if let Some(usage) = usage {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
+                        let _ = tx.send(Err(StreamError::Json(error))).await;
                     }
-                    let _ = tx.send(Err(StreamError::Json(error))).await;
                     return;
                 }
             };
@@ -1310,29 +1358,24 @@ impl AnthropicModelProvider {
                         cached_input_tokens,
                         cache_creation_input_tokens,
                     );
-                    if let Some(usage) = usage.as_ref() {
-                        let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
-                    }
                     let error = terminal_completion_error.or_else(|| {
                         last_stop_reason
                             .is_none()
                             .then_some(TerminalCompletionError::InvalidTerminalReason)
                     });
                     if let Some(error) = error {
-                        crate::terminal::publish_terminal_policy(
+                        Self::emit_terminal_completion_failure(
+                            tx,
                             &terminal_policy_slot,
                             error,
-                            Self::terminal_completion_policy(
-                                error,
-                                !saw_server_tool_activity && !saw_client_tool_activity,
-                            ),
-                        );
-                        let _ = tx
-                            .send(Err(StreamError::TerminalCompletion(
-                                TerminalCompletionFailure::new(error, usage),
-                            )))
-                            .await;
+                            usage,
+                            !saw_server_tool_activity && !saw_client_tool_activity,
+                        )
+                        .await;
                     } else {
+                        if let Some(usage) = usage {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
                         let _ = tx.send(Ok(StreamEvent::Final)).await;
                     }
                     return;
@@ -1343,17 +1386,29 @@ impl AnthropicModelProvider {
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    if let Some(usage) = Self::streaming_usage(
+                    let usage = Self::streaming_usage(
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
                         cache_creation_input_tokens,
-                    ) {
-                        let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
-                    }
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(msg.to_string())))
+                    );
+                    if let Some(error) = terminal_completion_error {
+                        Self::emit_terminal_completion_failure(
+                            tx,
+                            &terminal_policy_slot,
+                            error,
+                            usage,
+                            !saw_server_tool_activity && !saw_client_tool_activity,
+                        )
                         .await;
+                    } else {
+                        if let Some(usage) = usage {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
+                        let _ = tx
+                            .send(Err(StreamError::ModelProvider(msg.to_string())))
+                            .await;
+                    }
                     return;
                 }
                 _ => {}
@@ -1367,22 +1422,14 @@ impl AnthropicModelProvider {
                 cached_input_tokens,
                 cache_creation_input_tokens,
             );
-            if let Some(usage) = usage.as_ref() {
-                let _ = tx.send(Ok(StreamEvent::Usage(usage.clone()))).await;
-            }
-            crate::terminal::publish_terminal_policy(
+            Self::emit_terminal_completion_failure(
+                tx,
                 &terminal_policy_slot,
                 error,
-                Self::terminal_completion_policy(
-                    error,
-                    !saw_server_tool_activity && !saw_client_tool_activity,
-                ),
-            );
-            let _ = tx
-                .send(Err(StreamError::TerminalCompletion(
-                    TerminalCompletionFailure::new(error, usage),
-                )))
-                .await;
+                usage,
+                !saw_server_tool_activity && !saw_client_tool_activity,
+            )
+            .await;
             return;
         }
 
@@ -2008,6 +2055,95 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
 
+    fn max_tokens_sse_prefix() -> &'static [u8] {
+        b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n"
+    }
+
+    async fn assert_known_terminal_reason_survives_sse_exit<R>(reader: R)
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        let slot = std::sync::Arc::new(crate::terminal::TerminalPolicySlot::default());
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, Some(slot.clone()))
+            .await;
+
+        let mut final_count = 0;
+        let mut usage_count = 0;
+        let mut terminal_failure = None;
+        drop(tx);
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(StreamEvent::Final) => final_count += 1,
+                Ok(StreamEvent::Usage(_)) => usage_count += 1,
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(final_count, 0, "premature SSE exits must not emit Final");
+        assert_eq!(
+            usage_count, 1,
+            "observed usage must be emitted exactly once"
+        );
+        let failure = terminal_failure.expect("captured max_tokens reason must stay typed");
+        assert_eq!(failure.reason, TerminalCompletionError::OutputTokenLimit);
+        let usage = failure
+            .usage
+            .as_ref()
+            .expect("terminal failure retains observed usage");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
+
+        let contextual = crate::terminal::contextualize_terminal_stream_error(
+            &slot,
+            StreamError::TerminalCompletion(failure),
+        );
+        let context = crate::terminal::terminal_completion_context(&contextual)
+            .expect("typed error must retain provider recovery policy");
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NextCandidate,
+            "terminal-aware recovery must advance instead of using generic replay"
+        );
+        assert_eq!(
+            context.policy().usage_chargeability(),
+            TerminalUsageChargeability::Billable
+        );
+    }
+
+    /// Feeds the terminal-reason frames, then reports a transport read failure.
+    struct ErrorAfterReader {
+        data: std::io::Cursor<Vec<u8>>,
+        errored: bool,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.errored {
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "test SSE reader failure",
+                )));
+            }
+            let before = buf.filled().len();
+            let result = std::pin::Pin::new(&mut self.data).poll_read(cx, buf);
+            if matches!(result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+                self.errored = true;
+                return std::task::Poll::Ready(Err(std::io::Error::other(
+                    "test SSE reader failure",
+                )));
+            }
+            result
+        }
+    }
+
     #[tokio::test]
     async fn streaming_usage_emitted_before_final() {
         // The originallive repro was Anthropic streaming; before this
@@ -2395,6 +2531,40 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"u
         let failure = failure.expect("known terminal state must survive a truncated stream");
         assert_eq!(failure.reason, TerminalCompletionError::OutputTokenLimit);
         assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(4));
+    }
+
+    #[tokio::test]
+    async fn malformed_sse_after_terminal_reason_preserves_typed_outcome() {
+        let mut bytes = max_tokens_sse_prefix().to_vec();
+        bytes.extend_from_slice(
+            b"event: corrupted\n\
+data: {not-json}\n\n",
+        );
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+
+        assert_known_terminal_reason_survives_sse_exit(reader).await;
+    }
+
+    #[tokio::test]
+    async fn reader_error_after_terminal_reason_preserves_typed_outcome() {
+        let reader = tokio::io::BufReader::new(ErrorAfterReader {
+            data: std::io::Cursor::new(max_tokens_sse_prefix().to_vec()),
+            errored: false,
+        });
+
+        assert_known_terminal_reason_survives_sse_exit(reader).await;
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_terminal_reason_preserves_typed_outcome() {
+        let mut bytes = max_tokens_sse_prefix().to_vec();
+        bytes.extend_from_slice(
+            b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"test upstream error\"}}\n\n",
+        );
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+
+        assert_known_terminal_reason_survives_sse_exit(reader).await;
     }
 
     #[tokio::test]
