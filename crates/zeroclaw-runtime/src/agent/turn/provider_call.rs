@@ -10,9 +10,7 @@ use super::outcome::{
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::{
-    check_tool_loop_budget, record_rejected_tool_loop_cost_usage, record_tool_loop_cost_usage,
-};
+use crate::agent::cost::{check_tool_loop_budget, record_rejected_tool_loop_cost_usage};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -221,7 +219,11 @@ pub(crate) async fn call_provider(
                     .downcast_ref::<StreamInterruptedAfterOutput>()
                     .and_then(|error| error.usage.as_ref())
                 {
-                    record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
+                    // The caller already received a partial response, but the
+                    // provider attempt is still incomplete. Bill it once
+                    // without treating its prompt size as accepted context
+                    // fill for the next turn.
+                    record_rejected_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage);
                 }
                 Err(stream_err)
             }
@@ -629,7 +631,7 @@ mod streaming_fallback_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
-        StreamError, StreamEvent, TerminalCompletionError, TerminalCompletionFailure,
+        StreamChunk, StreamError, StreamEvent, TerminalCompletionError, TerminalCompletionFailure,
     };
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::ModelProvider;
@@ -648,6 +650,8 @@ mod streaming_fallback_tests {
         ordinary_stream_error: bool,
     }
 
+    struct PartialStreamProvider;
+
     impl Attributable for EmptyStreamThenTextProvider {
         fn role(&self) -> Role {
             Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
@@ -665,6 +669,16 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "PreExecutedToolThenEmptyProvider"
+        }
+    }
+
+    impl Attributable for PartialStreamProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "PartialStreamProvider"
         }
     }
 
@@ -802,6 +816,52 @@ mod streaming_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for PartialStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("a visible partial stream must not be replayed")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                })),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "partial response",
+                ))),
+                Err(StreamError::Http("connection interrupted".to_string())),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
@@ -929,6 +989,71 @@ mod streaming_fallback_tests {
         assert_eq!(
             recorded.last_input_tokens, 0,
             "rejected usage must not become accepted context fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_partial_stream_error_records_rejected_usage_without_context_fill() {
+        let provider = PartialStreamProvider;
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("dispatch returns the interrupted provider outcome");
+        let error = outcome
+            .chat_result
+            .expect_err("visible partial stream must not become a completed response");
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_some()
+        );
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "an incomplete visible partial must not become accepted context fill"
         );
     }
 
