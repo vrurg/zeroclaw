@@ -5819,16 +5819,8 @@ mod tests {
                 .await;
             Mock::given(method("PUT"))
                 .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
-                .and(body_partial_json(serde_json::json!({ "typing": true })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method("PUT"))
-                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
                 .and(body_partial_json(serde_json::json!({ "typing": false })))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-                .expect(1)
                 .mount(&server)
                 .await;
             Mock::given(method("PUT"))
