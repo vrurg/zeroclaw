@@ -475,54 +475,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_resolves_anthropic_oauth_profile_for_dotted_alias() {
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn execute_preserves_anthropic_oauth_dotted_alias() {
         use zeroclaw_config::schema::{
             AnthropicModelProviderConfig, AuthMode, ModelProviderConfig,
         };
 
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("authorization", "Bearer synthetic-profile-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
-            .mount(&server)
-            .await;
-
-        let state_dir = tempfile::tempdir().unwrap();
         let mut config = Config {
-            config_path: state_dir.path().join("config.toml"),
-            data_dir: state_dir.path().join("workspace"),
             ..Default::default()
         };
         config.providers.models.anthropic.insert(
             "subscription".to_string(),
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some(server.uri()),
+                    uri: Some("http://127.0.0.1:1".to_string()),
                     model: Some("claude-sonnet-4-5".to_string()),
                     ..Default::default()
                 },
                 auth_mode: Some(AuthMode::OAuth),
             },
         );
-        zeroclaw_providers::auth::AuthService::from_config(&config)
-            .store_model_provider_token(
-                "anthropic",
-                "subscription",
-                "synthetic-profile-token",
-                std::collections::HashMap::from([(
-                    "auth_kind".to_string(),
-                    "authorization".to_string(),
-                )]),
-                false,
-            )
-            .await
-            .unwrap();
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
             Arc::new(config),
@@ -532,7 +503,15 @@ mod tests {
         );
 
         let result = tool.execute(json!({"prompt": "hello"})).await.unwrap();
-        assert!(result.success, "tool result: {result:?}");
-        server.verify().await;
+        assert!(!result.success, "tool result: {result:?}");
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("providers.models.anthropic.subscription"),
+            "dotted alias was not preserved: {error}"
+        );
+        assert!(
+            error.contains("requires the official https://api.anthropic.com endpoint"),
+            "OAuth endpoint guard was not applied: {error}"
+        );
     }
 }
