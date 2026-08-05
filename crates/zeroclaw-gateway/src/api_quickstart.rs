@@ -120,14 +120,20 @@ pub async fn handle_apply(
     let quickstart_config = zeroclaw_runtime::quickstart::QuickstartConfigState::from_parts(
         Arc::clone(&state.config),
         Arc::clone(&state.quickstart_config_write_lock),
+        Arc::clone(&state.quickstart_reload_admission),
     );
-    let result = quickstart_config.apply(submission, Surface::Web).await;
+    let result = quickstart_config
+        .apply_and_admit_reload(submission, Surface::Web)
+        .await;
     let body = match result {
         Ok(outcome) => {
             state
                 .pending_reload
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let reload_signalled = signal_daemon_reload(&state);
+            if !reload_signalled {
+                quickstart_config.cancel_reload_admission();
+            }
             ApplyResult::Applied {
                 agent: outcome.agent,
                 daemon_restarted: reload_signalled,
@@ -141,6 +147,9 @@ pub async fn handle_apply(
 
 fn signal_daemon_reload(state: &AppState) -> bool {
     let Some(reload_tx) = state.reload_tx.clone() else {
+        state
+            .pending_reload
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -189,8 +198,6 @@ mod tests {
     use axum::{Router, body::Body, http::Request, routing::post};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
     };
@@ -198,16 +205,6 @@ mod tests {
     #[tokio::test]
     async fn http_quickstart_apply_persists_anthropic_setup_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .and(header("authorization", "Bearer synthetic-setup-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "content": [{"type": "text", "text": "ok"}],
-                "usage": {"input_tokens": 1, "output_tokens": 1}
-            })))
-            .mount(&server)
-            .await;
         let config = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
             data_dir: tmp.path().join("workspace"),
@@ -226,7 +223,6 @@ mod tests {
                 fields: std::collections::HashMap::from([
                     ("auth_mode".to_string(), "setup_token".to_string()),
                     ("api_key".to_string(), "synthetic-setup-token".to_string()),
-                    ("uri".to_string(), server.uri()),
                 ]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
@@ -347,13 +343,16 @@ mod tests {
             Some("synthetic-setup-token-two")
         );
         assert!(
-            state
+            !state
                 .pending_reload
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "standalone gateway must not retain a reload request it cannot dispatch"
         );
 
         // Reconstruct from the persisted file, rather than the gateway's
-        // in-memory working clone, and exercise the selected OAuth alias.
+        // in-memory working clone, and build the selected OAuth alias. OAuth
+        // aliases deliberately cannot use a local HTTP mock: their setup
+        // token is restricted to Anthropic's official endpoint.
         let mut reloaded: zeroclaw_config::schema::Config =
             toml::from_str(&std::fs::read_to_string(tmp.path().join("config.toml")).unwrap())
                 .unwrap();
@@ -366,14 +365,8 @@ mod tests {
                 .is_some(),
             "persisted config must retain both concurrent applies"
         );
-        let provider =
-            zeroclaw_providers::create_model_provider_from_ref(&reloaded, "anthropic.subscription")
-                .unwrap();
-        let response = zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
-            .simple_chat("hello", "claude-sonnet-4-5", None)
-            .await
-            .unwrap();
-        assert_eq!(response, "ok");
+        zeroclaw_providers::create_model_provider_from_ref(&reloaded, "anthropic.subscription")
+            .expect("gateway bootstrap must build the persisted OAuth alias");
 
         // Use the exact resilient-construction call made by gateway boot.
         // This makes the provider-selection contract explicit instead of only
@@ -396,7 +389,6 @@ mod tests {
             ),
         )
         .expect("gateway bootstrap must resolve the persisted OAuth alias");
-        server.verify().await;
     }
 
     #[tokio::test]
@@ -464,6 +456,90 @@ mod tests {
                 .pending_reload
                 .load(std::sync::atomic::Ordering::Relaxed),
             "failed HTTP apply must not request reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_quickstart_rejects_another_apply_while_supervised_reload_is_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let mut state = crate::api::test_state(config);
+        let (reload_tx, _reload_rx) = tokio::sync::watch::channel(false);
+        state.reload_tx = Some(reload_tx);
+        let router = Router::new()
+            .route("/api/quickstart/apply", post(handle_apply))
+            .with_state(state.clone());
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "subscription".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                ]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+        let mut second_submission = submission.clone();
+        second_submission.agent.name = "quickstart_bot_two".into();
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/quickstart/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&submission).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first["kind"], "applied");
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/quickstart/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&second_submission).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(second["kind"], "errors");
+        assert_eq!(second["errors"][0]["field"], "reload");
+        assert!(
+            !state
+                .config
+                .read()
+                .agents
+                .contains_key("quickstart_bot_two"),
+            "rejected queued HTTP apply must not modify the outgoing daemon config"
         );
     }
 

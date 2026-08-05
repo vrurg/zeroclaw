@@ -582,6 +582,7 @@ cli-quickstart-step-agent = Agente
 cli-quickstart-error-internal-no-result = error interno: apply_into no devolvió resultado aunque no hubo errores de validación
 cli-quickstart-error-completion-flag = no se pudo cambiar quickstart-completed: {$err}
 cli-quickstart-error-persist-config = no se pudo persistir la configuración: {$err}
+cli-quickstart-error-reload-pending = Quickstart está esperando que el daemon se recargue después de un envío exitoso anterior
 cli-quickstart-warning = ADVERTENCIA: {$message}
 cli-quickstart-warning-config-durability = Quickstart se completó, pero no se pudo confirmar la durabilidad de la configuración: {$err}
 cli-quickstart-warning-anthropic-profile-durability = Quickstart se completó, pero no se pudo confirmar la durabilidad de las credenciales de Anthropic: {$err}

@@ -402,9 +402,14 @@ impl AnthropicModelProvider {
             .get_profile("anthropic", Some(profile_name))
             .await?
             .ok_or_else(Self::missing_credentials_error)?;
+        // Anthropic's alias-bound OAuth contract currently supports the
+        // setup-token profile shape only. Generic OAuth token sets require an
+        // expiry and refresh owner, which this provider does not define.
         let token = match profile.kind {
             AuthProfileKind::Token => profile.token,
-            AuthProfileKind::OAuth => profile.token_set.map(|tokens| tokens.access_token),
+            AuthProfileKind::OAuth => {
+                anyhow::bail!("Anthropic OAuth aliases require a stored setup-token profile")
+            }
         }
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
@@ -2244,6 +2249,48 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn metadata_less_stored_setup_token_uses_authorization_header() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "sk-ant-oat01-legacy-token",
+                std::collections::HashMap::new(),
+                false,
+            )
+            .await
+            .expect("store legacy setup-token profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve metadata-less setup-token profile");
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/messages"),
+                &credential,
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-ant-oat01-legacy-token")
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[tokio::test]
     async fn stored_profile_with_invalid_auth_kind_fails_closed() {
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         let auth_service = AuthService::new(state_dir.path(), false);
@@ -2342,11 +2389,10 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn oauth_alias_factory_resolves_stored_profile_for_messages_request() {
+    async fn oauth_alias_resolves_stored_profile_for_messages_request() {
         use axum::{Json, Router, http::HeaderMap, routing::post};
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
-        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode, Config};
 
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         AuthService::new(state_dir.path(), false)
@@ -2399,28 +2445,10 @@ data: {\"type\":\"message_stop\"}\n\n";
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.expect("serve mock");
         });
-        let mut config = Config::default();
-        config.providers.models.anthropic.insert(
-            "subscription".to_string(),
-            AnthropicModelProviderConfig {
-                base: Default::default(),
-                auth_mode: Some(AuthMode::OAuth),
-            },
-        );
-        let options = crate::ModelProviderRuntimeOptions {
-            zeroclaw_dir: Some(state_dir.path().to_path_buf()),
-            secrets_encrypt: false,
-            ..Default::default()
-        };
-        let provider = crate::create_model_provider_for_alias_with_url(
-            &config,
-            "anthropic",
-            "subscription",
-            None,
-            Some(&format!("http://{address}")),
-            &options,
-        )
-        .expect("factory should build OAuth alias");
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(AuthService::new(state_dir.path(), false))
+            .base_url(&format!("http://{address}"))
+            .build();
         assert_eq!(
             provider
                 .chat_with_system(None, "hello", "claude-opus-4-6", None)
@@ -2556,6 +2584,73 @@ data: {\"type\":\"message_stop\"}\n\n";
             .err()
             .expect("OAuth plus api_key must not construct a provider");
         assert!(error.to_string().contains("must not be combined"));
+    }
+
+    #[test]
+    fn oauth_factory_accepts_only_the_official_anthropic_endpoint() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+
+        let config = AnthropicModelProviderConfig {
+            base: Default::default(),
+            auth_mode: Some(AuthMode::OAuth),
+        };
+        let options = ModelProviderRuntimeOptions::default();
+        config
+            .create_provider(
+                "subscription",
+                None,
+                Some("https://api.anthropic.com"),
+                &options,
+            )
+            .expect("official Anthropic endpoint must be accepted");
+        for endpoint in ["http://api.anthropic.com", "https://proxy.example"] {
+            let error = match config.create_provider("subscription", None, Some(endpoint), &options)
+            {
+                Ok(_) => {
+                    panic!("OAuth aliases must not send setup tokens to a nonofficial endpoint")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("official https://api.anthropic.com")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_rejects_generic_token_sets_without_lifecycle_owner() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        crate::auth::profiles::AuthProfilesStore::new(state_dir.path(), false)
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_oauth(
+                    "anthropic",
+                    "subscription",
+                    crate::auth::profiles::TokenSet {
+                        access_token: "synthetic-access-token".to_string(),
+                        refresh_token: None,
+                        id_token: None,
+                        expires_at: None,
+                        token_type: Some("Bearer".to_string()),
+                        scope: None,
+                    },
+                ),
+                false,
+            )
+            .await
+            .expect("store generic OAuth profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(AuthService::new(state_dir.path(), false))
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("Anthropic OAuth aliases must reject unsupported token sets");
+        assert!(error.to_string().contains("stored setup-token profile"));
     }
 
     #[test]

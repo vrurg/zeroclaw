@@ -4497,13 +4497,17 @@ impl RpcDispatcher {
         let quickstart_config = crate::quickstart::QuickstartConfigState::from_parts(
             Arc::clone(&self.ctx.config),
             Arc::clone(&self.ctx.config_write_lock),
+            Arc::clone(&self.ctx.quickstart_reload_admission),
         );
         let result = quickstart_config
-            .apply(req.submission, crate::quickstart::Surface::Tui)
+            .apply_and_admit_reload(req.submission, crate::quickstart::Surface::Tui)
             .await;
         let body = match result {
             Ok(outcome) => {
                 let reload_signalled = self.signal_daemon_reload();
+                if !reload_signalled {
+                    quickstart_config.cancel_reload_admission();
+                }
                 QuickstartApplyResult::Applied {
                     agent: outcome.agent,
                     daemon_restarted: reload_signalled,
@@ -6214,7 +6218,7 @@ mod tests {
         };
 
         let result = dispatcher
-            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .handle_quickstart_apply(&json!({ "submission": submission.clone() }))
             .await
             .expect("quickstart/apply should accept reload-capable contexts");
         assert_eq!(
@@ -6222,6 +6226,14 @@ mod tests {
             "quickstart/apply result: {result:#?}"
         );
         assert_eq!(result["daemon_restarted"], true);
+        let mut second_submission = submission.clone();
+        second_submission.agent.name = "quickstart_bot_two".into();
+        let rejected = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": second_submission }))
+            .await
+            .expect("a pending reload is a valid quickstart response");
+        assert_eq!(rejected["kind"], "errors");
+        assert_eq!(rejected["errors"][0]["field"], "reload");
         let persisted = ctx.config.read().clone();
         let entry = persisted
             .providers
@@ -6235,6 +6247,10 @@ mod tests {
             .expect("read persisted auth profile")
             .expect("TUI apply must store the same-alias profile");
         assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
+        assert!(
+            !persisted.agents.contains_key("quickstart_bot_two"),
+            "rejected queued RPC apply must not mutate the outgoing daemon config"
+        );
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -9233,6 +9249,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -9276,6 +9293,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -9376,6 +9394,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,

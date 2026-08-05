@@ -1,6 +1,9 @@
 //! Quickstart apply path.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -21,6 +24,11 @@ use zeroclaw_config::schema::{Config, WireApi};
 pub struct QuickstartConfigState {
     config: Arc<RwLock<Config>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Set after a successful supervised Quickstart commit and before the
+    /// handler schedules its delayed daemon reload. It closes the interval in
+    /// which a queued second Web/RPC apply could otherwise commit only to be
+    /// interrupted by the first submission's reload.
+    reload_admitted: Arc<AtomicBool>,
 }
 
 impl QuickstartConfigState {
@@ -28,6 +36,7 @@ impl QuickstartConfigState {
         Self {
             config: Arc::new(RwLock::new(config)),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reload_admitted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -40,8 +49,13 @@ impl QuickstartConfigState {
     pub fn from_parts(
         config: Arc<RwLock<Config>>,
         write_lock: Arc<tokio::sync::Mutex<()>>,
+        reload_admitted: Arc<AtomicBool>,
     ) -> Self {
-        Self { config, write_lock }
+        Self {
+            config,
+            write_lock,
+            reload_admitted,
+        }
     }
 
     pub fn config(&self) -> Arc<RwLock<Config>> {
@@ -52,6 +66,11 @@ impl QuickstartConfigState {
         Arc::clone(&self.write_lock)
     }
 
+    /// Daemon-owned reload admission shared by every Quickstart adapter.
+    pub fn reload_admission(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reload_admitted)
+    }
+
     /// Apply and commit one Quickstart submission while owning the shared
     /// config transaction. The lock is acquired before cloning and held until
     /// the persisted working copy replaces the shared live state.
@@ -60,10 +79,53 @@ impl QuickstartConfigState {
         submission: BuilderSubmission,
         surface: Surface,
     ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+        self.apply_inner(submission, surface, false).await
+    }
+
+    /// Apply a submission that will immediately request a daemon reload.
+    ///
+    /// The pending-reload admission is set while the complete transaction is
+    /// still locked. A later queued Web/RPC apply therefore fails cleanly
+    /// instead of persisting a change the scheduled reload would interrupt.
+    pub async fn apply_and_admit_reload(
+        &self,
+        submission: BuilderSubmission,
+        surface: Surface,
+    ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
+        self.apply_inner(submission, surface, true).await
+    }
+
+    /// Release an admission when the caller cannot schedule the reload (for
+    /// example, a standalone gateway or test harness). A successful
+    /// supervised reload intentionally leaves the admission set because the
+    /// daemon process will be replaced.
+    pub fn cancel_reload_admission(&self) {
+        self.reload_admitted.store(false, Ordering::Release);
+    }
+
+    async fn apply_inner(
+        &self,
+        submission: BuilderSubmission,
+        surface: Surface,
+        admit_reload: bool,
+    ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
         let _transaction_guard = Arc::clone(&self.write_lock).lock_owned().await;
+        if admit_reload && self.reload_admitted.load(Ordering::Acquire) {
+            return Err(vec![QuickstartError::for_surface(
+                None,
+                QuickstartStep::Agent,
+                "reload",
+                "Quickstart is waiting for the daemon to reload after a previous successful submission",
+                "cli-quickstart-error-reload-pending",
+                &[],
+            )]);
+        }
         let mut working = self.config.read().clone();
         let outcome = apply_with_surface_outcome(submission, &mut working, surface).await?;
         *self.config.write() = working;
+        if admit_reload {
+            self.reload_admitted.store(true, Ordering::Release);
+        }
         Ok(outcome)
     }
 }
@@ -3665,6 +3727,61 @@ mod tests {
                     && error.message.contains("required")
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn shared_reload_admission_rejects_queued_cross_surface_apply_until_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+        let state = QuickstartConfigState::new(config);
+        let web_state = QuickstartConfigState::from_parts(
+            state.config(),
+            state.write_lock(),
+            state.reload_admission(),
+        );
+        let tui_state = QuickstartConfigState::from_parts(
+            state.config(),
+            state.write_lock(),
+            state.reload_admission(),
+        );
+
+        let mut web_submission = fresh_submission("web_bot");
+        let SelectorChoice::Fresh(web_provider) = &mut web_submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        web_provider.alias = "web_provider".to_string();
+        let mut tui_submission = fresh_submission("tui_bot");
+        let SelectorChoice::Fresh(tui_provider) = &mut tui_submission.model_provider else {
+            panic!("fresh submission must create a provider");
+        };
+        tui_provider.alias = "tui_provider".to_string();
+
+        web_state
+            .apply_and_admit_reload(web_submission, Surface::Web)
+            .await
+            .expect("first supervised Quickstart apply must commit");
+
+        let errors = tui_state
+            .apply_and_admit_reload(tui_submission.clone(), Surface::Tui)
+            .await
+            .expect_err("queued TUI apply must not commit while Web reload is pending");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, "reload");
+        assert!(
+            !state.config().read().agents.contains_key("tui_bot"),
+            "rejected queued apply must not modify the outgoing daemon configuration"
+        );
+
+        web_state.cancel_reload_admission();
+        tui_state
+            .apply_and_admit_reload(tui_submission, Surface::Tui)
+            .await
+            .expect("standalone caller cancellation must permit a later apply");
     }
 
     #[test]

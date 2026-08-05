@@ -447,6 +447,9 @@ pub struct AppState {
     /// Serializes the await-spanning Web Quickstart transaction. The config
     /// `RwLock` alone cannot cross profile/config persistence awaits.
     pub quickstart_config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Shared with RPC/TUI to reject additional Quickstart commits after a
+    /// successful submission has been admitted for delayed daemon reload.
+    pub quickstart_reload_admission: Arc<std::sync::atomic::AtomicBool>,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -1558,6 +1561,7 @@ pub async fn run_gateway(
     let state = AppState {
         config: config_state,
         quickstart_config_write_lock: quickstart_config.write_lock(),
+        quickstart_reload_admission: quickstart_config.reload_admission(),
         model_provider,
         model,
         temperature,
@@ -4424,6 +4428,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5282,6 +5287,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5371,6 +5377,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5967,6 +5974,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6074,6 +6082,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6197,6 +6206,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -6299,6 +6309,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6420,6 +6431,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6507,6 +6519,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6599,6 +6612,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6698,6 +6712,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6795,6 +6810,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6948,6 +6964,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -7792,6 +7809,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -7880,6 +7898,7 @@ mod tests {
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -8042,6 +8061,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider,
             model: "test-model".into(),
             temperature: None,

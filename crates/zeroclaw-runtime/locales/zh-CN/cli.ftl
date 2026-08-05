@@ -581,6 +581,7 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = 内部错误：没有验证错误，但 apply_into 没有返回结果
 cli-quickstart-error-completion-flag = 无法切换 quickstart-completed：{$err}
 cli-quickstart-error-persist-config = 无法持久化配置：{$err}
+cli-quickstart-error-reload-pending = Quickstart 正在等待守护进程在上一次成功提交后重新加载
 cli-quickstart-warning = 警告：{$message}
 cli-quickstart-warning-config-durability = Quickstart 已完成，但无法确认配置的持久性：{$err}
 cli-quickstart-warning-anthropic-profile-durability = Quickstart 已完成，但无法确认 Anthropic 凭据的持久性：{$err}

@@ -19424,6 +19424,20 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
 
+        // TOML deserialization inserts provider aliases directly into their
+        // maps. Preserve legacy aliases that are broader than the mutation
+        // API grammar, but reject ':' because it is an auth-profile-id
+        // separator and can change credential ownership.
+        for (family, alias, _) in self.providers.models.iter_entries() {
+            if alias.contains(':') {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("providers.models.{family}.{alias}"),
+                    "provider alias `{alias}` must not contain ':'"
+                );
+            }
+        }
+
         for (alias, provider) in &self.providers.models.anthropic {
             if provider.auth_mode == Some(AuthMode::OAuth) && provider.base.api_key.is_some() {
                 let path = format!("providers.models.anthropic.{alias}.api_key");
@@ -37534,6 +37548,35 @@ model_provider = \"ollama.default\"
 
         let error = config.validate().expect_err("OAuth plus api_key must fail");
         assert!(error.to_string().contains("auth_mode = \"oauth\""));
+    }
+
+    #[::core::prelude::v1::test]
+    fn validation_rejects_colon_bearing_provider_aliases() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription:other-provider".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+
+        let error = config
+            .validate()
+            .expect_err("provider aliases must not contain the profile-id separator");
+        assert!(error.to_string().contains("must not contain ':'"));
+        assert!(error.to_string().contains("subscription:other-provider"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn validation_preserves_legacy_hyphenated_provider_aliases() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .custom
+            .insert("kimi-k2-5".into(), CustomModelProviderConfig::default());
+
+        config
+            .validate()
+            .expect("legacy hyphenated provider aliases must remain valid");
     }
 
     #[::core::prelude::v1::test]

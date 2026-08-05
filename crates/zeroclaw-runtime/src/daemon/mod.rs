@@ -550,6 +550,7 @@ pub async fn run(
         Some(std::sync::Arc::new(RpcContext {
             config: quickstart_config.config(),
             config_write_lock: quickstart_config.write_lock(),
+            quickstart_reload_admission: quickstart_config.reload_admission(),
             sessions,
             session_backend,
             memory: rpc_memory,

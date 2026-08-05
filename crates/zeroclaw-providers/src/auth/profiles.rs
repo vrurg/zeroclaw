@@ -597,6 +597,7 @@ impl AuthProfilesStore {
                     parent.display()
                 )
             })?;
+            set_owner_only_directory_permissions(parent).await?;
         }
 
         let json =
@@ -620,6 +621,7 @@ impl AuthProfilesStore {
                     tmp_path.display()
                 )
             })?;
+        set_owner_only_file_permissions(&tmp_path).await?;
 
         if let Err(err) = temp_file.write_all(&json).await {
             drop(temp_file);
@@ -735,6 +737,42 @@ impl AuthProfilesStore {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn set_owner_only_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to set owner-only auth-profile directory permissions: {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn set_owner_only_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to set owner-only auth-profile file permissions: {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+async fn set_owner_only_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 struct AuthProfileLockGuard {
@@ -914,6 +952,52 @@ mod tests {
         let persisted: PersistedAuthProfiles =
             serde_json::from_slice(&tokio::fs::read(store.path()).await.unwrap()).unwrap();
         assert_eq!(persisted.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_write_uses_owner_only_permissions_for_parent_and_replaced_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = AuthProfilesStore::new(&state_dir, false);
+        std::fs::write(store.path(), b"legacy").unwrap();
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let outcome = store
+            .write_persisted_locked_with_sync(
+                &PersistedAuthProfiles::default(),
+                |file| {
+                    Box::pin(async move {
+                        let mode = file.metadata().await?.permissions().mode() & 0o777;
+                        assert_eq!(mode, 0o600, "temporary profile store must be owner-only");
+                        Ok(())
+                    })
+                },
+                |parent| Box::pin(sync_directory(parent)),
+            )
+            .await
+            .expect("profile replacement must succeed");
+
+        assert!(matches!(outcome, ProfileSaveOutcome::Durable));
+        assert_eq!(
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "auth-profile parent directory must be owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "replaced auth-profile store must inherit owner-only temporary-file permissions"
+        );
     }
 
     #[test]

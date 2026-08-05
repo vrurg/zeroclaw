@@ -2220,6 +2220,7 @@ pub(crate) mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             quickstart_config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,

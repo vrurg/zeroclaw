@@ -582,6 +582,7 @@ cli-quickstart-step-agent = エージェント
 cli-quickstart-error-internal-no-result = 内部エラー: 検証エラーがないのに apply_into が結果を返しませんでした
 cli-quickstart-error-completion-flag = quickstart-completed の切り替えに失敗しました: {$err}
 cli-quickstart-error-persist-config = 設定の保存に失敗しました: {$err}
+cli-quickstart-error-reload-pending = Quickstart は、前回の送信成功後にデーモンが再読み込みされるのを待機しています
 cli-quickstart-warning = 警告: {$message}
 cli-quickstart-warning-config-durability = Quickstart は完了しましたが、設定の永続性を確認できませんでした: {$err}
 cli-quickstart-warning-anthropic-profile-durability = Quickstart は完了しましたが、Anthropic 認証情報の永続性を確認できませんでした: {$err}
