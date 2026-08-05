@@ -8289,7 +8289,7 @@ command = "echo hi"
     }
 
     #[tokio::test]
-    async fn delegate_returns_ordered_aggregate_when_fallbacks_exhaust() {
+    async fn delegate_returns_safe_ordered_summary_when_fallbacks_exhaust() {
         let (primary, primary_requests) =
             start_failing_chat_server_with_error(503, "primary failure marker").await;
         let (backup, backup_requests) =
@@ -8329,15 +8329,18 @@ command = "echo hi"
             "the configured fallback must be attempted exactly once"
         );
         let error = result.error.expect("terminal delegate error");
-        let primary_index = error
-            .find("primary failure marker")
-            .expect("aggregate includes the primary failure: {error}");
-        let backup_index = error
-            .find("backup failure marker")
-            .expect("aggregate includes the fallback failure: {error}");
         assert!(
-            primary_index < backup_index,
-            "aggregate must retain configured candidate order: {error}"
+            error.contains("All model providers/models failed after 2 attempt(s)"),
+            "terminal error summarizes every attempted candidate: {error}"
+        );
+        assert!(
+            error.contains("attempt 1 (retry 1/1): retryable")
+                && error.contains("attempt 2 (retry 1/1): retryable"),
+            "summary preserves attempt order: {error}"
+        );
+        assert!(
+            !error.contains("primary failure marker") && !error.contains("backup failure marker"),
+            "provider-controlled response bodies must not reach the caller: {error}"
         );
         let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
         assert!(
@@ -8380,7 +8383,7 @@ command = "echo hi"
     }
 
     #[tokio::test]
-    async fn background_delegate_exposes_aggregate_when_fallbacks_exhaust() {
+    async fn background_delegate_persists_safe_summary_when_fallbacks_exhaust() {
         let (primary, primary_requests) =
             start_failing_chat_server_with_error(503, "background primary failure marker").await;
         let (backup, backup_requests) =
@@ -8424,15 +8427,16 @@ command = "echo hi"
             .error
             .as_deref()
             .expect("persisted failure detail");
-        let primary_index = persisted_error
-            .find("background primary failure marker")
-            .expect("persisted aggregate includes the primary failure");
-        let backup_index = persisted_error
-            .find("background backup failure marker")
-            .expect("persisted aggregate includes the fallback failure");
         assert!(
-            primary_index < backup_index,
-            "persisted aggregate must retain configured candidate order: {persisted_error}"
+            persisted_error.contains("All model providers/models failed after 2 attempt(s)")
+                && persisted_error.contains("attempt 1 (retry 1/1): retryable")
+                && persisted_error.contains("attempt 2 (retry 1/1): retryable"),
+            "persisted error must contain the safe ordered summary: {persisted_error}"
+        );
+        assert!(
+            !persisted_error.contains("background primary failure marker")
+                && !persisted_error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not persist: {persisted_error}"
         );
 
         let result = tool
@@ -8446,15 +8450,16 @@ command = "echo hi"
         let error = result
             .error
             .expect("caller receives background failure detail");
-        let primary_index = error
-            .find("background primary failure marker")
-            .expect("check_result aggregate includes the primary failure");
-        let backup_index = error
-            .find("background backup failure marker")
-            .expect("check_result aggregate includes the fallback failure");
         assert!(
-            primary_index < backup_index,
-            "check_result aggregate must retain configured candidate order: {error}"
+            error.contains("All model providers/models failed after 2 attempt(s)")
+                && error.contains("attempt 1 (retry 1/1): retryable")
+                && error.contains("attempt 2 (retry 1/1): retryable"),
+            "check_result returns the same safe summary: {error}"
+        );
+        assert!(
+            !error.contains("background primary failure marker")
+                && !error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not reach check_result: {error}"
         );
         let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
         assert!(

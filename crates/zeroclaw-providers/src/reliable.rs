@@ -733,27 +733,33 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
 
 fn push_failure(
     failures: &mut Vec<String>,
-    provider_name: &str,
-    model: &str,
     attempt: u32,
     max_attempts: u32,
     reason: &str,
-    error_detail: &str,
     diagnostic: Option<&ProviderErrorDiagnostic>,
 ) {
+    // This aggregate can cross into model-visible tool results and durable
+    // background results. Keep it to fields controlled by ZeroClaw; the
+    // provider response detail is retained in the structured attempt logs.
     let mut failure = format!(
-        "model_provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+        "attempt {} (retry {attempt}/{max_attempts}): {reason}",
+        failures.len() + 1
     );
     if let Some(diagnostic) = diagnostic {
         failure.push_str(&format!(
             "; kind={}; phase={}; hint={}",
             diagnostic.kind, diagnostic.phase, diagnostic.hint
         ));
-        if let Some(endpoint) = diagnostic.endpoint.as_deref() {
-            failure.push_str(&format!("; endpoint={endpoint}"));
-        }
     }
     failures.push(failure);
+}
+
+fn failure_aggregate(failures: &[String]) -> String {
+    format!(
+        "All model providers/models failed after {} attempt(s). Attempts:\n{}",
+        failures.len(),
+        failures.join("\n")
+    )
 }
 
 fn is_empty_completion(resp: &ChatResponse) -> bool {
@@ -986,10 +992,20 @@ impl ReliableModelProvider {
         self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
-    fn record_cooldown_skip_failure(failures: &mut Vec<String>, provider_name: &str, model: &str) {
-        failures.push(format!(
-            "model_provider={provider_name} model={model}: skipped; reason=rate_limit_cooldown"
-        ));
+    fn record_cooldown_skip_failure(failures: &mut Vec<String>, max_attempts: u32) {
+        let diagnostic = ProviderErrorDiagnostic {
+            kind: "rate_limited",
+            phase: "cooldown",
+            hint: "wait for provider cooldown or switch provider",
+            endpoint: None,
+        };
+        push_failure(
+            failures,
+            0,
+            max_attempts,
+            "rate_limit_cooldown",
+            Some(&diagnostic),
+        );
     }
 
     fn log_cooldown_skip(&self, provider_name: &str) {
@@ -1049,12 +1065,9 @@ impl ReliableModelProvider {
     ) {
         push_failure(
             failures,
-            provider_name,
-            model,
             attempt + 1,
             self.max_retries + 1,
             "empty_response",
-            "model_provider returned an empty completion",
             None,
         );
         ::zeroclaw_log::record!(
@@ -1121,7 +1134,7 @@ impl ModelProvider for ReliableModelProvider {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1189,16 +1202,13 @@ impl ModelProvider for ReliableModelProvider {
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
                             if is_context_window_exceeded(&e) {
-                                let error_detail = compact_error_detail(&e);
+                                let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    Some(&diagnostic),
                                 );
                                 anyhow::bail!(
                                     "Request exceeds model context window. Attempts:\n{}",
@@ -1217,12 +1227,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1311,10 +1318,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(failure_aggregate(&failures))
     }
 
     async fn chat_with_history(
@@ -1333,7 +1337,7 @@ impl ModelProvider for ReliableModelProvider {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1408,18 +1412,15 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
+                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    Some(&diagnostic),
                                 );
                                 anyhow::bail!(
                                     "Request exceeds model context window and cannot be reduced without \
@@ -1441,12 +1442,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1529,10 +1527,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(failure_aggregate(&failures))
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
@@ -1595,7 +1590,7 @@ impl ModelProvider for ReliableModelProvider {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1671,18 +1666,15 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
+                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    Some(&diagnostic),
                                 );
                                 anyhow::bail!(
                                     "Request exceeds model context window and cannot be reduced without \
@@ -1704,12 +1696,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1792,10 +1781,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(failure_aggregate(&failures))
     }
 
     async fn chat(
@@ -1814,7 +1800,7 @@ impl ModelProvider for ReliableModelProvider {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1895,18 +1881,15 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
+                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
                                 push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
                                     attempt + 1,
                                     self.max_retries + 1,
                                     "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    Some(&diagnostic),
                                 );
                                 anyhow::bail!(
                                     "Request exceeds model context window and cannot be reduced without \
@@ -1928,12 +1911,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -2020,10 +2000,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        anyhow::bail!(failure_aggregate(&failures))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -2853,11 +2830,11 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 error"));
-        assert!(msg.contains("error=p2 error"));
+        assert!(msg.contains("All model providers/models failed after 2 attempt(s)"));
+        assert!(msg.contains("attempt 1 (retry 1/1): retryable"));
+        assert!(msg.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 error"));
+        assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
     }
 
@@ -3031,7 +3008,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_summary_includes_provider_diagnostic_fields() {
+    fn failure_summary_contains_only_safe_diagnostic_fields() {
         let diagnostic = ProviderErrorDiagnostic {
             kind: "connect_timeout",
             phase: "tls_or_connect",
@@ -3040,22 +3017,15 @@ mod tests {
         };
         let mut failures = Vec::new();
 
-        push_failure(
-            &mut failures,
-            "deepseek",
-            "deepseek-reasoner",
-            1,
-            3,
-            "retryable",
-            "operation timed out",
-            Some(&diagnostic),
-        );
+        push_failure(&mut failures, 1, 3, "retryable", Some(&diagnostic));
 
         let summary = failures.join("\n");
+        assert!(summary.contains("attempt 1 (retry 1/3): retryable"));
         assert!(summary.contains("kind=connect_timeout"));
         assert!(summary.contains("phase=tls_or_connect"));
-        assert!(summary.contains("endpoint=https://api.deepseek.com/chat/completions"));
         assert!(summary.contains("hint=check network, VPN, or firewall"));
+        assert!(!summary.contains("https://api.deepseek.com/chat/completions"));
+        assert!(!summary.contains("operation timed out"));
     }
 
     #[tokio::test]
@@ -3093,7 +3063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
+    async fn aggregated_error_marks_non_retryable_model_mismatch_without_provider_text() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -3116,8 +3086,10 @@ mod tests {
             .expect_err("model_provider should fail");
         let msg = err.to_string();
 
+        assert!(msg.contains("All model providers/models failed after 1 attempt(s)"));
         assert!(msg.contains("non_retryable"));
-        assert!(msg.contains("error=unsupported model: glm-4.7"));
+        assert!(msg.contains("kind=model_not_found"));
+        assert!(!msg.contains("unsupported model: glm-4.7"));
         // Non-retryable errors should not consume retry budget.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -3302,7 +3274,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(
             err.to_string()
-                .contains("All model_providers/models failed")
+                .contains("All model providers/models failed after 3 attempt(s)")
         );
 
         let seen = mock.models_seen.lock();
@@ -3696,6 +3668,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cooldown_skip_uses_safe_terminal_summary() {
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "provider-alias-should-not-escape",
+                    "primary-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "should be skipped",
+                        error: "unreachable",
+                    }),
+                ),
+                ReliableModelProviderEntry::new(
+                    "fallback-alias-should-not-escape",
+                    "fallback-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "unreachable",
+                        error: "fallback provider response marker",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let cooldown_error = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
+        model_provider.set_rate_limit_cooldown("primary-cooldown-key", &cooldown_error);
+
+        let error = model_provider
+            .simple_chat("hello", "model-id-should-not-escape", Some(0.0))
+            .await
+            .expect_err("the non-cooled fallback should fail");
+        let message = error.to_string();
+
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert!(message.contains("attempt 1 (retry 0/1): rate_limit_cooldown"));
+        assert!(message.contains("kind=rate_limited"));
+        assert!(message.contains("phase=cooldown"));
+        assert!(message.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(!message.contains("provider-alias-should-not-escape"));
+        assert!(!message.contains("fallback-alias-should-not-escape"));
+        assert!(!message.contains("model-id-should-not-escape"));
+        assert!(!message.contains("fallback provider response marker"));
+    }
+
+    #[tokio::test]
     async fn retryable_rate_limit_cools_down_shared_provider_identity() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let shared_model_fallback_calls = Arc::new(AtomicUsize::new(0));
@@ -4007,11 +4031,11 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 chat error"));
-        assert!(msg.contains("error=p2 chat error"));
+        assert!(msg.contains("All model providers/models failed after 2 attempt(s)"));
+        assert!(msg.contains("attempt 1 (retry 1/1): retryable"));
+        assert!(msg.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 chat error"));
+        assert!(!msg.contains("p2 chat error"));
         assert!(msg.contains("retryable"));
     }
 
