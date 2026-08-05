@@ -119,7 +119,7 @@ pub async fn handle_apply(
     }
     let quickstart_config = zeroclaw_runtime::quickstart::QuickstartConfigState::from_parts(
         Arc::clone(&state.config),
-        Arc::clone(&state.quickstart_config_write_lock),
+        Arc::clone(&state.config_write_lock),
         Arc::clone(&state.quickstart_reload_admission),
     );
     let result = quickstart_config

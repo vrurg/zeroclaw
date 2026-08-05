@@ -19,9 +19,10 @@ use crate::auth::profiles::AuthProfileKind;
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
 pub(crate) const BASE_URL: &str = "https://api.anthropic.com";
-const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
-
 use crate::stream_guard::AbortOnDrop;
+
+/// Maximum silence between body reads for Anthropic SSE streams.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Clone)]
 pub struct AnthropicModelProvider {
@@ -60,6 +61,7 @@ struct StreamTransport {
     alias: String,
     client: Client,
     url: String,
+    phase_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -970,6 +972,20 @@ impl AnthropicModelProvider {
         serde_json::to_vec(request).context("Failed to serialize NativeChatRequest to JSON")
     }
 
+    /// Streaming requests have no whole-request deadline. Header acquisition
+    /// and buffered error bodies are bounded separately, while successful SSE
+    /// bodies use the shared byte-idle timeout.
+    fn streaming_http_client(&self) -> Result<Client, reqwest::Error> {
+        let builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(STREAM_IDLE_TIMEOUT);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.anthropic",
+        );
+        builder.build()
+    }
+
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
     async fn parse_anthropic_sse(
         response: reqwest::Response,
@@ -1005,13 +1021,11 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
-        let mut saw_stop_reason = false;
-
         loop {
-            let line = match tokio::time::timeout(SSE_IDLE_TIMEOUT, lines.next_line()).await {
-                Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) => break,
-                Ok(Err(err)) => {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(err) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1024,24 +1038,6 @@ impl AnthropicModelProvider {
                     );
                     let _ = tx
                         .send(Err(StreamError::Http(format!("SSE read error: {err}"))))
-                        .await;
-                    return;
-                }
-                Err(_) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "idle_secs": SSE_IDLE_TIMEOUT.as_secs(),
-                            })),
-                        "stream: SSE idle timeout — connection stalled, aborting stream"
-                    );
-                    let _ = tx
-                        .send(Err(StreamError::Http(format!(
-                            "SSE stream stalled: no data for {}s",
-                            SSE_IDLE_TIMEOUT.as_secs()
-                        ))))
                         .await;
                     return;
                 }
@@ -1175,9 +1171,6 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
-                    if stop_reason != "none" {
-                        saw_stop_reason = true;
-                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -1247,7 +1240,7 @@ impl AnthropicModelProvider {
             }
         }
 
-        crate::stream_guard::finish_sse_stream(tx, saw_stop_reason, "message_stop").await;
+        crate::stream_guard::finish_sse_stream(tx, false, "message_stop").await;
     }
 }
 
@@ -1556,12 +1549,13 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn stream_transport(&self) -> StreamTransport {
-        StreamTransport {
+    fn stream_transport(&self) -> Result<StreamTransport, reqwest::Error> {
+        Ok(StreamTransport {
             alias: self.alias.clone(),
-            client: self.http_client(),
+            client: self.streaming_http_client()?,
             url: format!("{}/v1/messages", self.base_url),
-        }
+            phase_timeout: std::time::Duration::from_secs(self.timeout_secs),
+        })
     }
 
     fn stream_prepared(
@@ -1707,12 +1701,16 @@ impl AnthropicModelProvider {
                 .boxed();
             }
         };
+        let phase_timeout = transport.phase_timeout;
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
                 .with_category(::zeroclaw_log::EventCategory::Provider)
-                .with_attrs(::serde_json::json!({"idle_timeout_secs": SSE_IDLE_TIMEOUT.as_secs(), "channel_capacity": 64})),
+                .with_attrs(::serde_json::json!({
+                    "idle_timeout_secs": STREAM_IDLE_TIMEOUT.as_secs(),
+                    "channel_capacity": 64,
+                })),
             "stream: spawning detached Anthropic SSE parser task"
         );
         let parser_handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1733,21 +1731,34 @@ impl AnthropicModelProvider {
             } else {
                 req = req.header("x-api-key", &credential.token);
             }
-            let response = match req.send().await {
-                Ok(response) => response,
-                Err(error) => {
+            let response = match tokio::time::timeout(phase_timeout, req.send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&error))))
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(StreamError::Http(format!(
+                            "streaming response headers not received within {}s",
+                            phase_timeout.as_secs()
+                        ))))
                         .await;
                     return;
                 }
             };
             if !response.status().is_success() {
                 let status = response.status();
-                let error = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let error = match tokio::time::timeout(phase_timeout, response.text()).await {
+                    Ok(Ok(body)) => body,
+                    Ok(Err(error)) => format!("error response body read failed: {error}"),
+                    Err(_) => format!(
+                        "error response body not received within {}s",
+                        phase_timeout.as_secs()
+                    ),
+                };
                 let _ = tx
                     .send(Err(StreamError::ModelProvider(format!(
                         "{status}: {error}"
@@ -1757,6 +1768,11 @@ impl AnthropicModelProvider {
             }
             Self::parse_anthropic_sse(response, &tx).await;
         });
+
+        // The guard travels inside the unfold state so it is dropped at the
+        // exact moment the consumer drops the stream — turning a turn cancel
+        // (or normal completion) into an immediate parser-task abort instead
+        // of a leaked socket that lingers until STREAM_IDLE_TIMEOUT.
         let guard = AbortOnDrop::new(parser_handle.abort_handle());
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|event| (event, (rx, guard)))
@@ -1776,7 +1792,16 @@ impl AnthropicModelProvider {
         }
 
         let prepared = self.prepare_stream_request(request, model, temperature);
-        let transport = self.stream_transport();
+        let transport = match self.stream_transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                let message = format!(
+                    "Failed to build Anthropic streaming client: {}",
+                    super::format_error_chain(&error)
+                );
+                return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
+            }
+        };
         if let Some(credential) = self.credential.as_deref() {
             return Self::stream_prepared(
                 prepared,
@@ -1955,50 +1980,10 @@ data: {\"type\":\"message_stop\"}\n\n"
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_stream_times_out_instead_of_hanging() {
-        // Repro: connection delivers message_start then goes silent. The
-        // parser must surface a retryable StreamError rather than parking on
-        // next_line() forever (the "stuck on working" hang).
-        let start = b"event: message_start\n\
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
-            .to_vec();
-        let reader = tokio::io::BufReader::new(StallAfterReader {
-            data: std::io::Cursor::new(start),
-            drained: false,
-        });
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-
-        let parser = ::zeroclaw_spawn::spawn!(async move {
-            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
-        });
-
-        // Let the parser run until it parks on the stalled read before we
-        // jump virtual time forward.
-        tokio::task::yield_now().await;
-        // Advance virtual time past the idle bound; the parser should wake,
-        // emit an error, and return — closing the channel.
-        tokio::time::advance(SSE_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
-
-        let mut last_err = None;
-        while let Some(ev) = rx.recv().await {
-            if let Err(e) = ev {
-                last_err = Some(e);
-            }
-        }
-        parser.await.expect("parser task must finish, not hang");
-
-        let err = last_err.expect("a StreamError must be emitted on stall");
-        assert!(
-            matches!(err, StreamError::Http(ref m) if m.contains("stalled")),
-            "expected stalled-stream Http error, got: {err:?}"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn dropping_guard_aborts_parser_without_idle_wait() {
         // The full-measure fix: dropping the consumer stream must abort the
         // detached parser immediately (turn cancel), not leak the socket until
-        // SSE_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
+        // STREAM_IDLE_TIMEOUT. We model the stream's lifetime with AbortOnDrop and
         // assert the task is aborted the instant the guard drops.
         let start = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n"
@@ -2022,13 +2007,86 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
             "parser must still be running (parked on the stalled read) before drop"
         );
 
-        // Dropping the guard must abort the parser — no SSE_IDLE_TIMEOUT wait.
+        // Dropping the guard must abort the parser — no STREAM_IDLE_TIMEOUT wait.
         drop(guard);
         tokio::task::yield_now().await;
         assert!(
             probe.is_finished(),
             "guard drop must abort the parser task immediately, not wait out the idle timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_stream_can_outlive_configured_request_timeout() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                    ))
+                });
+                let terminal = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ))
+                });
+                axum::body::Body::from_stream(first.chain(terminal)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .timeout_secs(1)
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-haiku-4-5",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        let mut text = String::new();
+        let mut saw_final = false;
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while let Some(event) = stream.next().await {
+                match event.expect("successful SSE stream must not fail") {
+                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                    StreamEvent::Final => {
+                        saw_final = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("successful stream must finish after exceeding the request timeout");
+
+        server.abort();
+        assert_eq!(text, "hi");
+        assert!(saw_final, "message_stop must emit Final");
     }
 
     #[tokio::test]
@@ -2040,7 +2098,9 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"clau
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
