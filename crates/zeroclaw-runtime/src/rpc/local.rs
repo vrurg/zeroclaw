@@ -583,7 +583,8 @@ mod tests {
                         let server_ctx = Arc::clone(&ctx);
                         let server_cancel = cancel.clone();
                         let handle = zeroclaw_spawn::spawn!(async move {
-                            run_local_listener(server_ctx, server_cancel, test_client_count()).await
+                            run_local_listener(server_ctx, server_cancel, test_client_count(), None)
+                                .await
                         });
                         wait_for_socket(&sock_path).await;
 

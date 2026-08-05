@@ -173,7 +173,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {

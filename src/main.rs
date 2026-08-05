@@ -4283,7 +4283,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 sop_audit,
                                 quickstart_config,
                                 ready_tx,
-                                ready_tx,
                             ))
                             .await
                         })
@@ -8153,7 +8152,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

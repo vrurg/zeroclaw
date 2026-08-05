@@ -523,8 +523,6 @@ pub async fn run(
                         Some(tui_reg),
                         Some(quickstart_config),
                         readiness_reporter,
-                        Some(quickstart_config),
-                        readiness_reporter,
                     )
                     .await
                 }
