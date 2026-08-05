@@ -156,6 +156,22 @@ pub struct ChatResponse {
     pub reasoning_content: Option<String>,
 }
 
+/// A transport-successful provider result that cannot complete a request.
+///
+/// The result has neither user-visible final text nor native tool calls.
+/// Reasoning is intentionally not part of this contract because it is opaque
+/// provider round-trip metadata rather than a final answer.
+#[derive(Debug)]
+pub struct SemanticEmptyTerminalCompletion;
+
+impl std::fmt::Display for SemanticEmptyTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider completed without final text or tool calls")
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalCompletion {}
+
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
@@ -631,23 +647,29 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             let text = self
                 .chat_with_history(&modified_messages, model, temperature)
                 .await?;
-            return Ok(ChatResponse {
+            let response = ChatResponse {
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
-            });
+            };
+            return (!response.is_semantically_empty_terminal())
+                .then_some(response)
+                .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion));
         }
 
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        (!response.is_semantically_empty_terminal())
+            .then_some(response)
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
     }
 
     /// Whether model_provider supports native tool calls over API.
@@ -675,12 +697,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        (!response.is_semantically_empty_terminal())
+            .then_some(response)
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
     }
 
     /// Whether model_provider supports streaming responses.
@@ -933,6 +958,23 @@ mod turn_order_tests {
         };
 
         assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_keeps_tool_only_response_valid() {
+        let response = ChatResponse {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+
+        assert!(!response.is_semantically_empty_terminal());
     }
 
     #[test]

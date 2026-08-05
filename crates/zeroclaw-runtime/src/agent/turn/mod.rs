@@ -760,7 +760,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         usage,
                     );
                 }
-                return Err(anyhow::Error::new(outcome::SemanticEmptyTerminalCompletion));
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                ));
             }
             Ok(response)
         });

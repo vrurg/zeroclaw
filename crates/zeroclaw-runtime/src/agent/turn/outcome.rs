@@ -86,24 +86,10 @@ impl std::fmt::Display for StreamSemanticEmptyCompletion {
 
 impl std::error::Error for StreamSemanticEmptyCompletion {}
 
-/// A non-streaming provider response that cannot complete a turn because it
-/// exposes neither a final answer nor a tool call. Keep this typed through the
-/// turn boundary so delivery adapters do not infer it from English diagnostics.
-#[derive(Debug)]
-pub(crate) struct SemanticEmptyTerminalCompletion;
-
-impl std::fmt::Display for SemanticEmptyTerminalCompletion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("provider completed without final text or tool calls")
-    }
-}
-
-impl std::error::Error for SemanticEmptyTerminalCompletion {}
-
 /// Whether a turn error has the canonical semantic-empty terminal reason.
 pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
     err.chain().any(|source| {
-        source.is::<SemanticEmptyTerminalCompletion>()
+        source.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             || source.is::<StreamSemanticEmptyCompletion>()
             || source.is::<zeroclaw_providers::ReliableSemanticEmptyCompletion>()
     })
@@ -221,7 +207,7 @@ mod tests {
 
     #[test]
     fn terminal_completion_diagnostics_are_stable_english() {
-        let direct = SemanticEmptyTerminalCompletion;
+        let direct = zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion;
         let stream = StreamSemanticEmptyCompletion { usage: None };
         let provider_tools = StreamPreExecutedToolsWithoutFinalResponse { usage: None };
 
@@ -241,7 +227,8 @@ mod tests {
 
     #[test]
     fn semantic_empty_cause_uses_the_fluent_delivery_projection() {
-        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
         assert!(is_semantic_empty_terminal_completion(&error));
         assert_eq!(
             terminal_completion_error_message(&error, None),
@@ -251,7 +238,8 @@ mod tests {
 
     #[test]
     fn disk_catalog_override_changes_delivery_not_the_diagnostic() {
-        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
         let disk_override =
             "cli-agent-error-invalid-semantic-completion = Réponse terminale invalide.\n";
         let delivered = crate::i18n::get_disk_override_cli_string_for_test(

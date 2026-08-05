@@ -5021,6 +5021,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+        );
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let expected = invalid_semantic_completion_error("delegate");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
     async fn execute_agentic_rejects_empty_terminal_completion() {
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())

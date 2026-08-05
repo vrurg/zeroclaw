@@ -830,6 +830,26 @@ impl AnthropicModelProvider {
         parsed
     }
 
+    /// Project a native completion into the legacy string-only API without
+    /// erasing the terminal semantic cause required by Reliable and SOP
+    /// delivery boundaries.
+    fn require_terminal_text(parsed: ProviderChatResponse) -> anyhow::Result<String> {
+        if parsed.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ));
+        }
+        parsed.text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "anthropic: empty text in response"
+            );
+            anyhow::Error::msg("No response from Anthropic")
+        })
+    }
+
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
@@ -1269,15 +1289,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
-        parsed.text.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "anthropic: empty text in response"
-            );
-            anyhow::Error::msg("No response from Anthropic")
-        })
+        Self::require_terminal_text(parsed)
     }
 
     async fn chat(
@@ -3098,6 +3110,23 @@ data: {\"type\":\"message_stop\"}\n\n";
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn string_projection_preserves_semantic_empty_terminal_cause() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [{"type": "thinking", "thinking": "internal only"}]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let error = AnthropicModelProvider::require_terminal_text(
+            AnthropicModelProvider::parse_native_response(response),
+        )
+        .expect_err("thinking alone is not a string-only final answer");
+
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
     }
 
     #[test]

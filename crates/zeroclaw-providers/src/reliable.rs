@@ -747,6 +747,12 @@ fn is_empty_text_completion(text: &str) -> bool {
     zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
 }
 
+fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>())
+}
+
 /// A Reliable chat request exhausted its candidates after receiving rejected
 /// semantic completions. The provider-reported usage is retained so the turn
 /// loop can account for work that was billed even though no response was
@@ -1256,6 +1262,28 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
@@ -1468,6 +1496,28 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
@@ -1736,6 +1786,28 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
@@ -1972,6 +2044,28 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        current_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {

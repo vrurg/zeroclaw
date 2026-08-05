@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{
     ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
@@ -65,9 +65,22 @@ impl ResolvedModelAccess<'_> {
                         usage,
                     );
                 }
-                // Record accepted spend immediately after the call (before any
-                // caller-side output validation) so downstream failure still
-                // counts it without folding in rejected Reliable attempts.
+                // A terminal response without final text or tools was billed
+                // but cannot be accepted. Keep it out of context-window fill
+                // and successful response telemetry before returning its typed
+                // cause to every one-shot caller.
+                if accounted.response.is_semantically_empty_terminal() {
+                    if let Some(usage) = accounted.response.usage.as_ref() {
+                        crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                            self.provider_name,
+                            self.model,
+                            usage,
+                        );
+                    }
+                    return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+                }
+                // Only a semantically valid result controls accepted context
+                // usage and successful response telemetry.
                 if let Some(usage) = accounted.response.usage.as_ref() {
                     crate::agent::cost::record_tool_loop_cost_usage(
                         self.provider_name,
@@ -220,7 +233,9 @@ mod run_model_query_tests {
         atomic::{AtomicUsize, Ordering},
     };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, ToolCall,
+    };
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider, ReliableRejectedCompletionUsage};
@@ -319,7 +334,52 @@ mod run_model_query_tests {
         }
     }
 
+    struct DirectResponseProvider {
+        response: ChatResponse,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DirectResponseProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(self.response.clone())
+        }
+    }
+
+    impl Attributable for DirectResponseProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "direct-response-test"
+        }
+    }
+
     fn access(provider: &UsageProvider) -> ResolvedModelAccess<'_> {
+        ResolvedModelAccess {
+            model_provider: provider,
+            provider_name: "custom",
+            model: "test-model",
+            temperature: None,
+        }
+    }
+
+    fn direct_access(provider: &DirectResponseProvider) -> ResolvedModelAccess<'_> {
         ResolvedModelAccess {
             model_provider: provider,
             provider_name: "custom",
@@ -468,5 +528,91 @@ mod run_model_query_tests {
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
         assert_eq!(recorded.last_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
+        let messages = [ChatMessage::user("hi")];
+        for text in ["", " \n\t", "<think>internal reasoning</think>"] {
+            let provider = DirectResponseProvider {
+                response: ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(TokenUsage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                },
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+            let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    direct_access(&provider)
+                        .run_model_query(ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        })
+                        .await
+                        .expect_err("direct semantic-empty response must fail")
+                })
+                .await;
+
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+            let recorded = *turn_usage.lock();
+            assert_eq!(recorded.input_tokens, 80, "case {text:?}");
+            assert_eq!(recorded.output_tokens, 5, "case {text:?}");
+            assert_eq!(recorded.last_input_tokens, 0, "case {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_model_query_keeps_direct_tool_only_response_valid() {
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            },
+        };
+        let messages = [ChatMessage::user("hi")];
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                direct_access(&provider)
+                    .run_model_query(ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    })
+                    .await
+            })
+            .await
+            .expect("a direct tool-only response remains valid");
+
+        assert!(response.has_tool_calls());
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 80);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 80);
     }
 }
