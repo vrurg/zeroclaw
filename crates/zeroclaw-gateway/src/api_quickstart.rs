@@ -252,9 +252,7 @@ mod tests {
         // With the historical clone-before-lock ordering, both requests would
         // take the same stale snapshot here and the later swap would erase the
         // first agent/alias after this guard is released.
-        let held_transaction = Arc::clone(&state.quickstart_config_write_lock)
-            .lock_owned()
-            .await;
+        let held_transaction = Arc::clone(&state.config_write_lock).lock_owned().await;
         let first_router = router.clone();
         let mut first_apply = zeroclaw_spawn::spawn!(async move {
             let request = Request::builder()

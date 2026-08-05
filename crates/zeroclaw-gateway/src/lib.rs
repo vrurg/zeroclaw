@@ -582,7 +582,7 @@ pub struct AppState {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -2517,7 +2517,7 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayChatDispatchCapture {
     message: String,
@@ -2525,20 +2525,20 @@ struct GatewayChatDispatchCapture {
     agent_override: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2546,7 +2546,7 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2554,7 +2554,7 @@ fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> 
         .clone()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "channel-linq"))]
 fn record_gateway_chat_dispatch_for_test(
     message: &str,
     session_id: Option<&str>,
@@ -2586,7 +2586,10 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
+        #[cfg(feature = "channel-linq")]
         record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        #[cfg(not(feature = "channel-linq"))]
+        let _ = (session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -5042,6 +5045,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5110,6 +5114,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5157,6 +5162,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -5237,6 +5243,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5281,6 +5288,7 @@ mod tests {
                 config,
                 None,
                 Some(reload_controls),
+                None,
                 None,
                 None,
                 None,
@@ -5418,6 +5426,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(readiness),
             )
             .await
@@ -5481,6 +5490,7 @@ mod tests {
             "127.0.0.1",
             0,
             config,
+            None,
             None,
             None,
             None,
