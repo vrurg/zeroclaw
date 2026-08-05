@@ -14419,14 +14419,16 @@ Let me check the result."#;
     }
 
     #[tokio::test]
-    async fn cost_tracking_enforces_budget() {
+    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
         use super::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
             run_tool_call_loop,
         };
+        use crate::agent::turn::events::StreamDelta;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
+        use zeroclaw_api::channel::ProgressEvent;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
@@ -14459,6 +14461,7 @@ Let me check the result."#;
         pricing.insert("mock-provider".to_string(), model_pricing);
         let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -14497,7 +14500,7 @@ Let me check the result."#;
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
-                    on_delta: None,
+                    on_delta: Some(delta_tx),
                     shared_budget: None,
                     channel: None,
                     collected_receipts: None,
@@ -14519,6 +14522,16 @@ Let me check the result."#;
         assert!(
             err.to_string().contains("Budget exceeded"),
             "error should mention budget: {err}"
+        );
+        let mut lifecycle = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let StreamDelta::Lifecycle(event) = delta {
+                lifecycle.push(event);
+            }
+        }
+        assert!(
+            !lifecycle.contains(&ProgressEvent::WaitingOnModel),
+            "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
         );
     }
 

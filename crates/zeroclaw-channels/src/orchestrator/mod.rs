@@ -6643,6 +6643,16 @@ async fn process_channel_message_body(
     })
     .await;
 
+    if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
+        && let Some(tx) = delta_tx.as_ref()
+    {
+        let _ = tx
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse,
+            ))
+            .await;
+    }
+
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
@@ -8345,6 +8355,24 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+#[cfg(feature = "channel-slack")]
+fn slack_thread_context_max_messages_resolver(
+    config_arc: &Arc<RwLock<Config>>,
+    alias: &str,
+) -> Arc<dyn Fn() -> usize + Send + Sync> {
+    let cfg_arc = Arc::clone(config_arc);
+    let alias = alias.to_string();
+    Arc::new(move || {
+        cfg_arc
+            .read()
+            .channels
+            .slack
+            .get(&alias)
+            .map(zeroclaw_config::schema::SlackConfig::effective_thread_context_max_messages)
+            .unwrap_or(zeroclaw_config::schema::DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES)
+    })
+}
+
 /// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
 ///
 /// One-off callers match on this sentinel instead of the error text so the
@@ -8471,6 +8499,8 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
+            let thread_context_max_messages_resolver =
+                slack_thread_context_max_messages_resolver(config_arc, &alias);
             let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
             let bot_token = sl.resolved_bot_token().with_context(|| {
                 format!(
@@ -8487,6 +8517,7 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
+                .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                 .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
@@ -9705,6 +9736,8 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
         };
+        let thread_context_max_messages_resolver =
+            slack_thread_context_max_messages_resolver(config_arc, alias);
         let Some(bot_token) = sl.resolved_bot_token() else {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -9728,6 +9761,7 @@ fn collect_configured_channels(
                         alias.clone(),
                         peer_resolver,
                     )
+                    .with_thread_context_max_messages_resolver(thread_context_max_messages_resolver)
                     .with_thread_replies(sl.thread_replies.unwrap_or(true))
                     .with_group_reply_policy(sl.mention_only, Vec::new())
                     .with_strict_mention_in_thread(sl.strict_mention_in_thread)
@@ -16296,6 +16330,83 @@ api_key = "anthropic-key"
             subject: None,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn successful_draft_turn_ends_with_finalizing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert_eq!(
+            events.last(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_draft_turn_does_not_emit_finalizing_lifecycle() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_draft_turn_does_not_emit_finalizing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -28482,6 +28593,31 @@ This is an example JSON object for profile settings."#;
 
         assert_eq!(resolved, config.agent_workspace_dir("alice"));
         assert_ne!(resolved, config.data_dir);
+    }
+
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn slack_thread_context_resolver_tracks_live_alias_config() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                thread_context_max_messages: Some(3),
+                ..Default::default()
+            },
+        );
+        let config_arc = Arc::new(RwLock::new(config));
+        let resolver = slack_thread_context_max_messages_resolver(&config_arc, "default");
+
+        assert_eq!(resolver(), 3);
+        config_arc
+            .write()
+            .channels
+            .slack
+            .get_mut("default")
+            .unwrap()
+            .thread_context_max_messages = Some(8);
+        assert_eq!(resolver(), 8);
     }
 
     // ── Query classification in channel message processing ─────────
