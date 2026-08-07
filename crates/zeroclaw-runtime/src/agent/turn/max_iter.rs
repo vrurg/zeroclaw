@@ -4,7 +4,7 @@
 
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
@@ -161,7 +161,9 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             history.pop();
-            return Err(e);
+            return Err(e).context(format!(
+                "Agent exceeded maximum tool iterations ({max_iterations})"
+            ));
         }
         SummaryCall::Done(Ok(resp)) => resp,
     };
@@ -397,6 +399,12 @@ mod graceful_summary_metering_tests {
             error
                 .chain()
                 .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Agent exceeded maximum tool iterations (2)"),
+            "the iteration cap remains the caller-visible summary failure: {error}"
         );
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);

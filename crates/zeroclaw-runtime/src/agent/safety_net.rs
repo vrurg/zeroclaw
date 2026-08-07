@@ -1669,9 +1669,15 @@ async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
     assert!(
         err.error
             .to_string()
-            .contains("provider 500: scripted mid-turn failure"),
+            .contains("Agent exceeded maximum tool iterations (2)"),
         "unexpected error: {}",
         err.error
+    );
+    assert!(
+        err.error
+            .chain()
+            .any(|cause| cause.to_string() == "provider 500: scripted mid-turn failure"),
+        "the original summary failure must remain available for diagnostics"
     );
     assert!(
         !err.new_messages.iter().any(|m| matches!(
