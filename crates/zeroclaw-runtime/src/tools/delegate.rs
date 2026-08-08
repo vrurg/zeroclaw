@@ -3817,6 +3817,42 @@ mod tests {
         (LocalChatServer { uri, _task: task }, requests)
     }
 
+    async fn start_text_tool_then_final_chat_server() -> (
+        LocalChatServer,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let request_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_bodies = Arc::clone(&request_bodies);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let responses = [
+                serde_json::json!({
+                    "choices": [{"message": {"content": "<tool_call>{\"name\":\"echo_tool\",\"arguments\":{\"value\":\"fallback\"}}</tool_call>"}}]
+                }),
+                serde_json::json!({
+                    "choices": [{"message": {"content": "fallback final reply"}}]
+                }),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                captured_bodies.lock().unwrap().push(request);
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        (
+            LocalChatServer { uri, _task: task },
+            requests,
+            request_bodies,
+        )
+    }
+
     async fn start_slow_chat_server(
         delay: Duration,
     ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
@@ -7970,6 +8006,16 @@ command = "echo hi"
         backup_uri: String,
         agentic: bool,
     ) -> (Arc<Config>, TempDir) {
+        fallback_delegate_config_with_native_tools(primary_uri, backup_uri, agentic, None, None)
+    }
+
+    fn fallback_delegate_config_with_native_tools(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+        primary_native_tools: Option<bool>,
+        backup_native_tools: Option<bool>,
+    ) -> (Arc<Config>, TempDir) {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
             AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
@@ -7990,6 +8036,7 @@ command = "echo hi"
                 base: ModelProviderConfig {
                     uri: Some(primary_uri),
                     model: Some("primary-model".to_string()),
+                    native_tools: primary_native_tools,
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "custom.backup",
                     )],
@@ -8005,6 +8052,7 @@ command = "echo hi"
                     // This deliberately matches the primary model. The two aliases
                     // still represent distinct configured candidates.
                     model: Some("primary-model".to_string()),
+                    native_tools: backup_native_tools,
                     ..ModelProviderConfig::default()
                 },
             },
@@ -8166,6 +8214,58 @@ command = "echo hi"
         assert!(
             !result.output.contains("custom.backup"),
             "the final primary response must not be labeled as backup-served: {result:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_uses_text_tools_when_only_its_fallback_supports_them() {
+        // The primary advertises native tools but fails. The text-only fallback
+        // must receive the XML protocol and execute its tool, rather than a
+        // native request that it cannot reliably interpret.
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests, backup_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must receive the initial failing request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the fallback must receive the tool request and the final response request"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = backup_bodies.lock().unwrap();
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !body.windows(7).any(|part| part == b"\"tools\"")),
+            "the text-only fallback must not receive native tool specifications: {bodies:?}"
+        );
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second fallback request must contain the executed tool result: {bodies:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
     }

@@ -1545,6 +1545,11 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().supports_vision());
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools());
         capabilities
     }
 
@@ -1559,14 +1564,25 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().capabilities_for_model(model).vision);
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self.model_providers.iter().all(|entry| {
+                entry
+                    .provider()
+                    .capabilities_for_model(model)
+                    .native_tool_calling
+            });
         capabilities
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.model_providers
-            .first()
-            .map(|entry| entry.provider().supports_native_tools())
-            .unwrap_or(false)
+        // The turn loop selects one tool protocol before Reliable chooses a
+        // candidate. A native request is therefore safe only when every
+        // candidate the request may reach accepts native tool specifications.
+        !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
@@ -3985,6 +4001,51 @@ mod tests {
         assert!(
             model_provider.supports_native_tools(),
             "ReliableModelProvider must propagate supports_native_tools from inner model_provider"
+        );
+    }
+
+    #[test]
+    fn mixed_chain_disables_native_tools_before_dispatch() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider.supports_native_tools(),
+            "a text-only fallback must select prompt-guided tools before dispatch"
+        );
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Reliable capabilities must not advertise native tools that a fallback cannot accept"
+        );
+        assert!(
+            !provider
+                .capabilities_for_model("any-model")
+                .native_tool_calling,
+            "model-specific Reliable capabilities must not advertise native tools that a fallback cannot accept"
         );
     }
 
