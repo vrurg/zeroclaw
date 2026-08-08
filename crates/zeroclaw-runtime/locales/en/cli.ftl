@@ -233,9 +233,9 @@ cli-cron-long-about =
 
     Examples:
       zeroclaw cron list
-      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-      zeroclaw cron add '*/5 * * * *' 'echo ok'
+      zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+      zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+      zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
       zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
       zeroclaw cron add-every 60000 'Ping heartbeat'
       zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -1078,6 +1078,9 @@ cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for c
 cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
+cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
+cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: unknown / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
