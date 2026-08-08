@@ -477,6 +477,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 mod tests {
     use super::*;
 
+    #[cfg(feature = "channel-slack")]
     #[test]
     fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
         assert_eq!(
