@@ -4613,23 +4613,6 @@ fn matrix_stream_draft_lines(
     matrix_stream_draft_lines_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
-fn matrix_message_max_bytes_for_config(
-    config: &zeroclaw_config::schema::Config,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> usize {
-    let default_bytes =
-        zeroclaw_config::schema::MatrixConfig::default().effective_message_max_bytes();
-    matrix_config_for_message(config, msg)
-        .map_or(default_bytes, |config| config.effective_message_max_bytes())
-}
-
-fn matrix_message_max_bytes(
-    ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
-) -> usize {
-    matrix_message_max_bytes_for_config(ctx.prompt_config.as_ref(), msg)
-}
-
 fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
     text.strip_prefix(prefix)
         .is_some_and(|rest| !rest.is_empty())
@@ -4657,13 +4640,6 @@ fn single_message_pending_visible_lines(text: &str) -> usize {
     } else {
         1
     }
-}
-
-fn removing_pending_line_merges_reasoning(pending: &[String], idx: usize) -> bool {
-    idx > 0
-        && idx + 1 < pending.len()
-        && single_message_pending_is_reasoning(&pending[idx - 1])
-        && single_message_pending_is_reasoning(&pending[idx + 1])
 }
 
 fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
@@ -4704,58 +4680,21 @@ fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usiz
         .sum::<usize>();
     while total_lines > max_lines {
         let remove_lines = total_lines - max_lines;
-        let newest = pending.len().saturating_sub(1);
-        let remove_at = pending
-            .iter()
-            .enumerate()
-            .position(|(idx, line)| {
-                idx != newest
-                    && !single_message_pending_is_reasoning(line)
-                    && !single_message_pending_is_thinking_status(line)
-                    && !removing_pending_line_merges_reasoning(pending, idx)
-            })
-            .unwrap_or(0);
-        let line_count = single_message_pending_visible_lines(&pending[remove_at]);
+        let line_count = single_message_pending_visible_lines(&pending[0]);
         if remove_lines >= line_count {
-            pending.remove(remove_at);
+            pending.remove(0);
             total_lines = total_lines.saturating_sub(line_count);
         } else {
-            pending[remove_at] =
-                trim_pending_visible_lines_from_front(&pending[remove_at], remove_lines);
+            pending[0] = trim_pending_visible_lines_from_front(&pending[0], remove_lines);
             break;
         }
     }
 }
 
-fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut end = max_bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
-}
-
-fn truncate_utf8_bytes_owned(text: String, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    truncate_utf8_bytes(&text, max_bytes)
-}
-
-fn push_matrix_single_message_pending(
-    pending: &mut Vec<String>,
-    text: String,
-    max_lines: usize,
-    max_bytes: usize,
-) {
+fn push_matrix_single_message_pending(pending: &mut Vec<String>, text: String, max_lines: usize) {
     if text.is_empty() {
         return;
     }
-    let text = truncate_utf8_bytes_owned(text, max_bytes);
-
     if let Some(incoming_round) = single_message_pending_thinking_round(&text)
         && let Some(existing) = pending.last_mut()
         && single_message_pending_is_thinking_status(existing)
@@ -4772,9 +4711,6 @@ fn push_matrix_single_message_pending(
         && single_message_pending_is_reasoning(existing)
     {
         existing.push_str(fragment);
-        if existing.len() > max_bytes {
-            *existing = truncate_utf8_bytes(existing, max_bytes);
-        }
         trim_matrix_single_message_pending(pending, max_lines);
         return;
     }
@@ -5177,7 +5113,6 @@ async fn run_matrix_single_message_draft_updater(
     draft_id: String,
     interval_ms: u64,
     stream_draft_lines: usize,
-    message_max_bytes: usize,
     matrix_config: Arc<Config>,
     matrix_alias: String,
 ) {
@@ -5194,12 +5129,7 @@ async fn run_matrix_single_message_draft_updater(
     macro_rules! queue_progress {
         ($event:expr) => {
             if let Some(text) = matrix_progress_text(&$event, &matrix_config, &matrix_alias) {
-                push_matrix_single_message_pending(
-                    &mut pending,
-                    text,
-                    stream_draft_lines,
-                    message_max_bytes,
-                );
+                push_matrix_single_message_pending(&mut pending, text, stream_draft_lines);
             }
         };
     }
@@ -6157,7 +6087,6 @@ async fn process_channel_message_body(
             if matrix_single_message_streaming {
                 let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
-                let message_max_bytes = matrix_message_max_bytes(ctx.as_ref(), &msg);
                 let matrix_config = Arc::clone(&ctx.prompt_config);
                 let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
                 Some(zeroclaw_spawn::spawn!(async move {
@@ -6168,7 +6097,6 @@ async fn process_channel_message_body(
                         draft_id,
                         interval_ms,
                         stream_draft_lines,
-                        message_max_bytes,
                         matrix_config,
                         matrix_alias,
                     )
@@ -13335,13 +13263,8 @@ pub(crate) mod tests {
             } else {
                 format!("{REASONING_FULL_PREFIX} r{idx}")
             };
-            push_matrix_single_message_pending(&mut pending, fragment, 3, usize::MAX);
-            push_matrix_single_message_pending(
-                &mut pending,
-                format!("tool-{idx}\n"),
-                3,
-                usize::MAX,
-            );
+            push_matrix_single_message_pending(&mut pending, fragment, 3);
+            push_matrix_single_message_pending(&mut pending, format!("tool-{idx}\n"), 3);
         }
 
         assert!(
@@ -13367,14 +13290,12 @@ pub(crate) mod tests {
             &mut pending,
             format!("{REASONING_FULL_PREFIX}before tool"),
             2,
-            usize::MAX,
         );
-        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2);
         push_matrix_single_message_pending(
             &mut pending,
             format!("{REASONING_FULL_PREFIX}after tool"),
             2,
-            usize::MAX,
         );
 
         assert_eq!(
@@ -13387,26 +13308,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn matrix_single_message_pending_caps_reasoning_to_message_budget() {
+    fn matrix_single_message_pending_keeps_complete_reasoning_until_matrix_event_fitting() {
         use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
 
         let mut pending = Vec::new();
         let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
-        push_matrix_single_message_pending(
-            &mut pending,
-            format!("{REASONING_FULL_PREFIX}abcd"),
-            3,
-            max_bytes,
-        );
-        push_matrix_single_message_pending(
-            &mut pending,
-            format!("{REASONING_FULL_PREFIX}efgh"),
-            3,
-            max_bytes,
-        );
+        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}abcd"), 3);
+        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}efgh"), 3);
 
-        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcd")]);
-        assert!(pending.iter().all(|line| line.len() <= max_bytes));
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcdefgh")]);
+        assert!(pending.iter().any(|line| line.len() > max_bytes));
     }
 
     #[test]
@@ -13418,17 +13329,11 @@ pub(crate) mod tests {
             &mut pending,
             format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
             2,
-            usize::MAX,
         );
 
         assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
 
-        push_matrix_single_message_pending(
-            &mut pending,
-            "tool line\nwith detail\n".to_string(),
-            2,
-            usize::MAX,
-        );
+        push_matrix_single_message_pending(&mut pending, "tool line\nwith detail\n".to_string(), 2);
 
         assert_eq!(
             pending,
@@ -13444,14 +13349,14 @@ pub(crate) mod tests {
         use zeroclaw_runtime::agent::loop_::thinking_status_text;
 
         let mut pending = Vec::new();
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3, usize::MAX);
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3);
 
         assert_eq!(pending, vec![thinking_status_text(1)]);
 
-        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3);
 
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3, usize::MAX);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3);
 
         assert_eq!(
             pending,
@@ -13526,7 +13431,6 @@ pub(crate) mod tests {
             "draft".to_string(),
             50,
             5,
-            128,
             Arc::new(Config::default()),
             "test".to_string(),
         ));
@@ -13564,10 +13468,6 @@ pub(crate) mod tests {
         assert!(
             batches.iter().all(|batch| batch.len() <= 5),
             "batch staging should be bounded by stream_draft_lines, got {batches:?}"
-        );
-        assert!(
-            batches.iter().flatten().all(|line| line.len() <= 128),
-            "batch staging should honor Matrix message_max_bytes, got {batches:?}"
         );
         assert!(
             batches
@@ -16197,6 +16097,103 @@ api_key = "anthropic-key"
         )
     }
 
+    /// Test context with executable tools. The explicit Full profile keeps the
+    /// lifecycle test focused on the real post-tool transition rather than an
+    /// approval-path short circuit.
+    #[allow(clippy::too_many_arguments)]
+    fn test_runtime_ctx_with_observer_and_tools(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            auto_approve: tools.iter().map(|tool| tool.name().to_string()).collect(),
+            ..Default::default()
+        };
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider,
+            model_provider_ref: Arc::new(model_provider_ref.to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(agent_cfg),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(tools),
+            observer,
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
     #[cfg(feature = "channel-matrix")]
     pub(crate) async fn process_message_with_dummy_provider(
         channel: Arc<dyn Channel>,
@@ -16406,6 +16403,127 @@ api_key = "anthropic-key"
         assert!(
             !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
             "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_emits_running_tool_and_post_tool_planning() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        let progress = channel_impl.progress_messages.lock().await.clone();
+        let running_tool = events
+            .iter()
+            .position(|event| {
+                *event == zeroclaw_runtime::agent::loop_::ProgressEvent::RunningTool
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a tool-calling turn must emit RunningTool, got lifecycle={events:?} progress={progress:?}"
+                )
+            });
+        assert!(
+            events[..running_tool]
+                .contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::WaitingOnModel),
+            "the model wait must precede the tool run, got {events:?}"
+        );
+        assert!(
+            events[running_tool + 1..]
+                .contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::Planning),
+            "the post-tool hand-back must re-enter Planning, got {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_cancellation_cancels_the_draft() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a cancelled turn must cancel its draft so terminal cleanup runs"
+        );
+        assert!(
+            channel_impl.finalized_messages.lock().await.is_empty(),
+            "a cancelled turn must not finalize a draft"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::Received),
+            "the turn must still have announced receipt, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_turn_error_cancels_the_draft() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert!(
+            events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::WaitingOnModel),
+            "the failure happened at the provider, so the model wait must have been shown: {events:?}"
         );
     }
 
