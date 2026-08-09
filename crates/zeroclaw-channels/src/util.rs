@@ -1,7 +1,7 @@
-#[cfg(any(feature = "channel-slack", test))]
+#[cfg(feature = "channel-slack")]
 use zeroclaw_api::channel::ProgressEvent;
 
-#[cfg(any(feature = "channel-slack", test))]
+#[cfg(feature = "channel-slack")]
 pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
