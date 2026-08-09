@@ -2,6 +2,7 @@ pub mod anthropic_token;
 pub mod email_oauth2;
 pub mod gemini_oauth;
 pub mod oauth_common;
+pub mod onboarding;
 pub mod openai_oauth;
 pub mod profiles;
 pub mod xai_oauth;

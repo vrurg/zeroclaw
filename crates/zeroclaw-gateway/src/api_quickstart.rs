@@ -197,10 +197,45 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request, routing::post};
     use http_body_util::BodyExt;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+    #[cfg(unix)]
+    use zeroclaw_api::jsonrpc::JsonRpcRequest;
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
     };
+    #[cfg(unix)]
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+    #[cfg(unix)]
+    use zeroclaw_runtime::rpc::{
+        context::RpcContext,
+        dispatch::Method,
+        local::run_local_listener,
+        session::SessionStore,
+        types::{InitializeParams, QuickstartApplyParams, QuickstartApplyResult},
+    };
+
+    #[cfg(unix)]
+    fn rpc_frame<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
+        let request = JsonRpcRequest::new(
+            method.wire_name(),
+            serde_json::to_value(params).unwrap(),
+            serde_json::Value::Number(id.into()),
+        );
+        format!("{}\n", serde_json::to_string(&request).unwrap())
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_socket(path: &std::path::Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("local RPC socket did not appear at {}", path.display());
+    }
 
     #[tokio::test]
     async fn http_quickstart_apply_persists_anthropic_setup_token() {
@@ -539,6 +574,255 @@ mod tests {
                 .contains_key("quickstart_bot_two"),
             "rejected queued HTTP apply must not modify the outgoing daemon config"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_web_apply_rejects_queued_unix_rpc_before_any_second_mutation() {
+        std::thread::Builder::new()
+            .name("quickstart-web-rpc-reload-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let tmp = tempfile::tempdir().unwrap();
+                        let config = zeroclaw_config::schema::Config {
+                            config_path: tmp.path().join("config.toml"),
+                            data_dir: tmp.path().join("workspace"),
+                            ..Default::default()
+                        };
+                        config.save().await.unwrap();
+                        let mut state = crate::api::test_state(config);
+                        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+                        state.reload_tx = Some(reload_tx.clone());
+
+                        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+                        let sessions = Arc::new(SessionStore::new(64, queue));
+                        let mut rpc_context =
+                            RpcContext::for_live_test(state.config.read().clone(), sessions);
+                        {
+                            let rpc = Arc::get_mut(&mut rpc_context).unwrap();
+                            rpc.config = Arc::clone(&state.config);
+                            rpc.config_write_lock = Arc::clone(&state.config_write_lock);
+                            rpc.quickstart_reload_admission =
+                                Arc::clone(&state.quickstart_reload_admission);
+                            rpc.reload_tx = Some(reload_tx);
+                        }
+                        let router = Router::new()
+                            .route("/api/quickstart/apply", post(handle_apply))
+                            .with_state(state.clone());
+
+                        let make_submission =
+                            |alias: &str, agent: &str, token: &str| BuilderSubmission {
+                                model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                                    provider_type: "anthropic".into(),
+                                    alias: alias.into(),
+                                    model: "claude-sonnet-4-5".into(),
+                                    fields: std::collections::HashMap::from([
+                                        ("auth_mode".to_string(), "setup_token".to_string()),
+                                        ("api_key".to_string(), token.to_string()),
+                                    ]),
+                                }),
+                                risk_profile: SelectorChoice::Fresh("balanced".into()),
+                                runtime_profile: SelectorChoice::Fresh("balanced".into()),
+                                memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+                                channels: vec![],
+                                peer_groups: vec![],
+                                agent: AgentIdentity {
+                                    name: agent.into(),
+                                    system_prompt: "You are helpful.".into(),
+                                    personality_file: None,
+                                    personality_files: vec![
+                                        zeroclaw_config::presets::QuickstartPersonalityFile {
+                                            filename: "SOUL.md".into(),
+                                            content: "synthetic personality".into(),
+                                        },
+                                    ],
+                                },
+                            };
+                        let web_submission =
+                            make_submission("web_alias", "web_agent", "synthetic-web-token");
+                        let rpc_submission =
+                            make_submission("rpc_alias", "rpc_agent", "synthetic-rpc-token");
+
+                        let socket_path = state.config.read().data_dir.join("daemon.sock");
+                        let cancel = tokio_util::sync::CancellationToken::new();
+                        let listener_context = Arc::clone(&rpc_context);
+                        let listener_cancel = cancel.clone();
+                        let listener = zeroclaw_spawn::spawn!(async move {
+                            run_local_listener(
+                                listener_context,
+                                listener_cancel,
+                                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                                None,
+                            )
+                            .await
+                        });
+                        wait_for_socket(&socket_path).await;
+
+                        // The profile-store lock is a production-path coordination point. Once
+                        // Web owns the shared Quickstart lock, it blocks here before config
+                        // persistence, leaving the actual Unix RPC request queued behind it.
+                        let profile_lock = tmp.path().join("auth-profiles.lock");
+                        std::fs::write(&profile_lock, b"test lock\n").unwrap();
+                        let web_router = router.clone();
+                        let web = zeroclaw_spawn::spawn!(async move {
+                            web_router
+                                .oneshot(
+                                    Request::builder()
+                                        .method("POST")
+                                        .uri("/api/quickstart/apply")
+                                        .header("content-type", "application/json")
+                                        .body(Body::from(
+                                            serde_json::to_vec(&web_submission).unwrap(),
+                                        ))
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap()
+                        });
+                        for _ in 0..100 {
+                            if state.config_write_lock.try_lock().is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        assert!(
+                            state.config_write_lock.try_lock().is_err(),
+                            "Web must own the shared transaction"
+                        );
+
+                        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+                        let (read_half, mut writer) = stream.into_split();
+                        let mut reader = tokio::io::BufReader::new(read_half);
+                        writer
+                            .write_all(
+                                rpc_frame(
+                                    Method::Initialize,
+                                    &InitializeParams {
+                                        protocol_version: 1,
+                                        tui_id: None,
+                                        tui_sig: None,
+                                        env: Default::default(),
+                                        client_capabilities: None,
+                                    },
+                                    1,
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let mut init_line = String::new();
+                        reader.read_line(&mut init_line).await.unwrap();
+                        writer
+                            .write_all(
+                                rpc_frame(
+                                    Method::QuickstartApply,
+                                    &QuickstartApplyParams {
+                                        submission: rpc_submission,
+                                    },
+                                    2,
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let mut rpc_line = String::new();
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(75),
+                                reader.read_line(&mut rpc_line),
+                            )
+                            .await
+                            .is_err(),
+                            "the real RPC request must wait behind the Web transaction"
+                        );
+
+                        std::fs::remove_file(&profile_lock).unwrap();
+                        let web_response = web.await.unwrap();
+                        assert_eq!(web_response.status(), StatusCode::OK);
+                        let web_body: serde_json::Value = serde_json::from_slice(
+                            &web_response.into_body().collect().await.unwrap().to_bytes(),
+                        )
+                        .unwrap();
+                        assert_eq!(web_body["kind"], "applied");
+                        reload_rx.changed().await.unwrap();
+                        assert!(*reload_rx.borrow(), "Web must signal supervised reload");
+
+                        reader.read_line(&mut rpc_line).await.unwrap();
+                        let rpc_frame: serde_json::Value =
+                            serde_json::from_str(rpc_line.trim()).unwrap();
+                        let rpc_result: QuickstartApplyResult =
+                            serde_json::from_value(rpc_frame["result"].clone()).unwrap();
+                        let QuickstartApplyResult::Errors { errors } = rpc_result else {
+                            panic!("queued RPC must return a structured Quickstart error");
+                        };
+                        assert_eq!(errors[0].field, "reload");
+
+                        let live = state.config.read().clone();
+                        assert!(
+                            live.providers
+                                .models
+                                .find("anthropic", "web_alias")
+                                .is_some()
+                        );
+                        assert!(live.agents.contains_key("web_agent"));
+                        assert!(
+                            live.providers
+                                .models
+                                .find("anthropic", "rpc_alias")
+                                .is_none()
+                        );
+                        assert!(!live.agents.contains_key("rpc_agent"));
+                        let auth = zeroclaw_providers::auth::AuthService::from_config(&live);
+                        assert!(
+                            auth.get_profile("anthropic", Some("web_alias"))
+                                .await
+                                .unwrap()
+                                .is_some()
+                        );
+                        assert!(
+                            auth.get_profile("anthropic", Some("rpc_alias"))
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                        assert!(
+                            !live
+                                .agent_workspace_dir("rpc_agent")
+                                .join("SOUL.md")
+                                .exists()
+                        );
+
+                        let reloaded: zeroclaw_config::schema::Config =
+                            toml::from_str(&std::fs::read_to_string(&live.config_path).unwrap())
+                                .unwrap();
+                        assert!(
+                            reloaded
+                                .providers
+                                .models
+                                .find("anthropic", "web_alias")
+                                .is_some()
+                        );
+                        assert!(
+                            reloaded
+                                .providers
+                                .models
+                                .find("anthropic", "rpc_alias")
+                                .is_none()
+                        );
+                        assert!(!reloaded.agents.contains_key("rpc_agent"));
+                        cancel.cancel();
+                        drop(writer);
+                        let _ = listener.await;
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]

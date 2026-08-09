@@ -799,9 +799,9 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
   zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
   zeroclaw cron add-every 60000 'Ping heartbeat'
   zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
@@ -2471,10 +2471,7 @@ async fn run_quickstart_cli(
         }
         Err(errs) => {
             eprintln!();
-            if errs.iter().any(|err| {
-                err.message
-                    .contains("Anthropic setup-token rollback also failed")
-            }) {
+            if errs.iter().any(|err| err.rollback_failed) {
                 eprintln!(
                     "{}",
                     t(
@@ -7382,7 +7379,30 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
         return Ok(());
     };
 
-    zeroclaw_runtime::quickstart::store_anthropic_setup_token(config, alias, &token).await?;
+    let outcome = zeroclaw_providers::auth::onboarding::store_onboarding_credential(
+        config,
+        zeroclaw_providers::auth::onboarding::OnboardingCredentialSubmission::new(
+            "anthropic",
+            alias,
+            Some("setup_token"),
+            Some(&token),
+        ),
+    )
+    .await?;
+    if let zeroclaw_providers::auth::onboarding::OnboardingCredentialCommit::CommittedWithDurabilityWarning {
+        detail,
+        ..
+    } = outcome
+    {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-quickstart-warning-anthropic-profile-durability",
+                &[("err", &detail)],
+                "Quickstart completed, but Anthropic credential durability could not be confirmed.",
+            )
+        );
+    }
     let path = format!("providers.models.anthropic.{alias}.auth_mode");
     config.set_prop_persistent(&path, "oauth")?;
     Box::pin(config.save_dirty()).await?;
