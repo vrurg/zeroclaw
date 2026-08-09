@@ -3293,12 +3293,12 @@ mod tests {
             "a failed setup-token submission must not leave a profile"
         );
         assert!(
-            auth.load_profiles()
+            !auth
+                .load_profiles()
                 .await
                 .unwrap()
                 .active_profiles
-                .get("anthropic")
-                .is_none(),
+                .contains_key("anthropic"),
             "a failed setup-token submission must not change the active profile"
         );
     }
