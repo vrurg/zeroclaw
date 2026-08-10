@@ -217,6 +217,15 @@ pub struct Config {
     #[group = "Agent"]
     pub reliability: ReliabilityConfig,
 
+    /// Experimental Goal Mode controller configuration (`[goal]`).
+    ///
+    /// The section is intentionally dormant by default. Configuration alone
+    /// never starts autonomous work.
+    #[serde(default, skip_serializing_if = "GoalConfig::is_disabled")]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: GoalConfig,
+
     /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     #[nested]
@@ -12355,6 +12364,58 @@ impl Default for ReliabilityConfig {
     }
 }
 
+// ── Goal Mode ────────────────────────────────────────────────────
+
+/// Experimental Goal Mode configuration (`[goal]`).
+///
+/// Limits are admission limits interpreted against the canonical cost ledger;
+/// they are not mutable remaining-budget counters. The verifier is selected
+/// independently from the owning agent's model provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal"]
+pub struct GoalConfig {
+    /// Enable experimental Goal Mode admission. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional positive default total-token limit for `/goal start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_token_limit: Option<u64>,
+    /// Optional finite positive default USD limit for `/goal start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cost_limit_usd: Option<f64>,
+    /// The isolated verifier selection used for every Goal Mode candidate.
+    #[serde(default)]
+    #[nested]
+    pub verifier: GoalVerifierConfig,
+}
+
+impl GoalConfig {
+    /// True when omitting this optional experimental section preserves all
+    /// current runtime behavior.
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+            && self.default_token_limit.is_none()
+            && self.default_cost_limit_usd.is_none()
+            && self.verifier.provider.is_empty()
+            && self.verifier.model.is_none()
+    }
+}
+
+/// Verifier provider/model selection (`[goal.verifier]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal.verifier"]
+pub struct GoalVerifierConfig {
+    /// Existing configured model-provider reference, either dotted
+    /// `<provider>.<profile>` or an unambiguous configured profile name.
+    #[serde(default)]
+    pub provider: String,
+    /// Optional model override for the verifier provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 // ── Scheduler ────────────────────────────────────────────────────
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
@@ -17847,6 +17908,7 @@ impl Default for Config {
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
@@ -19858,6 +19920,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        validate_goal_config(&self.goal, &self.providers.models)?;
 
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
@@ -21784,6 +21847,64 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn validate_goal_config(
+    goal: &GoalConfig,
+    providers: &crate::providers::ModelProviders,
+) -> Result<()> {
+    if goal
+        .default_token_limit
+        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.default_token_limit",
+            "goal.default_token_limit must be between 1 and the SQLite INTEGER maximum"
+        );
+    }
+    if goal
+        .default_cost_limit_usd
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+            "goal.default_cost_limit_usd must be finite and greater than 0"
+        );
+    }
+    if goal
+        .verifier
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        validation_bail!(
+            RequiredFieldEmpty,
+            "goal.verifier.model",
+            "goal.verifier.model must not be empty when configured"
+        );
+    }
+    if !goal.enabled {
+        return Ok(());
+    }
+
+    let provider = goal.verifier.provider.trim();
+    if provider.is_empty() {
+        validation_bail!(
+            RequiredFieldEmpty,
+            "goal.verifier.provider",
+            "goal.enabled requires goal.verifier.provider"
+        );
+    }
+    if providers.find_by_name(provider).is_none() {
+        validation_bail!(
+            DanglingReference,
+            "goal.verifier.provider",
+            "goal.verifier.provider = {provider:?} does not resolve to a configured model provider"
+        );
+    }
+    Ok(())
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -25922,6 +26043,7 @@ auto_save = true
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -26865,6 +26987,7 @@ default_temperature = 0.7
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -38699,5 +38822,48 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[test]
+    async fn goal_config_is_disabled_by_default_and_validates_its_verifier_reference() {
+        let mut config = Config::default();
+        assert!(!config.goal.enabled);
+        assert!(config.validate().is_ok());
+
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        config.goal.verifier.model = Some("gpt-test".into());
+        assert!(config.validate().is_err());
+
+        let _ = config.providers.models.ensure("openai", "verifier");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn goal_config_rejects_invalid_limits_and_round_trips_the_optional_section() {
+        let mut config = Config::default();
+        config.goal.default_token_limit = Some(0);
+        assert!(config.validate().is_err());
+
+        config.goal.default_token_limit = Some(i64::MAX as u64 + 1);
+        assert!(config.validate().is_err());
+
+        config.goal.default_token_limit = Some(i64::MAX as u64);
+        assert!(config.validate().is_ok());
+
+        config.goal.default_token_limit = Some(64);
+        config.goal.default_cost_limit_usd = Some(f64::INFINITY);
+        assert!(config.validate().is_err());
+
+        config.goal.default_cost_limit_usd = Some(2.5);
+        config.goal.verifier.provider = "openai.verifier".into();
+        let serialized = toml::to_string(&config).expect("goal config serializes");
+        assert!(serialized.contains("[goal]"));
+        assert!(serialized.contains("[goal.verifier]"));
+
+        let reloaded: Config = toml::from_str(&serialized).expect("goal config reloads");
+        assert_eq!(reloaded.goal.default_token_limit, Some(64));
+        assert_eq!(reloaded.goal.default_cost_limit_usd, Some(2.5));
+        assert_eq!(reloaded.goal.verifier.provider, "openai.verifier");
     }
 }
