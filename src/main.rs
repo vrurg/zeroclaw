@@ -2452,8 +2452,7 @@ async fn run_quickstart_cli(
                 );
             }
             if matches!(inline_auth, Some(InlineProviderAuth::Codex)) {
-                let auth = InlineProviderAuth::Codex;
-                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+                Box::pin(run_codex_inline_auth(&mut cfg)).await;
             }
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
@@ -7297,44 +7296,25 @@ fn codex_auth_json_path() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(feature = "agent-runtime")]
-async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config) {
+async fn run_codex_inline_auth(config: &mut Config) {
     use dialoguer::Confirm;
 
-    let codex_import = match &auth {
-        InlineProviderAuth::Codex => codex_auth_json_path().filter(|path| path.exists()),
-        InlineProviderAuth::AnthropicSetupToken { .. } => None,
+    let codex_import = codex_auth_json_path().filter(|path| path.exists());
+    let prompt = if codex_import.is_some() {
+        t(
+            "cli-quickstart-auth-codex-import-prompt",
+            "Found an existing Codex login (~/.codex/auth.json) — import it now?",
+        )
+    } else {
+        t(
+            "cli-quickstart-auth-codex-prompt",
+            "Sign in to OpenAI Codex with your ChatGPT account now?",
+        )
     };
-    let (prompt, skip_hint) = match &auth {
-        InlineProviderAuth::Codex => (
-            if codex_import.is_some() {
-                t(
-                    "cli-quickstart-auth-codex-import-prompt",
-                    "Found an existing Codex login (~/.codex/auth.json) — import it now?",
-                )
-            } else {
-                t(
-                    "cli-quickstart-auth-codex-prompt",
-                    "Sign in to OpenAI Codex with your ChatGPT account now?",
-                )
-            },
-            t(
-                "cli-quickstart-auth-codex-skip-hint",
-                "  Finish later with: zeroclaw auth login --model-provider openai-codex",
-            ),
-        ),
-        InlineProviderAuth::AnthropicSetupToken { alias } => (
-            ta(
-                "cli-quickstart-auth-anthropic-prompt",
-                &[("alias", alias)],
-                "Run `claude setup-token` for this Anthropic provider now?",
-            ),
-            ta(
-                "cli-quickstart-auth-anthropic-skip-hint",
-                &[("alias", alias)],
-                "  Finish later with: claude setup-token",
-            ),
-        ),
-    };
+    let skip_hint = t(
+        "cli-quickstart-auth-codex-skip-hint",
+        "  Finish later with: zeroclaw auth login --model-provider openai-codex",
+    );
     if !Confirm::new()
         .with_prompt(prompt)
         .default(true)
@@ -7345,20 +7325,13 @@ async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config)
         return;
     }
 
-    let result = match auth {
-        InlineProviderAuth::Codex => {
-            let cmd = AuthCommands::Login {
-                model_provider: "openai-codex".to_string(),
-                profile: "default".to_string(),
-                device_code: false,
-                import: codex_import,
-            };
-            handle_auth_command(cmd, config).await
-        }
-        InlineProviderAuth::AnthropicSetupToken { alias } => {
-            Box::pin(run_anthropic_setup_token_inline(&alias, config)).await
-        }
+    let cmd = AuthCommands::Login {
+        model_provider: "openai-codex".to_string(),
+        profile: "default".to_string(),
+        device_code: false,
+        import: codex_import,
     };
+    let result = handle_auth_command(cmd, config).await;
     if let Err(error) = result {
         let error = error.to_string();
         eprintln!(
@@ -7371,50 +7344,6 @@ async fn run_inline_provider_auth(auth: InlineProviderAuth, config: &mut Config)
         );
         println!("{skip_hint}");
     }
-}
-
-#[cfg(feature = "agent-runtime")]
-async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> Result<()> {
-    let Some(token) = collect_anthropic_setup_token_inline(alias).await? else {
-        return Ok(());
-    };
-
-    let outcome = zeroclaw_providers::auth::onboarding::store_onboarding_credential(
-        config,
-        zeroclaw_providers::auth::onboarding::OnboardingCredentialSubmission::new(
-            "anthropic",
-            alias,
-            Some("setup_token"),
-            Some(&token),
-        ),
-    )
-    .await?;
-    if let zeroclaw_providers::auth::onboarding::OnboardingCredentialCommit::CommittedWithDurabilityWarning {
-        detail,
-        ..
-    } = outcome
-    {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-quickstart-warning-anthropic-profile-durability",
-                &[("err", &detail)],
-                "Quickstart completed, but Anthropic credential durability could not be confirmed.",
-            )
-        );
-    }
-    let path = format!("providers.models.anthropic.{alias}.auth_mode");
-    config.set_prop_persistent(&path, "oauth")?;
-    Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-quickstart-auth-anthropic-saved",
-            &[("alias", alias)],
-            "  Saved Claude setup token.",
-        )
-    );
-    Ok(())
 }
 
 #[cfg(feature = "agent-runtime")]

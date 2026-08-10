@@ -538,7 +538,6 @@ cli-quickstart-auth-codex-import-prompt = 既存の Codex ログイン (~/.codex
 cli-quickstart-auth-codex-skip-hint = {"  "}後で完了させるには: zeroclaw auth login --model-provider openai-codex
 cli-quickstart-auth-anthropic-prompt = Anthropic プロバイダー `{$alias}` 用に今すぐ `claude setup-token` を実行しますか？
 cli-quickstart-auth-anthropic-token-prompt = `claude setup-token` のトークンを貼り付けてください
-cli-quickstart-auth-anthropic-saved = {"  "}anthropic.{$alias} の Claude setup token を保存しました
 cli-quickstart-auth-anthropic-skip-hint = {"  "}後で完了させるには: claude setup-token を実行し、zeroclaw auth setup-token --model-provider anthropic --profile {$alias} を実行して providers.models.anthropic.{$alias}.auth_mode = "oauth" を設定します
 cli-quickstart-auth-failed = {"  "}認証の設定が完了しませんでした: {$error}
 cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider}` の `model` フィールドを生成しませんでした — 手動入力にフォールバックします。報告してください。

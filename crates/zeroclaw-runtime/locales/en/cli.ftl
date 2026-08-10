@@ -620,7 +620,6 @@ cli-quickstart-auth-codex-import-prompt = Found an existing Codex login (~/.code
 cli-quickstart-auth-codex-skip-hint = {"  "}Finish later with: zeroclaw auth login --model-provider openai-codex
 cli-quickstart-auth-anthropic-prompt = Run `claude setup-token` for Anthropic provider `{$alias}` now?
 cli-quickstart-auth-anthropic-token-prompt = Paste the token from `claude setup-token`
-cli-quickstart-auth-anthropic-saved = {"  "}Saved Claude setup token for anthropic.{$alias}
 cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-token, then zeroclaw auth setup-token --model-provider anthropic --profile {$alias} and set providers.models.anthropic.{$alias}.auth_mode = "oauth"
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.

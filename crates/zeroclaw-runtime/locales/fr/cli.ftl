@@ -541,7 +541,6 @@ cli-quickstart-auth-codex-import-prompt = Connexion Codex existante trouvée (~/
 cli-quickstart-auth-codex-skip-hint = {"  "}Terminez plus tard avec : zeroclaw auth login --model-provider openai-codex
 cli-quickstart-auth-anthropic-prompt = Exécuter `claude setup-token` pour le fournisseur Anthropic `{$alias}` maintenant ?
 cli-quickstart-auth-anthropic-token-prompt = Collez le jeton de `claude setup-token`
-cli-quickstart-auth-anthropic-saved = {"  "}Jeton de configuration Claude enregistré pour anthropic.{$alias}
 cli-quickstart-auth-anthropic-skip-hint = {"  "}Terminez plus tard avec : `claude setup-token`, puis `zeroclaw auth setup-token --model-provider anthropic --profile {$alias}`
 cli-quickstart-auth-failed = {"  "}La configuration de l'authentification ne s'est pas terminée : {$error}
 cli-quickstart-model-field-missing-warning = AVERTISSEMENT : le schéma n'a produit aucun champ `model` pour `{$provider}` — saisie manuelle utilisée. Merci de le signaler.

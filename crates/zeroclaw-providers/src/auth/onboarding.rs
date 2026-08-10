@@ -187,18 +187,6 @@ pub async fn stage_onboarding_credential(
     }))
 }
 
-/// Persist an onboarding credential outside a config transaction, preserving
-/// provider ownership for callers such as the interactive recovery helper.
-pub async fn store_onboarding_credential(
-    config: &Config,
-    submission: OnboardingCredentialSubmission<'_>,
-) -> Result<OnboardingCredentialCommit> {
-    match stage_onboarding_credential(config, submission).await? {
-        Some(staged) => Ok(staged.commit()),
-        None => Ok(OnboardingCredentialCommit::Durable),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
