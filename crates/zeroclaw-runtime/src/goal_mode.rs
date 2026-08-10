@@ -403,7 +403,6 @@ pub enum GoalMessageKey {
     AlreadyActive,
     BudgetRequired,
     PricingUnavailable,
-    ProviderSingleAttemptUnsupported,
     VerifierUnavailable,
     Started,
     Status,
@@ -512,7 +511,6 @@ pub struct GoalExecutionPreflight {
 pub enum GoalExecutionReadiness {
     Ready,
     PricingUnavailable,
-    ProviderSingleAttemptUnsupported,
     VerifierUnavailable,
 }
 
@@ -989,9 +987,6 @@ fn readiness_message_key(readiness: GoalExecutionReadiness) -> GoalMessageKey {
     match readiness {
         GoalExecutionReadiness::Ready => GoalMessageKey::Started,
         GoalExecutionReadiness::PricingUnavailable => GoalMessageKey::PricingUnavailable,
-        GoalExecutionReadiness::ProviderSingleAttemptUnsupported => {
-            GoalMessageKey::ProviderSingleAttemptUnsupported
-        }
         GoalExecutionReadiness::VerifierUnavailable => GoalMessageKey::VerifierUnavailable,
     }
 }
