@@ -333,7 +333,11 @@ pub trait GoalTaskRegistry: Send + Sync {
     ) -> anyhow::Result<Option<TaskRecord>>;
 
     /// Admit a session-bound goal, rejecting a nonterminal current goal and
-    /// atomically replacing a terminal current goal.
+    /// atomically replacing a terminal current goal only when its durable
+    /// agent, route, and principal bindings exactly match `task`.
+    ///
+    /// A binding mismatch returns [`GoalTransitionResult::Stale`] without
+    /// deleting the predecessor control state.
     async fn create_or_replace_session_goal(
         &self,
         task: TaskRecord,

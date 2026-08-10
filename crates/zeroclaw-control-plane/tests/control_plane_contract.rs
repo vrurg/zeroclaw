@@ -975,6 +975,126 @@ async fn terminal_goal_stays_current_until_atomic_replacement() {
 }
 
 #[tokio::test]
+async fn terminal_goal_replacement_requires_the_existing_trusted_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(dir.path()).unwrap();
+    let (predecessor, predecessor_goal) = session_goal("predecessor", "session");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(predecessor, predecessor_goal)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .finish_session_goal("predecessor", "session", 1, TaskStatus::Completed, None)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    for field in ["agent", "route", "principal"] {
+        let replacement_id = format!("replacement-{field}");
+        let (mut replacement, replacement_goal) = session_goal(&replacement_id, "session");
+        match field {
+            "agent" => replacement.agent = "other-agent".into(),
+            "route" => replacement.originator_route = Some("other-route".into()),
+            "principal" => replacement.principal_id = Some("other-principal".into()),
+            _ => unreachable!("binding field is covered by the table"),
+        }
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(replacement, replacement_goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale,
+            "{field} mismatch must preserve the predecessor"
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .expect("mismatched admission must not remove the predecessor");
+        assert_eq!(current.id, "predecessor");
+        assert_eq!(current.agent, "main");
+        assert_eq!(current.originator_route.as_deref(), Some("route"));
+        assert_eq!(current.principal_id.as_deref(), Some("principal"));
+        assert!(store.get_goal_task("predecessor").await.unwrap().is_some());
+        assert!(store.get(&replacement_id).await.unwrap().is_none());
+    }
+}
+
+#[test]
+fn terminal_goal_binding_guard_is_atomic_across_file_backed_replacements() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = tempfile::tempdir().unwrap();
+    let left = Arc::new(SqliteTaskStore::new(dir.path()).unwrap());
+    let right = Arc::new(SqliteTaskStore::new(dir.path()).unwrap());
+    let (predecessor, predecessor_goal) = session_goal("predecessor", "session");
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(left.create_or_replace_session_goal(predecessor, predecessor_goal))
+        .unwrap();
+    assert_eq!(
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(left.finish_session_goal(
+                "predecessor",
+                "session",
+                1,
+                TaskStatus::Completed,
+                None,
+            ))
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    let (matching_task, matching_goal) = session_goal("matching", "session");
+    let (mut mismatched_task, mismatched_goal) = session_goal("mismatched", "session");
+    mismatched_task.agent = "other-agent".into();
+    let barrier = Arc::new(Barrier::new(3));
+    let spawn = |store: Arc<SqliteTaskStore>, task, goal, barrier: Arc<Barrier>| {
+        std::thread::spawn(move || {
+            barrier.wait();
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(store.create_or_replace_session_goal(task, goal))
+        })
+    };
+    let matching = spawn(
+        Arc::clone(&left),
+        matching_task,
+        matching_goal,
+        Arc::clone(&barrier),
+    );
+    let mismatched = spawn(
+        right,
+        mismatched_task,
+        mismatched_goal,
+        Arc::clone(&barrier),
+    );
+    barrier.wait();
+
+    assert_eq!(
+        matching.join().unwrap().unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        mismatched.join().unwrap().unwrap(),
+        GoalTransitionResult::Stale
+    );
+    let current = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(left.current_goal_for_session("session"))
+        .unwrap()
+        .expect("matching replacement remains current");
+    assert_eq!(current.id, "matching");
+    assert_eq!(current.agent, "main");
+}
+
+#[tokio::test]
 async fn session_goal_admission_id_collisions_are_stale_and_atomic() {
     let store = SqliteTaskStore::new_in_memory().unwrap();
     let (first, first_goal) = session_goal("shared-id", "session-a");

@@ -1142,15 +1142,23 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if id_exists {
             return Ok(GoalTransitionResult::Stale);
         }
-        let existing: Option<(String, String)> = tx
+        let existing: Option<(String, String, String, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT id, status FROM tasks WHERE kind = 'goal' AND session_id = ?1",
+                "SELECT id, status, agent, originator_route, principal_id
+                   FROM tasks
+                  WHERE kind = 'goal' AND session_id = ?1",
                 params![&session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
             .context("read current session goal")?;
-        if let Some((id, status)) = existing {
+        if let Some((id, status, agent, route, principal_id)) = existing {
+            if agent != task.agent
+                || route != task.originator_route
+                || principal_id != task.principal_id
+            {
+                return Ok(GoalTransitionResult::Stale);
+            }
             if !matches!(
                 status.as_str(),
                 "completed" | "failed" | "cancelled" | "lost" | "timed_out"
