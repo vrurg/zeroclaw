@@ -45,7 +45,7 @@ fn pid_is_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::task_registry::{TaskKind, TaskStatus};
+    use crate::task_registry::{TaskKind, TaskStatus};
 
     fn rec(owner_pid: u32, owner_boot_id: &str) -> TaskRecord {
         TaskRecord {

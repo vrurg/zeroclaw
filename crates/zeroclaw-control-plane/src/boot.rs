@@ -75,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn boot_id_distinguishes_runs_over_the_same_db() {
-        use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
+        use crate::task_registry::{TaskKind, TaskRecord, TaskStatus};
         let dir = tempfile::tempdir().unwrap();
         // First "boot" registers a running task, then the daemon "dies".
         let h1 = ControlPlaneHandle::start_with_boot_id(dir.path(), "boot-1".into())

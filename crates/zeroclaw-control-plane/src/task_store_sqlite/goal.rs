@@ -3,11 +3,11 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::control_plane::goal_task::{
+use crate::goal_task::{
     GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     TaskContinuationContext,
 };
-use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
+use crate::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
 use super::{
     SqliteTaskStore, add_column_if_missing, claim_task_owner_record, insert_task_record,
@@ -616,8 +616,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::goal_task::{GoalBlockerKind, GoalTaskRegistry};
-    use crate::control_plane::task_registry::{TaskKind, TaskRegistry, TaskStatus};
+    use crate::goal_task::{GoalBlockerKind, GoalTaskRegistry};
+    use crate::task_registry::{TaskKind, TaskRegistry, TaskStatus};
     use rusqlite::params;
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
@@ -660,8 +660,7 @@ mod tests {
             sender: "alice".into(),
             thread_ts: None,
             interruption_scope_id: Some("scope-1".into()),
-            conversation_scope:
-                crate::control_plane::goal_task::TaskContinuationConversationScope::Sender,
+            conversation_scope: crate::goal_task::TaskContinuationConversationScope::Sender,
         }
     }
 

@@ -13353,6 +13353,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-control-plane"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "zeroclaw-log",
+ "zeroclaw-spawn",
+]
+
+[[package]]
 name = "zeroclaw-desktop"
 version = "0.8.4"
 dependencies = [
@@ -13710,6 +13729,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-control-plane",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",

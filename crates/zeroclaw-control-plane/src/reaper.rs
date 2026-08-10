@@ -105,8 +105,8 @@ pub async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::task_registry::{TaskKind, TaskRecord};
-    use crate::control_plane::task_store_sqlite::SqliteTaskStore;
+    use crate::task_registry::{TaskKind, TaskRecord};
+    use crate::task_store_sqlite::SqliteTaskStore;
 
     fn rec(id: &str, boot: &str, pid: u32, beat_secs_ago: Option<i64>) -> TaskRecord {
         let beat = beat_secs_ago.map(|s| (Utc::now() - chrono::Duration::seconds(s)).to_rfc3339());
