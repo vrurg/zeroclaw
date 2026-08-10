@@ -30,6 +30,39 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
+    /// Provider-call admission fence. Both pending fields are either set or null.
+    #[serde(default)]
+    pub pending_call_id: Option<String>,
+    /// Execution epoch that admitted `pending_call_id`.
+    #[serde(default)]
+    pub pending_call_epoch: Option<i64>,
+    /// Durable accounting ambiguity marker. It does not contain usage totals.
+    #[serde(default)]
+    pub accounting_state: GoalAccountingState,
+}
+
+/// Whether usage reconciliation leaves a goal safe to restart-pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAccountingState {
+    /// No unresolved provider call is known to the control plane.
+    #[default]
+    Complete,
+    /// A provider call may have spent usage that has not been reconciled.
+    Missing,
+    Invalid,
+    OutcomeUnknown,
+}
+
+/// Outcome of a fenced goal-control mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTransitionResult {
+    /// The requested transition committed.
+    Applied,
+    /// The task exists but its session, state, or execution epoch no longer matches.
+    Stale,
+    /// No matching goal control row exists.
+    Missing,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +324,89 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<TaskContinuationContext>>;
+
+    /// Resolve the current goal for exactly one canonical session, including a
+    /// terminal current goal until it is replaced or disposed.
+    async fn current_goal_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// Admit a session-bound goal, rejecting a nonterminal current goal and
+    /// atomically replacing a terminal current goal.
+    async fn create_or_replace_session_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Atomically pause a running current goal and fence its previous executor.
+    async fn pause_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Atomically resume a paused current goal, incrementing its executor epoch.
+    async fn resume_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Fence and terminally transition the current goal when every supplied
+    /// state predicate matches.
+    async fn finish_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Admit one pending provider-call identifier for the current execution epoch.
+    async fn admit_pending_call(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        call_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Settle the matching pending call without deriving or persisting usage totals.
+    async fn settle_pending_call(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        call_id: &str,
+        accounting_state: GoalAccountingState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Replace limits only when the current session-bound goal still has the
+    /// expected execution epoch. Usage remains in the canonical ledger.
+    async fn update_session_goal_limits(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Delete only the session's current terminal control-plane record.
+    async fn delete_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
 }
 
 #[cfg(test)]

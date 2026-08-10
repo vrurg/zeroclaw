@@ -1,20 +1,38 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, functions::FunctionFlags, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
-mod goal;
+pub(crate) mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 15;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
+    goal_extension_delete_authorized: Arc<AtomicBool>,
+    future_schema_read_only: bool,
+}
+
+pub(crate) struct GoalExtensionDeleteAuthorization<'a> {
+    authorized: &'a AtomicBool,
+}
+
+impl Drop for GoalExtensionDeleteAuthorization<'_> {
+    fn drop(&mut self) {
+        self.authorized.store(false, Ordering::Release);
+    }
 }
 
 impl SqliteTaskStore {
@@ -34,7 +52,21 @@ impl SqliteTaskStore {
         Self::init(Connection::open_in_memory().context("open in-memory control-plane DB")?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
+        let goal_extension_delete_authorized = Arc::new(AtomicBool::new(false));
+        install_goal_extension_delete_authorizer(
+            &conn,
+            Arc::clone(&goal_extension_delete_authorized),
+        )?;
+        let version = schema_version(&conn)?;
+        if version > CONTROL_PLANE_SCHEMA_VERSION {
+            warn_future_schema_version(version);
+            return Ok(Self {
+                conn: Mutex::new(conn),
+                goal_extension_delete_authorized,
+                future_schema_read_only: true,
+            });
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -43,36 +75,30 @@ impl SqliteTaskStore {
              PRAGMA foreign_keys = ON;",
         )
         .context("set control-plane PRAGMAs")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tasks (
-                 id              TEXT PRIMARY KEY,
-                 kind            TEXT NOT NULL,
-                 agent           TEXT NOT NULL,
-                 status          TEXT NOT NULL,
-                 owner_pid       INTEGER NOT NULL DEFAULT 0,
-                 owner_boot_id   TEXT NOT NULL DEFAULT '',
-                 heartbeat_at    TEXT,
-                 depth           INTEGER NOT NULL DEFAULT 0,
-                 parent_id       TEXT,
-                 originator_route TEXT,
-                 delivered       INTEGER NOT NULL DEFAULT 0,
-                 idem_key        TEXT,
-                 principal_id    TEXT,
-                 started_at      TEXT NOT NULL,
-                 finished_at     TEXT,
-                 output          TEXT,
-                 error           TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-             CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
-             CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
-                ON tasks(agent, kind, started_at DESC);",
-        )
-        .context("create control-plane base schema")?;
-        migrate_schema(&conn).context("migrate control-plane schema")?;
+        migrate_schema(&mut conn, version).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            goal_extension_delete_authorized,
+            future_schema_read_only: false,
         })
+    }
+
+    /// A database from a newer binary is safe to inspect but must not be changed by
+    /// this binary's boot/recovery machinery.
+    pub(crate) fn is_future_schema_read_only(&self) -> bool {
+        self.future_schema_read_only
+    }
+
+    pub(crate) fn authorize_goal_extension_delete(&self) -> GoalExtensionDeleteAuthorization<'_> {
+        debug_assert!(
+            !self
+                .goal_extension_delete_authorized
+                .swap(true, Ordering::AcqRel),
+            "goal extension deletion authorization must not overlap"
+        );
+        GoalExtensionDeleteAuthorization {
+            authorized: &self.goal_extension_delete_authorized,
+        }
     }
 
     /// Admin enumeration — count this agent's records (mirrors AcpSessionStore's
@@ -93,29 +119,76 @@ impl SqliteTaskStore {
     pub fn delete_by_agent(&self, agent: &str) -> Result<u64> {
         let conn = self.conn.lock();
         let n = conn
-            .execute("DELETE FROM tasks WHERE agent = ?1", params![agent])
+            .execute(
+                "DELETE FROM tasks WHERE agent = ?1 AND kind != 'goal'",
+                params![agent],
+            )
             .context("delete tasks by agent")?;
         Ok(n as u64)
     }
 }
 
-fn migrate_schema(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("read control-plane schema version")?;
+fn install_goal_extension_delete_authorizer(
+    conn: &Connection,
+    authorized: Arc<AtomicBool>,
+) -> Result<()> {
+    conn.create_scalar_function(
+        "control_plane_goal_extension_delete_authorized",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        move |_| Ok(i64::from(authorized.load(Ordering::Acquire))),
+    )
+    .context("install goal extension deletion authorizer")
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read control-plane schema version")
+}
+
+fn warn_future_schema_version(version: i64) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "db_version": version,
+                "known_version": CONTROL_PLANE_SCHEMA_VERSION,
+            })
+        ),
+        "control-plane DB was created by a newer schema version"
+    );
+}
+
+fn migrate_schema(conn: &mut Connection, version: i64) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tasks (
+             id              TEXT PRIMARY KEY,
+             kind            TEXT NOT NULL,
+             agent           TEXT NOT NULL,
+             status          TEXT NOT NULL,
+             owner_pid       INTEGER NOT NULL DEFAULT 0,
+             owner_boot_id   TEXT NOT NULL DEFAULT '',
+             heartbeat_at    TEXT,
+             depth           INTEGER NOT NULL DEFAULT 0,
+             parent_id       TEXT,
+             originator_route TEXT,
+             delivered       INTEGER NOT NULL DEFAULT 0,
+             idem_key        TEXT,
+             principal_id    TEXT,
+             session_id      TEXT,
+             execution_epoch INTEGER NOT NULL DEFAULT 0,
+             started_at      TEXT NOT NULL,
+             finished_at     TEXT,
+             output          TEXT,
+             error           TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+         CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
+         CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
+            ON tasks(agent, kind, started_at DESC);",
+    )
+    .context("create control-plane base schema")?;
     goal::migrate_schema(conn, version)?;
-    if version > CONTROL_PLANE_SCHEMA_VERSION {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "db_version": version,
-                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
-                })
-            ),
-            "control-plane DB was created by a newer schema version"
-        );
-    }
     Ok(())
 }
 
@@ -192,6 +265,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -231,9 +306,9 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             parent_id, originator_route, delivered, idem_key, principal_id, session_id,
+             execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -249,11 +324,52 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
     )
     .context("insert task record")?;
+    Ok(())
+}
+
+/// Insert a new task row for a guarded control-plane transition.
+///
+/// Unlike the legacy idempotent registration helper, an ID collision is an
+/// observable stale transition and must never be silently accepted.
+pub(crate) fn insert_task_record_strict(conn: &Connection, rec: TaskRecord) -> Result<()> {
+    let changed = conn
+        .execute(
+            "INSERT INTO tasks
+                (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
+                 parent_id, originator_route, delivered, idem_key, principal_id, session_id,
+                 execution_epoch, started_at, finished_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![
+                rec.id,
+                kind_to_db(rec.kind),
+                rec.agent,
+                status_to_db(rec.status),
+                rec.owner_pid as i64,
+                rec.owner_boot_id,
+                rec.heartbeat_at,
+                rec.depth as i64,
+                rec.parent_id,
+                rec.originator_route,
+                rec.delivered as i64,
+                rec.idem_key,
+                rec.principal_id,
+                rec.session_id,
+                rec.execution_epoch,
+                rec.started_at,
+                rec.finished_at,
+            ],
+        )
+        .context("strictly insert task record")?;
+    if changed != 1 {
+        anyhow::bail!("strict task insertion changed {changed} rows");
+    }
     Ok(())
 }
 
@@ -274,6 +390,7 @@ fn update_task_status_record(
                 error  = COALESCE(?3, error),
                 finished_at = COALESCE(?4, finished_at)
           WHERE id = ?5
+            AND kind != 'goal'
             AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
         params![status_to_db(status), output, error, finished_at, id],
     )
@@ -292,6 +409,7 @@ fn claim_task_owner_record(
                 owner_boot_id = ?2,
                 heartbeat_at = NULL
           WHERE id = ?3
+            AND kind != 'goal'
             AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
         params![owner_pid as i64, owner_boot_id, id],
     )
@@ -301,6 +419,9 @@ fn claim_task_owner_record(
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
+        if rec.kind == TaskKind::Goal {
+            anyhow::bail!("TaskRegistry::create cannot create goal tasks");
+        }
         let conn = self.conn.lock();
         insert_task_record(&conn, rec)?;
         Ok(())
@@ -313,7 +434,7 @@ impl TaskRegistry for SqliteTaskStore {
         // resurrecting liveness it does not own.
         conn.execute(
             "UPDATE tasks SET heartbeat_at = ?1
-             WHERE id = ?2 AND owner_boot_id = ?3",
+             WHERE id = ?2 AND owner_boot_id = ?3 AND kind != 'goal'",
             params![now, id, owner_boot_id],
         )
         .context("heartbeat task")?;
@@ -389,13 +510,14 @@ impl TaskRegistry for SqliteTaskStore {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE tasks SET status = 'lost', finished_at = ?1
-              WHERE id = ?2 AND status = 'running'",
-            params![now, id],
-        )
-        .context("reconcile: mark lost")?;
-        Ok(true)
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET status = 'lost', finished_at = ?1
+              WHERE id = ?2 AND status = 'running' AND kind != 'goal'",
+                params![now, id],
+            )
+            .context("reconcile: mark lost")?;
+        Ok(changed == 1)
     }
 }
 
@@ -418,6 +540,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
@@ -488,6 +612,27 @@ mod tests {
             .await
             .unwrap();
         assert!(!s.reconcile_lost("done", "boot-NEW").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reconcile_lost_does_not_report_goal_as_reclaimed() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "INSERT INTO tasks (id, kind, agent, status, owner_boot_id, session_id, \
+                 execution_epoch, started_at) \
+                 VALUES ('goal', 'goal', 'main', 'running', 'boot-OLD', 'session', 1, 'now')",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(!s.reconcile_lost("goal", "boot-NEW").await.unwrap());
+        assert_eq!(
+            s.get("goal").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
     }
 
     #[tokio::test]

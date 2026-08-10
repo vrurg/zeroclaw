@@ -94,6 +94,13 @@ pub struct TaskRecord {
     pub idem_key: Option<String>,
     #[serde(default)]
     pub principal_id: Option<String>,
+    /// Canonical live-session binding for goal ownership. Legacy task rows may
+    /// omit it; newly admitted goals must bind a nonblank session id.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Fencing generation for goal executors. Generic tasks retain zero.
+    #[serde(default)]
+    pub execution_epoch: i64,
     /// Task registration/start timestamp in RFC3339 form.
     pub started_at: String,
     /// Terminal transition timestamp in RFC3339 form.
