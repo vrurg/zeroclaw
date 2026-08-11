@@ -442,10 +442,11 @@ stream_tool_arguments = [
 Rule order is irrelevant, duplicate tool/default entries are rejected, and an
 omitted rule `base` inherits `default_base`. `include` adds fields after the
 base is selected; `exclude` removes them. Runtime-only fields are never shown,
-top-level credential-named fields are always redacted, and every selected
-value passes credential leak detection and one-line normalization before it
-reaches Matrix. Composite values are intentionally not recursively inspected:
-including one is an explicit operator disclosure decision.
+credential-named fields are redacted recursively within every selected value,
+and every rendered value passes credential leak detection and one-line
+normalization before it reaches Matrix. Including a composite remains an
+explicit operator disclosure decision, but does not bypass credential
+redaction.
 In `safe` mode, only the recommended top-level scalar arguments are rendered;
 nulls, arrays, and objects are omitted. Selecting `all` or naming an argument
 in `include` is explicit operator opt-in to compact JSON rendering of a

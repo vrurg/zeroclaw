@@ -69,7 +69,9 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
             let scrubbed = map
                 .into_iter()
                 .map(|(key, val)| {
-                    if SENSITIVE_KEY_REGEX.is_match(&key) {
+                    if crate::approval::looks_like_secret_key(&key)
+                        || SENSITIVE_KEY_REGEX.is_match(&key)
+                    {
                         (key, redact_credential_leaf(val))
                     } else {
                         (key, scrub_credentials_value(val))
@@ -143,6 +145,15 @@ mod tests {
         assert!(set_cookie.contains("[REDACTED]"));
         assert!(!set_cookie.contains("9f8e7d6c5b4a3210feed"));
         assert_eq!(out["body"]["status"], "ok");
+    }
+
+    #[test]
+    fn scrub_credentials_value_matches_summary_secret_key_policy() {
+        let input = serde_json::json!({"body": {"private_key": "tiny"}});
+        let out = scrub_credentials_value(input);
+
+        assert_eq!(out["body"]["private_key"], "*[REDACTED]");
+        assert_ne!(out["body"]["private_key"], "tiny");
     }
 
     #[test]

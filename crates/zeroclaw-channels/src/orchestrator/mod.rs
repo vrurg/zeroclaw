@@ -5657,15 +5657,19 @@ fn matrix_render_argument(
     let rendered = if zeroclaw_runtime::approval::looks_like_secret_key(key) {
         "[redacted]".to_string()
     } else {
-        let rendered = match value {
+        // The shared structured redactor owns nested credential policy. Fix any
+        // newly discovered structured credential leak there rather than adding a
+        // Matrix-only exception.
+        let value = zeroclaw_runtime::agent::scrub_credentials_value(value.clone());
+        let rendered = match &value {
             serde_json::Value::String(value) => value.clone(),
             serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+                serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
             }
             serde_json::Value::Null => return None,
         };
-        matrix_scrub_display(&rendered)
+        matrix_scrub_structured_display(&rendered)
     };
     if rendered.is_empty() {
         None
@@ -5686,11 +5690,18 @@ fn matrix_is_scalar(value: &serde_json::Value) -> bool {
     )
 }
 
+fn matrix_normalize_display(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn matrix_scrub_display(value: &str) -> String {
-    scrub_credentials(&zeroclaw_runtime::security::scrub(value))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    matrix_normalize_display(&scrub_credentials(&zeroclaw_runtime::security::scrub(
+        value,
+    )))
+}
+
+fn matrix_scrub_structured_display(value: &str) -> String {
+    matrix_normalize_display(&zeroclaw_runtime::security::scrub(value))
 }
 
 fn matrix_scrub_progress_text(value: &str) -> String {
@@ -13754,6 +13765,83 @@ pub(crate) mod tests {
 
         assert_eq!(start, "⏳ delegate: agent=sysadmin\n");
         assert_eq!(completion, "✅ delegate: agent=sysadmin (4s)\n");
+    }
+
+    #[test]
+    fn matrix_tool_progress_recursively_redacts_explicit_composite_arguments() {
+        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_config::schema::{
+            MatrixConfig, StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        const CANONICAL_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+
+        let mut config = Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            MatrixConfig {
+                stream_tool_arguments: vec![Entry::Tool {
+                    tool: "delegate".to_string(),
+                    base: Some(Base::None),
+                    include: vec!["metadata".to_string()],
+                    exclude: Vec::new(),
+                    argument_chars: Some(0),
+                }],
+                ..Default::default()
+            },
+        );
+        let arguments = serde_json::json!({
+            "metadata": {
+                "password": "short",
+                "private_key": "tiny",
+                "opaque": CANONICAL_TOKEN
+            }
+        });
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments.clone()),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+            },
+            &config,
+            "single",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments),
+                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "single",
+        )
+        .expect("tool completion renders");
+
+        for progress in [&start, &completion] {
+            assert!(
+                progress.contains("metadata={")
+                    && progress.contains("\"password\":\"shor*[REDACTED]\"")
+                    && progress.contains("\"private_key\":\"*[REDACTED]\""),
+                "nested password must be redacted: {progress}"
+            );
+            assert!(
+                !progress.contains("short"),
+                "nested password must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("tiny"),
+                "nested private key must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains(CANONICAL_TOKEN),
+                "canonical token must not reach Matrix: {progress}"
+            );
+        }
     }
 
     #[test]
