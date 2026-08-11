@@ -5652,12 +5652,12 @@ fn matrix_render_argument(
     if value.is_null() || (!explicit && !matrix_is_scalar(value)) {
         return None;
     }
-    let rendered = if zeroclaw_runtime::approval::looks_like_secret_key(key) {
+    let rendered = if zeroclaw_runtime::agent::is_credential_key(key) {
         "[redacted]".to_string()
     } else {
-        // The shared structured redactor owns nested credential policy. Fix any
-        // newly discovered structured credential leak there rather than adding a
-        // Matrix-only exception.
+        // The shared structured redactor owns credential policy, including key
+        // classification. Fix any newly discovered structured credential leak
+        // there rather than adding a Matrix-only exception.
         let value = zeroclaw_runtime::agent::scrub_credentials_value(value.clone());
         let rendered = match &value {
             serde_json::Value::String(value) => value.clone(),
@@ -13716,7 +13716,11 @@ pub(crate) mod tests {
                 stream_tool_arguments: vec![Entry::Tool {
                     tool: "delegate".to_string(),
                     base: Some(Base::None),
-                    include: vec!["metadata".to_string()],
+                    include: vec![
+                        "metadata".to_string(),
+                        "cookie".to_string(),
+                        "user-key".to_string(),
+                    ],
                     exclude: Vec::new(),
                     argument_chars: Some(0),
                 }],
@@ -13724,9 +13728,13 @@ pub(crate) mod tests {
             },
         );
         let arguments = serde_json::json!({
+            "cookie": "short-cookie",
+            "user-key": "short-user-key",
             "metadata": {
                 "password": "short",
                 "private_key": "tiny",
+                "numeric_token": 1234,
+                "credentials": {"value": "nested"},
                 "opaque": CANONICAL_TOKEN
             }
         });
@@ -13757,8 +13765,12 @@ pub(crate) mod tests {
         for progress in [&start, &completion] {
             assert!(
                 progress.contains("metadata={")
-                    && progress.contains("\"password\":\"shor*[REDACTED]\"")
-                    && progress.contains("\"private_key\":\"*[REDACTED]\""),
+                    && progress.contains("\"password\":\"[REDACTED]\"")
+                    && progress.contains("\"private_key\":\"[REDACTED]\"")
+                    && progress.contains("\"numeric_token\":\"[REDACTED]\"")
+                    && progress.contains("\"credentials\":\"[REDACTED]\"")
+                    && progress.contains("cookie=[redacted]")
+                    && progress.contains("user-key=[redacted]"),
                 "nested password must be redacted: {progress}"
             );
             assert!(
@@ -13768,6 +13780,14 @@ pub(crate) mod tests {
             assert!(
                 !progress.contains("tiny"),
                 "nested private key must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("1234") && !progress.contains("nested"),
+                "credential-shaped values must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("short-cookie") && !progress.contains("short-user-key"),
+                "selected top-level credential values must not reach Matrix: {progress}"
             );
             assert!(
                 !progress.contains(CANONICAL_TOKEN),
