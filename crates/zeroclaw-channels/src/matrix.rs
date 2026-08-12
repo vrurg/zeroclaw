@@ -7561,6 +7561,10 @@ mod tests {
                 "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
                 "ZEROCLAW_MATRIX_ACCESS_TOKEN",
             );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time before unix epoch")
@@ -7570,6 +7574,7 @@ mod tests {
                 enabled: true,
                 homeserver,
                 access_token: Some(access_token),
+                device_id: Some(device_id),
                 allowed_rooms: vec![room_id.clone()],
                 stream_mode: MatrixStreamMode::Partial,
                 draft_update_interval_ms: 50,
@@ -7676,6 +7681,10 @@ mod tests {
                 "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
                 "ZEROCLAW_MATRIX_ACCESS_TOKEN",
             );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
             let stamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time before unix epoch")
@@ -7685,6 +7694,7 @@ mod tests {
                 enabled: true,
                 homeserver,
                 access_token: Some(access_token),
+                device_id: Some(device_id),
                 allowed_rooms: vec![room_id.clone()],
                 stream_mode: MatrixStreamMode::SingleMessage,
                 draft_update_interval_ms: 50,
@@ -7764,6 +7774,10 @@ mod tests {
                 "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
                 "ZEROCLAW_MATRIX_ACCESS_TOKEN",
             );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
 
             let idle_secs: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_IDLE_SECS")
                 .ok()
@@ -7782,6 +7796,7 @@ mod tests {
                 enabled: true,
                 homeserver,
                 access_token: Some(access_token),
+                device_id: Some(device_id),
                 allowed_rooms: vec![room_id.clone()],
                 stream_mode: MatrixStreamMode::Off,
                 reply_in_thread: false,

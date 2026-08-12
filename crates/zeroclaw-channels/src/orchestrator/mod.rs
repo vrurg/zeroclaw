@@ -5541,8 +5541,15 @@ fn matrix_tool_subject(
     tool_role: Option<zeroclaw_api::attribution::Role>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
 ) -> String {
-    matrix_tool_argument_hint(tool, arguments, tool_role, settings)
-        .map_or_else(|| tool.to_string(), |hint| format!("{tool}: {hint}"))
+    // Tool lookup can fail, leaving a parser/model-supplied name without a
+    // trusted registry identity. Scrub and flatten every name at the Matrix
+    // presentation boundary; the draft transport performs Markdown/HTML
+    // escaping exactly once when it inserts the complete progress entry.
+    let display_tool = matrix_scrub_display(tool);
+    matrix_tool_argument_hint(tool, arguments, tool_role, settings).map_or_else(
+        || display_tool.clone(),
+        |hint| format!("{display_tool}: {hint}"),
+    )
 }
 
 fn matrix_tool_argument_hint(
@@ -13819,6 +13826,56 @@ pub(crate) mod tests {
                 "WASM and unresolved roles must cross the event boundary without revealing safe arguments"
             );
         }
+    }
+
+    #[test]
+    fn matrix_tool_progress_scrubs_and_flattens_unresolved_tool_names() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        const CANONICAL_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+
+        let config = Config::default();
+        let tool = format!("unknown\r\n{CANONICAL_TOKEN}\t<div>**bold**</div>");
+        let arguments = Arc::new(serde_json::json!({"ignored": "value"}));
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: tool.clone(),
+                arguments: Arc::clone(&arguments),
+                tool_role: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool,
+                arguments,
+                tool_role: None,
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        let start_subject = start
+            .strip_prefix("⏳ ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .expect("start subject is framed");
+        let completion_subject = completion
+            .strip_prefix("✅ ")
+            .and_then(|value| value.strip_suffix(" (4s)\n"))
+            .expect("completion subject is framed");
+
+        assert_eq!(start_subject, completion_subject);
+        assert!(!start_subject.contains(CANONICAL_TOKEN));
+        assert!(!start_subject.chars().any(char::is_control));
+        assert!(start_subject.contains("[REDACTED"));
+        assert!(start_subject.contains("<div>**bold**</div>"));
+        assert!(!start_subject.contains("\\<div") && !start_subject.contains("\\*\\*bold"));
     }
 
     #[test]
