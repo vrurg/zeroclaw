@@ -85,11 +85,17 @@ pub fn build_session_model_provider(
 pub fn tool_dispatcher_for_provider(
     agent_cfg: &zeroclaw_config::schema::AliasedAgentConfig,
     model_provider: &dyn ModelProvider,
+    model: &str,
 ) -> Box<dyn ToolDispatcher> {
     match agent_cfg.resolved.tool_dispatcher.as_str() {
         "native" => Box::new(NativeToolDispatcher),
         "xml" => Box::new(XmlToolDispatcher),
-        _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+        _ if model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling =>
+        {
+            Box::new(NativeToolDispatcher)
+        }
         _ => Box::new(XmlToolDispatcher),
     }
 }
@@ -1650,7 +1656,8 @@ impl Agent {
                 &provider_runtime_options,
             )?;
 
-        let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
+        let tool_dispatcher =
+            tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -1973,7 +1980,11 @@ impl Agent {
         &mut self,
         loop_history: &mut [ChatMessage],
     ) -> Result<()> {
-        let dispatcher = tool_dispatcher_for_provider(&self.config, self.model_provider.as_ref());
+        let dispatcher = tool_dispatcher_for_provider(
+            &self.config,
+            self.model_provider.as_ref(),
+            &self.model_name,
+        );
         self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
 
         let Some(ConversationMessage::Chat(persisted)) = self.history.first() else {
@@ -2313,11 +2324,12 @@ impl Agent {
                         return Err(error);
                     }
                 };
-            let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_ref()
-                .map(|resolved| resolved.provider.as_ref())
-                .unwrap_or(self.model_provider.as_ref());
-            tool_dispatcher_for_provider(&self.config, active_provider)
+            let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                vision_provider_box.as_ref().map_or(
+                    (self.model_provider.as_ref(), effective_model.as_str()),
+                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                );
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -2640,11 +2652,12 @@ impl Agent {
                         });
                     }
                 };
-            let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_ref()
-                .map(|resolved| resolved.provider.as_ref())
-                .unwrap_or(self.model_provider.as_ref());
-            tool_dispatcher_for_provider(&self.config, active_provider)
+            let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                vision_provider_box.as_ref().map_or(
+                    (self.model_provider.as_ref(), effective_model.as_str()),
+                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                );
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -4471,6 +4484,39 @@ mod tests {
                 }),
                 captured,
             )
+        }
+
+        #[test]
+        fn dispatcher_selection_uses_the_selected_routes_tool_capability() {
+            let (native_default, _) = capturing_provider(true);
+            let (text_route, _) = capturing_provider(false);
+            let router = zeroclaw_providers::router::RouterModelProvider::new(
+                "test",
+                vec![
+                    ("default".to_string(), native_default),
+                    ("text".to_string(), text_route),
+                ],
+                vec![(
+                    "text".to_string(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: "text".to_string(),
+                        model: "text-model".to_string(),
+                    },
+                )],
+                "native-model".to_string(),
+            );
+            let config = zeroclaw_config::schema::AliasedAgentConfig::default();
+
+            assert!(
+                tool_dispatcher_for_provider(&config, &router, "native-model")
+                    .should_send_tool_specs(),
+                "the default native route must select the native dispatcher"
+            );
+            assert!(
+                !tool_dispatcher_for_provider(&config, &router, "hint:text")
+                    .should_send_tool_specs(),
+                "the hinted text-only route must select the XML dispatcher"
+            );
         }
 
         fn test_agent_with_provider(

@@ -171,7 +171,7 @@ If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` b
 
 This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 
-When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, the whole agentic turn uses the text/XML tool protocol. This ensures any fallback can execute tools after a primary failure; native tool transport is used only when every reachable candidate supports it.
+When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
 
 ### `delegate`: output strings the model sees
 

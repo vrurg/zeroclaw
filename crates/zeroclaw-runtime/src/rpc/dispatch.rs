@@ -2090,6 +2090,7 @@ impl RpcDispatcher {
                 let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                     &agent_cfg,
                     model_provider.as_ref(),
+                    &model_name,
                 );
                 (
                     model_provider,
@@ -2941,6 +2942,7 @@ impl RpcDispatcher {
                         let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                             &agent_cfg,
                             model_provider.as_ref(),
+                            &model_name,
                         );
                         (
                             model_provider,

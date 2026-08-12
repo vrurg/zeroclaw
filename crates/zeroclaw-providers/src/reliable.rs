@@ -1574,6 +1574,28 @@ impl ModelProvider for ReliableModelProvider {
         capabilities
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        let mut has_native = false;
+        let mut has_text_only = false;
+
+        for entry in &self.model_providers {
+            let provider = entry.provider();
+            if provider.has_mixed_native_tool_support_for_model(model) {
+                return true;
+            }
+            if provider.capabilities_for_model(model).native_tool_calling {
+                has_native = true;
+            } else {
+                has_text_only = true;
+            }
+            if has_native && has_text_only {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn supports_native_tools(&self) -> bool {
         // The turn loop selects one tool protocol before Reliable chooses a
         // candidate. A native request is therefore safe only when every
@@ -4047,9 +4069,80 @@ mod tests {
                 .native_tool_calling,
             "model-specific Reliable capabilities must not advertise native tools that a fallback cannot accept"
         );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("any-model"),
+            "the strict-mode preflight must distinguish a mixed chain from a homogeneous text-only chain"
+        );
     }
 
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
+
+    #[test]
+    fn homogeneous_chains_do_not_report_mixed_native_tool_support() {
+        let native_provider = ReliableModelProvider::new(
+            "native",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "native-fallback".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let text_provider = ReliableModelProvider::new(
+            "text",
+            vec![
+                (
+                    "text-primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(native_provider.supports_native_tools());
+        assert!(
+            !native_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-native chain is homogeneous"
+        );
+        assert!(!text_provider.supports_native_tools());
+        assert!(
+            !text_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-text chain is homogeneous and remains valid in strict mode"
+        );
+    }
 
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {

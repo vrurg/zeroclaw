@@ -1,3 +1,4 @@
+use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
@@ -2424,6 +2425,11 @@ impl DelegateTool {
         };
 
         // Build structured operational context using SystemPromptBuilder sections.
+        let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
+            String::new()
+        } else {
+            XmlToolDispatcher.prompt_instructions(prompt_tools)
+        };
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
@@ -2432,7 +2438,7 @@ impl DelegateTool {
             skills,
             skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
-            dispatcher_instructions: "",
+            dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
 
             security_summary: None,
@@ -2627,6 +2633,9 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
+        let native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2639,7 +2648,7 @@ impl DelegateTool {
             model,
             &sub_tools,
             prompt_workspace,
-            model_provider.supports_native_tools(),
+            native_tools,
             sub_skills.as_deref(),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
@@ -2649,7 +2658,7 @@ impl DelegateTool {
         let enriched_system_prompt = Self::compose_independent_system_prompt(
             enriched_system_prompt,
             sub_deferred_section,
-            model_provider.supports_native_tools(),
+            native_tools,
             loop_runtime.strict_tool_parsing,
         );
 
@@ -2858,7 +2867,7 @@ mod tests {
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
-        ModelProviderConfig,
+        ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
@@ -3714,6 +3723,16 @@ mod tests {
             }
         }
         buf
+    }
+
+    fn http_request_json(request: &[u8]) -> serde_json::Value {
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("captured HTTP request has a header terminator");
+        serde_json::from_slice(&request[body_start..])
+            .expect("captured HTTP request body is valid JSON")
     }
 
     async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
@@ -8255,12 +8274,22 @@ command = "echo hi"
         assert!(result.output.contains("fallback final reply"), "{result:?}");
 
         let bodies = backup_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first fallback request"));
         assert!(
-            bodies
-                .iter()
-                .all(|body| !body.windows(7).any(|part| part == b"\"tools\"")),
-            "the text-only fallback must not receive native tool specifications: {bodies:?}"
+            first_request.get("tools").is_none(),
+            "the text-only fallback must not receive native tool specifications: {first_request}"
         );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("fallback request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "fallback prompt must contain {required:?}: {system_prompt}"
+            );
+        }
         assert!(
             bodies
                 .get(1)
@@ -8268,6 +8297,136 @@ command = "echo hi"
             "the second fallback request must contain the executed tool result: {bodies:?}"
         );
         assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn routed_agentic_delegate_uses_selected_models_text_tool_protocol() {
+        let (default, default_requests) = start_failing_chat_server(503).await;
+        let (routed, routed_requests, routed_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            default.uri.clone(),
+            routed.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        let primary = &mut config
+            .providers
+            .models
+            .custom
+            .get_mut("primary")
+            .expect("primary provider")
+            .base;
+        primary.model = Some("hint:text".to_string());
+        primary.fallback.clear();
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("backup")
+            .expect("routed provider")
+            .base
+            .model = Some("routed-model".to_string());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "text".to_string(),
+            model_provider: "custom.backup".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        });
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("routed agentic delegate completes");
+
+        assert!(result.success, "routed delegate failed: {result:?}");
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Router default must not receive a hinted request"
+        );
+        assert_eq!(
+            routed_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the selected route must receive both tool-loop requests"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = routed_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first routed request"));
+        assert_eq!(first_request["model"], "routed-model");
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only selected route must not receive native tools: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("routed request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "routed prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second routed request must contain the tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn strict_mixed_agentic_delegate_fails_before_provider_dispatch() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .strict_tool_parsing = true;
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
+            .await
+            .expect("delegate returns a terminal tool result");
+
+        assert!(!result.success, "strict mixed chain must fail: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal failure has no output: {result:?}"
+        );
+        let expected =
+            crate::i18n::get_required_cli_string("turn-tool-protocol-strict-mixed-error");
+        let error = result.error.expect("strict mixed chain returns an error");
+        assert!(error.contains(&expected), "unexpected error: {error}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede the primary request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede fallback dispatch"
+        );
     }
 
     #[tokio::test]
