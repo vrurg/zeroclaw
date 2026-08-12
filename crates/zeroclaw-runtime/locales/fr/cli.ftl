@@ -482,7 +482,7 @@ cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
-cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool ou --uses-memory doit être fourni
+cli-cron-update-no-field = Au moins un des paramètres --expression, --tz, --command, --name, --allowed-tool, --uses-memory ou une option de livraison (--channel, --to, --thread, --best-effort, --no-best-effort) doit être fourni
 cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
 cli-cron-resumed = ▶️  Tâche cron {$id} reprise
@@ -498,6 +498,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}À     : {$v}
 cli-cron-at2 = {"  "}À   : {$v}
 cli-cron-every = {"  "}Toutes(ms): {$v}
+cli-cron-delivery = {"  "}Livraison : {$v}
+cli-cron-delivery-disabled = désactivée (la sortie n'est envoyée nulle part)
 cli-no-command = Aucune commande fournie.
 cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
@@ -952,6 +954,10 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de conte
 cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons
 cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
 cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.

@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
-cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory のうち少なくとも1つを指定する必要があります
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}配信: {$v}
+cli-cron-delivery-disabled = 無効（出力はどこにも送信されません）
 cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
@@ -949,6 +951,10 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込み
 cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン
 cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
 cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。

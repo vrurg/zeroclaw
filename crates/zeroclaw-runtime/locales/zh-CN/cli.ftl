@@ -478,7 +478,7 @@ cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
-cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool 或 --uses-memory 中的一个
+cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool、--uses-memory 或投递选项（--channel、--to、--thread、--best-effort、--no-best-effort）中的一个
 cli-cron-removed = ✅ 已移除 cron 任务 {$id}
 cli-cron-paused = ⏸️  已暂停 cron 任务 {$id}
 cli-cron-resumed = ▶️  已恢复 cron 任务 {$id}
@@ -494,6 +494,8 @@ cli-cron-cmd3 = {"  "}命令      : {$v}
 cli-cron-at = {"  "}时间    : {$v}
 cli-cron-at2 = {"  "}时间  : {$v}
 cli-cron-every = {"  "}间隔(ms): {$v}
+cli-cron-delivery = {"  "}投递: {$v}
+cli-cron-delivery-disabled = 已禁用（输出不会发送到任何地方）
 cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
@@ -948,6 +950,10 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: 
 cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
 cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
 cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。

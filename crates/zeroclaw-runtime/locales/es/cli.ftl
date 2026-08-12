@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ Tarea cron de una sola vez agregada {$id}
 cli-cron-added-interval-agent = ✅ Tarea cron de agente por intervalo agregada {$id}
 cli-cron-added-interval = ✅ Tarea cron de intervalo agregada {$id}
 cli-cron-updated = ✅ Tarea cron actualizada {$id}
-cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, o --uses-memory
+cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, --uses-memory, o una opción de entrega (--channel, --to, --thread, --best-effort, --no-best-effort)
 cli-cron-removed = ✅ Tarea cron eliminada {$id}
 cli-cron-paused = ⏸️  Tarea cron pausada {$id}
 cli-cron-resumed = ▶️  Tarea cron reanudada {$id}
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}En    : {$v}
 cli-cron-at2 = {"  "}En  : {$v}
 cli-cron-every = {"  "}Cada(ms): {$v}
+cli-cron-delivery = {"  "}Entrega: {$v}
+cli-cron-delivery-disabled = desactivada (la salida no se envía a ninguna parte)
 cli-no-command = No se proporcionó ningún comando.
 cli-press-enter = Presiona Enter para salir...
 cli-quickstart-title = Quickstart — crea un agente funcional de principio a fin.
@@ -949,6 +951,10 @@ cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_wind
 cli-doctor-context-window-ok = {$provider_ref}: ventana de contexto: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window es 0 (no válido; configúrelo con el límite de contexto real del modelo)
 cli-doctor-context-window-unset = {$provider_ref}: no se configuró context_window — usará el valor alternativo de {$fallback} tokens cuando se seleccione; probablemente sea muy inferior al límite real de este modelo; configure context_window en este perfil
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La comprobación de modelos agotó el tiempo de espera. Es posible que algunos catálogos de proveedores no estén accesibles. Puede volver a ejecutar Doctor para actualizar.
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
