@@ -5331,8 +5331,8 @@ fn push_matrix_single_message_pending(pending: &mut Vec<String>, text: String, m
 
 const RUNTIME_ONLY_TOOL_ARGUMENTS: &[&str] = &["approved", "__config"];
 
-/// Matrix's canonical safe-display policy for native standard tools. WASM and
-/// unresolved events never use this table, even when their public name collides.
+/// Matrix's canonical safe-display policy for native standard tools. Extensions
+/// and unresolved events never use this table, even when their public name collides.
 ///
 /// A schema-annotation alternative could mark displayable properties in each
 /// provider-facing `ToolSpec` and recursively traverse nested schemas. It is
@@ -5506,20 +5506,20 @@ fn matrix_tool_progress(
         zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart {
             tool,
             arguments,
-            tool_role,
+            tool_provenance,
         } => {
-            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
             Some(format!("\u{23f3} {subject}\n"))
         }
         zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
             tool,
             arguments,
-            tool_role,
+            tool_provenance,
             secs,
             success,
             error,
         } => {
-            let subject = matrix_tool_subject(tool, arguments, *tool_role, settings);
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
             if *success {
                 Some(format!("\u{2705} {subject} ({secs}s)\n"))
             } else if let Some(error) = error {
@@ -5538,7 +5538,7 @@ fn matrix_tool_progress(
 fn matrix_tool_subject(
     tool: &str,
     arguments: &serde_json::Value,
-    tool_role: Option<zeroclaw_api::attribution::Role>,
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
 ) -> String {
     // Tool lookup can fail, leaving a parser/model-supplied name without a
@@ -5546,7 +5546,7 @@ fn matrix_tool_subject(
     // presentation boundary; the draft transport performs Markdown/HTML
     // escaping exactly once when it inserts the complete progress entry.
     let display_tool = matrix_scrub_display(tool);
-    matrix_tool_argument_hint(tool, arguments, tool_role, settings).map_or_else(
+    matrix_tool_argument_hint(tool, arguments, tool_provenance, settings).map_or_else(
         || display_tool.clone(),
         |hint| format!("{display_tool}: {hint}"),
     )
@@ -5555,7 +5555,7 @@ fn matrix_tool_subject(
 fn matrix_tool_argument_hint(
     tool: &str,
     arguments: &serde_json::Value,
-    tool_role: Option<zeroclaw_api::attribution::Role>,
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
     settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
 ) -> Option<String> {
     use zeroclaw_config::schema::{
@@ -5605,7 +5605,7 @@ fn matrix_tool_argument_hint(
     let mut keys: Vec<(&str, bool)> = match base {
         StreamToolArgumentBase::None => Vec::new(),
         StreamToolArgumentBase::Safe => {
-            if matrix_safe_display_tool(tool_role) {
+            if matrix_safe_display_tool(tool_provenance) {
                 matrix_safe_tool_arguments(tool).unwrap_or_default()
             } else {
                 &[]
@@ -5640,13 +5640,14 @@ fn matrix_tool_argument_hint(
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// Matrix owns this disclosure policy. Only a resolved non-WASM `Tool` role
-/// may use its reviewed safe argument list; every other role is name-only.
-fn matrix_safe_display_tool(tool_role: Option<zeroclaw_api::attribution::Role>) -> bool {
+/// Matrix owns this disclosure policy. Only a resolved native tool may use its
+/// reviewed safe argument list; extensions and unresolved names are name-only.
+fn matrix_safe_display_tool(
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
+) -> bool {
     matches!(
-        tool_role,
-        Some(zeroclaw_api::attribution::Role::Tool(kind))
-            if kind != zeroclaw_api::attribution::ToolKind::WasmPlugin
+        tool_provenance,
+        Some(zeroclaw_api::attribution::ToolProvenance::Native)
     )
 }
 
@@ -13467,9 +13468,7 @@ pub(crate) mod tests {
             matrix_tool_argument_hint(
                 "delegate",
                 &serde_json::json!({"agent": "ops"}),
-                Some(zeroclaw_api::attribution::Role::Tool(
-                    zeroclaw_api::attribution::ToolKind::Plugin,
-                )),
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
                 single_policy
             ),
             None,
@@ -13497,9 +13496,7 @@ pub(crate) mod tests {
             matrix_tool_argument_hint(
                 "delegate",
                 &arguments,
-                Some(zeroclaw_api::attribution::Role::Tool(
-                    zeroclaw_api::attribution::ToolKind::Plugin,
-                )),
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
                 &[],
             )
             .as_deref(),
@@ -13521,9 +13518,7 @@ pub(crate) mod tests {
             matrix_tool_argument_hint(
                 "delegate",
                 &arguments,
-                Some(zeroclaw_api::attribution::Role::Tool(
-                    zeroclaw_api::attribution::ToolKind::Plugin,
-                )),
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
                 &policy,
             )
             .as_deref(),
@@ -13541,31 +13536,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn matrix_safe_policy_keeps_wasm_and_unresolved_name_collisions_name_only() {
-        use zeroclaw_api::attribution::{Role, ToolKind};
+    fn matrix_safe_policy_keeps_extension_and_unresolved_name_collisions_name_only() {
+        use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_config::schema::{
             StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
         };
 
         let arguments = serde_json::json!({"action": "navigate"});
         assert_eq!(
-            matrix_tool_argument_hint(
-                "browser",
-                &arguments,
-                Some(Role::Tool(ToolKind::WasmPlugin)),
-                &[],
-            ),
+            matrix_tool_argument_hint("browser", &arguments, Some(ToolProvenance::Extension), &[],),
             None,
-            "a WASM extension named like a standard tool stays name-only in safe mode"
+            "an extension named like a standard tool stays name-only in safe mode"
         );
         assert_eq!(
-            matrix_tool_argument_hint(
-                "browser",
-                &arguments,
-                Some(Role::Tool(ToolKind::Plugin)),
-                &[],
-            )
-            .as_deref(),
+            matrix_tool_argument_hint("browser", &arguments, Some(ToolProvenance::Native), &[],)
+                .as_deref(),
             Some("action=navigate"),
             "the canonical standard tool keeps its reviewed safe field"
         );
@@ -13585,7 +13570,7 @@ pub(crate) mod tests {
             matrix_tool_argument_hint(
                 "browser",
                 &arguments,
-                Some(Role::Tool(ToolKind::WasmPlugin)),
+                Some(ToolProvenance::Extension),
                 &explicit_policy,
             )
             .as_deref(),
@@ -13673,7 +13658,7 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
-        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
         let config = Config::default();
@@ -13682,7 +13667,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolStart {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments.clone()),
-                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                tool_provenance: Some(ToolProvenance::Native),
             },
             &config,
             "missing",
@@ -13692,7 +13677,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolComplete {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments),
-                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                tool_provenance: Some(ToolProvenance::Native),
                 secs: 4,
                 success: true,
                 error: None,
@@ -13708,7 +13693,7 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_tool_progress_recursively_redacts_explicit_composite_arguments() {
-        use zeroclaw_api::attribution::{Role, ToolKind};
+        use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_config::schema::{
             MatrixConfig, StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
         };
@@ -13749,7 +13734,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolStart {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments.clone()),
-                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                tool_provenance: Some(ToolProvenance::Extension),
             },
             &config,
             "single",
@@ -13759,7 +13744,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolComplete {
                 tool: "delegate".to_string(),
                 arguments: Arc::new(arguments),
-                tool_role: Some(Role::Tool(ToolKind::Plugin)),
+                tool_provenance: Some(ToolProvenance::Extension),
                 secs: 4,
                 success: true,
                 error: None,
@@ -13804,26 +13789,43 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn matrix_tool_progress_treats_carried_wasm_or_missing_roles_as_untrusted() {
-        use zeroclaw_api::attribution::{Role, ToolKind};
+    fn matrix_tool_progress_treats_carried_extension_or_missing_provenance_as_untrusted() {
+        use zeroclaw_api::attribution::ToolProvenance;
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
         let config = Config::default();
         let arguments = serde_json::json!({"action": "navigate"});
-        for tool_role in [Some(Role::Tool(ToolKind::WasmPlugin)), None] {
-            let progress = matrix_tool_progress(
+        for tool_provenance in [Some(ToolProvenance::Extension), None] {
+            let start = matrix_tool_progress(
                 &StreamDelta::ToolStart {
                     tool: "browser".to_string(),
                     arguments: Arc::new(arguments.clone()),
-                    tool_role,
+                    tool_provenance,
                 },
                 &config,
                 "missing",
             )
             .expect("tool start renders");
+            let completion = matrix_tool_progress(
+                &StreamDelta::ToolComplete {
+                    tool: "browser".to_string(),
+                    arguments: Arc::new(arguments.clone()),
+                    tool_provenance,
+                    secs: 4,
+                    success: true,
+                    error: None,
+                },
+                &config,
+                "missing",
+            )
+            .expect("tool completion renders");
             assert_eq!(
-                progress, "⏳ browser\n",
-                "WASM and unresolved roles must cross the event boundary without revealing safe arguments"
+                start, "⏳ browser\n",
+                "extension and unresolved tools must not reveal native safe arguments"
+            );
+            assert_eq!(
+                completion, "✅ browser (4s)\n",
+                "completion must preserve the same name-only default"
             );
         }
     }
@@ -13841,7 +13843,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolStart {
                 tool: tool.clone(),
                 arguments: Arc::clone(&arguments),
-                tool_role: None,
+                tool_provenance: None,
             },
             &config,
             "missing",
@@ -13851,7 +13853,7 @@ pub(crate) mod tests {
             &StreamDelta::ToolComplete {
                 tool,
                 arguments,
-                tool_role: None,
+                tool_provenance: None,
                 secs: 4,
                 success: true,
                 error: None,
@@ -32056,7 +32058,7 @@ Done."#;
         tx.send(StreamDelta::ToolStart {
             tool: "shell".to_string(),
             arguments: Arc::new(serde_json::json!({"command": "pwd"})),
-            tool_role: None,
+            tool_provenance: None,
         })
         .await
         .unwrap();
@@ -32066,7 +32068,7 @@ Done."#;
         tx.send(StreamDelta::ToolComplete {
             tool: "shell".to_string(),
             arguments: Arc::new(serde_json::json!({"command": "pwd"})),
-            tool_role: None,
+            tool_provenance: None,
             secs: 2,
             success: true,
             error: None,

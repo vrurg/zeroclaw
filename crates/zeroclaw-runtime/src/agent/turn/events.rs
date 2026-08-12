@@ -8,7 +8,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
-use zeroclaw_api::attribution::Role;
+use zeroclaw_api::attribution::ToolProvenance;
 pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
@@ -79,17 +79,17 @@ pub enum StreamDelta {
     ToolStart {
         tool: String,
         arguments: std::sync::Arc<serde_json::Value>,
-        /// Canonical attribution carried from the resolved tool. `None`
-        /// means the name did not resolve in the static tool registry.
-        tool_role: Option<Role>,
+        /// Canonical trust origin carried from the resolved static or activated
+        /// tool. `None` means the name did not resolve in either registry.
+        tool_provenance: Option<ToolProvenance>,
     },
     /// A completed tool call paired with its original arguments.
     ToolComplete {
         tool: String,
         arguments: std::sync::Arc<serde_json::Value>,
-        /// The same attribution observed when the matching start event was
+        /// The same trust origin observed when the matching start event was
         /// emitted; consumers must treat `None` as untrusted.
-        tool_role: Option<Role>,
+        tool_provenance: Option<ToolProvenance>,
         secs: u64,
         success: bool,
         error: Option<String>,

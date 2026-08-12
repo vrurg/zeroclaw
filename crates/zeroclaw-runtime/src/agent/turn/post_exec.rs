@@ -80,7 +80,7 @@ pub(crate) async fn record_executed_outcomes(
                 .send(StreamDelta::ToolComplete {
                     tool: call.name.clone(),
                     arguments: std::sync::Arc::clone(&stream_call.arguments),
-                    tool_role: stream_call.tool_role,
+                    tool_provenance: stream_call.tool_provenance,
                     secs,
                     success: outcome.success,
                     error: outcome.error_reason.as_deref().map(scrub_credentials),

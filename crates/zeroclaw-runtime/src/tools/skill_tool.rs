@@ -334,6 +334,10 @@ impl SkillBuiltinTool {
             advertised_schema,
         }
     }
+
+    pub(crate) fn target_tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+        self.target_tool.tool_provenance()
+    }
 }
 
 /// Merge caller args with manifest `locked` args. Locked args ALWAYS win — the
@@ -432,6 +436,7 @@ mod tests {
     use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -729,6 +734,13 @@ mod tests {
         assert_eq!(spec.parameters["type"], "object");
     }
 
+    #[test]
+    fn manifest_loaded_skill_shell_is_an_extension() {
+        let tool = SkillShellTool::new("browser", &sample_skill_tool(), test_security());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
+    }
+
     // ─── SkillBuiltinTool tests ──────────────────────────────────────────────
 
     /// Minimal mock tool for testing builtin delegation.
@@ -803,6 +815,19 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    #[test]
+    fn skill_builtin_tool_preserves_extension_target_provenance() {
+        let target: Arc<dyn Tool> = Arc::new(MockBuiltinTool::new("browser"));
+        let tool = SkillBuiltinTool::new(
+            "mcp_skill",
+            &sample_builtin_skill_tool(),
+            target,
+            HashMap::new(),
+        );
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

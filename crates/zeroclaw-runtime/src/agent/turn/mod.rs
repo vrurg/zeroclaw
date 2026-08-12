@@ -991,6 +991,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
+            activated_tools,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,

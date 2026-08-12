@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// A tool backed by a WASM plugin function.
@@ -33,6 +33,10 @@ impl Attributable for WasmTool {
         // binding identity remains on the host-issued scope and is emitted by
         // component logging under distinct plugin attributes.
         &self.name
+    }
+
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
     }
 }
 

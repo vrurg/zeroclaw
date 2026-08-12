@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::attribution::Role;
+use zeroclaw_api::attribution::ToolProvenance;
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
@@ -25,11 +25,15 @@ pub(crate) struct PreparedToolCalls {
 }
 
 /// Per-call draft metadata retained only until the matching completion event.
-/// The arguments are the prepared call arguments; `tool_role` is copied from
-/// the resolved tool's canonical attribution, not from a second registry.
+/// The arguments are the prepared call arguments; `tool_provenance` is copied
+/// from the resolved tool's canonical attribution, not from a second registry.
 pub(crate) struct StreamToolCall {
     pub(crate) arguments: Arc<serde_json::Value>,
-    pub(crate) tool_role: Option<Role>,
+    /// A narrow carry-through while draft events carry presentation metadata,
+    /// not resolved tool identity. A future event-subsystem redesign should
+    /// carry the resolved tool identity directly instead of copying its
+    /// provenance into paired events.
+    pub(crate) tool_provenance: Option<ToolProvenance>,
 }
 
 fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (String, String) {
@@ -85,6 +89,7 @@ async fn record_duplicate_tool_call(
 pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
     tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
@@ -258,8 +263,11 @@ pub(crate) async fn prepare_tool_calls(
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
         let stream_call = ctx.on_delta.map(|_| StreamToolCall {
             arguments: Arc::new(tool_args.clone()),
-            tool_role: crate::agent::tool_execution::find_tool(tools_registry, &tool_name)
-                .map(|tool| tool.role()),
+            tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
+                tools_registry,
+                activated_tools,
+                &tool_name,
+            ),
         });
         if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call.as_ref()) {
             ::zeroclaw_log::record!(
@@ -273,7 +281,7 @@ pub(crate) async fn prepare_tool_calls(
                 .send(StreamDelta::ToolStart {
                     tool: tool_name.clone(),
                     arguments: Arc::clone(&stream_call.arguments),
-                    tool_role: stream_call.tool_role,
+                    tool_provenance: stream_call.tool_provenance,
                 })
                 .await;
         }
@@ -317,22 +325,26 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
     use tokio::sync::mpsc;
-    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
     use zeroclaw_tool_call_parser::ParsedToolCall;
 
     struct AttributedTool {
         name: String,
-        role: Role,
+        provenance: ToolProvenance,
     }
 
     impl Attributable for AttributedTool {
-        fn role(&self) -> Role {
-            self.role
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
         }
 
         fn alias(&self) -> &str {
             &self.name
+        }
+
+        fn tool_provenance(&self) -> ToolProvenance {
+            self.provenance
         }
     }
 
@@ -387,10 +399,10 @@ mod tests {
         }
     }
 
-    async fn emitted_tool_roles(
+    async fn emitted_tool_provenance(
         tools_registry: Vec<Box<dyn Tool>>,
         tool_name: &str,
-    ) -> Vec<Option<Role>> {
+    ) -> Vec<Option<ToolProvenance>> {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let (tx, mut rx) = mpsc::channel(4);
@@ -405,6 +417,7 @@ mod tests {
         let mut prepared: PreparedToolCalls = prepare_tool_calls(
             &ctx,
             &tools_registry,
+            None,
             &tool_calls,
             &mut seen,
             &mut prompt_seen,
@@ -432,33 +445,39 @@ mod tests {
         )
         .await;
 
-        let mut roles = Vec::new();
-        while roles.len() < 2 {
+        let mut provenance = Vec::new();
+        while provenance.len() < 2 {
             match rx.recv().await.expect("start and completion events") {
-                StreamDelta::ToolStart { tool_role, .. }
-                | StreamDelta::ToolComplete { tool_role, .. } => roles.push(tool_role),
+                StreamDelta::ToolStart {
+                    tool_provenance, ..
+                }
+                | StreamDelta::ToolComplete {
+                    tool_provenance, ..
+                } => provenance.push(tool_provenance),
                 StreamDelta::Lifecycle(_) => {}
                 other => panic!("expected a tool event, got {other:?}"),
             }
         }
-        roles
+        provenance
     }
 
     #[tokio::test]
-    async fn prepare_carries_resolved_role_through_start_and_completion() {
-        let wasm_role = Role::Tool(ToolKind::WasmPlugin);
-        let wasm_registry: Vec<Box<dyn Tool>> = vec![Box::new(AttributedTool {
-            name: "wasm-test".to_string(),
-            role: wasm_role,
+    async fn prepare_carries_provenance_through_start_and_completion() {
+        let extension_registry: Vec<Box<dyn Tool>> = vec![Box::new(AttributedTool {
+            name: "extension-test".to_string(),
+            provenance: ToolProvenance::Extension,
         })];
         assert_eq!(
-            emitted_tool_roles(wasm_registry, "wasm-test").await,
-            vec![Some(wasm_role), Some(wasm_role)],
-            "the role resolved during preparation must be identical in both events"
+            emitted_tool_provenance(extension_registry, "extension-test").await,
+            vec![
+                Some(ToolProvenance::Extension),
+                Some(ToolProvenance::Extension)
+            ],
+            "the provenance resolved during preparation must be identical in both events"
         );
 
         assert_eq!(
-            emitted_tool_roles(Vec::new(), "unresolved-test").await,
+            emitted_tool_provenance(Vec::new(), "unresolved-test").await,
             vec![None, None],
             "an unresolved tool must remain untrusted through both events"
         );
