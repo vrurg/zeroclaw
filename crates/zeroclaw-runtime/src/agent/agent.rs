@@ -1,4 +1,7 @@
-use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
+use crate::agent::dispatcher::{
+    NativeToolDispatcher, ToolDispatcher, ToolTranscriptProtocol, XmlToolDispatcher,
+    project_provider_visible_tool_history,
+};
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::ApprovalManager;
@@ -1976,6 +1979,30 @@ impl Agent {
         Ok(())
     }
 
+    fn transcript_protocol_for_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> ToolTranscriptProtocol {
+        if dispatcher.should_send_tool_specs() {
+            ToolTranscriptProtocol::Native
+        } else if self.config.resolved.strict_tool_parsing {
+            ToolTranscriptProtocol::None
+        } else {
+            ToolTranscriptProtocol::Text
+        }
+    }
+
+    fn provider_messages_for_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Vec<ChatMessage> {
+        let canonical = NativeToolDispatcher.to_provider_messages(&self.history);
+        project_provider_visible_tool_history(
+            &canonical,
+            self.transcript_protocol_for_dispatcher(dispatcher),
+        )
+    }
+
     fn rebuild_streamed_system_prompt_for_active_provider(
         &mut self,
         loop_history: &mut Vec<ChatMessage>,
@@ -1997,16 +2024,9 @@ impl Agent {
             return Ok(());
         };
         active.content.clone_from(&persisted.content);
-        let target_protocol = if dispatcher.should_send_tool_specs() {
-            crate::agent::dispatcher::ToolTranscriptProtocol::Native
-        } else if self.config.resolved.strict_tool_parsing {
-            crate::agent::dispatcher::ToolTranscriptProtocol::None
-        } else {
-            crate::agent::dispatcher::ToolTranscriptProtocol::Text
-        };
-        *loop_history = crate::agent::dispatcher::project_provider_visible_tool_history(
+        *loop_history = project_provider_visible_tool_history(
             loop_history,
-            target_protocol,
+            self.transcript_protocol_for_dispatcher(dispatcher.as_ref()),
         );
         Ok(())
     }
@@ -2319,7 +2339,7 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let active_dispatcher = {
-            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let base_provider_messages = NativeToolDispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
                     self.full_config(),
@@ -2348,7 +2368,7 @@ impl Agent {
             return Err(error);
         }
 
-        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        let provider_messages = self.provider_messages_for_dispatcher(active_dispatcher.as_ref());
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -2642,7 +2662,7 @@ impl Agent {
             .await;
 
         let active_dispatcher = {
-            let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let base_provider_messages = NativeToolDispatcher.to_provider_messages(&self.history);
             let (vision_provider_box, _degrade_strip_images) =
                 match crate::agent::turn::resolve_vision_provider(
                     self.full_config(),
@@ -2681,7 +2701,7 @@ impl Agent {
             });
         }
 
-        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        let provider_messages = self.provider_messages_for_dispatcher(active_dispatcher.as_ref());
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -9706,30 +9726,16 @@ mod tests {
                 "the original provider must serve only the first call"
             );
 
-            let requests = switched_requests.lock();
-            assert_eq!(
-                requests.len(),
-                2,
-                "the JSON-only fixture should observe one stream attempt plus its pre-output chat fallback"
-            );
-            assert_eq!(
-                requests
-                    .iter()
-                    .map(|request| request.get("stream").and_then(serde_json::Value::as_bool))
-                    .collect::<Vec<_>>(),
-                vec![Some(true), Some(false)],
-                "the two transport requests must be the stream attempt and non-streaming fallback"
-            );
-            for switched_request in requests.iter() {
+            let assert_text_switch_request = |request: &serde_json::Value| {
                 assert!(
-                    switched_request.get("tools").is_none(),
-                    "a text-protocol target must not receive native tool specs: {switched_request}"
+                    request.get("tools").is_none(),
+                    "a text target must not receive native tool specs: {request}"
                 );
-                let switched_messages = switched_request
+                let messages = request
                     .get("messages")
                     .and_then(serde_json::Value::as_array)
-                    .expect("switched provider must receive chat messages");
-                let system_prompts = switched_messages
+                    .expect("the switched provider request must contain messages");
+                let system_prompts = messages
                     .iter()
                     .filter(|message| {
                         message.get("role").and_then(serde_json::Value::as_str) == Some("system")
@@ -9747,50 +9753,183 @@ mod tests {
                     "the switched system prompt must advertise one text-tool contract"
                 );
                 assert!(system_prompts[0].contains("<tool_call>"));
-                assert!(switched_messages.iter().all(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
-                }));
-                assert!(switched_messages.iter().all(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) != Some("assistant")
-                        || message
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
-                            .and_then(|content| content.get("tool_calls").cloned())
-                            .is_none()
-                }), "a text target must not receive a native assistant carrier: {switched_messages:?}");
-                assert!(switched_messages.iter().any(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                        && message
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|content| {
-                                content.contains("<tool_call>")
-                                    && content.contains("model_switch_trigger")
-                            })
-                }));
-                assert!(switched_messages.iter().any(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                        && message
-                            .get("content")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|content| {
-                                content.contains("<tool_result name=\"model_switch_trigger\">")
-                                    && content.contains("model switch queued")
-                            })
-                }));
+                assert!(
+                    messages.iter().all(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+                    }),
+                    "a text target must not receive native tool roles: {messages:?}"
+                );
+                assert!(
+                    messages.iter().all(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str)
+                            != Some("assistant")
+                            || message
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|content| {
+                                    serde_json::from_str::<serde_json::Value>(content).ok()
+                                })
+                                .and_then(|content| content.get("tool_calls").cloned())
+                                .is_none()
+                    }),
+                    "a text target must not receive a native assistant carrier: {messages:?}"
+                );
+                let assistant_content = messages.iter().filter_map(|message| {
+                    (message.get("role").and_then(serde_json::Value::as_str) == Some("assistant"))
+                        .then(|| {
+                            message
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .flatten()
+                });
+                assert_eq!(
+                    assistant_content
+                        .map(|content| {
+                            content
+                                .matches("\"name\":\"model_switch_trigger\"")
+                                .count()
+                        })
+                        .sum::<usize>(),
+                    1,
+                    "the text request must retain one projected switch call: {messages:?}"
+                );
+                let user_content = messages.iter().filter_map(|message| {
+                    (message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+                        .then(|| {
+                            message
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .flatten()
+                });
+                assert_eq!(
+                    user_content
+                        .map(|content| {
+                            content
+                                .matches("<tool_result name=\"model_switch_trigger\">")
+                                .count()
+                        })
+                        .sum::<usize>(),
+                    1,
+                    "the text request must retain one projected switch result: {messages:?}"
+                );
+                assert!(
+                    messages.iter().any(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                            && message
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|content| content.contains("model switch queued"))
+                    }),
+                    "the projected switch result must retain its output: {messages:?}"
+                );
+            };
+            {
+                let requests = switched_requests.lock();
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "the JSON-only fixture should observe one stream attempt plus its pre-output chat fallback"
+                );
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.get("stream").and_then(serde_json::Value::as_bool))
+                        .collect::<Vec<_>>(),
+                    vec![Some(true), Some(false)],
+                    "the two transport requests must be the stream attempt and non-streaming fallback"
+                );
+                for request in requests.iter() {
+                    assert_text_switch_request(request);
+                }
             }
 
-            assert!(agent.history.iter().any(|message| matches!(
-                message,
-                ConversationMessage::AssistantToolCalls { tool_calls, .. }
-                    if tool_calls.iter().any(|call| call.name == "model_switch_trigger")
-            )));
-            assert!(agent.history.iter().any(|message| matches!(
-                message,
-                ConversationMessage::ToolResults(results)
-                    if results.iter().any(|result| result.content == "model switch queued")
-            )));
+            let (follow_event_tx, _follow_event_rx) =
+                tokio::sync::mpsc::channel::<TurnEvent>(64);
+            let follow_up = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed("continue after the switch", follow_event_tx, None),
+            )
+            .await
+            .expect("follow-up turn must not hang")
+            .expect("the switched provider should serve the follow-up turn");
+            assert_eq!(follow_up.0, "switched-done");
+
+            {
+                let requests = switched_requests.lock();
+                assert_eq!(
+                    requests.len(),
+                    4,
+                    "each logical text-provider turn should produce one stream attempt and one \
+                     pre-output chat fallback"
+                );
+                assert_eq!(
+                    requests[2..]
+                        .iter()
+                        .map(|request| {
+                            request.get("stream").and_then(serde_json::Value::as_bool)
+                        })
+                        .collect::<Vec<_>>(),
+                    vec![Some(true), Some(false)]
+                );
+                for follow_up_request in &requests[2..] {
+                    assert_text_switch_request(follow_up_request);
+                }
+            }
+
+            let direct_follow_up = agent
+                .turn("continue through the non-streamed path")
+                .await
+                .expect("the switched provider should serve the direct follow-up turn");
+            assert_eq!(direct_follow_up, "switched-done");
+            {
+                let requests = switched_requests.lock();
+                assert_eq!(
+                    requests.len(),
+                    5,
+                    "the direct follow-up should add one non-streaming request"
+                );
+                let direct_request = &requests[4];
+                assert_eq!(
+                    direct_request
+                        .get("stream")
+                        .and_then(serde_json::Value::as_bool),
+                    Some(false)
+                );
+                assert_text_switch_request(direct_request);
+            }
+
+            assert_eq!(
+                agent
+                    .history
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                            if tool_calls
+                                .iter()
+                                .any(|call| call.name == "model_switch_trigger")
+                    ))
+                    .count(),
+                1,
+                "provider-view projection must not rewrite canonical native calls"
+            );
+            assert_eq!(
+                agent
+                    .history
+                    .iter()
+                    .filter(|message| matches!(
+                        message,
+                        ConversationMessage::ToolResults(results)
+                            if results
+                                .iter()
+                                .any(|result| result.content == "model switch queued")
+                    ))
+                    .count(),
+                1,
+                "provider-view projection must not rewrite canonical native results"
+            );
 
             let events = capturing.events.lock();
             assert!(events.iter().any(|event| matches!(
