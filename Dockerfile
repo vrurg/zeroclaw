@@ -95,6 +95,8 @@ COPY --parents crates/zeroclaw-macros/src/ ./
 # single-level crates/*/Cargo.toml glob above, so copy their manifests
 # explicitly to keep workspace manifest parsing intact during the pre-fetch.
 COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
+COPY --parents crates/zeroclaw-log/tests/fixtures/attribution-macro-support/Cargo.toml ./
+COPY --parents crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -129,7 +131,11 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
     && for d in crates/*/; do [ "$d" = "crates/zeroclaw-macros/" ] && continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
-    && printf '' > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs
+        crates/zeroclaw-log/tests/fixtures/attribution-macro-support/src \
+        crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src \
+    && printf '' > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs \
+    && printf '' > crates/zeroclaw-log/tests/fixtures/attribution-macro-support/src/lib.rs \
+    && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \

@@ -14,6 +14,14 @@ fn repository_file(name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
 }
 
+fn builder_stage<'a>(containerfile: &'a str, name: &str) -> &'a str {
+    let builder = containerfile
+        .split_once(" AS builder\n")
+        .map(|(_, builder)| builder)
+        .unwrap_or_else(|| panic!("{name} must define a builder stage"));
+    builder.split("\nFROM ").next().unwrap_or(builder)
+}
+
 fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
     let marker = format!("\n  {name}:\n");
     let (_, rest) = workflow
@@ -282,11 +290,7 @@ fn compose_smoke_proves_override_precedence_through_the_published_port() {
 fn plugin_enabled_container_variants_stage_wit_and_have_source_build_coverage() {
     for name in ["Dockerfile.alpine", "Dockerfile.debian"] {
         let containerfile = repository_file(name);
-        let builder = containerfile
-            .split_once(" AS builder\n")
-            .map(|(_, builder)| builder)
-            .unwrap_or_else(|| panic!("{name} must define a builder stage"));
-        let builder = builder.split("\nFROM ").next().unwrap_or(builder);
+        let builder = builder_stage(&containerfile, name);
         let wit_copy = builder
             .find("COPY wit/ wit/")
             .unwrap_or_else(|| panic!("{name} must stage the repository WIT contract"));
@@ -380,6 +384,59 @@ fn plugin_enabled_container_variants_stage_wit_and_have_source_build_coverage() 
             workflow_step(source_images, step).contains(alpine_smoke_guard),
             "{step} must exclude feature-only source-image lanes"
         );
+    }
+}
+
+#[test]
+fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace: toml::Value = toml::from_str(&repository_file("Cargo.toml"))
+        .expect("root Cargo.toml must contain valid TOML");
+    let members = workspace["workspace"]["members"]
+        .as_array()
+        .expect("root Cargo.toml must define workspace members");
+    let nested_crate_members: Vec<_> = members
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter(|member| member.starts_with("crates/") && member.split('/').count() > 2)
+        .collect();
+
+    assert!(
+        !nested_crate_members.is_empty(),
+        "workspace fixture must exercise nested crate-member staging"
+    );
+
+    for name in ["Dockerfile", "Dockerfile.alpine", "Dockerfile.debian"] {
+        let containerfile = repository_file(name);
+        let builder = builder_stage(&containerfile, name);
+        let dependency_build = builder
+            .find("$ZEROCLAW_CARGO_FLAGS;")
+            .unwrap_or_else(|| panic!("{name} must expose its dependency build"));
+        let prefetch = &builder[..dependency_build];
+
+        for member in &nested_crate_members {
+            let manifest_copy = format!("COPY --parents {member}/Cargo.toml ./");
+            assert!(
+                prefetch.contains(&manifest_copy),
+                "{name} must stage nested workspace manifest {member}/Cargo.toml before prefetch"
+            );
+
+            let mut found_target = false;
+            for target in ["src/lib.rs", "src/main.rs"] {
+                if root.join(member).join(target).is_file() {
+                    found_target = true;
+                    let stub = format!("{member}/{target}");
+                    assert!(
+                        prefetch.contains(&stub),
+                        "{name} must stub nested workspace target {stub} before prefetch"
+                    );
+                }
+            }
+            assert!(
+                found_target,
+                "nested workspace member {member} must expose a default lib or bin target"
+            );
+        }
     }
 }
 
