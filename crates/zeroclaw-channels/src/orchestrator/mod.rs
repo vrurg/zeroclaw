@@ -1039,6 +1039,16 @@ enum ChannelTurnToolProtocol {
     None,
 }
 
+impl From<ChannelTurnToolProtocol> for ToolTranscriptProtocol {
+    fn from(protocol: ChannelTurnToolProtocol) -> Self {
+        match protocol {
+            ChannelTurnToolProtocol::Native => Self::Native,
+            ChannelTurnToolProtocol::Text => Self::Text,
+            ChannelTurnToolProtocol::None => Self::None,
+        }
+    }
+}
+
 fn channel_turn_tool_protocol(
     model_provider: &dyn ModelProvider,
     model: &str,
@@ -1402,6 +1412,28 @@ fn strip_tool_result_content(text: &str) -> String {
     }
 
     cleaned.to_string()
+}
+
+/// Remove cached prompt-mode tool results unless they are structurally paired
+/// with an immediately preceding assistant tool call.
+fn strip_orphaned_tool_result_content(turns: &mut [ChatMessage]) {
+    for index in 0..turns.len() {
+        if !turns[index].content.contains("<tool_result") {
+            continue;
+        }
+
+        let follows_prompt_tool_call = turns[index].role == "user"
+            && turns[index].content.starts_with("[Tool results]\n")
+            && index.checked_sub(1).is_some_and(|previous_index| {
+                turns[previous_index].role == "assistant"
+                    && turns[previous_index].content.contains("<tool_call>")
+                    && turns[previous_index].content.contains("</tool_call>")
+            });
+
+        if !follows_prompt_tool_call {
+            turns[index].content = strip_tool_result_content(&turns[index].content);
+        }
+    }
 }
 
 fn strip_tool_summary_prefix(text: &str) -> String {
@@ -5560,14 +5592,9 @@ async fn process_channel_message_body(
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
-    // Strip stale tool_result blocks from cached turns so the LLM never
-    // sees a `<tool_result>` without a preceding `<tool_call>`, which
-    // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut prior_turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
+    // Keep complete prompt-mode tool exchanges, but strip orphaned result
+    // blocks that would otherwise reach the LLM without their invocation.
+    strip_orphaned_tool_result_content(&mut prior_turns);
 
     // Strip [Used tools: ...] prefixes from cached assistant turns so the
     // LLM never sees (and reproduces) this internal summary format.
@@ -5656,6 +5683,7 @@ async fn process_channel_message_body(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    history = project_provider_visible_tool_history(&history, turn_tool_protocol.into());
 
     let preamble = build_channel_turn_context_preamble(&msg, target_channel.as_ref());
     if let Some(last_turn) = history.last_mut()
@@ -6321,12 +6349,10 @@ async fn process_channel_message_body(
                             ctx.activated_tools.as_ref(),
                         )
                         .unwrap_or(ChannelTurnToolProtocol::None);
-                        let target_protocol = match turn_tool_protocol {
-                            ChannelTurnToolProtocol::Native => ToolTranscriptProtocol::Native,
-                            ChannelTurnToolProtocol::Text => ToolTranscriptProtocol::Text,
-                            ChannelTurnToolProtocol::None => ToolTranscriptProtocol::None,
-                        };
-                        history = project_provider_visible_tool_history(&history, target_protocol);
+                        history = project_provider_visible_tool_history(
+                            &history,
+                            turn_tool_protocol.into(),
+                        );
                         if let Some(system_message) = history
                             .first_mut()
                             .filter(|message| message.role == "system")
@@ -13956,6 +13982,29 @@ api_key = "anthropic-key"
     }
 
     #[test]
+    fn strip_orphaned_tool_results_preserves_complete_prompt_exchange() {
+        let prompt_result = concat!(
+            "[Tool results]\n",
+            "<tool_result name=\"mock_price\">{\"price_usd\":65000}</tool_result>"
+        );
+        let mut turns = vec![
+            ChatMessage::assistant(concat!(
+                "<tool_call>\n",
+                "{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}\n",
+                "</tool_call>"
+            )),
+            ChatMessage::user(prompt_result),
+            ChatMessage::assistant("ordinary reply"),
+            ChatMessage::user(prompt_result),
+        ];
+
+        strip_orphaned_tool_result_content(&mut turns);
+
+        assert_eq!(turns[1].content, prompt_result);
+        assert_eq!(turns[3].content, "");
+    }
+
+    #[test]
     fn strip_tool_summary_prefix_removes_prefix_and_preserves_content() {
         let input = "[Used tools: browser_open, shell]\nI opened the page successfully.";
         assert_eq!(
@@ -19282,11 +19331,116 @@ BTC is currently around $65,000 based on latest tool output."#
         let calls_after = switched_model_provider_impl
             .call_count
             .load(Ordering::SeqCst);
-        assert!(
-            calls_after > calls_before,
-            "follow-up message must be served by the switched provider (the persisted \
-             route override), not by the original default provider"
+        assert_eq!(
+            calls_after,
+            calls_before + 1,
+            "the persisted route override must send exactly one follow-up request to the \
+             switched provider"
         );
+        {
+            let switched_histories = switched_model_provider_impl
+                .histories
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert_eq!(
+                switched_histories.len(),
+                3,
+                "the follow-up must make exactly one additional provider request"
+            );
+            let follow_up_history = &switched_histories[2];
+            assert!(
+                follow_up_history
+                    .iter()
+                    .all(|message| message.role != "tool"),
+                "reloaded native tool history must be projected for the text provider: \
+                 {follow_up_history:?}"
+            );
+            assert_eq!(
+                follow_up_history
+                    .iter()
+                    .filter(|message| {
+                        message.role == "assistant"
+                            && message.content.contains("<tool_call>")
+                            && message.content.contains("\"name\":\"model_switch\"")
+                    })
+                    .count(),
+                1,
+                "the projected model-switch call must appear once: {follow_up_history:?}"
+            );
+            assert_eq!(
+                follow_up_history
+                    .iter()
+                    .filter(|message| {
+                        message.role == "user"
+                            && message
+                                .content
+                                .contains("<tool_result name=\"model_switch\">")
+                            && message.content.contains("Model switch requested")
+                    })
+                    .count(),
+                1,
+                "the projected model-switch result must appear once: {follow_up_history:?}"
+            );
+            assert_eq!(
+                follow_up_history
+                    .iter()
+                    .filter(|message| {
+                        message.role == "assistant"
+                            && message.content.contains("<tool_call>")
+                            && message.content.contains("\"name\":\"mock_price\"")
+                    })
+                    .count(),
+                1,
+                "the prompt-mode tool call must survive reload once: {follow_up_history:?}"
+            );
+            assert_eq!(
+                follow_up_history
+                    .iter()
+                    .filter(|message| {
+                        message.role == "user"
+                            && message.content.starts_with("[Tool results]\n")
+                            && message
+                                .content
+                                .contains("<tool_result name=\"mock_price\">")
+                            && message.content.contains("\"price_usd\":65000")
+                    })
+                    .count(),
+                1,
+                "the matched prompt-mode result must survive reload once: \
+                 {follow_up_history:?}"
+            );
+        }
+        {
+            let histories = runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let persisted = histories
+                .peek("telegram_chat-1_alice")
+                .expect("the follow-up must retain canonical sender history");
+            assert_eq!(
+                persisted
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .count(),
+                1,
+                "provider-view projection must not rewrite canonical native history"
+            );
+            assert_eq!(
+                persisted
+                    .iter()
+                    .filter(|message| {
+                        message.role == "user"
+                            && message.content.starts_with("[Tool results]\n")
+                            && message
+                                .content
+                                .contains("<tool_result name=\"mock_price\">")
+                    })
+                    .count(),
+                1,
+                "provider-view cleanup must not rewrite canonical prompt history"
+            );
+        }
         {
             let events = observer.events.lock().unwrap();
             let (starts, ends) = lifecycle_bracket_snapshot(&events);
