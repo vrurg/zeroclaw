@@ -731,19 +731,41 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
     first_kept_position
 }
 
+const MAX_RETAINED_FAILURE_EVENTS: usize = 8;
+const MAX_FAILURE_AGGREGATE_BYTES: usize = 2_048;
+
+#[derive(Default)]
+struct FailureEvents {
+    total: usize,
+    retained: Vec<String>,
+}
+
+impl FailureEvents {
+    fn push(&mut self, event: String) {
+        self.total += 1;
+        if self.retained.len() < MAX_RETAINED_FAILURE_EVENTS {
+            self.retained.push(event);
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        self.total + 1
+    }
+}
+
 fn push_failure(
-    failures: &mut Vec<String>,
+    failures: &mut FailureEvents,
     attempt: u32,
     max_attempts: u32,
-    reason: &str,
+    reason: &'static str,
     diagnostic: Option<&ProviderErrorDiagnostic>,
 ) {
     // This aggregate can cross into model-visible tool results and durable
     // background results. Keep it to fields controlled by ZeroClaw; the
     // provider response detail is retained in the structured attempt logs.
     let mut failure = format!(
-        "attempt {} (retry {attempt}/{max_attempts}): {reason}",
-        failures.len() + 1
+        "event {} (retry {attempt}/{max_attempts}): {reason}",
+        failures.next_index()
     );
     if let Some(diagnostic) = diagnostic {
         failure.push_str(&format!(
@@ -754,11 +776,69 @@ fn push_failure(
     failures.push(failure);
 }
 
-fn failure_aggregate(failures: &[String]) -> String {
-    format!(
-        "All model providers/models failed after {} attempt(s). Attempts:\n{}",
-        failures.len(),
-        failures.join("\n")
+fn omitted_failure_marker(count: usize) -> String {
+    format!("[{count} additional failure event(s) omitted]")
+}
+
+fn format_failure_aggregate(header: String, failures: &FailureEvents) -> String {
+    let all_omitted_marker = omitted_failure_marker(failures.total);
+    let minimum_suffix_len = if failures.total > 0 {
+        1 + all_omitted_marker.len()
+    } else {
+        0
+    };
+    let mut output = if header.len() + minimum_suffix_len <= MAX_FAILURE_AGGREGATE_BYTES {
+        header
+    } else {
+        format!(
+            "Model provider failure after {} failure event(s). Events:",
+            failures.total
+        )
+    };
+    let mut retained_count = 0;
+
+    for failure in &failures.retained {
+        let candidate_retained_count = retained_count + 1;
+        let omitted_after = failures.total - candidate_retained_count;
+        let reserved_marker_len = if omitted_after > 0 {
+            1 + omitted_failure_marker(omitted_after).len()
+        } else {
+            0
+        };
+        if output.len() + 1 + failure.len() + reserved_marker_len > MAX_FAILURE_AGGREGATE_BYTES {
+            break;
+        }
+        output.push('\n');
+        output.push_str(failure);
+        retained_count = candidate_retained_count;
+    }
+
+    let omitted = failures.total - retained_count;
+    if omitted > 0 {
+        output.push('\n');
+        output.push_str(&omitted_failure_marker(omitted));
+    }
+    debug_assert!(output.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+    output
+}
+
+fn failure_aggregate(failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "All model providers/models failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
+    )
+}
+
+fn context_failure_aggregate(message: &str, failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "{message} Failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
     )
 }
 
@@ -992,7 +1072,7 @@ impl ReliableModelProvider {
         self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
-    fn record_cooldown_skip_failure(failures: &mut Vec<String>, max_attempts: u32) {
+    fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
         let diagnostic = ProviderErrorDiagnostic {
             kind: "rate_limited",
             phase: "cooldown",
@@ -1057,7 +1137,7 @@ impl ReliableModelProvider {
     /// type) and the `continue`. See [`is_empty_completion`].
     async fn backoff_after_empty_completion(
         &self,
-        failures: &mut Vec<String>,
+        failures: &mut FailureEvents,
         provider_name: &str,
         model: &str,
         attempt: u32,
@@ -1123,7 +1203,7 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1207,13 +1287,13 @@ impl ModelProvider for ReliableModelProvider {
                                     &mut failures,
                                     attempt + 1,
                                     self.max_retries + 1,
-                                    "non_retryable",
+                                    "context_window",
                                     Some(&diagnostic),
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                anyhow::bail!(context_failure_aggregate(
+                                    "Request exceeds model context window.",
+                                    &failures,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1328,7 +1408,7 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1405,6 +1485,14 @@ impl ModelProvider for ReliableModelProvider {
                         Err(e) => {
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
@@ -1412,23 +1500,17 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    Some(&diagnostic),
-                                );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
+                                anyhow::bail!(context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
                                      breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                     of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1619,7 +1701,7 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -1697,6 +1779,14 @@ impl ModelProvider for ReliableModelProvider {
                         Err(e) => {
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
@@ -1704,23 +1794,17 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    Some(&diagnostic),
-                                );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
+                                anyhow::bail!(context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
                                      breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                     of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1829,7 +1913,7 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
@@ -1912,6 +1996,14 @@ impl ModelProvider for ReliableModelProvider {
                         Err(e) => {
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
                                     context_truncated = true;
@@ -1919,23 +2011,17 @@ impl ModelProvider for ReliableModelProvider {
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let diagnostic = provider_error_diagnostic(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    Some(&diagnostic),
-                                );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
+                                anyhow::bail!(context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
                                      breaking message/tool pairing ({truncation_limit}). \
                                      Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                     of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2868,12 +2954,54 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model providers/models failed after 2 attempt(s)"));
-        assert!(msg.contains("attempt 1 (retry 1/1): retryable"));
-        assert!(msg.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
         assert!(!msg.contains("p1 error"));
         assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
+    }
+
+    #[tokio::test]
+    async fn excessive_failure_events_are_bounded_without_provider_details() {
+        const PROVIDER_COUNT: usize = 64;
+        let providers: Vec<(String, Box<dyn ModelProvider>)> = (0..PROVIDER_COUNT)
+            .map(|index| {
+                (
+                    format!("sensitive-provider-identity-{index}"),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "sensitive provider response body: secret-token",
+                    }) as Box<dyn ModelProvider>,
+                )
+            })
+            .collect();
+        let model_provider = ReliableModelProvider::new("test", providers, 0, 1);
+
+        let err = model_provider
+            .simple_chat("hello", "sensitive-model-identity", Some(0.0))
+            .await
+            .expect_err("all model providers should fail");
+        let msg = err.to_string();
+
+        assert!(
+            msg.len() <= MAX_FAILURE_AGGREGATE_BYTES,
+            "aggregate was {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains("after 64 failure event(s)"));
+        assert!(msg.contains("event 8 (retry 1/1): retryable"));
+        assert!(!msg.contains("event 9 (retry 1/1): retryable"));
+        assert!(msg.contains(&format!(
+            "[{} additional failure event(s) omitted]",
+            PROVIDER_COUNT - MAX_RETAINED_FAILURE_EVENTS
+        )));
+        assert!(!msg.contains("sensitive-provider-identity"));
+        assert!(!msg.contains("sensitive-model-identity"));
+        assert!(!msg.contains("sensitive provider response body"));
+        assert!(!msg.contains("secret-token"));
     }
 
     #[test]
@@ -3053,17 +3181,30 @@ mod tests {
             hint: "check network, VPN, or firewall",
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
         };
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
 
         push_failure(&mut failures, 1, 3, "retryable", Some(&diagnostic));
 
-        let summary = failures.join("\n");
-        assert!(summary.contains("attempt 1 (retry 1/3): retryable"));
+        let summary = failure_aggregate(&failures);
+        assert!(summary.contains("event 1 (retry 1/3): retryable"));
         assert!(summary.contains("kind=connect_timeout"));
         assert!(summary.contains("phase=tls_or_connect"));
         assert!(summary.contains("hint=check network, VPN, or firewall"));
         assert!(!summary.contains("https://api.deepseek.com/chat/completions"));
         assert!(!summary.contains("operation timed out"));
+    }
+
+    #[test]
+    fn failure_aggregate_enforces_byte_limit_when_an_event_does_not_fit() {
+        let mut failures = FailureEvents::default();
+        failures.push("provider-controlled-body".repeat(MAX_FAILURE_AGGREGATE_BYTES));
+
+        let summary = failure_aggregate(&failures);
+
+        assert!(summary.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+        assert!(summary.contains("after 1 failure event(s)"));
+        assert!(summary.contains("[1 additional failure event(s) omitted]"));
+        assert!(!summary.contains("provider-controlled-body"));
     }
 
     #[tokio::test]
@@ -3124,7 +3265,7 @@ mod tests {
             .expect_err("model_provider should fail");
         let msg = err.to_string();
 
-        assert!(msg.contains("All model providers/models failed after 1 attempt(s)"));
+        assert!(msg.contains("All model providers/models failed after 1 failure event(s)"));
         assert!(msg.contains("non_retryable"));
         assert!(msg.contains("kind=model_not_found"));
         assert!(!msg.contains("unsupported model: glm-4.7"));
@@ -3312,7 +3453,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(
             err.to_string()
-                .contains("All model providers/models failed after 3 attempt(s)")
+                .contains("All model providers/models failed after 3 failure event(s)")
         );
 
         let seen = mock.models_seen.lock();
@@ -3747,10 +3888,10 @@ mod tests {
 
         assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
-        assert!(message.contains("attempt 1 (retry 0/1): rate_limit_cooldown"));
+        assert!(message.contains("event 1 (retry 0/1): rate_limit_cooldown"));
         assert!(message.contains("kind=rate_limited"));
         assert!(message.contains("phase=cooldown"));
-        assert!(message.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(message.contains("event 2 (retry 1/1): retryable"));
         assert!(!message.contains("provider-alias-should-not-escape"));
         assert!(!message.contains("fallback-alias-should-not-escape"));
         assert!(!message.contains("model-id-should-not-escape"));
@@ -4185,9 +4326,9 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model providers/models failed after 2 attempt(s)"));
-        assert!(msg.contains("attempt 1 (retry 1/1): retryable"));
-        assert!(msg.contains("attempt 2 (retry 1/1): retryable"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
         assert!(!msg.contains("p1 chat error"));
         assert!(!msg.contains("p2 chat error"));
         assert!(msg.contains("retryable"));
@@ -4625,7 +4766,24 @@ mod tests {
     struct ContextOverflowMock {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
+        post_context_error: Option<&'static str>,
         message_counts: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    impl ContextOverflowMock {
+        fn record_attempt(&self, message_count: usize) -> anyhow::Result<()> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.message_counts.lock().push(message_count);
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(
+                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
+                );
+            }
+            if let Some(error) = self.post_context_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -4637,7 +4795,8 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+            self.record_attempt(0)?;
+            Ok("recovered after truncation".to_string())
         }
 
         async fn chat_with_history(
@@ -4646,14 +4805,39 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            self.message_counts.lock().push(messages.len());
-            if attempt <= self.fail_until_attempt {
-                anyhow::bail!(
-                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
-                );
-            }
+            self.record_attempt(messages.len())?;
             Ok("recovered after truncation".to_string())
+        }
+
+        async fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(request.messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ContextOverflowMock {
@@ -4669,12 +4853,39 @@ mod tests {
         }
     }
 
+    fn all_non_stream_context_overflow_provider(calls: Arc<AtomicUsize>) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "local".into(),
+                Box::new(ContextOverflowMock {
+                    calls,
+                    fail_until_attempt: usize::MAX,
+                    post_context_error: None,
+                    message_counts: parking_lot::Mutex::new(Vec::new()),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        )
+    }
+
+    fn assert_single_safe_context_failure(err: anyhow::Error, calls: &AtomicUsize) {
+        let msg = err.to_string();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(msg.contains("after 1 failure event(s)"), "{msg}");
+        assert!(msg.contains("event 1 (retry 1/1): context_window"), "{msg}");
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+    }
+
     #[tokio::test]
     async fn chat_with_history_truncates_on_context_overflow() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 1, // fail first call, succeed after truncation
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
@@ -4704,11 +4915,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_non_stream_context_overflows_with_zero_retries_report_one_attempt() {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let system_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&system_calls))
+            .chat_with_system(None, "hello", "local-model", Some(0.0))
+            .await
+            .expect_err("the only system-chat call should overflow");
+        assert_single_safe_context_failure(err, &system_calls);
+
+        let history_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&history_calls))
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("the only history-chat call should overflow");
+        assert_single_safe_context_failure(err, &history_calls);
+
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&tool_calls))
+            .chat_with_tools(&messages, &[], "local-model", Some(0.0))
+            .await
+            .expect_err("the only tool-chat call should overflow");
+        assert_single_safe_context_failure(err, &tool_calls);
+
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&chat_calls))
+            .chat(request, "local-model", Some(0.0))
+            .await
+            .expect_err("the only structured-chat call should overflow");
+        assert_single_safe_context_failure(err, &chat_calls);
+    }
+
+    #[tokio::test]
+    async fn context_truncation_then_failure_reports_both_events_in_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ContextOverflowMock {
+            calls: Arc::clone(&calls),
+            fail_until_attempt: 1,
+            post_context_error: Some("sensitive final provider response body: secret-token"),
+            message_counts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+            1,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let err = model_provider
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("both provider calls should overflow");
+        let msg = err.to_string();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(msg.contains("after 2 failure event(s)"), "{msg}");
+        let first = msg
+            .find("event 1 (retry 1/2): context_window")
+            .expect("first overflow event should be retained");
+        let second = msg
+            .find("event 2 (retry 2/2): retryable")
+            .expect("post-truncation failure should be retained");
+        assert!(first < second, "events were reordered: {msg}");
+        assert!(msg.contains("kind=provider_error"));
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+        assert!(!msg.contains("sensitive final provider response body"));
+        assert!(!msg.contains("secret-token"));
+    }
+
+    #[tokio::test]
     async fn context_overflow_with_no_history_to_truncate_bails_immediately() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 999, // always fail
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 

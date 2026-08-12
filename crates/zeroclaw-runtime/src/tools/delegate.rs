@@ -8596,13 +8596,13 @@ command = "echo hi"
         );
         let error = result.error.expect("terminal delegate error");
         assert!(
-            error.contains("All model providers/models failed after 2 attempt(s)"),
-            "terminal error summarizes every attempted candidate: {error}"
+            error.contains("All model providers/models failed after 2 failure event(s)"),
+            "terminal error summarizes every failure event: {error}"
         );
         assert!(
-            error.contains("attempt 1 (retry 1/1): retryable")
-                && error.contains("attempt 2 (retry 1/1): retryable"),
-            "summary preserves attempt order: {error}"
+            error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "summary preserves event order: {error}"
         );
         assert!(
             !error.contains("primary failure marker") && !error.contains("backup failure marker"),
@@ -8694,9 +8694,9 @@ command = "echo hi"
             .as_deref()
             .expect("persisted failure detail");
         assert!(
-            persisted_error.contains("All model providers/models failed after 2 attempt(s)")
-                && persisted_error.contains("attempt 1 (retry 1/1): retryable")
-                && persisted_error.contains("attempt 2 (retry 1/1): retryable"),
+            persisted_error.contains("All model providers/models failed after 2 failure event(s)")
+                && persisted_error.contains("event 1 (retry 1/1): retryable")
+                && persisted_error.contains("event 2 (retry 1/1): retryable"),
             "persisted error must contain the safe ordered summary: {persisted_error}"
         );
         assert!(
@@ -8717,9 +8717,9 @@ command = "echo hi"
             .error
             .expect("caller receives background failure detail");
         assert!(
-            error.contains("All model providers/models failed after 2 attempt(s)")
-                && error.contains("attempt 1 (retry 1/1): retryable")
-                && error.contains("attempt 2 (retry 1/1): retryable"),
+            error.contains("All model providers/models failed after 2 failure event(s)")
+                && error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
             "check_result returns the same safe summary: {error}"
         );
         assert!(
