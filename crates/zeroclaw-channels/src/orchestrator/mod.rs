@@ -1029,6 +1029,116 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChannelTurnToolProtocol {
+    Native,
+    Text,
+    None,
+}
+
+fn channel_turn_tool_protocol(
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    strict_tool_parsing: bool,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    activated_tools: Option<&Arc<Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
+) -> Result<ChannelTurnToolProtocol> {
+    let native_tool_specs_present =
+        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            model_provider,
+            model,
+            tools_registry,
+            excluded_tools,
+            activated_tools,
+        )?;
+    if native_tool_specs_present {
+        return Ok(ChannelTurnToolProtocol::Native);
+    }
+
+    let native_tools = model_provider
+        .capabilities_for_model(model)
+        .native_tool_calling;
+    let has_text_tools = tools_registry.iter().any(|tool| {
+        !excluded_tools
+            .iter()
+            .any(|excluded| excluded == tool.name())
+    });
+    if !native_tools && !strict_tool_parsing && has_text_tools {
+        Ok(ChannelTurnToolProtocol::Text)
+    } else {
+        Ok(ChannelTurnToolProtocol::None)
+    }
+}
+
+fn channel_task_section(protocol: ChannelTurnToolProtocol) -> String {
+    match protocol {
+        ChannelTurnToolProtocol::Native => format!(
+            "## Your Task\n\n\
+             When the user sends a message, respond naturally. {} (running commands, reading files, etc.).\n\
+             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context \u{2014} do NOT ask the user to repeat themselves.\n\
+             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+            ::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING,
+        ),
+        ChannelTurnToolProtocol::Text => String::from(
+            "## Your Task\n\n\
+             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+             Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+        ),
+        ChannelTurnToolProtocol::None => format!(
+            "## Your Task\n\n\
+             When the user sends a message, respond naturally and answer directly from conversation context.\n\
+             {}, so do not emit tool calls or describe unavailable actions.\n\
+             Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
+            ::zeroclaw_runtime::agent::system_prompt::NO_TOOLS_TASK_FRAMING,
+        ),
+    }
+}
+
+fn reconcile_channel_tool_protocol(
+    base_prompt: &str,
+    protocol: ChannelTurnToolProtocol,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+) -> String {
+    let effective_tool_names: HashSet<&str> = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| !excluded_tools.iter().any(|excluded| excluded == name))
+        .collect();
+    let text_tool_instructions =
+        build_tool_instructions_for_names(tools_registry, &effective_tool_names);
+
+    let mut prompt = if text_tool_instructions.is_empty() {
+        base_prompt.to_string()
+    } else {
+        base_prompt.replace(&text_tool_instructions, "")
+    };
+
+    const TASK_HEADER: &str = "## Your Task\n\n";
+    const SAFETY_HEADER: &str = "\n## Safety\n\n";
+    if let Some(task_start) = prompt.find(TASK_HEADER) {
+        let task_body_start = task_start + TASK_HEADER.len();
+        if let Some(relative_end) = prompt[task_body_start..].find(SAFETY_HEADER) {
+            let task_end = task_body_start + relative_end + 1;
+            prompt.replace_range(task_start..task_end, &channel_task_section(protocol));
+        }
+    }
+
+    if protocol == ChannelTurnToolProtocol::Text && !text_tool_instructions.is_empty() {
+        if let Some(receipt_start) =
+            prompt.find(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM)
+        {
+            prompt.insert_str(receipt_start, &text_tool_instructions);
+        } else {
+            prompt.push_str(&text_tool_instructions);
+        }
+    }
+
+    prompt
+}
+
 fn current_date_section() -> String {
     let now = chrono::Local::now();
     format!(
@@ -5481,29 +5591,36 @@ async fn process_channel_message_body(
         } else {
             ctx.non_cli_excluded_tools.as_ref()
         };
+    let turn_tool_protocol = channel_turn_tool_protocol(
+        active_model_provider.as_ref(),
+        route.model.as_str(),
+        ctx.agent_cfg.resolved.strict_tool_parsing,
+        ctx.tools_registry.as_ref(),
+        per_turn_excluded_tools,
+        ctx.activated_tools.as_ref(),
+    )
+    .unwrap_or(ChannelTurnToolProtocol::None);
+    let protocol_system_prompt = reconcile_channel_tool_protocol(
+        ctx.system_prompt.as_str(),
+        turn_tool_protocol,
+        ctx.tools_registry.as_ref(),
+        per_turn_excluded_tools,
+    );
     let read_skill_available = read_skill_available_for_channel_turn(
         active_model_provider.as_ref(),
         route.model.as_str(),
         ctx.agent_cfg.resolved.strict_tool_parsing,
         ctx.tools_registry.as_ref(),
         per_turn_excluded_tools,
-        ctx.system_prompt.as_str(),
+        &protocol_system_prompt,
     );
     let base_system_prompt = system_prompt_for_channel_turn(
         ctx.as_ref(),
-        ctx.system_prompt.as_str(),
+        &protocol_system_prompt,
         !had_prior_history,
         read_skill_available,
     );
-    let per_turn_native_tool_specs_present =
-        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
-            active_model_provider.as_ref(),
-            route.model.as_str(),
-            ctx.tools_registry.as_ref(),
-            per_turn_excluded_tools,
-            ctx.activated_tools.as_ref(),
-        )
-        .unwrap_or(false);
+    let per_turn_native_tool_specs_present = turn_tool_protocol == ChannelTurnToolProtocol::Native;
     let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
         &base_system_prompt,
         &msg,
@@ -6180,6 +6297,26 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
+                        let turn_tool_protocol = channel_turn_tool_protocol(
+                            active_model_provider.as_ref(),
+                            route.model.as_str(),
+                            ctx.agent_cfg.resolved.strict_tool_parsing,
+                            ctx.tools_registry.as_ref(),
+                            excluded_tools,
+                            ctx.activated_tools.as_ref(),
+                        )
+                        .unwrap_or(ChannelTurnToolProtocol::None);
+                        if let Some(system_message) = history
+                            .first_mut()
+                            .filter(|message| message.role == "system")
+                        {
+                            system_message.content = reconcile_channel_tool_protocol(
+                                &system_message.content,
+                                turn_tool_protocol,
+                                ctx.tools_registry.as_ref(),
+                                excluded_tools,
+                            );
+                        }
                         let read_skill_available = read_skill_available_for_channel_turn(
                             active_model_provider.as_ref(),
                             route.model.as_str(),
@@ -11367,7 +11504,9 @@ pub async fn start_channels(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
+        let native_tools = model_provider
+            .capabilities_for_model(model.as_str())
+            .native_tool_calling;
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -16244,6 +16383,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        native_tool_spec_counts: std::sync::Mutex<Vec<usize>>,
         vision: bool,
     }
 
@@ -16274,8 +16414,45 @@ BTC is currently around $65,000 based on latest tool output."#
             Ok(format!("response-{}", calls.len()))
         }
 
+        async fn chat(
+            &self,
+            request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.capabilities_for_model(model).native_tool_calling
+                && let Some(tools) = request.tools
+                && !tools.is_empty()
+            {
+                self.native_tool_spec_counts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(tools.len());
+            }
+
+            let text = self
+                .chat_with_history(request.messages, model, temperature)
+                .await?;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
         fn supports_vision(&self) -> bool {
             self.vision
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            let mut capabilities = self.capabilities();
+            capabilities.native_tool_calling = model == "native-tools-model";
+            capabilities.vision = self.supports_vision();
+            capabilities
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for HistoryCaptureModelProvider {
@@ -21869,6 +22046,131 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.matches("## Tool Use Protocol").count(),
             1,
             "protocol block should appear exactly once in the final prompt"
+        );
+    }
+
+    async fn capture_routed_channel_tool_protocol(
+        startup_model: &str,
+        route_model: &str,
+    ) -> (String, Vec<usize>) {
+        let workspace = make_workspace();
+        let provider = HistoryCaptureModelProvider::default();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("echo_tool"))];
+        let tool_descs = vec![("echo_tool", "named mock")];
+        let startup_native = provider
+            .capabilities_for_model(startup_model)
+            .native_tool_calling;
+        let mut startup_prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            startup_model,
+            &tool_descs,
+            &[],
+            None,
+            None,
+            None,
+            startup_native,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+        );
+        if !startup_native {
+            let effective_tool_names: HashSet<&str> =
+                tools_registry.iter().map(|tool| tool.name()).collect();
+            startup_prompt.push_str(&build_tool_instructions_for_names(
+                &tools_registry,
+                &effective_tool_names,
+            ));
+        }
+
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let mut runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            provider,
+            Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(NamedMockTool("echo_tool"))],
+        );
+        let ctx = Arc::get_mut(&mut runtime_ctx).expect("test context must be uniquely owned");
+        ctx.system_prompt = Arc::new(startup_prompt);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: format!("{startup_model}-to-{route_model}"),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "use the echo tool".into(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        ctx.route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                conversation_history_key(&msg),
+                ChannelRouteSelection {
+                    model_provider: "test-provider".into(),
+                    model: route_model.into(),
+                    api_key: None,
+                },
+            );
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_prompt = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())[0][0]
+            .1
+            .clone();
+        let native_tool_spec_counts = provider_impl
+            .native_tool_spec_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        (sent_prompt, native_tool_spec_counts)
+    }
+
+    #[tokio::test]
+    async fn channel_turn_reconciles_native_startup_prompt_to_text_route() {
+        let (sent_prompt, native_tool_spec_counts) =
+            capture_routed_channel_tool_protocol("native-tools-model", "text-tools-model").await;
+
+        assert_eq!(sent_prompt.matches("## Tool Use Protocol").count(), 1);
+        assert!(sent_prompt.contains("<tool_call>"));
+        assert!(sent_prompt.contains("**echo_tool**: named mock"));
+        assert!(sent_prompt.contains("Parameters: `"));
+        assert!(sent_prompt.contains("emit actual <tool_call> tags"));
+        assert!(
+            !sent_prompt
+                .contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING)
+        );
+        assert!(
+            native_tool_spec_counts.is_empty(),
+            "text route must not receive native tool specs"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_turn_reconciles_text_startup_prompt_to_native_route() {
+        let (sent_prompt, native_tool_spec_counts) =
+            capture_routed_channel_tool_protocol("text-tools-model", "native-tools-model").await;
+
+        assert!(!sent_prompt.contains("## Tool Use Protocol"));
+        assert!(!sent_prompt.contains("<tool_call>"));
+        assert!(
+            sent_prompt
+                .contains(::zeroclaw_runtime::agent::system_prompt::NATIVE_TOOLS_TASK_FRAMING)
+        );
+        assert_eq!(
+            native_tool_spec_counts,
+            [1],
+            "native route must receive one native tool spec"
         );
     }
 
