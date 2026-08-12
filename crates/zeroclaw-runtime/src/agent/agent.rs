@@ -1978,7 +1978,7 @@ impl Agent {
 
     fn rebuild_streamed_system_prompt_for_active_provider(
         &mut self,
-        loop_history: &mut [ChatMessage],
+        loop_history: &mut Vec<ChatMessage>,
     ) -> Result<()> {
         let dispatcher = tool_dispatcher_for_provider(
             &self.config,
@@ -1997,6 +1997,17 @@ impl Agent {
             return Ok(());
         };
         active.content.clone_from(&persisted.content);
+        let target_protocol = if dispatcher.should_send_tool_specs() {
+            crate::agent::dispatcher::ToolTranscriptProtocol::Native
+        } else if self.config.resolved.strict_tool_parsing {
+            crate::agent::dispatcher::ToolTranscriptProtocol::None
+        } else {
+            crate::agent::dispatcher::ToolTranscriptProtocol::Text
+        };
+        *loop_history = crate::agent::dispatcher::project_provider_visible_tool_history(
+            loop_history,
+            target_protocol,
+        );
         Ok(())
     }
 
@@ -2735,9 +2746,11 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let mut skip_memory_next_round = false;
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
+            let inject_memory_this_round = !std::mem::take(&mut skip_memory_next_round);
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -2862,13 +2875,19 @@ impl Agent {
                         image_cache: Some(&mut self.image_cache),
                         // Direct embedded Agent::turn call; source/transport/
                         // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
-                        }),
+                        // A model-switch continuation re-enters this loop with
+                        // a provider-only textual result message. Injecting
+                        // again would attach memory to that synthetic user
+                        // message instead of the original request.
+                        memory: inject_memory_this_round.then_some(
+                            crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            },
+                        ),
                         ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
                         agent_alias: agent_alias_for_loop.as_deref(),
                         parent_agent_alias: None,
@@ -3008,6 +3027,7 @@ impl Agent {
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
                         effective_model = new_effective_model;
+                        skip_memory_next_round = true;
                         continue;
                     }
                     // Rebuild the committed text from the failed round's plain
@@ -9538,10 +9558,16 @@ mod tests {
 
     #[test]
     fn turn_streamed_applies_pending_model_switch_for_next_call() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+
         let initial_calls = Arc::new(Mutex::new(0usize));
         let provider = Box::new(StreamSwitchTriggerProvider {
             call_count: Arc::clone(&initial_calls),
         });
+        let switched_requests: Arc<Mutex<Vec<serde_json::Value>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let switched_requests_for_server = Arc::clone(&switched_requests);
 
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -9554,19 +9580,17 @@ mod tests {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
 
-        let switch_cfg = ProviderSwitchConfig {
-            config: Some(std::sync::Arc::new(zeroclaw_config::schema::Config {
-                reliability: zeroclaw_config::schema::ReliabilityConfig {
-                    provider_retries: 0,
-                    provider_backoff_ms: 0,
-                    ..zeroclaw_config::schema::ReliabilityConfig::default()
-                },
-                ..zeroclaw_config::schema::Config::default()
-            })),
+        let mut switch_config = zeroclaw_config::schema::Config {
+            reliability: zeroclaw_config::schema::ReliabilityConfig {
+                provider_retries: 0,
+                provider_backoff_ms: 0,
+                ..zeroclaw_config::schema::ReliabilityConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
-                strict_tool_parsing: true,
+                strict_tool_parsing: false,
                 ..Default::default()
             },
             ..Default::default()
@@ -9585,87 +9609,198 @@ mod tests {
             location: None,
         }];
 
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "ollama".to_string(),
-                target_model: "llama3".to_string(),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .config(agent_config)
-            .skills(skills)
-            .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .model_provider_name("openai".to_string())
-            .model_name("gpt-4o-mini".to_string())
-            .provider_switch_config(switch_cfg)
-            .build()
-            .expect("agent builder");
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
         rt.block_on(async {
+            async fn capture_switched_request(
+                State(captured): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                Json(body): Json<serde_json::Value>,
+            ) -> Json<serde_json::Value> {
+                captured.lock().push(body);
+                Json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "switched-done"}}]
+                }))
+            }
+
+            let app = Router::new()
+                .route("/v1/chat/completions", post(capture_switched_request))
+                .with_state(switched_requests_for_server);
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("mock switched provider listener");
+            let mock_addr = listener.local_addr().expect("mock listener address");
+            let server = zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("mock switched provider server");
+            });
+
+            switch_config.providers.models.custom.insert(
+                "switched".to_string(),
+                zeroclaw_config::schema::CustomModelProviderConfig {
+                    base: zeroclaw_config::schema::ModelProviderConfig {
+                        model: Some("llama3".to_string()),
+                        uri: Some(format!("http://{mock_addr}/v1")),
+                        ..Default::default()
+                    },
+                },
+            );
+            switch_config
+                .model_routes
+                .push(zeroclaw_config::schema::ModelRouteConfig {
+                    hint: "switched".to_string(),
+                    model_provider: "custom.switched".to_string(),
+                    model: "llama3".to_string(),
+                    api_key: None,
+                });
+            let switch_cfg = ProviderSwitchConfig {
+                config: Some(Arc::new(switch_config)),
+            };
+
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "custom.switched".to_string(),
+                    target_model: "llama3".to_string(),
+                })])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .config(agent_config)
+                .skills(skills)
+                .skills_prompt_mode(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .model_provider_name("openai".to_string())
+                .model_name("gpt-4o-mini".to_string())
+                .provider_switch_config(switch_cfg)
+                .build()
+                .expect("agent builder");
+
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-            // The turn ultimately errors because the switched provider has no
-            // live server; the timeout only guards against an unexpected hang.
-            let _ = tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
                 agent.turn_streamed("please switch the model", event_tx, None),
             )
-            .await;
-        });
+            .await
+            .expect("streamed model-switch turn must not hang")
+            .expect("switched provider should finish the turn");
+            assert_eq!(outcome.0, "switched-done");
 
-        // `turn_streamed` itself must have consumed the pending switch and
-        // committed the rebuilt provider/model via `ProviderSwitchConfig`.
-        assert_eq!(
-            agent.model_provider_name, "ollama",
-            "turn_streamed must commit the switched provider after the tool result"
-        );
-        assert_eq!(
-            agent.model_name, "llama3",
-            "turn_streamed must commit the switched model after the tool result"
-        );
-        let prompt = match agent.history.first() {
-            Some(ConversationMessage::Chat(message)) if message.role == "system" => {
-                &message.content
+            // `turn_streamed` itself must have consumed the pending switch and
+            // committed the rebuilt provider/model via `ProviderSwitchConfig`.
+            assert_eq!(agent.model_provider_name, "custom.switched");
+            assert_eq!(agent.model_name, "llama3");
+            let prompt = match agent.history.first() {
+                Some(ConversationMessage::Chat(message)) if message.role == "system" => {
+                    &message.content
+                }
+                _ => panic!("history must retain the rebuilt system prompt"),
+            };
+            assert!(prompt.contains("Model: llama3"));
+
+            assert_eq!(
+                *initial_calls.lock(),
+                1,
+                "the original provider must serve only the first call"
+            );
+
+            let requests = switched_requests.lock();
+            assert_eq!(
+                requests.len(),
+                2,
+                "the JSON-only fixture should observe one stream attempt plus its pre-output chat fallback"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.get("stream").and_then(serde_json::Value::as_bool))
+                    .collect::<Vec<_>>(),
+                vec![Some(true), Some(false)],
+                "the two transport requests must be the stream attempt and non-streaming fallback"
+            );
+            for switched_request in requests.iter() {
+                assert!(
+                    switched_request.get("tools").is_none(),
+                    "a text-protocol target must not receive native tool specs: {switched_request}"
+                );
+                let switched_messages = switched_request
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("switched provider must receive chat messages");
+                let system_prompts = switched_messages
+                    .iter()
+                    .filter(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+                    })
+                    .filter_map(|message| {
+                        message
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(system_prompts.len(), 1);
+                assert_eq!(
+                    system_prompts[0].matches("## Tool Use Protocol").count(),
+                    1,
+                    "the switched system prompt must advertise one text-tool contract"
+                );
+                assert!(system_prompts[0].contains("<tool_call>"));
+                assert!(switched_messages.iter().all(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+                }));
+                assert!(switched_messages.iter().all(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) != Some("assistant")
+                        || message
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                            .and_then(|content| content.get("tool_calls").cloned())
+                            .is_none()
+                }), "a text target must not receive a native assistant carrier: {switched_messages:?}");
+                assert!(switched_messages.iter().any(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                        && message
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|content| {
+                                content.contains("<tool_call>")
+                                    && content.contains("model_switch_trigger")
+                            })
+                }));
+                assert!(switched_messages.iter().any(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                        && message
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|content| {
+                                content.contains("<tool_result name=\"model_switch_trigger\">")
+                                    && content.contains("model switch queued")
+                            })
+                }));
             }
-            _ => panic!("history must retain the rebuilt system prompt"),
-        };
-        assert!(
-            prompt.contains("Model: llama3"),
-            "turn_streamed must rebuild the system prompt against the switched model"
-        );
 
-        // The original provider is used for exactly the first call; the next
-        // call in the same turn goes to the switched provider instead.
-        assert_eq!(
-            *initial_calls.lock(),
-            1,
-            "the original provider must serve only the first call — the next \
-             call must use the switched provider, not the original"
-        );
+            assert!(agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                    if tool_calls.iter().any(|call| call.name == "model_switch_trigger")
+            )));
+            assert!(agent.history.iter().any(|message| matches!(
+                message,
+                ConversationMessage::ToolResults(results)
+                    if results.iter().any(|result| result.content == "model switch queued")
+            )));
 
-        // The next provider call in the same streamed turn targets the
-        // switched provider/model: the `LlmRequest` event is recorded at the
-        // top of the post-switch iteration, immediately before that call.
-        let events = capturing.events.lock();
-        let switched_request = events.iter().any(|e| {
-            matches!(
-                e,
+            let events = capturing.events.lock();
+            assert!(events.iter().any(|event| matches!(
+                event,
                 ObserverEvent::LlmRequest { model_provider, model, .. }
-                    if model_provider == "ollama" && model == "llama3"
-            )
+                    if model_provider == "custom.switched" && model == "llama3"
+            )));
+            drop(events);
+            server.abort();
         });
-        assert!(
-            switched_request,
-            "turn_streamed must issue the next provider call against the switched \
-             provider/model (ollama/llama3); captured events: {events:?}"
-        );
-        drop(events);
     }
 }
 

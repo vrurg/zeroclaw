@@ -1,8 +1,188 @@
 use super::history::canonicalize_tool_result_media_markers_for;
 use crate::tools::{Tool, ToolSpec};
+use serde::Deserialize;
 use serde_json::Value;
 use std::fmt::Write;
-use zeroclaw_providers::{ChatMessage, ChatResponse, ConversationMessage, ToolResultMessage};
+use zeroclaw_providers::{
+    ChatMessage, ChatResponse, ConversationMessage, ToolCall, ToolResultMessage,
+};
+
+/// Tool transcript shape accepted by the provider serving the next request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolTranscriptProtocol {
+    Native,
+    Text,
+    None,
+}
+
+#[derive(Deserialize)]
+struct NativeAssistantHistory {
+    #[serde(default)]
+    content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Deserialize)]
+struct NativeToolResultHistory {
+    tool_call_id: String,
+    content: String,
+}
+
+fn escape_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn complete_native_tool_exchange(
+    history: &[ChatMessage],
+    assistant_index: usize,
+) -> Option<(NativeAssistantHistory, Vec<NativeToolResultHistory>, usize)> {
+    let assistant = history.get(assistant_index)?;
+    if assistant.role != "assistant" {
+        return None;
+    }
+    let envelope = serde_json::from_str::<NativeAssistantHistory>(&assistant.content).ok()?;
+    if envelope.tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut end = assistant_index + 1;
+    let mut results = Vec::new();
+    while let Some(message) = history.get(end).filter(|message| message.role == "tool") {
+        results.push(serde_json::from_str::<NativeToolResultHistory>(&message.content).ok()?);
+        end += 1;
+    }
+
+    let complete = results.len() == envelope.tool_calls.len()
+        && envelope.tool_calls.iter().all(|call| {
+            results
+                .iter()
+                .filter(|result| result.tool_call_id == call.id)
+                .count()
+                == 1
+        })
+        && results.iter().all(|result| {
+            envelope
+                .tool_calls
+                .iter()
+                .any(|call| call.id == result.tool_call_id)
+        });
+    complete.then_some((envelope, results, end))
+}
+
+fn render_text_tool_exchange(
+    envelope: &NativeAssistantHistory,
+    results: &[NativeToolResultHistory],
+) -> [ChatMessage; 2] {
+    let mut assistant = envelope.content.clone().unwrap_or_default();
+    for call in &envelope.tool_calls {
+        if !assistant.is_empty() && !assistant.ends_with('\n') {
+            assistant.push('\n');
+        }
+        let arguments = serde_json::from_str::<Value>(&call.arguments)
+            .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+        let payload = serde_json::json!({
+            "name": call.name,
+            "arguments": arguments,
+        });
+        let _ = writeln!(assistant, "<tool_call>\n{payload}\n</tool_call>");
+    }
+
+    let mut tool_results = String::from("[Tool results]\n");
+    for result in results {
+        let name = envelope
+            .tool_calls
+            .iter()
+            .find(|call| call.id == result.tool_call_id)
+            .map_or("unknown", |call| call.name.as_str());
+        let name = escape_xml_attribute(name);
+        let _ = writeln!(
+            tool_results,
+            "<tool_result name=\"{name}\">\n{}\n</tool_result>",
+            result.content
+        );
+    }
+
+    [
+        ChatMessage::assistant(assistant),
+        ChatMessage::user(tool_results),
+    ]
+}
+
+fn render_tool_free_exchange(
+    envelope: &NativeAssistantHistory,
+    results: &[NativeToolResultHistory],
+) -> [ChatMessage; 2] {
+    let mut assistant = envelope.content.clone().unwrap_or_default();
+    if !assistant.is_empty() && !assistant.ends_with('\n') {
+        assistant.push('\n');
+    }
+    let names = envelope
+        .tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = write!(
+        assistant,
+        "Completed tool calls before the model switch: {names}."
+    );
+
+    let mut tool_results = String::from("[Tool results from before the model switch]\n");
+    for result in results {
+        let name = envelope
+            .tool_calls
+            .iter()
+            .find(|call| call.id == result.tool_call_id)
+            .map_or("unknown", |call| call.name.as_str());
+        let _ = writeln!(tool_results, "\n{name}:\n{}", result.content);
+    }
+
+    [
+        ChatMessage::assistant(assistant),
+        ChatMessage::user(tool_results),
+    ]
+}
+
+/// Materialize a provider-only view of completed tool exchanges.
+///
+/// The input remains the canonical/durable transcript. Native exchanges are
+/// rewritten only when the target cannot accept `role=tool`; incomplete or
+/// malformed exchanges are kept byte-for-byte rather than partially rewritten.
+/// Text exchanges remain ordinary assistant/user messages when switching to a
+/// native provider: fabricating native call IDs would lose provider metadata.
+#[must_use]
+pub fn project_provider_visible_tool_history(
+    history: &[ChatMessage],
+    target: ToolTranscriptProtocol,
+) -> Vec<ChatMessage> {
+    if target == ToolTranscriptProtocol::Native {
+        return history.to_vec();
+    }
+
+    let mut projected = Vec::with_capacity(history.len());
+    let mut index = 0;
+    while index < history.len() {
+        let Some((envelope, results, end)) = complete_native_tool_exchange(history, index) else {
+            projected.push(history[index].clone());
+            index += 1;
+            continue;
+        };
+
+        let rendered = match target {
+            ToolTranscriptProtocol::Text => render_text_tool_exchange(&envelope, &results),
+            ToolTranscriptProtocol::None => render_tool_free_exchange(&envelope, &results),
+            ToolTranscriptProtocol::Native => unreachable!(),
+        };
+        projected.extend(rendered);
+        index = end;
+    }
+    projected
+}
 
 #[derive(Debug, Clone)]
 pub struct ParsedToolCall {
@@ -676,5 +856,145 @@ mod tests {
         // XmlToolDispatcher returns text only, not JSON payload
         assert_eq!(messages[0].content, "answer");
         assert!(!messages[0].content.contains("reasoning_content"));
+    }
+
+    fn native_exchange() -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::user("do it"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "Switching",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "name": "model_switch",
+                            "arguments": "{\"model\":\"gemini\"}",
+                            "extra_content": {"google": {"thought_signature": "opaque"}}
+                        },
+                        {
+                            "id": "call_2",
+                            "name": "status<&\"'",
+                            "arguments": "{}"
+                        }
+                    ],
+                    "reasoning_content": "opaque reasoning"
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_1",
+                    "content": "switch queued"
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_2",
+                    "content": "ready"
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn provider_history_projection_renders_complete_native_exchange_for_text_target() {
+        let canonical = native_exchange();
+        let projected =
+            project_provider_visible_tool_history(&canonical, ToolTranscriptProtocol::Text);
+
+        assert_eq!(projected.len(), 3);
+        assert!(projected.iter().all(|message| message.role != "tool"));
+        assert_eq!(projected[1].role, "assistant");
+        assert!(projected[1].content.starts_with("Switching\n"));
+        assert_eq!(projected[1].content.matches("<tool_call>").count(), 2);
+        assert!(projected[1].content.contains("\"name\":\"model_switch\""));
+        assert_eq!(projected[2].role, "user");
+        assert!(
+            projected[2]
+                .content
+                .contains("<tool_result name=\"model_switch\">\nswitch queued")
+        );
+        assert!(
+            projected[2]
+                .content
+                .contains("<tool_result name=\"status&lt;&amp;&quot;&apos;\">\nready")
+        );
+
+        assert_eq!(
+            canonical.len(),
+            4,
+            "projection must not mutate canonical history"
+        );
+        assert_eq!(canonical[2].role, "tool");
+        assert!(canonical[1].content.contains("opaque reasoning"));
+        assert!(canonical[1].content.contains("thought_signature"));
+    }
+
+    #[test]
+    fn provider_history_projection_keeps_native_target_byte_stable() {
+        let canonical = native_exchange();
+        let projected =
+            project_provider_visible_tool_history(&canonical, ToolTranscriptProtocol::Native);
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&canonical).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_history_projection_removes_tool_protocol_for_none_target() {
+        let canonical = native_exchange();
+        let projected =
+            project_provider_visible_tool_history(&canonical, ToolTranscriptProtocol::None);
+
+        assert_eq!(projected.len(), 3);
+        assert!(projected.iter().all(|message| message.role != "tool"));
+        assert!(projected.iter().all(|message| {
+            !message.content.contains("<tool_call>") && !message.content.contains("<tool_result")
+        }));
+        assert!(
+            projected[1]
+                .content
+                .contains("Completed tool calls before the model switch")
+        );
+        assert!(
+            projected[2]
+                .content
+                .contains("Tool results from before the model switch")
+        );
+
+        assert_eq!(canonical.len(), 4);
+        assert_eq!(canonical[2].role, "tool");
+    }
+
+    #[test]
+    fn provider_history_projection_does_not_partially_rewrite_incomplete_exchange() {
+        let mut canonical = native_exchange();
+        canonical.pop();
+        let projected =
+            project_provider_visible_tool_history(&canonical, ToolTranscriptProtocol::Text);
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&canonical).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_history_projection_does_not_fabricate_native_calls_from_text() {
+        let canonical = vec![
+            ChatMessage::assistant(
+                "<tool_call>\n{\"name\":\"shell\",\"arguments\":{}}\n</tool_call>",
+            ),
+            ChatMessage::user("[Tool results]\n<tool_result name=\"shell\">ok</tool_result>"),
+        ];
+        let projected =
+            project_provider_visible_tool_history(&canonical, ToolTranscriptProtocol::Native);
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&canonical).unwrap()
+        );
+        assert!(projected.iter().all(|message| message.role != "tool"));
     }
 }
