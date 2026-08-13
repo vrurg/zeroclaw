@@ -320,9 +320,12 @@ mod tests {
     use crate::agent::turn::post_exec::record_executed_outcomes;
     use crate::agent::turn::{DraftEvent, StreamDelta};
     use crate::observability::NoopObserver;
+    use crate::skills::SkillTool;
+    use crate::tools::skill_tool::SkillBuiltinTool;
     use crate::tools::{Tool, ToolResult};
     use async_trait::async_trait;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use zeroclaw_api::attribution::{Attributable, ToolProvenance};
@@ -480,6 +483,39 @@ mod tests {
             emitted_tool_provenance(Vec::new(), "unresolved-test").await,
             vec![None, None],
             "an unresolved tool must remain untrusted through both events"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_keeps_native_targets_wrapped_by_skills_as_extensions() {
+        let target: Arc<dyn Tool> = Arc::new(AttributedTool {
+            name: "browser".to_string(),
+            provenance: ToolProvenance::Native,
+        });
+        let skill_tool = SkillBuiltinTool::new(
+            "skill_browser",
+            &SkillTool {
+                name: "open".to_string(),
+                description: "Open a browser page through a skill".to_string(),
+                kind: "builtin".to_string(),
+                command: String::new(),
+                args: HashMap::new(),
+                target: Some("browser".to_string()),
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            },
+            target,
+            HashMap::new(),
+        );
+        let skill_name = skill_tool.name().to_string();
+
+        assert_eq!(
+            emitted_tool_provenance(vec![Box::new(skill_tool)], &skill_name).await,
+            vec![
+                Some(ToolProvenance::Extension),
+                Some(ToolProvenance::Extension)
+            ],
+            "the callable skill boundary, not its native target, controls both stream events"
         );
     }
 }

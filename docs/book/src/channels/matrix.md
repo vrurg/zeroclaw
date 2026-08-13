@@ -427,9 +427,9 @@ Matrix specifics: in `partial` mode, tool-execution status is shown through the 
 
 `stream_tool_arguments` controls which tool arguments appear in `single_message`
 progress lines. Missing or empty configuration uses conservative per-tool
-defaults; unknown skill, plugin, and MCP tools show their names only. A single
-`default_base` entry selects `none`, `safe`, or `all`, while exact-name tool
-rules can replace that base or add and remove fields:
+defaults; skill wrappers, plugins, MCP tools, and unresolved names show their
+names only. A single `default_base` entry selects `none`, `safe`, or `all`,
+while exact-name tool rules can replace that base or add and remove fields:
 
 ```toml
 stream_tool_arguments = [

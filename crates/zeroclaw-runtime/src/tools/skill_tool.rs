@@ -334,10 +334,6 @@ impl SkillBuiltinTool {
             advertised_schema,
         }
     }
-
-    pub(crate) fn target_tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
-        self.target_tool.tool_provenance()
-    }
 }
 
 /// Merge caller args with manifest `locked` args. Locked args ALWAYS win — the
@@ -818,10 +814,46 @@ mod tests {
     }
 
     #[test]
-    fn skill_builtin_tool_preserves_extension_target_provenance() {
-        let target: Arc<dyn Tool> = Arc::new(MockBuiltinTool::new("browser"));
+    fn skill_builtin_tool_is_extension_even_when_target_is_native() {
+        struct NativeMockBuiltinTool(MockBuiltinTool);
+
+        impl ::zeroclaw_api::attribution::Attributable for NativeMockBuiltinTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+
+            fn tool_provenance(&self) -> ToolProvenance {
+                ToolProvenance::Native
+            }
+        }
+
+        #[async_trait]
+        impl Tool for NativeMockBuiltinTool {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+
+            fn description(&self) -> &str {
+                self.0.description()
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                self.0.parameters_schema()
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                self.0.execute(args).await
+            }
+        }
+
+        let target: Arc<dyn Tool> =
+            Arc::new(NativeMockBuiltinTool(MockBuiltinTool::new("browser")));
         let tool = SkillBuiltinTool::new(
-            "mcp_skill",
+            "skill_browser",
             &sample_builtin_skill_tool(),
             target,
             HashMap::new(),

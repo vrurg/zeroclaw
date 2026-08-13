@@ -65,10 +65,11 @@ impl Attributable for SkillBuiltinTool {
         zeroclaw_api::tool::Tool::name(self)
     }
 
-    // Elevated skills can delegate to MCP tools. Preserve the target's origin
-    // so presentation does not grant an extension native safe-display fields.
+    // A skill controls this callable's public name, schema, and locked
+    // arguments. It is therefore an extension presentation boundary even
+    // when it delegates execution to a native target.
     fn tool_provenance(&self) -> ToolProvenance {
-        self.target_tool_provenance()
+        ToolProvenance::Extension
     }
 }
 
