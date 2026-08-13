@@ -2375,35 +2375,31 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
-/// Extract intermediate tool-call and tool-result messages from the canonical
-/// output delta of one channel turn, excluding the final assistant response.
-///
-/// Prompt-mode tool results use `role=user`, so role alone cannot recover a
-/// turn boundary after multiple provider attempts. The caller owns that
-/// boundary and passes only messages generated during the current turn.
-fn extract_current_turn_tool_messages(turn_delta: &[ChatMessage]) -> Vec<ChatMessage> {
-    if turn_delta.is_empty() {
+/// Extract tool-call (assistant with tool_call content) and tool-result
+/// messages from the current turn in the LLM history, excluding the final
+/// assistant text response.  "Current turn" = everything after the last
+/// user-role message.
+fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Find the index of the last user message — tool messages for the
+    // current turn come after it.
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+
+    let tail = &history[last_user_idx + 1..];
+    if tail.is_empty() {
         return Vec::new();
     }
 
     // Everything except the very last assistant message (which is the
     // final text response that gets stored separately).
-    let end = if turn_delta
-        .last()
-        .is_some_and(|message| message.role == "assistant")
-    {
-        turn_delta.len() - 1
+    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
+        tail.len() - 1
     } else {
-        turn_delta.len()
+        tail.len()
     };
 
-    turn_delta[..end]
+    tail[..end]
         .iter()
-        .filter(|message| {
-            message.role == "assistant"
-                || message.role == "tool"
-                || (message.role == "user" && message.content.starts_with("[Tool results]\n"))
-        })
+        .filter(|m| m.role == "assistant" || m.role == "tool")
         .cloned()
         .collect()
 }
@@ -5666,6 +5662,7 @@ async fn process_channel_message_body(
     }
     // Preserve the turn's canonical provider transcript independently from
     // the provider-only view, which may be normalized after a model switch.
+    let canonical_history_prefix = history.clone();
     let mut canonical_turn_delta = Vec::new();
     let mut model_switch_attempt = 0usize;
 
@@ -6598,10 +6595,13 @@ async fn process_channel_message_body(
             // context, preventing drift toward tool-less responses.
             let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
             if keep_tool_turns > 0 {
-                // Persist the current turn's canonical intermediate messages;
-                // the final assistant response is stored separately below.
+                // Find tool messages for the current turn: everything after
+                // the last user message up to (but not including) the final
+                // assistant response that matches our delivered text.
+                let mut canonical_history = canonical_history_prefix.clone();
+                canonical_history.extend(canonical_turn_delta.iter().cloned());
                 let tool_messages: Vec<ChatMessage> =
-                    extract_current_turn_tool_messages(&canonical_turn_delta);
+                    extract_current_turn_tool_messages(&canonical_history);
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
@@ -16694,60 +16694,6 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[derive(Default)]
-    struct TextToolRoundModelProvider {
-        call_count: AtomicUsize,
-        histories: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl ModelProvider for TextToolRoundModelProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            Ok("fallback".to_string())
-        }
-
-        async fn chat_with_history(
-            &self,
-            messages: &[ChatMessage],
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            self.histories
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push(messages.to_vec());
-            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if call_index == 0 {
-                Ok(
-                    "<tool_call>\n{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}\n</tool_call>"
-                        .to_string(),
-                )
-            } else {
-                Ok("ok".to_string())
-            }
-        }
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for TextToolRoundModelProvider {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Provider(
-                ::zeroclaw_api::attribution::ProviderKind::Model(
-                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                ),
-            )
-        }
-
-        fn alias(&self) -> &str {
-            "TextToolRoundModelProvider"
-        }
-    }
-
-    #[derive(Default)]
     struct ModelSwitchRequestProvider {
         call_count: AtomicUsize,
     }
@@ -18947,7 +18893,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let default_model_provider_impl = Arc::new(ModelSwitchRequestProvider::default());
         let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
-        let switched_model_provider_impl = Arc::new(TextToolRoundModelProvider::default());
+        let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
         let observer = Arc::new(RecordingObserver::default());
 
@@ -19013,7 +18959,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(model_switch_tool), Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(vec![Box::new(model_switch_tool)]),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -19057,7 +19003,7 @@ BTC is currently around $65,000 based on latest tool output."#
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
-                    auto_approve: vec!["model_switch".to_string(), "mock_price".to_string()],
+                    auto_approve: vec!["model_switch".to_string()],
                     ..zeroclaw_config::schema::RiskProfileConfig::default()
                 },
             )),
@@ -19103,11 +19049,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 .histories
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            assert_eq!(
-                switched_histories.len(),
-                2,
-                "the switched text provider must execute one tool round before its final response"
-            );
             let switched_history = switched_histories
                 .first()
                 .expect("the switched provider must receive the continued turn");
@@ -19134,22 +19075,6 @@ BTC is currently around $65,000 based on latest tool output."#
                     && last.content.contains("Model switch requested"),
                 "the switched request must end with the model-switch result as user-side prompt history: {switched_history:?}"
             );
-
-            let after_text_tool = &switched_histories[1];
-            assert!(after_text_tool.iter().all(|message| message.role != "tool"));
-            assert!(after_text_tool.iter().any(|message| {
-                message.role == "assistant"
-                    && message.content.contains("<tool_call>")
-                    && message.content.contains("\"name\":\"mock_price\"")
-            }));
-            assert!(after_text_tool.iter().any(|message| {
-                message.role == "user"
-                    && message.content.starts_with("[Tool results]\n")
-                    && message
-                        .content
-                        .contains("<tool_result name=\"mock_price\">")
-                    && message.content.contains("\"price_usd\":65000")
-            }));
         }
 
         {
@@ -19181,32 +19106,6 @@ BTC is currently around $65,000 based on latest tool output."#
                     .count(),
                 1,
                 "the per-attempt canonical delta must persist each tool result once"
-            );
-            assert_eq!(
-                persisted
-                    .iter()
-                    .filter(|message| {
-                        message.role == "assistant"
-                            && message.content.contains("<tool_call>")
-                            && message.content.contains("\"name\":\"mock_price\"")
-                    })
-                    .count(),
-                1,
-                "the prompt-mode tool call must be persisted exactly once: {persisted:?}"
-            );
-            assert_eq!(
-                persisted
-                    .iter()
-                    .filter(|message| {
-                        message.role == "user"
-                            && message.content.starts_with("[Tool results]\n")
-                            && message
-                                .content
-                                .contains("<tool_result name=\"mock_price\">")
-                    })
-                    .count(),
-                1,
-                "the prompt-mode tool result must be persisted exactly once: {persisted:?}"
             );
         }
 
@@ -30515,13 +30414,17 @@ Done."#;
 
     #[test]
     fn extract_current_turn_tool_messages_returns_intermediate_messages() {
-        let turn_delta = vec![
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older msg"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("block the iPad"),
             ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
             ChatMessage::tool("ok"),
             ChatMessage::assistant("Done, iPad is blocked."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&turn_delta);
+        let tool_msgs = extract_current_turn_tool_messages(&history);
         assert_eq!(tool_msgs.len(), 2);
         assert_eq!(tool_msgs[0].role, "assistant");
         assert!(tool_msgs[0].content.contains("tool_call"));
@@ -30530,15 +30433,19 @@ Done."#;
 
     #[test]
     fn extract_current_turn_tool_messages_empty_when_no_tools() {
-        let turn_delta = vec![ChatMessage::assistant("Hi there!")];
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("Hi there!"),
+        ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&turn_delta);
+        let tool_msgs = extract_current_turn_tool_messages(&history);
         assert!(tool_msgs.is_empty());
     }
 
     #[test]
     fn extract_current_turn_tool_messages_multiple_tool_rounds() {
-        let turn_delta = vec![
+        let history = vec![
+            ChatMessage::user("do two things"),
             ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
             ChatMessage::tool("skill content"),
             ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
@@ -30546,36 +30453,8 @@ Done."#;
             ChatMessage::assistant("All done."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&turn_delta);
+        let tool_msgs = extract_current_turn_tool_messages(&history);
         assert_eq!(tool_msgs.len(), 4);
-    }
-
-    #[test]
-    fn extract_current_turn_tool_messages_preserves_native_then_text_rounds() {
-        let turn_delta = vec![
-            ChatMessage::assistant("{\"tool_calls\":[{\"name\":\"model_switch\"}]}"),
-            ChatMessage::tool("switch queued"),
-            ChatMessage::assistant(
-                "<tool_call>\n{\"name\":\"mock_price\",\"arguments\":{}}\n</tool_call>",
-            ),
-            ChatMessage::user("[Tool results]\n<tool_result name=\"mock_price\">ok</tool_result>"),
-            ChatMessage::assistant("All done."),
-        ];
-
-        let tool_msgs = extract_current_turn_tool_messages(&turn_delta);
-        assert_eq!(tool_msgs.len(), 4);
-        assert_eq!(
-            tool_msgs
-                .iter()
-                .map(|message| message.role.as_str())
-                .collect::<Vec<_>>(),
-            ["assistant", "tool", "assistant", "user"]
-        );
-        assert!(
-            tool_msgs
-                .last()
-                .is_some_and(|message| message.content.starts_with("[Tool results]\n"))
-        );
     }
 
     #[test]
