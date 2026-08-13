@@ -2107,15 +2107,12 @@ fn system_prompt_for_channel_turn(
 
 fn read_skill_available_for_channel_turn(
     model_provider: &dyn ModelProvider,
-    model: &str,
     strict_tool_parsing: bool,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     system_prompt: &str,
 ) -> bool {
-    let callable_protocol = model_provider
-        .capabilities_for_model(model)
-        .native_tool_calling
+    let callable_protocol = model_provider.supports_native_tools()
         || (!strict_tool_parsing && text_tool_prompt_advertises(system_prompt, "read_skill"));
 
     callable_protocol
@@ -5483,7 +5480,6 @@ async fn process_channel_message_body(
         };
     let read_skill_available = read_skill_available_for_channel_turn(
         active_model_provider.as_ref(),
-        route.model.as_str(),
         ctx.agent_cfg.resolved.strict_tool_parsing,
         ctx.tools_registry.as_ref(),
         per_turn_excluded_tools,
@@ -5498,7 +5494,6 @@ async fn process_channel_message_body(
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
-            route.model.as_str(),
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools,
             ctx.activated_tools.as_ref(),
@@ -6182,7 +6177,6 @@ async fn process_channel_message_body(
 
                         let read_skill_available = read_skill_available_for_channel_turn(
                             active_model_provider.as_ref(),
-                            route.model.as_str(),
                             ctx.agent_cfg.resolved.strict_tool_parsing,
                             ctx.tools_registry.as_ref(),
                             excluded_tools,
@@ -21928,7 +21922,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert!(read_skill_available_for_channel_turn(
             &provider,
-            "test-model",
             false,
             &tools_registry,
             &[],
@@ -21936,7 +21929,6 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
-            "test-model",
             false,
             &tools_registry,
             &[],
@@ -21944,7 +21936,6 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
-            "test-model",
             false,
             &tools_registry,
             &[],
@@ -21952,7 +21943,6 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
-            "test-model",
             false,
             &tools_registry,
             &["read_skill".to_string()],
@@ -21960,7 +21950,6 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
         assert!(!read_skill_available_for_channel_turn(
             &provider,
-            "test-model",
             true,
             &tools_registry,
             &[],
