@@ -117,9 +117,6 @@ use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
-use zeroclaw_runtime::agent::dispatcher::{
-    ToolTranscriptProtocol, project_provider_visible_tool_history,
-};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ProgressEvent, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
     ResolvedRuntimeKnobs, StreamDelta, ToolLoop, append_pinned_mcp_section,
@@ -5660,11 +5657,6 @@ async fn process_channel_message_body(
         let raw_content = last_turn.content.clone();
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
-    // Preserve the turn's canonical provider transcript independently from
-    // the provider-only view, which may be normalized after a model switch.
-    let canonical_history_prefix = history.clone();
-    let mut canonical_turn_delta = Vec::new();
-    let mut model_switch_attempt = 0usize;
 
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
@@ -6119,7 +6111,6 @@ async fn process_channel_message_body(
     );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
-            let mut attempt_delta = Vec::new();
             let thread_scope_id = msg
                 .interruption_scope_id
                 .clone()
@@ -6183,27 +6174,25 @@ async fn process_channel_message_body(
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
                 steering: None,
-                new_messages_out: Some(&mut attempt_delta),
+                new_messages_out: None,
                 image_cache: None,
                 // Channel-orchestrator dispatch; source/transport/trust stay
                 // placeholders, not yet stamped at the edge.
-                memory: (model_switch_attempt == 0).then_some(
-                    zeroclaw_runtime::agent::memory_inject::TurnMemory {
-                        handle: ctx.memory.as_ref(),
-                        query: msg.content.clone(),
-                        sessions: memory_sessions.clone(),
-                        suppress: false,
-                        // The relevance floor stays the context's resolved copy;
-                        // the rerank stage settings thread from the live config.
-                        cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
-                            min_relevance_score: ctx.min_relevance_score,
-                            ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
-                                &ctx.prompt_config.memory,
-                                zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
-                            )
-                        },
+                memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
+                    handle: ctx.memory.as_ref(),
+                    query: msg.content.clone(),
+                    sessions: memory_sessions.clone(),
+                    suppress: false,
+                    // The relevance floor stays the context's resolved copy;
+                    // the rerank stage settings thread from the live config.
+                    cfg: zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig {
+                        min_relevance_score: ctx.min_relevance_score,
+                        ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
+                            &ctx.prompt_config.memory,
+                            zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                        )
                     },
-                ),
+                }),
                 ingress: zeroclaw_api::ingress::IngressContext::channel(),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 parent_agent_alias: None,
@@ -6235,7 +6224,6 @@ async fn process_channel_message_body(
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
-            canonical_turn_delta.extend(attempt_delta);
 
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
@@ -6318,12 +6306,6 @@ async fn process_channel_message_body(
                             ctx.activated_tools.as_ref(),
                         )
                         .unwrap_or(ChannelTurnToolProtocol::None);
-                        let target_protocol = match turn_tool_protocol {
-                            ChannelTurnToolProtocol::Native => ToolTranscriptProtocol::Native,
-                            ChannelTurnToolProtocol::Text => ToolTranscriptProtocol::Text,
-                            ChannelTurnToolProtocol::None => ToolTranscriptProtocol::None,
-                        };
-                        history = project_provider_visible_tool_history(&history, target_protocol);
                         if let Some(system_message) = history
                             .first_mut()
                             .filter(|message| message.role == "system")
@@ -6351,7 +6333,6 @@ async fn process_channel_message_body(
                             read_skill_available,
                         );
 
-                        model_switch_attempt += 1;
                         continue;
                     }
                     Err(err) => {
@@ -6598,10 +6579,7 @@ async fn process_channel_message_body(
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
                 // assistant response that matches our delivered text.
-                let mut canonical_history = canonical_history_prefix.clone();
-                canonical_history.extend(canonical_turn_delta.iter().cloned());
-                let tool_messages: Vec<ChatMessage> =
-                    extract_current_turn_tool_messages(&canonical_history);
+                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
@@ -16647,7 +16625,6 @@ BTC is currently around $65,000 based on latest tool output."#
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
-        histories: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     #[async_trait::async_trait]
@@ -16664,7 +16641,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn chat_with_history(
             &self,
-            messages: &[ChatMessage],
+            _messages: &[ChatMessage],
             model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
@@ -16673,10 +16650,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
-            self.histories
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(messages.to_vec());
             Ok("ok".to_string())
         }
     }
@@ -19043,71 +19016,6 @@ BTC is currently around $65,000 based on latest tool output."#
             CancellationToken::new(),
         )
         .await;
-
-        {
-            let switched_histories = switched_model_provider_impl
-                .histories
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let switched_history = switched_histories
-                .first()
-                .expect("the switched provider must receive the continued turn");
-            assert!(
-                switched_history
-                    .iter()
-                    .all(|message| message.role != "tool"),
-                "a text-protocol target must not receive native role=tool history: {switched_history:?}"
-            );
-            assert!(
-                switched_history.iter().any(|message| {
-                    message.role == "assistant"
-                        && message.content.contains("<tool_call>")
-                        && message.content.contains("\"name\":\"model_switch\"")
-                }),
-                "the native model-switch call must be represented in prompt protocol history: {switched_history:?}"
-            );
-            let last = switched_history
-                .last()
-                .expect("the switched request must contain turn history");
-            assert_eq!(last.role, "user");
-            assert!(
-                last.content.contains("<tool_result name=\"model_switch\">")
-                    && last.content.contains("Model switch requested"),
-                "the switched request must end with the model-switch result as user-side prompt history: {switched_history:?}"
-            );
-        }
-
-        {
-            let histories = runtime_ctx
-                .conversation_histories
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let persisted = histories
-                .peek("telegram_chat-1_alice")
-                .expect("the completed turn must remain in sender history");
-            let native_assistant = persisted
-                .iter()
-                .find(|message| {
-                    message.role == "assistant"
-                        && message.content.contains("\"tool_calls\"")
-                        && message.content.contains("\"name\":\"model_switch\"")
-                })
-                .expect("canonical native assistant tool call must be persisted");
-            let native_result = persisted
-                .iter()
-                .find(|message| message.role == "tool")
-                .expect("canonical native tool result must be persisted");
-            assert!(native_assistant.content.contains("switch-call"));
-            assert!(native_result.content.contains("switch-call"));
-            assert_eq!(
-                persisted
-                    .iter()
-                    .filter(|message| message.role == "tool")
-                    .count(),
-                1,
-                "the per-attempt canonical delta must persist each tool result once"
-            );
-        }
 
         {
             let events = observer.events.lock().unwrap();
