@@ -3009,10 +3009,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -3023,6 +3019,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
 
         fn build_shell_command(
