@@ -14,6 +14,7 @@ use zeroclaw_config::presets::{
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::{Config, WireApi};
+use zeroclaw_config::traits::AliasSource;
 
 /// Canonical config state for await-spanning Quickstart writes in one daemon.
 ///
@@ -823,12 +824,7 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
-        model_providers: cfg
-            .providers
-            .models
-            .iter_entries()
-            .map(|(family, alias, _)| format!("{family}.{alias}"))
-            .collect(),
+        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
@@ -2635,6 +2631,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn snapshot_state_sorts_configured_model_provider_refs() {
+        let mut cfg = Config::default();
+        cfg.create_map_key("providers.models.openai", "zeta")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "omega")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "alpha")
+            .unwrap();
+
+        let snapshot = snapshot_state(&cfg);
+
+        assert_eq!(
+            snapshot.model_providers,
+            vec![
+                "anthropic.alpha".to_string(),
+                "anthropic.omega".to_string(),
+                "openai.zeta".to_string(),
+            ]
+        );
     }
 
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {

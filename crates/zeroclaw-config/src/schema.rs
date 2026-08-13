@@ -44,7 +44,6 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.signal",
     "channel.slack",
     "channel.telegram",
-    "channel.wati",
     "channel.wechat",
     "channel.whatsapp",
     "tool.browser",
@@ -124,6 +123,11 @@ pub struct Config {
     /// section is impossible to miss.
     #[serde(skip)]
     pub degraded_sections: Vec<String>,
+    /// Retired WATI config section roots detected before migration and typed
+    /// deserialization erase them. Never serialized; the CLI surfaces each
+    /// path on stderr so an operator cannot miss the retired channel.
+    #[serde(skip)]
+    pub retired_wati_config_sections: Vec<String>,
     /// Config file schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -6065,13 +6069,12 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions. This legacy behavior remains supported
-    /// when explicitly configured during the deprecation window.
+    /// Default behavior for the v0.8.x line: inline full skill instructions.
+    #[default]
     Full,
-    /// Default behavior: inline compact skill metadata
+    /// Inline compact skill metadata
     /// (name/description/location + callable tool specs) and load instructions
     /// on demand via `read_skill`.
-    #[default]
     Compact,
 }
 
@@ -6192,9 +6195,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt. Omission now
-    /// defaults to `compact`; explicit `full` remains supported during the
-    /// deprecation window and emits a validation warning before Schema V4.
+    /// Controls how skills are injected into the system prompt. Omission
+    /// defaults to `full` throughout the v0.8.x release line; `compact`
+    /// remains available as an explicit global or runtime-profile setting.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -6884,6 +6887,12 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Longest supported dashboard WebSocket keepalive interval.
+///
+/// Longer periods do not protect typical intermediary idle deadlines, while
+/// this bound keeps timer construction portable across supported targets.
+pub const GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS: u64 = 86_400;
+
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
@@ -6962,6 +6971,15 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub session_ttl_hours: u32,
 
+    /// Send WebSocket ping frames every N seconds to keep dashboard chat
+    /// connections alive. Range:
+    /// `0..=GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS`. 0 = disabled. Default: 30.
+    /// The value is read when each WebSocket connection opens; changing it
+    /// requires reconnecting clients (or restarting the gateway) to affect
+    /// existing connections.
+    #[serde(default = "default_gateway_websocket_ping_interval_secs")]
+    pub websocket_ping_interval_secs: u64,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -7015,6 +7033,10 @@ fn default_gateway_request_timeout_secs() -> u64 {
 
 fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
+}
+
+fn default_gateway_websocket_ping_interval_secs() -> u64 {
+    30
 }
 
 fn default_gateway_host() -> String {
@@ -7075,6 +7097,7 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -12213,13 +12236,17 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used. The shell is
-    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
-    /// shell binary.
+    /// When unset or `null`, the system default `sh` is used.
     ///
-    /// Accepted forms (Unix):
+    /// **Unix:** POSIX-compatible shells are invoked as
+    /// `<shell> -c "<command>"`. Accepted forms:
     /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
     /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// `powershell` and `pwsh` select the PowerShell policy dialect and run as
+    /// `<interpreter> -NoProfile -NonInteractive -Command <command>` on every
+    /// supported desktop host; other Unix interpreters are treated as
+    /// POSIX-compatible shells.
     ///
     /// The value is validated when the native runtime is constructed, so a bad
     /// value is reported up front rather than failing on the first shell
@@ -12228,15 +12255,33 @@ pub struct RuntimeConfig {
     /// instead); a bare name not found on `PATH`; and a path that does not
     /// exist or is not executable.
     ///
-    /// **Ignored on Windows and Android** (and not validated there): Windows
-    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
-    /// (its shell is not on `PATH` for spawned processes).
+    /// **Windows:** the value selects the interpreter *family* by its file stem
+    /// (case-insensitive), which fixes the invocation convention:
+    /// - `"powershell"` (Windows PowerShell 5.x) or `"pwsh"` (PowerShell 7+),
+    ///   as a bare name resolved via `PATH` or an absolute path (e.g.
+    ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
+    ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
+    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
+    ///
+    /// Only an empty/whitespace value is rejected on Windows; the interpreter is
+    /// located at spawn time.
+    ///
+    /// Command policy uses the selected interpreter's dialect. PowerShell
+    /// accepts a bounded grammar of simple command invocations, arguments,
+    /// variable reads, and pipelines; expression and invocation constructs
+    /// that cannot be safely classified are rejected before execution.
+    ///
+    /// **Ignored on Android** (always `/system/bin/sh`, whose shell is not on
+    /// `PATH` for spawned processes).
     ///
     /// **Examples:**
     /// ```toml
     /// [runtime]
-    /// shell = "bash" # resolves via PATH
-    /// shell = "/bin/zsh" # absolute path
+    /// shell = "bash" # Unix: resolves via PATH
+    /// shell = "/bin/zsh" # Unix: absolute path
+    /// shell = "pwsh" # PowerShell 7+ (Windows, Linux, or macOS)
+    /// shell = "powershell" # Windows: Windows PowerShell 5.x
     /// ```
     #[serde(default)]
     pub shell: Option<String>,
@@ -13223,10 +13268,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub linq: HashMap<String, LinqConfig>,
-    /// WATI WhatsApp Business API channel instances (`[channels.wati.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub wati: HashMap<String, WatiConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -13439,12 +13480,6 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
-                kind: "wati",
-                name: "WATI",
-                desc: "WhatsApp via WATI Business API",
-                configured: !self.wati.is_empty(),
-            },
-            ChannelInfo {
                 kind: "nextcloud",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
@@ -13613,7 +13648,6 @@ impl ChannelsConfig {
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
-            || self.wati.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -13648,7 +13682,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -13660,7 +13694,6 @@ impl ChannelsConfig {
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
-            ("wati", !self.wati.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
@@ -13746,7 +13779,6 @@ impl Default for ChannelsConfig {
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -14875,7 +14907,13 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
@@ -15029,6 +15067,24 @@ pub struct WhatsAppConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for WhatsAppConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree.
+    ///
+    /// A hand-written field list was the other option and was rejected: this
+    /// struct carries two dozen fields, so such a list silently goes stale the
+    /// first time one is added, which is the same class of defect this exists
+    /// to remove. Every field here either declares a serde default or is an
+    /// `Option`, which is what makes the empty object total. The unwrap is
+    /// covered by `whatsapp_rust_default_matches_serde_default` below, so a
+    /// field added without a default fails that test rather than reaching a
+    /// caller.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every WhatsAppConfig field declares a serde default or is Option")
+    }
+}
+
 impl ChannelConfig for WhatsAppConfig {
     fn name() -> &'static str {
         "WhatsApp"
@@ -15093,57 +15149,6 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
-    }
-}
-
-/// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.wati"]
-pub struct WatiConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// WATI API token (Bearer auth).
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_token: String,
-    /// WATI API base URL (default: <https://live-mt-server.wati.io>).
-    #[tab(Advanced)]
-    #[serde(default = "default_wati_api_url")]
-    pub api_url: String,
-    /// Tenant ID for multi-channel setups (optional).
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-fn default_wati_api_url() -> String {
-    "https://live-mt-server.wati.io".to_string()
-}
-
-impl ChannelConfig for WatiConfig {
-    fn name() -> &'static str {
-        "WATI"
-    }
-    fn desc() -> &'static str {
-        "WhatsApp via WATI Business API"
     }
 }
 
@@ -17871,6 +17876,7 @@ impl Default for Config {
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::Providers::default(),
             model_routes: Vec::new(),
@@ -18732,6 +18738,26 @@ impl Config {
             .collect()
     }
 
+    /// Return retired WATI section roots before migration and typed
+    /// deserialization erase them. V1 used `[channels_config.wati]`; V2/V3
+    /// channel aliases use `[channels.wati.<alias>]`.
+    fn retired_wati_config_sections(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        ["channels", "channels_config"]
+            .into_iter()
+            .filter(|root| {
+                raw.get(*root)
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|channels| channels.contains_key("wati"))
+            })
+            .map(|root| format!("{root}.wati"))
+            .collect()
+    }
+
     /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
     /// whose family is not a known typed slot (kinds: models, tts,
     /// transcription). Serde silently drops these sections at deserialize
@@ -18980,6 +19006,24 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
+            let retired_wati_config_sections = Self::retired_wati_config_sections(&contents);
+            for path in &retired_wati_config_sections {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel": "wati",
+                            "retired_config": path,
+                        })),
+                    &format!(
+                        "Retired WATI channel config section `{path}` is ignored because WATI \
+                         support was removed. Migrate to `[channels.whatsapp.<alias>]` using \
+                         the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+                    )
+                );
+            }
+
             // Deserialize the config with the standard TOML parser.
             //
             // Previously this used `serde_ignored::deserialize` for both
@@ -19015,6 +19059,7 @@ impl Config {
             let mut config: Config = salvage.config;
             config.degraded_security = salvage.dropped_security;
             config.degraded_sections = salvage.dropped;
+            config.retired_wati_config_sections = retired_wati_config_sections;
             if let Some(from_version) = stale_version {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -19231,31 +19276,6 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
-        if matches!(
-            self.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
-        ) {
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "skills_prompt_injection_mode_full_deprecated",
-                "skills.prompt_injection_mode = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.",
-                "skills.prompt_injection_mode",
-            ));
-        }
-        for (profile_alias, profile) in &self.runtime_profiles {
-            if matches!(
-                profile.prompt_injection_mode,
-                Some(SkillsPromptInjectionMode::Full)
-            ) {
-                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "skills_prompt_injection_mode_full_deprecated",
-                    format!(
-                        "{path} = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode."
-                    ),
-                    path,
-                ));
-            }
-        }
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
@@ -19920,6 +19940,16 @@ impl Config {
                     "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
                 );
             }
+        }
+
+        let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
+        if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
+            let path = "gateway.websocket_ping_interval_secs";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
+            );
         }
 
         // Tunnel — OpenVPN
@@ -24414,17 +24444,39 @@ api_token = "Bearer test-token"
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
+            SkillsPromptInjectionMode::default(),
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Compact
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
+            c.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Full
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
 
     #[test]
+    async fn skills_table_without_prompt_mode_keeps_full_default() {
+        let config = parse_test_config(
+            r#"
+[skills]
+open_skills_enabled = false
+"#,
+        );
+
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
     async fn runtime_profile_prompt_injection_mode_overrides_global() {
         let mut config = Config::default();
-        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
         // A runtime profile that pins compact, and an agent pointing at it.
         config.runtime_profiles.insert(
             "compact_profile".to_string(),
@@ -24456,13 +24508,13 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override to Compact beats the (deprecated) global value.
+        // Profile override to Compact beats the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
         // An unset profile, an agent with no profile, and an unknown alias all
-        // inherit the explicit global Full value during the deprecation window.
+        // inherit the global Full value.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
@@ -24575,8 +24627,7 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: explicit global `full` remains effective during
-        // the deprecation window.
+        // Profile-less agent: explicit global `full` remains effective.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
@@ -24591,43 +24642,23 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn explicit_global_full_emits_structured_deprecation_warning() {
+    async fn full_modes_do_not_emit_deprecation_warning_before_v09() {
         let mut config = Config::default();
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
-
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| warning.code == "skills_prompt_injection_mode_full_deprecated")
-            .expect("explicit global full should emit a deprecation warning");
-
-        assert_eq!(warning.path, "skills.prompt_injection_mode");
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
-    }
-
-    #[test]
-    async fn runtime_profile_full_emits_structured_deprecation_warning() {
-        let mut config = Config::default();
         config.runtime_profiles.insert(
-            "legacy".to_string(),
+            "full".to_string(),
             RuntimeProfileConfig {
                 prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
                 ..RuntimeProfileConfig::default()
             },
         );
 
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| {
-                warning.code == "skills_prompt_injection_mode_full_deprecated"
-                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
-            })
-            .expect("runtime-profile full should emit a deprecation warning");
-
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
+        assert!(
+            config
+                .collect_warnings()
+                .into_iter()
+                .all(|warning| warning.code != "skills_prompt_injection_mode_full_deprecated")
+        );
     }
 
     #[test]
@@ -24755,6 +24786,32 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_websocket_ping_interval_above_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
+
+        let err = config
+            .validate()
+            .expect_err("over-bound WebSocket ping interval must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("gateway.websocket_ping_interval_secs"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_websocket_ping_interval_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS;
+
+        config
+            .validate()
+            .expect("WebSocket ping interval upper bound must validate");
     }
 
     #[test]
@@ -25979,6 +26036,7 @@ auto_save = true
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
                 let mut p = crate::providers::Providers::default();
@@ -26084,7 +26142,6 @@ auto_save = true
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
-                wati: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -27010,6 +27067,7 @@ default_temperature = 0.7
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             degraded_sections: Vec::new(),
+            retired_wati_config_sections: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
             model_routes: Vec::new(),
@@ -27875,7 +27933,6 @@ allowed_users = ["@u:matrix.org"]
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -28441,7 +28498,6 @@ allowed_numbers = ["+1", "+2"]
                 },
             )]),
             linq: HashMap::new(),
-            wati: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -28562,6 +28618,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_max_keys: 4096,
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: 30,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -29762,6 +29819,78 @@ default_model = "persisted-profile"
 
     #[test]
     #[allow(clippy::large_futures)]
+    async fn load_or_init_warns_for_current_and_legacy_wati_config() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let _home_guard = EnvValueGuard::set("HOME", &temp_home);
+        let _config_guard = EnvValueGuard::remove("ZEROCLAW_CONFIG_DIR");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+
+        let cases = [
+            (
+                "current",
+                r#"schema_version = 3
+
+[channels.wati.production]
+enabled = true
+api_token = "current-placeholder-token"
+"#,
+                "channels.wati",
+                "current-placeholder-token",
+            ),
+            (
+                "legacy",
+                r#"[channels_config.wati]
+enabled = true
+api_token = "legacy-placeholder-token"
+"#,
+                "channels_config.wati",
+                "legacy-placeholder-token",
+            ),
+        ];
+
+        for (case, raw, expected_path, secret_value) in cases {
+            let install = temp_home.join(case);
+            fs::create_dir_all(&install).await.unwrap();
+            fs::write(install.join("config.toml"), raw).await.unwrap();
+            let _workspace_guard = EnvValueGuard::set("ZEROCLAW_WORKSPACE", &install);
+            let mut rx = capture_log_events();
+
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            let logs = drain_captured(&mut rx);
+
+            assert!(
+                config
+                    .channels_by_alias()
+                    .iter()
+                    .all(|entry| entry.channel_type != "wati"),
+                "retired WATI config must not re-enable a live channel"
+            );
+            assert_eq!(
+                config.retired_wati_config_sections,
+                vec![expected_path.to_string()],
+                "load-time diagnostics must preserve the retired section path"
+            );
+            assert!(
+                logs.contains("Retired WATI channel config section"),
+                "missing WATI retirement warning for {case}: {logs}"
+            );
+            assert!(
+                logs.contains(expected_path),
+                "warning must name {expected_path}: {logs}"
+            );
+            assert!(
+                !logs.contains(secret_value),
+                "warning must never copy retired WATI credentials into logs: {logs}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(temp_home).await;
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
     async fn load_or_init_assigns_degraded_security_for_malformed_section() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -30518,6 +30647,7 @@ api_token = "tok"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert_eq!(g.websocket_ping_interval_secs, 30);
     }
 
     // ── Peripherals config ───────────────────────────────────────
@@ -35028,6 +35158,29 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     }
 
     #[test]
+    async fn retired_wati_config_sections_cover_current_and_legacy_shapes() {
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.wati.production]\nenabled = true\n",
+            ),
+            vec!["channels.wati".to_string()]
+        );
+        assert_eq!(
+            Config::retired_wati_config_sections(
+                "[channels_config.wati]\nenabled = true\napi_token = \"placeholder\"\n",
+            ),
+            vec!["channels_config.wati".to_string()]
+        );
+        assert!(
+            Config::retired_wati_config_sections(
+                "schema_version = 3\n[channels.whatsapp.production]\nenabled = true\n",
+            )
+            .is_empty()
+        );
+        assert!(Config::retired_wati_config_sections("not toml {{{").is_empty());
+    }
+
+    #[test]
     async fn unknown_provider_families_flags_silent_serde_drop() {
         // serde ignores unknown keys under providers.models, so a typo'd
         // family parses cleanly and its aliases vanish on reload. The
@@ -36362,6 +36515,121 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+    }
+
+    /// The test above proves the SERDE path. It says nothing about the RUST
+    /// path, and the two used to disagree: a derived `Default` zeroed the
+    /// field while serde supplied 300.
+    ///
+    /// That gap is not cosmetic. An alias created through a surface that
+    /// constructs the struct in Rust, rather than parsing a file, got `0`,
+    /// and `Duration::from_secs(0)` is an already-elapsed deadline, so every
+    /// approval on that alias denied at once with nothing in the operator's
+    /// config looking wrong.
+    #[test]
+    async fn whatsapp_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            WhatsAppConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "a constructed alias must wait the documented timeout, not deny at once"
+        );
+    }
+
+    /// Pins the whole struct rather than the one field, so a field added later
+    /// with a serde default but no matching Rust default fails here instead of
+    /// reaching an operator. This is also what makes the `expect` in
+    /// `Default::default` safe: if any field stopped being defaultable, the
+    /// deserialize would fail and this test would panic first.
+    #[test]
+    async fn whatsapp_rust_default_matches_serde_default() {
+        let from_rust = serde_json::to_value(WhatsAppConfig::default()).unwrap();
+        let from_serde =
+            serde_json::to_value(serde_json::from_str::<WhatsAppConfig>("{}").unwrap()).unwrap();
+        assert_eq!(
+            from_rust, from_serde,
+            "Default::default() and the serde defaults disagree; every field must match"
+        );
+    }
+
+    /// A zero is still honoured when an operator writes it. The fix above
+    /// changes what an UNSET field means, and must not take away the ability
+    /// to refuse every gated tool deliberately.
+    #[test]
+    async fn whatsapp_explicit_zero_timeout_is_preserved() {
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 0);
+    }
+
+    /// The whole lifecycle that persisted the accidental zero: create an alias
+    /// through the supported map-key surface, save, reload.
+    ///
+    /// The two tests above compare `Default::default()` against the serde
+    /// defaults, which pins the TYPE. That is where the fix lives, and it is
+    /// not where the defect was felt. An operator never calls
+    /// `WhatsAppConfig::default()`; they add an alias, and the generated
+    /// `create_map_key` inserts `<T>::default()` on their behalf. The field
+    /// carries no `skip_serializing_if` and the struct sets no global skip, so
+    /// whatever that default held is written out EXPLICITLY, and a serde
+    /// default only fires on an ABSENT key. The zero therefore reached the file
+    /// and survived every reload after it, with nothing in the operator's
+    /// config looking wrong.
+    ///
+    /// So this drives the surface rather than the type, and asserts on the
+    /// bytes as well as the reparse: the on-disk assert names the mechanism
+    /// (an explicit `= 0` was persisted) while the reparse asserts what the
+    /// operator gets back. Nothing here sets `approval_timeout_secs`; it is
+    /// omitted throughout, which is the case that broke.
+    #[test]
+    async fn whatsapp_alias_created_through_the_map_key_surface_reloads_waiting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+
+        // The same wire sequence the create dispatch runs: create_map_key,
+        // then mark the new alias dirty.
+        let created = config
+            .create_map_key("channels.whatsapp", "shop")
+            .expect("channels.whatsapp must be a map-keyed section");
+        assert!(
+            created,
+            "a fresh alias must be created, not silently reused"
+        );
+        config.mark_dirty("channels.whatsapp.shop");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("approval_timeout_secs = 0"),
+            "creating an alias must not persist an already-elapsed approval deadline; \
+             got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        let shop = reparsed
+            .channels
+            .whatsapp
+            .get("shop")
+            .expect("the created alias must survive save and reload");
+        assert_eq!(
+            shop.approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "an alias whose approval_timeout_secs was never set must reload waiting the \
+             documented timeout, not denying at once"
+        );
     }
 
     #[test]
