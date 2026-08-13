@@ -413,11 +413,21 @@ fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
             .find("$ZEROCLAW_CARGO_FLAGS;")
             .unwrap_or_else(|| panic!("{name} must expose its dependency build"));
         let prefetch = &builder[..dependency_build];
+        let generic_fixture_manifests =
+            prefetch.contains("COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./");
+        let generic_fixture_lib_stubs = prefetch.contains("for d in crates/*/tests/fixtures/*/")
+            && prefetch.contains("printf '' > \"${d}src/lib.rs\"");
 
         for member in &nested_crate_members {
+            let member_segments: Vec<_> = member.split('/').collect();
+            let generic_fixture_member = matches!(
+                member_segments.as_slice(),
+                ["crates", _, "tests", "fixtures", _]
+            );
             let manifest_copy = format!("COPY --parents {member}/Cargo.toml ./");
             assert!(
-                prefetch.contains(&manifest_copy),
+                prefetch.contains(&manifest_copy)
+                    || (generic_fixture_member && generic_fixture_manifests),
                 "{name} must stage nested workspace manifest {member}/Cargo.toml before prefetch"
             );
 
@@ -427,7 +437,10 @@ fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
                     found_target = true;
                     let stub = format!("{member}/{target}");
                     assert!(
-                        prefetch.contains(&stub),
+                        prefetch.contains(&stub)
+                            || (generic_fixture_member
+                                && target == "src/lib.rs"
+                                && generic_fixture_lib_stubs),
                         "{name} must stub nested workspace target {stub} before prefetch"
                     );
                 }
