@@ -5494,6 +5494,7 @@ async fn process_channel_message_body(
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
+            route.model.as_str(),
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools,
             ctx.activated_tools.as_ref(),

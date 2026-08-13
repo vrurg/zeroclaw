@@ -41,6 +41,10 @@ tokio::task_local! {
     static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackAttribution>>;
 }
 
+tokio::task_local! {
+    static PROVIDER_CONTEXT_TRUNCATED: RefCell<bool>;
+}
+
 /// Take (consume) the last model_provider fallback info, if any.
 /// Must be called within a `scope_provider_fallback` scope.
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
@@ -57,6 +61,22 @@ pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttri
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
+}
+
+/// Take whether Reliable shortened the provider-visible transcript while
+/// recovering the current request from a context-window error.
+///
+/// This is intentionally distinct from fallback attribution: retrying the
+/// same candidate must not render a fallback notice, but the caller must not
+/// cache that response under the untrimmed request transcript.
+pub fn take_last_provider_context_truncation() -> bool {
+    PROVIDER_CONTEXT_TRUNCATED
+        .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+        .unwrap_or(false)
+}
+
+fn record_provider_context_truncation() {
+    let _ = PROVIDER_CONTEXT_TRUNCATED.try_with(|cell| *cell.borrow_mut() = true);
 }
 
 /// Record the fallback that served the current successful provider request, or
@@ -78,7 +98,12 @@ fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) 
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
-    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+    PROVIDER_FALLBACK
+        .scope(
+            RefCell::new(None),
+            PROVIDER_CONTEXT_TRUNCATED.scope(RefCell::new(false), future),
+        )
+        .await
 }
 
 /// Record a model_provider fallback event.
@@ -1510,6 +1535,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -1804,6 +1830,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -2021,6 +2048,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
@@ -5024,13 +5052,29 @@ mod tests {
             ChatMessage::user("current question"),
         ];
 
-        let result = model_provider
-            .chat_with_history(&messages, "local-model", Some(0.0))
-            .await
-            .unwrap();
+        let (result, fallback, context_truncated) = scope_provider_fallback(async {
+            let result = model_provider
+                .chat_with_history(&messages, "local-model", Some(0.0))
+                .await
+                .unwrap();
+            (
+                result,
+                take_last_provider_fallback(),
+                take_last_provider_context_truncation(),
+            )
+        })
+        .await;
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            fallback.is_none(),
+            "same-candidate context recovery is not user-visible fallback attribution"
+        );
+        assert!(
+            context_truncated,
+            "the internal provenance signal must remain available for cache safety"
+        );
     }
 
     #[tokio::test]
