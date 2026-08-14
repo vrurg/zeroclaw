@@ -71,7 +71,7 @@ impl AuthService {
         self.store.stage_profile_binding(profile).await
     }
 
-    /// Restore a binding captured by [`stage_model_provider_token`].
+    /// Restore a binding captured by [`Self::stage_model_provider_token`].
     /// This is intentionally scoped to one profile binding and never changes
     /// a provider-local active selector, so it cannot overwrite unrelated
     /// credentials or a concurrent selection change.
