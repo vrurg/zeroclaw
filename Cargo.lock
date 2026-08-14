@@ -13831,6 +13831,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "zeroclaw-api",
  "zeroclaw-log",
 ]
 
