@@ -2117,7 +2117,7 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
+                            let nested_step = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
@@ -2214,8 +2214,10 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     sop_reassembly,
                                 })),
-                            )
-                            .await;
+                            );
+                            let step_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step)
+                                .await;
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()

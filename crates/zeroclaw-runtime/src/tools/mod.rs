@@ -108,8 +108,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    SessionDeleteTool, SessionPromptDeleteTool, SessionPromptListTool, SessionPromptSetTool,
+    SessionResetTool, SessionsCurrentTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -1280,7 +1280,18 @@ pub fn all_tools_with_runtime(
             backend.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(
+            backend.clone(),
+            security.clone(),
+        )));
+        if config.channels.session_prompts_enabled
+            && config.channels.session_persistence
+            && config.channels.session_backend == "sqlite"
+        {
+            tool_arcs.push(Arc::new(SessionPromptListTool::new(security.clone())));
+            tool_arcs.push(Arc::new(SessionPromptSetTool::new(security.clone())));
+            tool_arcs.push(Arc::new(SessionPromptDeleteTool::new(security.clone())));
+        }
     }
 
     // LinkedIn integration (config-gated)
@@ -2007,6 +2018,45 @@ const = true
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 7);
+    }
+
+    #[test]
+    fn session_prompt_tools_follow_the_feature_gate() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap(),
+        );
+        let mut config = test_config(&tmp);
+        config.channels.session_prompts_enabled = true;
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            memory,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"session_prompt_list"));
+        assert!(names.contains(&"session_prompt_set"));
+        assert!(names.contains(&"session_prompt_delete"));
     }
 
     #[cfg(feature = "plugins-wasm")]

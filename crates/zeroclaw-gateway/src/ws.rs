@@ -1005,6 +1005,21 @@ async fn process_chat_message(
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
+    let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
+    let attachments = if session_prompts_enabled {
+        state
+            .session_backend
+            .as_ref()
+            .and_then(|backend| backend.list_session_prompts(session_key).ok())
+            .map(|prompts| zeroclaw_infra::session_prompts::render_session_prompts(&prompts))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // Refresh once before the primary turn. Changes made by a prompt tool in
+    // this turn are deliberately picked up only by the next turn.
+    agent.set_session_prompt_attachments(attachments);
+
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
     let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
@@ -1063,6 +1078,8 @@ async fn process_chat_message(
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
+    let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
+    let canonical_session_backend = state.session_backend.clone();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
@@ -1074,24 +1091,32 @@ async fn process_chat_message(
             model = %turn_model,
             channel = WS_CHANNEL_KEY,
         );
-        zeroclaw_runtime::agent::loop_::scope_session_key(
-            Some(session_key_owned.clone()),
-            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                turn_usage.clone(),
-                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                    agent
-                        .turn_streamed_with_steering_state(
-                            &content_owned,
-                            event_tx,
-                            Some(cancel_token.clone()),
-                            Some(&mut steering_rx),
-                        )
-                        .instrument(span),
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                session_prompt_tools_allowed,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    canonical_session_backend
+                        .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                    zeroclaw_runtime::agent::loop_::scope_session_key(
+                        Some(session_key_owned.clone()),
+                        zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                            turn_usage.clone(),
+                            zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                cost_tracking_context.clone(),
+                                agent
+                                    .turn_streamed_with_steering_state(
+                                        &content_owned,
+                                        event_tx,
+                                        Some(cancel_token.clone()),
+                                        Some(&mut steering_rx),
+                                    )
+                                    .instrument(span),
+                            ),
+                        ),
+                    ),
                 ),
-            ),
-        )
-        .await
+            )
+            .await
     };
 
     // Drive both futures concurrently: the agent turn produces events

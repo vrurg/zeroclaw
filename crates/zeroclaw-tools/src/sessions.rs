@@ -9,6 +9,51 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_prompts::SessionPromptSetOutcome;
+
+fn current_session_key() -> Result<String, ToolResult> {
+    let allowed = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        .try_with(|allowed| *allowed)
+        .unwrap_or(false);
+    if !allowed {
+        return Err(ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(
+                "No active chat-session context. This tool is unavailable to auxiliary calls."
+                    .into(),
+            ),
+        });
+    }
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .ok_or_else(|| ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(
+                "No active chat-session context. This tool is unavailable to auxiliary calls."
+                    .into(),
+            ),
+        })
+}
+
+fn current_session_backend() -> Result<Arc<dyn SessionBackend>, ToolResult> {
+    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(|scoped| scoped.0)
+        .ok_or_else(|| ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(
+                "No active chat-session backend. This tool is unavailable to auxiliary calls."
+                    .into(),
+            ),
+        })
+}
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -504,6 +549,216 @@ impl Tool for SessionsCurrentTool {
     }
 }
 
+// ── Session prompt attachment tools ────────────────────────────────
+
+/// Lists prompt attachments for the active chat session only.
+pub struct SessionPromptListTool {
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionPromptListTool {
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionPromptListTool {
+    fn name(&self) -> &str {
+        "session_prompt_list"
+    }
+
+    fn description(&self) -> &str {
+        "List persistent prompt attachments for the chat session currently running this agent."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Read, self.name())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+        let key = match current_session_key() {
+            Ok(key) => key,
+            Err(result) => return Ok(result),
+        };
+        let backend = match current_session_backend() {
+            Ok(backend) => backend,
+            Err(result) => return Ok(result),
+        };
+        match backend.list_session_prompts(&key) {
+            Ok(prompts) => Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string(
+                    &prompts
+                        .iter()
+                        .map(|prompt| json!({"id": prompt.id, "content": prompt.content}))
+                        .collect::<Vec<_>>(),
+                )?
+                .into(),
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to list session prompts: {error}")),
+            }),
+        }
+    }
+}
+
+/// Creates or replaces one prompt attachment for the active chat session only.
+pub struct SessionPromptSetTool {
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionPromptSetTool {
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionPromptSetTool {
+    fn name(&self) -> &str {
+        "session_prompt_set"
+    }
+    fn description(&self) -> &str {
+        "Create or replace one persistent prompt attachment for the current chat session."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {
+            "id": {"type": "string", "description": "Lowercase symbolic ID: [a-z][a-z0-9_.-]{0,63}"},
+            "content": {"type": "string", "description": "Prompt text, up to 2048 UTF-8 bytes"}
+        }, "required": ["id", "content"]})
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, self.name())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+        let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
+            anyhow::bail!("Missing 'id' parameter");
+        };
+        let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
+            anyhow::bail!("Missing 'content' parameter");
+        };
+        let key = match current_session_key() {
+            Ok(key) => key,
+            Err(result) => return Ok(result),
+        };
+        let backend = match current_session_backend() {
+            Ok(backend) => backend,
+            Err(result) => return Ok(result),
+        };
+        match backend.set_session_prompt(&key, id, content) {
+            Ok(SessionPromptSetOutcome::Created) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Session prompt '{id}' created; it applies on the next top-level turn."
+                )
+                .into(),
+                error: None,
+            }),
+            Ok(SessionPromptSetOutcome::Updated) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Session prompt '{id}' updated; it applies on the next top-level turn."
+                )
+                .into(),
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to set session prompt: {error}")),
+            }),
+        }
+    }
+}
+
+/// Deletes one prompt attachment from the active chat session only.
+pub struct SessionPromptDeleteTool {
+    security: Arc<SecurityPolicy>,
+}
+
+impl SessionPromptDeleteTool {
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionPromptDeleteTool {
+    fn name(&self) -> &str {
+        "session_prompt_delete"
+    }
+    fn description(&self) -> &str {
+        "Delete one persistent prompt attachment from the current chat session."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, self.name())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+        let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
+            anyhow::bail!("Missing 'id' parameter");
+        };
+        let key = match current_session_key() {
+            Ok(key) => key,
+            Err(result) => return Ok(result),
+        };
+        let backend = match current_session_backend() {
+            Ok(backend) => backend,
+            Err(result) => return Ok(result),
+        };
+        match backend.delete_session_prompt(&key, id) {
+            Ok(true) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "Session prompt '{id}' deleted; the change applies on the next top-level turn."
+                )
+                .into(),
+                error: None,
+            }),
+            Ok(false) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Session prompt '{id}' does not exist.")),
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to delete session prompt: {error}")),
+            }),
+        }
+    }
+}
+
 // ── SessionResetTool ────────────────────────────────────────────────
 
 /// Resets a session by clearing its message history. The session key
@@ -605,7 +860,7 @@ impl Tool for SessionResetTool {
                 .unwrap_or_else(|| session_id.trim().to_string()),
         };
 
-        match self.backend.clear_messages(&target_session_key) {
+        match self.backend.reset_session(&target_session_key) {
             Ok(0) => Ok(ToolResult {
                 success: true,
                 output: format!("Session '{target_session_key}' is already empty.").into(),
@@ -935,7 +1190,10 @@ mod tests {
     async fn list_empty_sessions() {
         let (_tmp, backend) = test_backend();
         let tool = SessionsListTool::new(backend);
-        let result = tool.execute(json!({})).await.unwrap();
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("acp-session".to_string()), tool.execute(json!({})))
+            .await
+            .unwrap();
         assert!(result.success);
         assert!(result.output.contains("No active sessions"));
     }
@@ -1263,6 +1521,117 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("No active session context"));
+    }
+
+    #[tokio::test]
+    async fn session_prompt_tools_are_scoped_to_the_current_session() {
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        backend
+            .append("first", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .append("second", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let set = SessionPromptSetTool::new(test_security());
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("first".to_string()),
+                        set.execute(json!({"id": "task", "content": "keep first"})),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(backend.list_session_prompts("second").unwrap().len(), 0);
+
+        let list = SessionPromptListTool::new(test_security());
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                        .scope(Some("first".to_string()), list.execute(json!({}))),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("keep first"));
+
+        let delete = SessionPromptDeleteTool::new(test_security());
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("first".to_string()),
+                        delete.execute(json!({"id": "task"})),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(backend.list_session_prompts("first").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_tools_reject_auxiliary_calls_without_session_scope() {
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let tool = SessionPromptListTool::new(test_security());
+
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("No active chat-session context")
+        );
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend,
+                    )),
+                    zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                        Some("parent-chat".to_string()),
+                        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                            .scope(false, tool.execute(json!({}))),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("No active chat-session context")
+        );
     }
 
     #[tokio::test]

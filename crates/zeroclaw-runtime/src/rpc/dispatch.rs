@@ -1812,6 +1812,28 @@ impl RpcDispatcher {
             .chat_mode(sid)
             .await
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        let tool_loop_session_key = if matches!(chat_mode, crate::rpc::types::ChatMode::Chat) {
+            format!("rpc_{sid}")
+        } else {
+            sid.to_string()
+        };
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+            && self.ctx.config.read().channels.session_prompts_enabled
+        {
+            let attachments = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .and_then(|backend| backend.list_session_prompts(&tool_loop_session_key).ok())
+                .map(|prompts| zeroclaw_infra::session_prompts::render_session_prompts(&prompts))
+                .unwrap_or_default();
+            if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+                agent
+                    .lock()
+                    .await
+                    .set_session_prompt_attachments(attachments);
+            }
+        }
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1864,12 +1886,12 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let outcome = execute_turn(
+        let turn = execute_turn(
             agent,
             prompt.clone(),
             cancel,
             TurnAttribution {
-                session_key: Some(sid.to_string()),
+                session_key: Some(tool_loop_session_key),
                 agent_alias,
                 model_provider,
                 model,
@@ -1904,8 +1926,25 @@ impl RpcDispatcher {
                     }
                 }
             },
-        )
-        .await;
+        );
+        let outcome = if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+            && self.ctx.session_backend.is_some()
+        {
+            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .scope(
+                    true,
+                    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                        self.ctx
+                            .session_backend
+                            .clone()
+                            .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                        turn,
+                    ),
+                )
+                .await
+        } else {
+            turn.await
+        };
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;

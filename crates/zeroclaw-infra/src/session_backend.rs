@@ -1,7 +1,31 @@
 //! Trait abstraction for session persistence backends.
 
+use crate::session_prompts::{SessionPrompt, SessionPromptSetOutcome};
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use zeroclaw_api::model_provider::ChatMessage;
+
+/// Task-local transport wrapper for the canonical session backend.
+///
+/// `Arc<dyn SessionBackend>` predates the trait's `Send + Sync` supertraits,
+/// so the auto traits are erased from that object spelling. The wrapper is
+/// sound because every `SessionBackend` implementation must satisfy those
+/// supertraits by the trait declaration below.
+#[derive(Clone)]
+pub struct ScopedSessionBackend(pub Arc<dyn SessionBackend>);
+
+// SAFETY: `SessionBackend` has `Send + Sync` supertraits, so every value that
+// can inhabit this trait object is safe to transfer between task workers.
+unsafe impl Send for ScopedSessionBackend {}
+// SAFETY: `SessionBackend` has `Send + Sync` supertraits, so shared access to
+// this wrapper preserves the synchronization contract of its implementation.
+unsafe impl Sync for ScopedSessionBackend {}
+
+tokio::task_local! {
+    /// Canonical durable chat backend for the active primary turn. Session
+    /// prompt tools use this instead of opening an independent SQLite handle.
+    pub static TOOL_LOOP_SESSION_BACKEND: Option<ScopedSessionBackend>;
+}
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -68,6 +92,37 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// List prompt attachments belonging to exactly one durable session.
+    fn list_session_prompts(&self, _session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    fn set_session_prompt(
+        &self,
+        _session_key: &str,
+        _id: &str,
+        _content: &str,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    fn delete_session_prompt(&self, _session_key: &str, _id: &str) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Reset history and session prompt attachments while retaining the session identity.
+    fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
+        self.clear_messages(session_key)
+    }
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 

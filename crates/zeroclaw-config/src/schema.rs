@@ -13975,6 +13975,10 @@ pub struct ChannelsConfig {
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
+    /// Enable session-scoped persistent prompt attachments. Requires the SQLite
+    /// session backend. Default: `false`.
+    #[serde(default = "default_false")]
+    pub session_prompts_enabled: bool,
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
@@ -14396,6 +14400,7 @@ impl Default for ChannelsConfig {
             show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         }
@@ -21009,6 +21014,17 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+
+        if self.channels.session_prompts_enabled && self.channels.session_backend != "sqlite" {
+            anyhow::bail!(
+                "channels.session_prompts_enabled requires channels.session_backend = \"sqlite\""
+            );
+        }
+        if self.channels.session_prompts_enabled && !self.channels.session_persistence {
+            anyhow::bail!(
+                "channels.session_prompts_enabled requires channels.session_persistence = true"
+            );
+        }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -27883,6 +27899,7 @@ auto_save = true
                 show_tool_calls: true,
                 session_persistence: true,
                 session_backend: default_session_backend(),
+                session_prompts_enabled: false,
                 session_ttl_hours: 0,
                 debounce_ms: 0,
             },
@@ -29794,6 +29811,7 @@ allowed_users = ["@u:matrix.org"]
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         };
@@ -30345,6 +30363,7 @@ allowed_numbers = ["+1", "+2"]
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         };
@@ -30359,6 +30378,35 @@ allowed_numbers = ["+1", "+2"]
     async fn channels_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
         assert!(c.whatsapp.is_empty());
+    }
+
+    #[test]
+    async fn session_prompts_are_disabled_by_default() {
+        assert!(!ChannelsConfig::default().session_prompts_enabled);
+    }
+
+    #[test]
+    async fn validate_rejects_session_prompts_with_jsonl_backend() {
+        for backend in ["jsonl", "SQLite", "unsupported"] {
+            let mut config = Config::default();
+            config.channels.session_prompts_enabled = true;
+            config.channels.session_backend = backend.to_string();
+
+            let error = config.validate().expect_err("only SQLite must be accepted");
+            assert!(error.to_string().contains("session_prompts_enabled"));
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_session_prompts_without_session_persistence() {
+        let mut config = Config::default();
+        config.channels.session_prompts_enabled = true;
+        config.channels.session_persistence = false;
+
+        let error = config
+            .validate()
+            .expect_err("disabled session persistence must be rejected");
+        assert!(error.to_string().contains("session_persistence"));
     }
 
     #[test]

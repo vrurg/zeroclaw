@@ -36,6 +36,11 @@ tokio::task_local! {
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
 
+    /// Capability marker for primary durable chat turns. It is deliberately
+    /// absent from ACP, one-shot, delegate, cron, and auxiliary executions so
+    /// session prompt tools cannot create unsupported attachment records.
+    pub static TOOL_LOOP_SESSION_PROMPTS_ALLOWED: bool;
+
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;

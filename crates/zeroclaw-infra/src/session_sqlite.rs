@@ -3,6 +3,10 @@
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
 };
+use crate::session_prompts::{
+    MAX_SESSION_PROMPTS, MAX_SESSION_PROMPTS_BYTES, SessionPrompt, SessionPromptSetOutcome,
+    validate_prompt, validate_prompt_id,
+};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -67,6 +71,7 @@ impl SqliteSessionBackend {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
@@ -88,6 +93,15 @@ impl SqliteSessionBackend {
                 last_activity TEXT NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
                 name         TEXT
+             );
+
+             CREATE TABLE IF NOT EXISTS session_prompts (
+                session_key TEXT NOT NULL REFERENCES session_metadata(session_key) ON DELETE CASCADE,
+                prompt_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_key, prompt_id)
              );
 
              CREATE TABLE IF NOT EXISTS jsonl_import_receipts (
@@ -761,6 +775,118 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn list_session_prompts(&self, session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare("SELECT prompt_id, content, updated_at FROM session_prompts WHERE session_key = ?1 ORDER BY prompt_id ASC")
+            .map_err(std::io::Error::other)?;
+        statement
+            .query_map(params![session_key], |row| {
+                Ok(SessionPrompt {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            })
+            .map_err(std::io::Error::other)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
+    fn set_session_prompt(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        let (id, content) = validate_prompt(id, content)?;
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        // A first tool call can happen before the channel/RPC loop persists its
+        // first conversation message. Materialize metadata here so attachment
+        // creation is still atomic with a valid durable session owner.
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count) \
+                 VALUES (?1, ?2, ?2, 0) ON CONFLICT(session_key) DO NOTHING",
+                params![session_key, now],
+            )
+            .map_err(std::io::Error::other)?;
+        let already_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2)", params![session_key, id], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if !already_exists {
+            let count: usize = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM session_prompts WHERE session_key = ?1",
+                    params![session_key],
+                    |row| row.get(0),
+                )
+                .map_err(std::io::Error::other)?;
+            if count >= MAX_SESSION_PROMPTS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session prompt limit reached",
+                ));
+            }
+        }
+        let total_bytes: usize = transaction.query_row(
+            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM session_prompts WHERE session_key = ?1 AND prompt_id <> ?2", params![session_key, id], |row| row.get(0),
+        ).map_err(std::io::Error::other)?;
+        if total_bytes.saturating_add(content.len()) > MAX_SESSION_PROMPTS_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session prompt aggregate limit reached",
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            params![session_key, id, content, now],
+        ).map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(if already_exists {
+            SessionPromptSetOutcome::Updated
+        } else {
+            SessionPromptSetOutcome::Created
+        })
+    }
+
+    fn delete_session_prompt(&self, session_key: &str, id: &str) -> std::io::Result<bool> {
+        let id = validate_prompt_id(id)?;
+        let conn = self.conn.lock();
+        Ok(conn
+            .execute(
+                "DELETE FROM session_prompts WHERE session_key = ?1 AND prompt_id = ?2",
+                params![session_key, id],
+            )
+            .map_err(std::io::Error::other)?
+            > 0)
+    }
+
+    fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        let count = transaction
+            .execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction
+            .execute(
+                "DELETE FROM session_prompts WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
+        transaction.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        ).map_err(std::io::Error::other)?;
+        transaction.commit().map_err(std::io::Error::other)?;
+        Ok(count)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1425,6 +1551,7 @@ mod tests {
     use crate::session_store::SessionStore;
     use std::sync::{Arc, mpsc};
     use std::time::Duration as StdDuration;
+    use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use tempfile::TempDir;
 
     #[test]
@@ -1443,6 +1570,125 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn session_prompts_persist_across_restart_and_are_isolated() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend
+                .append("first", &ChatMessage::user("hello"))
+                .unwrap();
+            backend
+                .append("second", &ChatMessage::user("hello"))
+                .unwrap();
+            assert_eq!(
+                backend
+                    .set_session_prompt("first", "task.primary", "keep the current task")
+                    .unwrap(),
+                SessionPromptSetOutcome::Created
+            );
+            assert_eq!(
+                backend
+                    .set_session_prompt("second", "task.primary", "separate task")
+                    .unwrap(),
+                SessionPromptSetOutcome::Created
+            );
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            backend.list_session_prompts("first").unwrap()[0].content,
+            "keep the current task"
+        );
+        assert_eq!(
+            backend.list_session_prompts("second").unwrap()[0].content,
+            "separate task"
+        );
+    }
+
+    #[test]
+    fn session_prompt_can_create_its_session_owner_before_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        assert_eq!(
+            backend
+                .set_session_prompt("new-session", "task", "start here")
+                .unwrap(),
+            SessionPromptSetOutcome::Created
+        );
+        assert!(backend.session_exists("new-session"));
+        assert_eq!(
+            backend.list_session_prompts("new-session").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_prompts_enforce_count_and_byte_bounds_transactionally() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+
+        for id in ["one", "two", "three", "four"] {
+            backend.set_session_prompt("session", id, "x").unwrap();
+        }
+        assert!(backend.set_session_prompt("session", "five", "x").is_err());
+        assert_eq!(
+            backend.list_session_prompts("session").unwrap().len(),
+            MAX_SESSION_PROMPTS
+        );
+
+        assert_eq!(
+            backend
+                .set_session_prompt("session", "one", &"x".repeat(MAX_SESSION_PROMPT_BYTES))
+                .unwrap(),
+            SessionPromptSetOutcome::Updated
+        );
+        assert_eq!(
+            backend
+                .set_session_prompt("session", "two", &"é".repeat(MAX_SESSION_PROMPT_BYTES / 2))
+                .unwrap(),
+            SessionPromptSetOutcome::Updated
+        );
+        assert!(
+            backend
+                .set_session_prompt(
+                    "session",
+                    "two",
+                    &"é".repeat(MAX_SESSION_PROMPT_BYTES / 2 + 1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            backend.list_session_prompts("session").unwrap()[3].content,
+            "é".repeat(MAX_SESSION_PROMPT_BYTES / 2)
+        );
+    }
+
+    #[test]
+    fn reset_and_delete_session_remove_prompt_attachments() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("reset", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("reset", "task", "current task")
+            .unwrap();
+        assert_eq!(backend.reset_session("reset").unwrap(), 1);
+        assert!(backend.list_session_prompts("reset").unwrap().is_empty());
+        assert!(backend.session_exists("reset"));
+
+        backend
+            .set_session_prompt("reset", "task", "new task")
+            .unwrap();
+        assert!(backend.delete_session("reset").unwrap());
+        assert!(backend.list_session_prompts("reset").unwrap().is_empty());
     }
 
     #[test]
@@ -1580,6 +1826,9 @@ mod tests {
         backend
             .append("new_session", &ChatMessage::user("fresh"))
             .unwrap();
+        backend
+            .set_session_prompt("old_session", "task", "expired context")
+            .unwrap();
 
         let cleaned = backend.cleanup_stale(48).unwrap(); // 48h TTL
         assert_eq!(cleaned, 1);
@@ -1587,6 +1836,12 @@ mod tests {
         let sessions = backend.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0], "new_session");
+        let attachment_count: i64 = backend
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM session_prompts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(attachment_count, 0);
     }
 
     #[test]

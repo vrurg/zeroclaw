@@ -382,6 +382,11 @@ pub struct Agent {
     /// were skipped. Appended to the system prompt in `build_system_prompt`.
     mcp_pinned_section: String,
     mcp_deferred_section: String,
+    /// Durable session prompt attachments are resolved by the owning chat
+    /// transport at the start of each primary turn. They are intentionally not
+    /// part of agent configuration, so ACP and auxiliary callers never inherit
+    /// them accidentally.
+    session_prompt_attachments: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
@@ -876,6 +881,15 @@ impl AgentBuilder {
         let exclude_memory = self.exclude_memory;
         if exclude_memory {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
+            // ACP/Code sessions opt into this isolated construction path.
+            // Prompt attachments are chat-session state and must not even be
+            // advertised there until the stacked ACP follow-up lands.
+            tools.retain(|t| {
+                !matches!(
+                    t.name(),
+                    "session_prompt_list" | "session_prompt_set" | "session_prompt_delete"
+                )
+            });
         }
 
         let memory: Arc<dyn Memory> = if exclude_memory {
@@ -978,6 +992,7 @@ impl AgentBuilder {
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
+            session_prompt_attachments: String::new(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1256,6 +1271,13 @@ impl Agent {
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
         self.tool_dispatcher = tool_dispatcher;
+        self.refresh_system_prompt();
+    }
+
+    /// Replace the per-turn session prompt attachment section and refresh the
+    /// stored system message so the next top-level turn observes it.
+    pub fn set_session_prompt_attachments(&mut self, attachments: String) {
+        self.session_prompt_attachments = attachments;
         self.refresh_system_prompt();
     }
 
@@ -2075,6 +2097,22 @@ impl Agent {
         if !self.mcp_pinned_section.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&self.mcp_pinned_section);
+        }
+        if !self.session_prompt_attachments.is_empty() {
+            let attachment_len = self.session_prompt_attachments.len().saturating_add(2);
+            let max = self.config.resolved.max_system_prompt_chars;
+            if max == 0 || prompt.len().saturating_add(attachment_len) <= max {
+                prompt.push_str("\n\n");
+                prompt.push_str(&self.session_prompt_attachments);
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
+                    "Session prompt attachments skipped because the system prompt budget is exhausted"
+                );
+            }
         }
         Ok(prompt)
     }
@@ -5339,6 +5377,71 @@ mod tests {
             assert!(
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn session_prompt_attachments_are_host_appended_and_refreshable() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let host_prompt_len = agent.system_prompt_for_test().unwrap().len();
+            agent.config.resolved.max_system_prompt_chars = host_prompt_len + 1;
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"too large\"\n".to_string(),
+            );
+            assert!(
+                !agent
+                    .system_prompt_for_test()
+                    .unwrap()
+                    .contains("content: \"too large\"")
+            );
+
+            agent.config.resolved.max_system_prompt_chars = 0;
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"first\"\n".to_string(),
+            );
+            let first_prompt = agent.system_prompt_for_test().unwrap();
+            assert!(first_prompt.contains("content: \"first\""));
+            assert!(first_prompt.find("## Session Prompts").unwrap() > 0);
+
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"second\"\n".to_string(),
+            );
+            let prompt = agent.system_prompt_for_test().unwrap();
+            assert!(prompt.contains("content: \"second\""));
+            assert!(!prompt.contains("content: \"first\""));
+        }
+
+        #[test]
+        fn acp_style_agent_does_not_advertise_session_prompt_tools() {
+            let (provider, _) = capturing_provider(true);
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let workspace = tempfile::TempDir::new().unwrap();
+            let memory: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None).unwrap(),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(provider)
+                .tools(vec![Box::new(crate::tools::SessionPromptListTool::new(
+                    Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                ))])
+                .memory(memory)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .exclude_memory(true)
+                .build()
+                .unwrap();
+
+            assert!(
+                agent
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name() != "session_prompt_list")
             );
         }
 

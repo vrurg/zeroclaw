@@ -6430,6 +6430,45 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
+    if ctx.prompt_config.channels.session_prompts_enabled
+        && let Some(backend) = ctx.session_store.as_ref()
+    {
+        match backend.list_session_prompts(&history_key) {
+            Ok(prompts) => {
+                let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
+                if !attachments.is_empty() {
+                    // Attachments are loaded once for this primary channel turn.
+                    // Tool mutations intentionally affect the next turn only.
+                    let attachment_len = attachments.len().saturating_add(2);
+                    let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+                    if max == 0 || system_prompt.len().saturating_add(attachment_len) <= max {
+                        system_prompt.push_str("\n\n");
+                        system_prompt.push_str(&attachments);
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
+                            "Session prompt attachments skipped because the system prompt budget is exhausted"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Session prompt attachments skipped because they could not be loaded"
+                );
+            }
+        }
+    }
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -7068,6 +7107,15 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .scope(ctx.session_store.is_some(), tool_loop);
+            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND
+                .scope(
+                    ctx.session_store
+                        .clone()
+                        .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                    tool_loop,
+                );
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
