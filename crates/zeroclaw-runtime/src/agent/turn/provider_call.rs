@@ -170,7 +170,7 @@ pub(crate) async fn call_provider(
         // attempt ledger instead of opening a second scope.
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let (result, live_deltas, protocol_suppressed, visible_text) = scope
-            .scope(zeroclaw_providers::reliable::scope_provider_fallback(async {
+            .scope(Box::pin(zeroclaw_providers::reliable::scope_provider_fallback(Box::pin(async {
                     match consume_provider_streaming_response(
                         active_model_provider,
                         prepared_messages,
@@ -292,7 +292,7 @@ pub(crate) async fn call_provider(
                             (result, false, false, String::new())
                         }
                     }
-                }))
+                }))))
             .await;
         let accounting = scope.take();
         streamed_live_deltas = live_deltas;
@@ -304,7 +304,7 @@ pub(crate) async fn call_provider(
         // pacing config to catch hung model responses.
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let chat_future = scope.scope(
+        let chat_future = scope.scope(Box::pin(
             dispatcher.chat(
                 ChatRequest {
                     messages: prepared_messages,
@@ -317,7 +317,7 @@ pub(crate) async fn call_provider(
                 active_model,
                 ctx.temperature,
             ),
-        );
+        ));
 
         let result = match ctx.pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
