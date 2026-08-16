@@ -79,6 +79,7 @@ pub(crate) struct ReliableCallAccounting {
     next_attempt_id: usize,
     pending_stream_attempt: Option<ReliableRejectedAttempt>,
     stream_resume_after: Option<ReliableEntryId>,
+    stream_recovery_semantic_empty: bool,
 }
 
 impl ReliableCallAccounting {
@@ -307,6 +308,18 @@ fn record_accepted_attempt(
 
 fn has_reliable_call_accounting() -> bool {
     RELIABLE_CALL_ACCOUNTING.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn mark_stream_recovery_semantic_empty() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting.lock().stream_recovery_semantic_empty = true;
+    });
+}
+
+fn stream_recovery_was_semantic_empty() -> bool {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_semantic_empty)
+        .unwrap_or(false)
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
@@ -1237,6 +1250,7 @@ impl std::error::Error for ReliableRejectedCompletionUsage {
 pub struct ReliableSemanticEmptyCompletion {
     failures: FailureEvents,
     rejected_usage: Option<ReliableRejectedCompletionUsage>,
+    terminal_cause: zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
 }
 
 impl std::fmt::Display for ReliableSemanticEmptyCompletion {
@@ -1250,6 +1264,7 @@ impl std::error::Error for ReliableSemanticEmptyCompletion {
         self.rejected_usage
             .as_ref()
             .map(|usage| usage as &(dyn std::error::Error + 'static))
+            .or(Some(&self.terminal_cause))
     }
 }
 
@@ -1260,10 +1275,19 @@ fn reliable_terminal_error(
 ) -> anyhow::Error {
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
     if final_cause_is_semantic_empty {
+        let terminal_cause = zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion;
         return anyhow::Error::new(ReliableSemanticEmptyCompletion {
             failures: failures.clone(),
-            rejected_usage: rejected_attempt_usage
-                .map(|usage| ReliableRejectedCompletionUsage::new(usage, failures)),
+            rejected_usage: rejected_attempt_usage.map(|usage| {
+                ReliableRejectedCompletionUsage::with_terminal_cause(
+                    usage,
+                    failures,
+                    anyhow::Error::new(
+                        zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                    ),
+                )
+            }),
+            terminal_cause,
         });
     }
 
@@ -1722,7 +1746,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
-        let mut final_cause_is_semantic_empty = false;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
@@ -1987,7 +2011,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
-        let mut final_cause_is_semantic_empty = false;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
@@ -2342,7 +2366,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
-        let mut final_cause_is_semantic_empty = false;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -2634,7 +2658,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
-        let mut final_cause_is_semantic_empty = false;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -8033,7 +8057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_recovery_keeps_earlier_stream_ineligible_entry_eligible() {
+    async fn semantic_stream_recovery_skips_only_failed_entry_and_uses_later_candidate() {
         let earlier_chat_calls = Arc::new(AtomicUsize::new(0));
         let failed_stream_calls = Arc::new(AtomicUsize::new(0));
         let failed_chat_calls = Arc::new(AtomicUsize::new(0));
@@ -8084,6 +8108,7 @@ mod tests {
                 StreamOptions::new(true),
             );
             assert!(stream.next().await.unwrap().is_err());
+            mark_stream_recovery_semantic_empty();
             model_provider
                 .chat(
                     ChatRequest {

@@ -228,6 +228,11 @@ impl AccountedChatScope {
         crate::reliable::record_rejected_stream_usage(usage)
     }
 
+    /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
+    pub fn mark_stream_recovery_semantic_empty(&self) {
+        crate::reliable::mark_stream_recovery_semantic_empty();
+    }
+
     /// Clear a provisional route before an in-scope recovery replaces it.
     ///
     /// This has no presentation effect until [`commit_accepted_provider_route`]

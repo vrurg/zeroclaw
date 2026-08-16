@@ -253,6 +253,12 @@ pub(crate) async fn call_provider(
                                     &usage,
                                 );
                             }
+                            if stream_err
+                                .downcast_ref::<StreamSemanticEmptyCompletion>()
+                                .is_some()
+                            {
+                                scope.mark_stream_recovery_semantic_empty();
+                            }
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
