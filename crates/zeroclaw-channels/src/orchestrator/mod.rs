@@ -13934,6 +13934,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn matrix_tool_progress_scrubs_secret_pattern_assembled_across_components() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        // Neither component alone is a complete PEM span. The final Matrix
+        // egress scrub must therefore see their assembled progress line.
+        let progress = matrix_progress_text(
+            &StreamDelta::ToolComplete {
+                tool: "-----BEGIN PRIVATE KEY-----".to_string(),
+                arguments: Arc::new(serde_json::json!({})),
+                tool_provenance: None,
+                secs: 0,
+                success: false,
+                error: Some("-----END PRIVATE KEY-----".to_string()),
+            },
+            &Config::default(),
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        assert!(!progress.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!progress.contains("-----END PRIVATE KEY-----"));
+        assert!(progress.contains("[REDACTED"));
+    }
+
+    #[test]
     fn matrix_single_message_pending_splits_reasoning_after_tool_progress() {
         use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
 
