@@ -5733,7 +5733,7 @@ fn matrix_progress_text(
 ) -> Option<String> {
     use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
 
-    match event {
+    let text = match event {
         StreamDelta::Status(text) => Some(matrix_scrub_progress_text(text)),
         StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
             matrix_tool_progress(event, config, matrix_alias)
@@ -5742,7 +5742,15 @@ fn matrix_progress_text(
             "{REASONING_FULL_PREFIX}{text}"
         ))),
         StreamDelta::Text(_) | StreamDelta::Lifecycle(_) => None,
-    }
+    }?;
+
+    // Every dynamic component has its own presentation/structured redaction,
+    // but the completed line is the Matrix progress egress boundary. Keep one
+    // canonical detector pass here after assembly, before buffering or
+    // transport encoding, so a future dynamic field cannot bypass the guard.
+    // Do not apply `scrub_credentials` again: structured-value redaction is
+    // the shared authority for serialized tool arguments.
+    Some(zeroclaw_runtime::security::scrub(&text))
 }
 
 async fn run_matrix_single_message_draft_updater(
