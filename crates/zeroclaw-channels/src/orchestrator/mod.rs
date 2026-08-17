@@ -16189,8 +16189,10 @@ api_key = "anthropic-key"
         }
     }
 
+    #[cfg(feature = "channel-email")]
     struct TransientErrorModelProvider;
 
+    #[cfg(feature = "channel-email")]
     #[async_trait::async_trait]
     impl ModelProvider for TransientErrorModelProvider {
         async fn chat_with_system(
@@ -16213,6 +16215,7 @@ api_key = "anthropic-key"
         }
     }
 
+    #[cfg(feature = "channel-email")]
     impl ::zeroclaw_api::attribution::Attributable for TransientErrorModelProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
