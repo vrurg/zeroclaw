@@ -374,6 +374,14 @@ fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) 
 /// A primary/direct accepted response intentionally clears an earlier fallback
 /// candidate in the same outer delivery scope.
 pub(crate) fn commit_accepted_provider_route(route: Option<ProviderFallbackInfo>) {
+    // The runtime's accepted-route projection deliberately carries only the
+    // presentation fields. Exact configured candidate identity remains owned
+    // by Reliable's per-attempt accounting record, not by this final notice.
+    let route = route.map(|fallback| ProviderFallbackAttribution {
+        requested_candidate: fallback.requested_provider.clone(),
+        actual_candidate: fallback.actual_provider.clone(),
+        fallback,
+    });
     let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = route);
 }
 
@@ -1226,11 +1234,7 @@ impl ReliableRejectedCompletionUsage {
 
 impl std::fmt::Display for ReliableRejectedCompletionUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", failure_aggregate(&self.failures))?;
-        if let Some(cause) = &self.terminal_cause {
-            write!(f, "\nFinal provider error: {cause}")?;
-        }
-        Ok(())
+        write!(f, "{}", failure_aggregate(&self.failures))
     }
 }
 
@@ -1294,19 +1298,6 @@ fn reliable_terminal_error(
     match rejected_attempt_usage {
         Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage::new(usage, failures)),
         None => anyhow::Error::msg(failure_aggregate(&failures)),
-    }
-}
-
-fn reliable_context_terminal_error(
-    message: String,
-    failures: FailureEvents,
-    rejected_attempt_usage: Option<TokenUsage>,
-) -> anyhow::Error {
-    let context_error = context_failure_aggregate(&message, &failures);
-    match rejected_attempt_usage {
-        Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage::new(usage, failures))
-            .context(context_error),
-        None => anyhow::Error::msg(context_error),
     }
 }
 
@@ -1881,13 +1872,17 @@ impl ModelProvider for ReliableModelProvider {
                                     "context_window",
                                     Some(&diagnostic),
                                 );
+                                let context_error = context_failure_aggregate(
+                                    "Request exceeds model context window.",
+                                    &failures,
+                                );
                                 return Err(reliable_terminal_error_with_cause(
                                     failures,
                                     None,
                                     false,
                                     Some(e),
                                 )
-                                .context("Request exceeds model context window"));
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2155,18 +2150,22 @@ impl ModelProvider for ReliableModelProvider {
                                 // No complete older turn can be removed safely.
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                );
                                 return Err(reliable_terminal_error_with_cause(
                                     failures,
                                     None,
                                     false,
                                     Some(e),
                                 )
-                                .context(format!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). Try using a model \
-                                     with a larger context window, reducing the number of tools/skills, or \
-                                     enabling compact_context in config."
-                                )));
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2529,18 +2528,22 @@ impl ModelProvider for ReliableModelProvider {
                                 // No complete older turn can be removed safely.
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                );
                                 return Err(reliable_terminal_error_with_cause(
                                     failures,
                                     rejected_attempt_usage,
                                     false,
                                     Some(e),
                                 )
-                                .context(format!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). Try using a model \
-                                     with a larger context window, reducing the number of tools/skills, or \
-                                     enabling compact_context in config."
-                                )));
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2826,18 +2829,22 @@ impl ModelProvider for ReliableModelProvider {
                                 // No complete older turn can be removed safely.
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
+                                );
                                 return Err(reliable_terminal_error_with_cause(
                                     failures,
                                     rejected_attempt_usage,
                                     false,
                                     Some(e),
                                 )
-                                .context(format!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). Try using a model \
-                                     with a larger context window, reducing the number of tools/skills, or \
-                                     enabling compact_context in config."
-                                )));
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -3694,7 +3701,7 @@ mod tests {
                 output_tokens: Some(5),
                 cached_input_tokens: None,
             },
-            Vec::new(),
+            FailureEvents::default(),
             anyhow::Error::new(TerminalProviderTypedError),
         ))
     }

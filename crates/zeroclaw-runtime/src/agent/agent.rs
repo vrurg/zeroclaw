@@ -2676,8 +2676,7 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
-            None;
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
         let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(

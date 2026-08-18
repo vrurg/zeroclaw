@@ -5104,18 +5104,6 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
-/// Whether a recovered request crossed provider families and needs a channel footer.
-///
-/// Exact configured aliases deliberately do not participate here: callers of this
-/// channel boundary receive stable provider-family display names only.
-fn fallback_crossed_provider_family(requested_provider: &str, actual_provider: &str) -> bool {
-    let requested_base = requested_provider.split(':').next().unwrap_or("");
-    let actual_base = actual_provider.split(':').next().unwrap_or("");
-    !(requested_base == actual_base
-        || requested_base.starts_with(actual_base)
-        || actual_base.starts_with(requested_base))
-}
-
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -13876,19 +13864,6 @@ api_key = "anthropic-key"
             "15551234567@s.whatsapp.net",
         );
         assert_eq!(result, "Hello");
-    }
-
-    #[test]
-    fn same_family_alias_fallback_does_not_need_channel_footer() {
-        // Reliable retains these family fields for the channel boundary even
-        // when delegate-local attribution distinguishes aliases such as
-        // `custom.primary` and `custom.backup`.
-        assert!(!fallback_crossed_provider_family("custom", "custom"));
-    }
-
-    #[test]
-    fn cross_family_fallback_needs_channel_footer() {
-        assert!(fallback_crossed_provider_family("anthropic", "openai"));
     }
 
     #[test]
