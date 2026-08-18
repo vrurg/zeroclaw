@@ -88,9 +88,7 @@ impl ResolvedModelAccess<'_> {
                     }
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
-                zeroclaw_providers::dispatch::commit_accepted_provider_route(
-                    accepted_route.and_then(|route| route.fallback().cloned()),
-                );
+                zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
                 if let Some(usage) = response.usage.as_ref() {

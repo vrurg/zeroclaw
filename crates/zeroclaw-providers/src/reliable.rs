@@ -295,7 +295,7 @@ pub(crate) fn clear_provisional_provider_route() {
 fn record_accepted_attempt(
     entry: &ReliableModelProviderEntry,
     model: &str,
-    fallback: Option<ProviderFallbackInfo>,
+    fallback: Option<ProviderFallbackAttribution>,
 ) {
     let route = AcceptedRoute::new(
         entry.cooldown_key.clone(),
@@ -373,15 +373,7 @@ fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) 
 /// Commit the route of a response the runtime has accepted semantically.
 /// A primary/direct accepted response intentionally clears an earlier fallback
 /// candidate in the same outer delivery scope.
-pub(crate) fn commit_accepted_provider_route(route: Option<ProviderFallbackInfo>) {
-    // The runtime's accepted-route projection deliberately carries only the
-    // presentation fields. Exact configured candidate identity remains owned
-    // by Reliable's per-attempt accounting record, not by this final notice.
-    let route = route.map(|fallback| ProviderFallbackAttribution {
-        requested_candidate: fallback.requested_provider.clone(),
-        actual_candidate: fallback.actual_provider.clone(),
-        fallback,
-    });
+pub(crate) fn commit_accepted_provider_route(route: Option<ProviderFallbackAttribution>) {
     let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = route);
 }
 
@@ -423,7 +415,11 @@ fn record_provider_fallback(
     // An accounted runtime call owns presentation timing. Legacy direct trait
     // callers still receive the historical immediate recovery record.
     if !has_reliable_call_accounting() {
-        commit_accepted_provider_route(Some(fallback.clone()));
+        commit_accepted_provider_route(Some(ProviderFallbackAttribution {
+            fallback: fallback.clone(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
+        }));
     }
     fallback
 }
@@ -478,6 +474,14 @@ impl ProviderFallbackRecord {
             requested_model: self.requested_model.clone(),
             actual_provider: self.actual_provider.clone(),
             actual_model: self.actual_model.clone(),
+        }
+    }
+
+    fn attribution(&self) -> ProviderFallbackAttribution {
+        ProviderFallbackAttribution {
+            fallback: self.info(),
+            requested_candidate: self.requested_candidate.clone(),
+            actual_candidate: self.actual_candidate.clone(),
         }
     }
 }
@@ -1822,7 +1826,9 @@ impl ModelProvider for ReliableModelProvider {
                                 record_accepted_attempt(
                                     entry,
                                     current_model,
-                                    fallback_record.as_ref().map(ProviderFallbackRecord::info),
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
                                 );
                             } else {
                                 record_successful_provider_fallback(None);
@@ -2090,7 +2096,9 @@ impl ModelProvider for ReliableModelProvider {
                                 record_accepted_attempt(
                                     entry,
                                     current_model,
-                                    fallback_record.as_ref().map(ProviderFallbackRecord::info),
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
                                 );
                             } else {
                                 record_successful_provider_fallback(None);
@@ -2469,7 +2477,9 @@ impl ModelProvider for ReliableModelProvider {
                                 record_accepted_attempt(
                                     entry,
                                     current_model,
-                                    fallback_record.as_ref().map(ProviderFallbackRecord::info),
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
                                 );
                             } else {
                                 record_successful_provider_fallback(None);
@@ -2770,7 +2780,9 @@ impl ModelProvider for ReliableModelProvider {
                                 record_accepted_attempt(
                                     entry,
                                     current_model,
-                                    fallback_record.as_ref().map(ProviderFallbackRecord::info),
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
                                 );
                             } else {
                                 record_successful_provider_fallback(None);
@@ -3022,7 +3034,9 @@ impl ModelProvider for ReliableModelProvider {
             record_accepted_attempt(
                 entry,
                 &current_model,
-                fallback_record.as_ref().map(ProviderFallbackRecord::info),
+                fallback_record
+                    .as_ref()
+                    .map(ProviderFallbackRecord::attribution),
             );
 
             let req = ChatRequest {

@@ -67,14 +67,14 @@ impl RejectedAttempt {
 pub struct AcceptedRoute {
     provider_ref: String,
     model: String,
-    fallback: Option<crate::reliable::ProviderFallbackInfo>,
+    fallback: Option<crate::reliable::ProviderFallbackAttribution>,
 }
 
 impl AcceptedRoute {
     pub(crate) fn new(
         provider_ref: String,
         model: String,
-        fallback: Option<crate::reliable::ProviderFallbackInfo>,
+        fallback: Option<crate::reliable::ProviderFallbackAttribution>,
     ) -> Self {
         Self {
             provider_ref,
@@ -98,7 +98,15 @@ impl AcceptedRoute {
     #[must_use]
     /// Presentation-only fallback data, if this accepted route recovered.
     pub fn fallback(&self) -> Option<&crate::reliable::ProviderFallbackInfo> {
-        self.fallback.as_ref()
+        self.fallback
+            .as_ref()
+            .map(|attribution| &attribution.fallback)
+    }
+
+    pub(crate) fn into_fallback_attribution(
+        self,
+    ) -> Option<crate::reliable::ProviderFallbackAttribution> {
+        self.fallback
     }
 }
 
@@ -246,8 +254,10 @@ impl AccountedChatScope {
 ///
 /// Passing `None` clears a prior candidate. Call this only after the runtime
 /// accepts the response; it mutates task-local presentation state, not billing.
-pub fn commit_accepted_provider_route(route: Option<crate::reliable::ProviderFallbackInfo>) {
-    crate::reliable::commit_accepted_provider_route(route)
+pub fn commit_accepted_provider_route(route: Option<AcceptedRoute>) {
+    crate::reliable::commit_accepted_provider_route(
+        route.and_then(AcceptedRoute::into_fallback_attribution),
+    )
 }
 
 /// Wraps a model provider so every call opens the correct

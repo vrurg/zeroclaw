@@ -1121,9 +1121,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // A provider transport success is only a candidate. Commit (or clear)
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
-        zeroclaw_providers::dispatch::commit_accepted_provider_route(
-            accepted_route.and_then(|route| route.fallback().cloned()),
-        );
+        zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
