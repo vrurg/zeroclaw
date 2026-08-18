@@ -33,6 +33,7 @@ use zeroclaw_api::channel::{
     RoomVisibility, SendMessage,
 };
 use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode, TranscriptionConfig};
+use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
 
 // ─── markers ───────────────────────────────────────────────────────────────
 mod markers {
@@ -1000,7 +1001,17 @@ mod streaming {
             return SingleRetainedDraftAction::DeletePlaceholder;
         }
         let visible_text = single_visible_text_with_edit_budget(draft, max_bytes);
-        if visible_text.is_empty() || visible_text == draft.last_text {
+        if visible_text.is_empty() {
+            return if draft.last_text == DRAFT_PLACEHOLDER {
+                // The buffered lines are not Matrix-visible until an edit
+                // succeeds. Retention must not leave a placeholder behind
+                // when no visible progress body can be established.
+                SingleRetainedDraftAction::DeletePlaceholder
+            } else {
+                SingleRetainedDraftAction::KeepCurrent
+            };
+        }
+        if visible_text == draft.last_text {
             SingleRetainedDraftAction::KeepCurrent
         } else {
             SingleRetainedDraftAction::Flush(visible_text)
@@ -4683,9 +4694,23 @@ impl Channel for MatrixChannel {
                                     .with_attrs(::serde_json::json!({"err": edit_err.to_string()})),
                                     "matrix: single-message retained draft flush failed before final send"
                                 );
-                                // Retention mode makes the durable progress
-                                // transcript best-effort once it already
-                                // exists. A stale retained draft is less
+                                if draft.last_text == DRAFT_PLACEHOLDER {
+                                    // Buffered progress is not durable until
+                                    // an edit succeeds. Remove the still-
+                                    // visible placeholder before sending the
+                                    // final answer rather than retaining an
+                                    // empty progress event.
+                                    Self::redact_single_draft_before_final(
+                                        client,
+                                        recipient,
+                                        &draft.event_id,
+                                        "unpublished streaming draft removed before final response",
+                                    )
+                                    .await;
+                                }
+                                // Once a successful edit establishes a
+                                // durable transcript, retention is
+                                // best-effort. A stale retained draft is less
                                 // harmful than suppressing the separate final
                                 // Matrix answer, so final delivery proceeds.
                             }
@@ -7029,6 +7054,17 @@ mod tests {
         }
 
         #[test]
+        fn single_retained_draft_action_deletes_placeholder_when_progress_cannot_fit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "unpublished progress", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, 0),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
         fn single_cancel_deletes_placeholder_but_retains_durable_progress() {
             let mut draft = single_draft(owned_event_id!("$single:server"));
             assert!(single_cancel_deletes_draft(&draft, false));
@@ -7080,8 +7116,10 @@ mod tests {
             assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
         }
 
-        #[tokio::test]
-        async fn retained_single_draft_flush_failure_still_sends_final() {
+        async fn assert_retained_single_draft_flush_failure(
+            last_text: &str,
+            expect_placeholder_cleanup: bool,
+        ) {
             let server = MockServer::start().await;
             let room_id = "!room:server";
             let draft_id = owned_event_id!("$draft:server");
@@ -7151,7 +7189,7 @@ mod tests {
                                         "origin_server_ts": 1,
                                         "content": {
                                             "msgtype": "m.text",
-                                            "body": "old progress"
+                                            "body": last_text
                                         }
                                     }]
                                 }
@@ -7173,12 +7211,25 @@ mod tests {
                     "room_id": room_id,
                     "content": {
                         "msgtype": "m.text",
-                        "body": "old progress"
+                        "body": last_text
                     }
                 })))
                 .expect(1)
                 .mount(&server)
                 .await;
+
+            if expect_placeholder_cleanup {
+                Mock::given(method("PUT"))
+                    .and(path_regex(
+                        r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                    ))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "event_id": "$redaction:server"
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
 
             Mock::given(method("GET"))
                 .and(path_regex(
@@ -7258,7 +7309,7 @@ mod tests {
             let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
             {
                 let mut draft = single_draft(draft_id.clone());
-                draft.last_text = "old progress".to_string();
+                draft.last_text = last_text.to_string();
                 push_single_progress_line(&mut draft, "new progress", 10);
                 let mut state = channel.streaming_state.write().await;
                 insert_single(&mut state, key, draft).expect("single-message state accepts draft");
@@ -7294,6 +7345,42 @@ mod tests {
                     panic!("retained draft finalize timed out; received paths: {paths:?}");
                 }
             }
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("requests captured by Matrix mock");
+            let redaction_index = requests
+                .iter()
+                .position(|request| request.url.path().contains("/redact/"));
+            assert_eq!(
+                redaction_index.is_some(),
+                expect_placeholder_cleanup,
+                "placeholder cleanup must match the Matrix delivery checkpoint"
+            );
+            if let Some(redaction_index) = redaction_index {
+                let final_index = requests
+                    .iter()
+                    .position(|request| {
+                        request.url.path().contains("/send/m.room.message/")
+                            && String::from_utf8_lossy(&request.body).contains("final answer")
+                    })
+                    .expect("final answer request captured");
+                assert!(
+                    redaction_index < final_index,
+                    "placeholder cleanup must be attempted before the final answer"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn retained_single_draft_flush_failure_still_sends_final() {
+            assert_retained_single_draft_flush_failure("old progress", false).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_draft_flush_failure_redacts_before_final() {
+            assert_retained_single_draft_flush_failure(DRAFT_PLACEHOLDER, true).await;
         }
 
         async fn assert_single_redact_failure_still_sends_budgeted_final(
