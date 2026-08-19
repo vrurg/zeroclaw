@@ -2920,7 +2920,7 @@ impl AnthropicModelProvider {
         let Some(auth_service) = self.auth_service.clone() else {
             return stream::once(async {
                 Err(StreamError::ModelProvider(
-                    "Anthropic credentials not set".to_string(),
+                    Self::missing_credentials_error().to_string(),
                 ))
             })
             .boxed();
@@ -3583,9 +3583,52 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("credentials not set"),
-            "Expected key error, got: {err}"
+        assert_eq!(
+            err,
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_credential() {
+        let p = AnthropicModelProvider::builder("test").build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = p.chat(request, "claude-sonnet-4-5", Some(0.7)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_credential_returns_error() {
+        let p = AnthropicModelProvider::builder("test").build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream = p.stream_chat(
+            request,
+            "claude-sonnet-4-5",
+            Some(0.7),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        let first = stream.next().await.expect("stream should yield an event");
+        assert!(first.is_err(), "expected error without credential");
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            "ModelProvider error: Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
         );
     }
 
