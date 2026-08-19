@@ -5,6 +5,10 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
     TokenUsage,
 };
+use crate::terminal::{
+    TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
+    default_terminal_policy, terminal_completion_context,
+};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::cell::RefCell;
@@ -12,6 +16,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::model_provider::{
+    StreamCandidateFailure, StreamProviderAttempt, TerminalCompletionFailure,
+    terminal_completion_error, terminal_completion_failure,
+};
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -48,6 +56,13 @@ tokio::task_local! {
 
 tokio::task_local! {
     static RELIABLE_REJECTED_ATTEMPT_USAGE: RefCell<Option<TokenUsage>>;
+}
+
+tokio::task_local! {
+    /// Candidate selected by the immediately preceding stream. The explicit
+    /// `chat_after_stream_failure` input is scoped here only while reusing the
+    /// regular Reliable chat loop, so no retry state escapes the request.
+    static STREAM_FALLBACK_AFTER: Option<StreamProviderAttempt>;
 }
 
 /// Run a provider call while retaining billed usage from rejected Reliable
@@ -270,6 +285,13 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // An output-limited, paused, or refused response is a completed provider
+    // protocol state. Repeating the identical request cannot repair it, but
+    // the outer provider/model fallback chain may still select a viable path.
+    if terminal_completion_error(err).is_some() {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -374,6 +396,13 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    // A provider can report context exhaustion while generating its response.
+    // That is a terminal incomplete completion, not an input-overflow signal
+    // for history trimming.
+    if terminal_completion_error(err).is_some() {
+        return false;
+    }
+
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -531,6 +560,31 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
+
+    if let Some(reason) = terminal_completion_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "incomplete_completion",
+            phase: "response_delivery",
+            hint: match reason {
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit => {
+                    "increase output budget or use a fallback model"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::ContextWindow => {
+                    "use a fallback model with more available context"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn => {
+                    "continue the paused turn or use a fallback model"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
+                    "use a fallback model or revise the request"
+                }
+                zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason => {
+                    "retry later or contact the provider operator"
+                }
+            },
+            endpoint,
+        };
+    }
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
@@ -903,12 +957,6 @@ fn is_empty_text_completion(text: &str) -> bool {
     zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
 }
 
-fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>())
-}
-
 /// A Reliable chat request exhausted its candidates after receiving rejected
 /// semantic completions. The provider-reported usage is retained so the turn
 /// loop can account for work that was billed even though no response was
@@ -951,11 +999,46 @@ impl std::error::Error for ReliableSemanticEmptyCompletion {
     }
 }
 
+/// The last candidate produced a typed incomplete-terminal outcome after the
+/// Reliable chain had already rejected one or more attempts. Keep the terminal
+/// cause and accounting state separate so callers can render the right failure
+/// without treating informational usage as billable.
+#[derive(Debug)]
+pub struct ReliableTerminalCompletion {
+    failures: FailureEvents,
+    pub failure: TerminalCompletionFailure,
+    pub policy: TerminalCompletionPolicy,
+    context: crate::terminal::TerminalCompletionContext,
+    pub rejected_usage: Option<TokenUsage>,
+}
+
+impl std::fmt::Display for ReliableTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", failure_aggregate(&self.failures))
+    }
+}
+
+impl std::error::Error for ReliableTerminalCompletion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.context)
+    }
+}
+
 fn reliable_terminal_error(
     failures: FailureEvents,
     rejected_attempt_usage: Option<TokenUsage>,
     final_cause_is_semantic_empty: bool,
+    final_terminal: Option<(TerminalCompletionFailure, TerminalCompletionPolicy)>,
 ) -> anyhow::Error {
+    if let Some((failure, policy)) = final_terminal {
+        return anyhow::Error::new(ReliableTerminalCompletion {
+            failures,
+            context: crate::terminal::TerminalCompletionContext::new(failure.clone(), policy, None),
+            failure,
+            policy,
+            rejected_usage: rejected_attempt_usage,
+        });
+    }
     if final_cause_is_semantic_empty {
         return anyhow::Error::new(ReliableSemanticEmptyCompletion {
             failures: failures.clone(),
@@ -981,6 +1064,38 @@ fn reliable_context_terminal_error(
             .context(context_error),
         None => anyhow::Error::msg(context_error),
     }
+}
+
+/// Return billable rejected-attempt usage held by a Reliable aggregate error.
+/// Terminal failures are intentionally inspected before this helper, because a
+/// typed terminal outcome can carry informational usage that must not be billed.
+pub fn reliable_rejected_completion_usage(error: &anyhow::Error) -> Option<&TokenUsage> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .map(|rejected| &rejected.usage)
+            .or_else(|| {
+                cause
+                    .downcast_ref::<ReliableTerminalCompletion>()
+                    .and_then(|terminal| terminal.rejected_usage.as_ref())
+            })
+    })
+}
+
+fn owned_terminal_completion_failure(
+    error: &anyhow::Error,
+) -> Option<(TerminalCompletionFailure, TerminalCompletionPolicy)> {
+    terminal_completion_context(error)
+        .map(|context| (context.failure().clone(), context.policy()))
+        .or_else(|| {
+            terminal_completion_failure(error)
+                .cloned()
+                .or_else(|| terminal_completion_error(error).map(Into::into))
+                .map(|failure| {
+                    let policy = default_terminal_policy(failure.reason);
+                    (failure, policy)
+                })
+        })
 }
 
 fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
@@ -1398,6 +1513,8 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
+        let mut final_terminal = None;
+        let mut rejected_attempt_usage = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1441,8 +1558,12 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_terminal = None;
                                 final_cause_is_semantic_empty = true;
                                 break;
+                            }
+                            if let Some(usage) = rejected_attempt_usage.take() {
+                                let _ = record_rejected_attempt_usage(usage);
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -1482,29 +1603,37 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            if is_semantic_empty_completion_error(&e) {
-                                if attempt < self.max_retries {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        current_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
+                            final_cause_is_semantic_empty = false;
+                            if let Some((terminal, policy)) = owned_terminal_completion_failure(&e)
+                            {
+                                if policy.usage_chargeability()
+                                    == TerminalUsageChargeability::Billable
+                                {
+                                    accumulate_usage(
+                                        &mut rejected_attempt_usage,
+                                        terminal.usage.as_ref(),
+                                    );
                                 }
-                                self.record_empty_completion_failure(
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt,
-                                    false,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal",
+                                    Some(&diagnostic),
                                 );
-                                final_cause_is_semantic_empty = true;
+                                if policy.recovery() == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(reliable_terminal_error(
+                                        failures,
+                                        rejected_attempt_usage,
+                                        false,
+                                        Some((terminal, policy)),
+                                    ));
+                                }
+                                final_terminal = Some((terminal, policy));
                                 break;
                             }
-                            final_cause_is_semantic_empty = false;
+                            final_terminal = None;
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
                             if is_context_window_exceeded(&e) {
@@ -1626,8 +1755,9 @@ impl ModelProvider for ReliableModelProvider {
 
         Err(reliable_terminal_error(
             failures,
-            None,
+            rejected_attempt_usage,
             final_cause_is_semantic_empty,
+            final_terminal,
         ))
     }
 
@@ -1640,8 +1770,10 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
+        let mut final_terminal = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
+        let mut rejected_attempt_usage = None;
 
         for (model_index, current_model) in models.iter().enumerate() {
             for (provider_index, entry) in self.model_providers.iter().enumerate() {
@@ -1681,8 +1813,12 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_terminal = None;
                                 final_cause_is_semantic_empty = true;
                                 break;
+                            }
+                            if let Some(usage) = rejected_attempt_usage.take() {
+                                let _ = record_rejected_attempt_usage(usage);
                             }
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
@@ -1723,29 +1859,37 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            if is_semantic_empty_completion_error(&e) {
-                                if attempt < self.max_retries {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        current_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
+                            final_cause_is_semantic_empty = false;
+                            if let Some((terminal, policy)) = owned_terminal_completion_failure(&e)
+                            {
+                                if policy.usage_chargeability()
+                                    == TerminalUsageChargeability::Billable
+                                {
+                                    accumulate_usage(
+                                        &mut rejected_attempt_usage,
+                                        terminal.usage.as_ref(),
+                                    );
                                 }
-                                self.record_empty_completion_failure(
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt,
-                                    false,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal",
+                                    Some(&diagnostic),
                                 );
-                                final_cause_is_semantic_empty = true;
+                                if policy.recovery() == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(reliable_terminal_error(
+                                        failures,
+                                        rejected_attempt_usage,
+                                        false,
+                                        Some((terminal, policy)),
+                                    ));
+                                }
+                                final_terminal = Some((terminal, policy));
                                 break;
                             }
-                            final_cause_is_semantic_empty = false;
+                            final_terminal = None;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -1876,8 +2020,9 @@ impl ModelProvider for ReliableModelProvider {
 
         Err(reliable_terminal_error(
             failures,
-            None,
+            rejected_attempt_usage,
             final_cause_is_semantic_empty,
+            final_terminal,
         ))
     }
 
@@ -1972,6 +2117,7 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
+        let mut final_terminal = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -2015,6 +2161,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_terminal = None;
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
@@ -2062,29 +2209,37 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            if is_semantic_empty_completion_error(&e) {
-                                if attempt < self.max_retries {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        current_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
+                            final_cause_is_semantic_empty = false;
+                            if let Some((terminal, policy)) = owned_terminal_completion_failure(&e)
+                            {
+                                if policy.usage_chargeability()
+                                    == TerminalUsageChargeability::Billable
+                                {
+                                    accumulate_usage(
+                                        &mut rejected_attempt_usage,
+                                        terminal.usage.as_ref(),
+                                    );
                                 }
-                                self.record_empty_completion_failure(
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt,
-                                    false,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal",
+                                    Some(&diagnostic),
                                 );
-                                final_cause_is_semantic_empty = true;
+                                if policy.recovery() == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(reliable_terminal_error(
+                                        failures,
+                                        rejected_attempt_usage,
+                                        false,
+                                        Some((terminal, policy)),
+                                    ));
+                                }
+                                final_terminal = Some((terminal, policy));
                                 break;
                             }
-                            final_cause_is_semantic_empty = false;
+                            final_terminal = None;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -2217,6 +2372,7 @@ impl ModelProvider for ReliableModelProvider {
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
+            final_terminal,
         ))
     }
 
@@ -2229,13 +2385,28 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
+        let mut final_terminal = None;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
+        let mut resume_after = STREAM_FALLBACK_AFTER.try_with(Clone::clone).ok().flatten();
 
         for (model_index, current_model) in models.iter().enumerate() {
             for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
+                if let Some(candidate) = resume_after.as_ref() {
+                    if *current_model != candidate.model {
+                        anyhow::bail!(
+                            "stream fallback candidate {} for model {} was not found in Reliable chain",
+                            candidate.provider_name,
+                            candidate.model
+                        );
+                    }
+                    if provider_index == candidate.candidate_index {
+                        resume_after = None;
+                    }
+                    continue;
+                }
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
                     Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
@@ -2277,6 +2448,7 @@ impl ModelProvider for ReliableModelProvider {
                                     attempt,
                                     false,
                                 );
+                                final_terminal = None;
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
@@ -2324,29 +2496,37 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            if is_semantic_empty_completion_error(&e) {
-                                if attempt < self.max_retries {
-                                    self.backoff_after_empty_completion(
-                                        &mut failures,
-                                        provider_name,
-                                        current_model,
-                                        attempt,
-                                        &mut backoff_ms,
-                                    )
-                                    .await;
-                                    continue;
+                            final_cause_is_semantic_empty = false;
+                            if let Some((terminal, policy)) = owned_terminal_completion_failure(&e)
+                            {
+                                if policy.usage_chargeability()
+                                    == TerminalUsageChargeability::Billable
+                                {
+                                    accumulate_usage(
+                                        &mut rejected_attempt_usage,
+                                        terminal.usage.as_ref(),
+                                    );
                                 }
-                                self.record_empty_completion_failure(
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt,
-                                    false,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal",
+                                    Some(&diagnostic),
                                 );
-                                final_cause_is_semantic_empty = true;
+                                if policy.recovery() == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(reliable_terminal_error(
+                                        failures,
+                                        rejected_attempt_usage,
+                                        false,
+                                        Some((terminal, policy)),
+                                    ));
+                                }
+                                final_terminal = Some((terminal, policy));
                                 break;
                             }
-                            final_cause_is_semantic_empty = false;
+                            final_terminal = None;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let diagnostic = provider_error_diagnostic(&e);
@@ -2483,7 +2663,34 @@ impl ModelProvider for ReliableModelProvider {
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
+            final_terminal,
         ))
+    }
+
+    async fn chat_after_stream_failure(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        failed_candidate: Option<&StreamProviderAttempt>,
+    ) -> anyhow::Result<ChatResponse> {
+        let Some(failed_candidate) = failed_candidate else {
+            anyhow::bail!(
+                "cannot continue terminal stream failure without an exact Reliable candidate"
+            )
+        };
+        let Some(entry) = self.model_providers.get(failed_candidate.candidate_index) else {
+            anyhow::bail!("stream fallback candidate index is outside the Reliable chain")
+        };
+        if failed_candidate.model != model || failed_candidate.provider_name != entry.display_name {
+            anyhow::bail!("stream fallback candidate does not match the Reliable chain")
+        }
+        STREAM_FALLBACK_AFTER
+            .scope(
+                Some(failed_candidate.clone()),
+                self.chat(request, model, temperature),
+            )
+            .await
     }
 
     fn supports_streaming(&self) -> bool {
@@ -2560,6 +2767,11 @@ impl ModelProvider for ReliableModelProvider {
                 options,
             );
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+            let attempt = StreamProviderAttempt {
+                provider_name: provider_clone.clone(),
+                model: current_model.clone(),
+                candidate_index: provider_index,
+            };
 
             let handle = ::zeroclaw_spawn::spawn!(async move {
                 let mut stream = stream;
@@ -2567,6 +2779,12 @@ impl ModelProvider for ReliableModelProvider {
                     if let Err(ref e) = event {
                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
                     }
+                    let event = event.map_err(|source| {
+                        super::traits::StreamError::CandidateFailure(StreamCandidateFailure {
+                            attempt: attempt.clone(),
+                            source: Box::new(source),
+                        })
+                    });
                     if tx.send(event).await.is_err() {
                         break;
                     }
@@ -3191,6 +3409,20 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct TerminalCompletionMock {
+        calls: Arc<AtomicUsize>,
+        reason: ::zeroclaw_api::model_provider::TerminalCompletionError,
+    }
+
+    struct TerminalCompletionUsageMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct TerminalStreamCandidateMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl ModelProvider for EmptyThenTextMock {
         async fn chat_with_system(
@@ -3428,6 +3660,136 @@ mod tests {
 
         fn alias(&self) -> &str {
             "ThinkOnlyThenTextMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalCompletionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(self.reason))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalCompletionMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalCompletionMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalCompletionUsageMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(
+                ::zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                    ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                    Some(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    }),
+                ),
+            ))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalCompletionUsageMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalCompletionUsageMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalStreamCandidateMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("primary replay".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(
+                ::zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    ::zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        Some(TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            cached_input_tokens: None,
+                        }),
+                    ),
+                ),
+            )])
+            .boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalStreamCandidateMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalStreamCandidateMock"
         }
     }
 
@@ -4201,6 +4563,322 @@ mod tests {
 
         assert_eq!(result.text.as_deref(), Some("recovered by fallback"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_incomplete_completion_skips_retry_and_uses_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalCompletionMock {
+                        calls: Arc::clone(&primary_calls),
+                        reason: ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let result = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect("fallback should recover a terminal incomplete completion");
+
+        assert_eq!(result, "recovered by fallback");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "a terminal reason is not retryable against the same candidate"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_terminal_failure_usage_survives_fallback_recovery() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalCompletionUsageMock {
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("fallback should recover a terminal incomplete completion");
+
+        assert_eq!(response.text.as_deref(), Some("recovered by fallback"));
+        let usage = response.usage.expect("rejected attempt usage is retained");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_terminal_failure_usage_survives_exhaustion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(TerminalCompletionUsageMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let error = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect_err("terminal incomplete completion must fail after all candidates");
+
+        let terminal = error
+            .downcast_ref::<ReliableTerminalCompletion>()
+            .expect("terminal cause and rejected usage must survive exhaustion");
+        assert_eq!(
+            terminal.failure.reason,
+            ::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        );
+        let rejected = terminal
+            .rejected_usage
+            .as_ref()
+            .expect("rejected usage must survive exhaustion");
+        assert_eq!(rejected.input_tokens, Some(10));
+        assert_eq!(rejected.output_tokens, Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paused_turn_returns_without_retry_or_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalCompletionMock {
+                        calls: Arc::clone(&primary_calls),
+                        reason: ::zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "must not be replayed",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("a paused turn requires a continuation, not replay");
+
+        assert_eq!(
+            terminal_completion_error(&error),
+            Some(::zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn)
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_fallback_continues_after_the_candidate_that_stopped() {
+        let primary_stream_calls = Arc::new(AtomicUsize::new(0));
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(TerminalStreamCandidateMock {
+                        stream_calls: Arc::clone(&primary_stream_calls),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream =
+            model_provider.stream_chat(request, "test", Some(0.0), StreamOptions::new(true));
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not be final");
+        assert_eq!(
+            error
+                .terminal_completion_failure()
+                .map(|failure| failure.reason),
+            Some(::zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit)
+        );
+        let failed_candidate = error
+            .failed_candidate()
+            .cloned()
+            .expect("Reliable stream error identifies its selected candidate");
+
+        let response = model_provider
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                Some(&failed_candidate),
+            )
+            .await
+            .expect("fallback after the selected candidate succeeds");
+
+        assert_eq!(response.text.as_deref(), Some("recovered by fallback"));
+        assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary_chat_calls.load(Ordering::SeqCst),
+            0,
+            "the terminal stream candidate must not be replayed non-streaming"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_fallback_skips_the_exact_duplicate_named_candidate() {
+        let stopped_stream_calls = Arc::new(AtomicUsize::new(0));
+        let stopped_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "anthropic".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        empty_until_attempt: 0,
+                        response: "earlier duplicate must stay skipped",
+                    }),
+                ),
+                (
+                    "anthropic".into(),
+                    Box::new(TerminalStreamCandidateMock {
+                        stream_calls: Arc::clone(&stopped_stream_calls),
+                        chat_calls: Arc::clone(&stopped_chat_calls),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by exact fallback",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "test",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream emits an error")
+            .expect_err("terminal stream must not complete successfully");
+        let failed_candidate = error
+            .failed_candidate()
+            .cloned()
+            .expect("Reliable identifies the exact failed candidate");
+
+        let response = model_provider
+            .chat_after_stream_failure(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                Some(&failed_candidate),
+            )
+            .await
+            .expect("fallback after exact candidate succeeds");
+
+        assert_eq!(
+            response.text.as_deref(),
+            Some("recovered by exact fallback")
+        );
+        assert_eq!(stopped_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stopped_chat_calls.load(Ordering::SeqCst),
+            0,
+            "the duplicate-named terminal candidate must not be replayed"
+        );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 

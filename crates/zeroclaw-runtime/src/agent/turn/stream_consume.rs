@@ -2,8 +2,9 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
-    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    StreamCancelledAfterOutput, StreamFailureWithoutOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
+    StreamTerminalCompletion, ToolLoopCancelled,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -40,19 +41,20 @@ pub(crate) async fn consume_provider_streaming_response(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
-        ChatRequest {
-            messages,
-            tools: request_tools,
-            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
-        },
-        model,
-        temperature,
-        zeroclaw_providers::traits::StreamOptions::new(true),
-    );
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider)
+        .stream_chat_terminal_aware(
+            ChatRequest {
+                messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
+            model,
+            temperature,
+            zeroclaw_providers::traits::StreamOptions::new(true),
+        );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
@@ -142,7 +144,74 @@ pub(crate) async fn consume_provider_streaming_response(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
                 );
+                if let Some(failure) =
+                    zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
+                {
+                    if visible_event_output || !outcome.forwarded_visible_text.is_empty() {
+                        let partial_text = if forwarded_text.is_empty() {
+                            outcome.forwarded_visible_text.clone()
+                        } else {
+                            forwarded_text
+                        };
+                        return Err(StreamInterruptedAfterOutput {
+                            partial_text,
+                            message: format!(
+                                "model_provider stream incomplete: {}",
+                                failure.reason
+                            ),
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
+                        }
+                        .into());
+                    }
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
+                        }
+                        .into());
+                    }
+                    let mut policy = zeroclaw_providers::terminal_completion_context(&err)
+                        .map(zeroclaw_providers::TerminalCompletionContext::policy)
+                        .unwrap_or_else(|| {
+                            zeroclaw_providers::default_terminal_policy(failure.reason)
+                        });
+                    if !outcome.tool_calls.is_empty() {
+                        policy = zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            policy.usage_chargeability(),
+                        );
+                    }
+                    let failed_candidate = zeroclaw_providers::terminal_completion_context(&err)
+                        .and_then(|context| context.failed_candidate().cloned())
+                        .or_else(|| {
+                            err.downcast_ref::<zeroclaw_api::model_provider::StreamError>()
+                                .and_then(
+                                    zeroclaw_api::model_provider::StreamError::failed_candidate,
+                                )
+                                .cloned()
+                        });
+                    return Err(StreamTerminalCompletion {
+                        failure,
+                        policy,
+                        failed_candidate,
+                    }
+                    .into());
+                }
+
                 let message = format!("model_provider stream error: {err}");
+                if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
+                    return Err(StreamInterruptedAfterOutput {
+                        partial_text: forwarded_text,
+                        message,
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
+                if outcome.saw_pre_executed_tool_activity {
+                    return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                        usage: outcome.usage,
+                    }
+                    .into());
+                }
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -151,10 +220,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
+                        usage: outcome.usage,
                     }
                     .into());
                 }
-                return Err(anyhow::Error::msg(message));
+                return Err(StreamFailureWithoutOutput {
+                    message,
+                    usage: outcome.usage,
+                }
+                .into());
             }
         };
         match event {
@@ -343,6 +417,7 @@ mod tests {
                 ),
             )
         }
+
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
         }
@@ -496,9 +571,9 @@ mod tests {
         .await
         .expect_err("a semantically empty stream must not complete successfully");
 
-        assert_eq!(
-            err.to_string(),
-            "provider stream completed without final text or tool calls"
+        assert!(
+            err.downcast_ref::<StreamSemanticEmptyCompletion>()
+                .is_some()
         );
     }
 

@@ -2350,16 +2350,6 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
-/// Select the user-facing channel failure after preserving the typed terminal
-/// cause. Substring-based transient hints remain a fallback only: an earlier
-/// transport failure in an aggregate must not mask the final terminal cause.
-fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
-    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
-        .map(|message| format!("⚠️ Error: {message}"))
-        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
-        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
-}
-
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -2374,6 +2364,16 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|hint| lower.contains(hint))
+}
+
+fn channel_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    if let Some(message) = zeroclaw_runtime::agent::terminal_completion_error_message(error, None) {
+        return format!("⚠️ Error: {message}");
+    }
+
+    zeroclaw_providers::reliable::transient_error_hint(error)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
 }
 
 fn load_cached_model_preview(
@@ -3328,6 +3328,7 @@ impl AssistantChannelOutcome {
 
 async fn classify_channel_reply_intent(
     model_provider: &dyn ModelProvider,
+    provider_name: &str,
     system_prompt: &str,
     history: &[ChatMessage],
     model: &str,
@@ -3371,9 +3372,14 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &convo, model, temperature)
-        .await?;
+    let response = ResolvedModelAccess {
+        model_provider,
+        provider_name,
+        model,
+        temperature,
+    }
+    .run_text_query(Some(system_prompt), &convo)
+    .await?;
     Ok(parse_reply_intent(&response))
 }
 
@@ -3419,7 +3425,7 @@ async fn resolve_classifier_route(
     ctx: &ChannelRuntimeContext,
     provider_ref: &zeroclaw_config::providers::ModelProviderRef,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
-) -> Option<(Arc<dyn ModelProvider>, String, Option<f64>)> {
+) -> Option<(Arc<dyn ModelProvider>, String, String, Option<f64>)> {
     let provider_str = provider_ref.as_str().trim();
     if provider_str.is_empty() {
         return None;
@@ -3500,7 +3506,7 @@ async fn resolve_classifier_route(
         "classifier_provider override active"
     );
 
-    Some((provider, model, temperature))
+    Some((provider, provider_str.to_string(), model, temperature))
 }
 
 fn outcome_for_no_reply(reason: &str, kind: NoReplyKind) -> AssistantChannelOutcome {
@@ -5535,6 +5541,18 @@ async fn process_channel_message_body(
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
+    // The reply-intent classifier is a provider request within this turn. Open
+    // the same accounting context now and reuse it for the main tool loop, so
+    // a Reliable recovery cannot lose its rejected-attempt usage before the
+    // loop begins.
+    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+            state.tracker,
+            state.model_provider_pricing,
+        )
+        .with_agent_alias(state.agent_alias.as_str())
+    });
+
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
         .as_ref()
@@ -5561,8 +5579,14 @@ async fn process_channel_message_body(
                 );
                 AssistantChannelOutcome::Reply(String::new())
             } else {
-                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
+                let (
+                    classifier_provider_arc,
+                    classifier_provider_name,
+                    classifier_model_owned,
+                    classifier_temperature,
+                ): (
                     Arc<dyn ModelProvider>,
+                    String,
                     String,
                     Option<f64>,
                 ) = resolve_classifier_route(
@@ -5574,19 +5598,25 @@ async fn process_channel_message_body(
                 .unwrap_or_else(|| {
                     (
                         Arc::clone(&active_model_provider),
+                        route.model_provider.clone(),
                         route.model.clone(),
                         None,
                     )
                 });
 
                 let started = Instant::now();
-                let precheck_future = classify_channel_reply_intent(
-                    classifier_provider_arc.as_ref(),
-                    history[0].content.as_str(),
-                    &history,
-                    classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
-                );
+                let precheck_future =
+                    zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context.clone(),
+                        classify_channel_reply_intent(
+                            classifier_provider_arc.as_ref(),
+                            classifier_provider_name.as_str(),
+                            history[0].content.as_str(),
+                            &history,
+                            classifier_model_owned.as_str(),
+                            classifier_temperature.or(runtime_defaults.defaults.temperature),
+                        ),
+                    );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
                 {
@@ -5938,13 +5968,6 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
-    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
-            state.tracker,
-            state.model_provider_pricing,
-        )
-        .with_agent_alias(state.agent_alias.as_str())
-    });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -6806,7 +6829,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = channel_user_error_message(&e, &safe_error);
+                    let user_msg = channel_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -12310,27 +12333,6 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
     #[test]
-    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
-        let error =
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
-                .context("earlier attempt returned HTTP 503 unavailable");
-
-        let delivered = channel_user_error_message(&error, "safe fallback");
-
-        assert_eq!(
-            delivered,
-            format!(
-                "⚠️ Error: {}",
-                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
-            )
-        );
-        assert!(
-            !delivered.contains("temporarily unavailable"),
-            "an aggregate's earlier transient hint must not mask terminal completion failure"
-        );
-    }
-
-    #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
         // `config_path` and `data_dir` deliberately live under unrelated
         // temp roots, so `config_path.parent()` (the old install-root-derived
@@ -13061,7 +13063,8 @@ temperature = 0.3
         )
         .await;
 
-        let (_, _, temp) = result.expect("must resolve to alias");
+        let (_, provider_name, _, temp) = result.expect("must resolve to alias");
+        assert_eq!(provider_name, "openai.my-classifier");
         assert_eq!(
             temp,
             Some(0.0),
@@ -13854,6 +13857,23 @@ api_key = "anthropic-key"
     #[test]
     fn cross_family_fallback_needs_channel_footer() {
         assert!(fallback_crossed_provider_family("anthropic", "openai"));
+    }
+
+    #[test]
+    fn channel_error_message_prefers_final_terminal_cause_over_transient_hint() {
+        let error = anyhow::Error::new(
+            zeroclaw_api::model_provider::TerminalCompletionFailure::from(
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+            ),
+        )
+        .context("503 service unavailable");
+
+        let message = channel_error_message(&error, "sanitized provider error");
+
+        assert_eq!(
+            message,
+            "⚠️ Error: The provider reached its output token limit before completing the response."
+        );
     }
 
     #[test]
@@ -16329,6 +16349,18 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    fn is_reply_intent_classifier_request(messages: &[ChatMessage]) -> bool {
+        messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .is_some_and(|message| {
+                message
+                    .content
+                    .starts_with("Decide whether the assistant should send any visible reply")
+            })
+    }
+
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -16353,6 +16385,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            if is_reply_intent_classifier_request(messages) {
+                return Ok("REPLY".to_string());
+            }
             let snapshot = messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -16495,6 +16530,9 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            if is_reply_intent_classifier_request(messages) {
+                return Ok("REPLY".to_string());
+            }
             let snapshot = messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -16535,6 +16573,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
+        precheck_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
     }
 
@@ -16552,10 +16591,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn chat_with_history(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            if is_reply_intent_classifier_request(messages) {
+                self.precheck_count.fetch_add(1, Ordering::SeqCst);
+                return Ok("REPLY".to_string());
+            }
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models
                 .lock()
@@ -16596,10 +16639,18 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn chat(
             &self,
-            _request: zeroclaw_providers::ChatRequest<'_>,
+            request: zeroclaw_providers::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if is_reply_intent_classifier_request(request.messages) {
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("REPLY".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
             let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
             if call_index == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
@@ -16660,25 +16711,44 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
-            message: &str,
-            model: &str,
+            _message: &str,
+            _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            anyhow::bail!("precheck probe requires structured chat")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             self.models
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
 
-            if message.starts_with("Decide whether the assistant should send any visible reply") {
+            if is_reply_intent_classifier_request(request.messages) {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
                 if let Some(delay) = self.precheck_delay {
                     tokio::time::sleep(delay).await;
                 }
-                return Ok("NO_REPLY[INFO]: background chatter".to_string());
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("NO_REPLY[INFO]: background chatter".to_string()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                });
             }
 
             self.main_calls.fetch_add(1, Ordering::SeqCst);
-            Ok("visible reply".to_string())
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("visible reply".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
 
@@ -28064,7 +28134,19 @@ This is an example JSON object for profile settings."#;
             0
         );
         assert_eq!(
+            agent_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            vision_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -28217,7 +28299,19 @@ This is an example JSON object for profile settings."#;
             1
         );
         assert_eq!(
+            agent_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            vision_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
             0
         );
     }
@@ -28362,7 +28456,19 @@ This is an example JSON object for profile settings."#;
             1
         );
         assert_eq!(
+            agent_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            vision_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
             0
         );
     }
@@ -28527,11 +28633,29 @@ This is an example JSON object for profile settings."#;
             0
         );
         assert_eq!(
+            agent_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
             fast_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
+            fast_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
             code_model_provider_impl.call_count.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            code_model_provider_impl
+                .precheck_count
+                .load(Ordering::SeqCst),
             1
         );
         assert_eq!(
