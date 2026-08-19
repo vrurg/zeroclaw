@@ -293,6 +293,9 @@ pub(crate) async fn call_provider(
                     }
                 }))))
             .await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         streamed_live_deltas = live_deltas;
         streamed_protocol_suppressed = protocol_suppressed;
@@ -355,6 +358,9 @@ pub(crate) async fn call_provider(
                 }
             }
         };
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         (result, scope.take())
     };
     let (attempts, _, accepted_route) = accounting.into_attempts_and_parts();

@@ -288,7 +288,7 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub fn settle_provider_attempts(
+pub(crate) fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
 ) {

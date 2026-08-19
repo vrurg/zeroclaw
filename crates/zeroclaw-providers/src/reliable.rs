@@ -1,8 +1,8 @@
 use super::ModelProvider;
 use super::dispatch::{
     AcceptedRoute, AccountedCallReport, ProviderDispatch, current_dispatch_billable_usage,
-    mark_current_dispatch_composite, record_current_dispatch_error_usage,
-    stream_as_dispatch_composite, stream_with_exact_dispatch_route, with_exact_dispatch_route,
+    mark_current_dispatch_composite, stream_as_dispatch_composite,
+    stream_with_exact_dispatch_route, with_exact_dispatch_route,
 };
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -110,13 +110,6 @@ async fn scope_reliable_call_accounting<F: std::future::Future>(
     let scope = ReliableCallAccountingScope::default();
     let output = scope.scope(future).await;
     (output, scope.take())
-}
-
-fn record_terminal_error_usage(error: &anyhow::Error) {
-    let Some(usage) = terminal_error_usage(error) else {
-        return;
-    };
-    record_current_dispatch_error_usage(usage);
 }
 
 fn accounted_rejected_attempt_usage() -> Option<TokenUsage> {
@@ -385,9 +378,6 @@ where
             is_final,
         ),
         |(mut stream, fallback_record, accepted_route, saw_error, recorded, is_final)| async move {
-            // Stream constructors run before their caller first polls. Mark the
-            // enclosing dispatch node here, at the actual poll boundary.
-            mark_current_dispatch_composite();
             match stream.next().await {
                 Some(event) => {
                     let mut saw_error = saw_error;
@@ -1092,7 +1082,7 @@ fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
 
 /// Extract billing metadata a Reliable terminal error preserves alongside its
 /// actual cause. The caller still returns the original error unchanged.
-fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
+pub(crate) fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
     error.chain().find_map(|cause| {
         cause
             .downcast_ref::<ReliableRejectedCompletionUsage>()
@@ -1741,7 +1731,6 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            record_terminal_error_usage(&e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2011,7 +2000,6 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            record_terminal_error_usage(&e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2387,7 +2375,6 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            record_terminal_error_usage(&e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2684,7 +2671,6 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            record_terminal_error_usage(&e);
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -4457,10 +4443,16 @@ mod tests {
         let messages = vec![ChatMessage::user("hello")];
         let inner = ReliableModelProvider::new(
             "inner",
-            vec![(
-                "inner.actual".into(),
-                Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
-            )],
+            vec![
+                (
+                    "inner.first".into(),
+                    Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "inner.second".into(),
+                    Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
+                ),
+            ],
             0,
             1,
         );
@@ -4487,12 +4479,15 @@ mod tests {
             .await;
 
         assert!(outcome.result.is_err());
-        assert_eq!(outcome.accounting.rejected_attempts().len(), 1);
-        let rejected = &outcome.accounting.rejected_attempts()[0];
-        assert_eq!(rejected.provider_ref(), "inner.actual");
-        assert_eq!(rejected.model(), "served-model");
-        assert_eq!(rejected.usage().input_tokens, Some(10));
-        assert_eq!(rejected.usage().output_tokens, Some(5));
+        let rejected = outcome.accounting.rejected_attempts();
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].provider_ref(), "inner.first");
+        assert_eq!(rejected[1].provider_ref(), "inner.second");
+        for attempt in rejected {
+            assert_eq!(attempt.model(), "served-model");
+            assert_eq!(attempt.usage().input_tokens, Some(10));
+            assert_eq!(attempt.usage().output_tokens, Some(5));
+        }
     }
 
     #[tokio::test]

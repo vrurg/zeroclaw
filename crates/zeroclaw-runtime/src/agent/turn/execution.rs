@@ -57,6 +57,9 @@ impl ResolvedModelAccess<'_> {
                 dispatcher.chat(request, self.model, self.temperature),
             ))
             .await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
 
         let attempts = accounting.attempts();

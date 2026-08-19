@@ -14,11 +14,14 @@ use std::sync::Arc;
 
 tokio::task_local! {
     static ACTIVE_COLLECTOR: Arc<Mutex<CollectorState>>;
+    static POLL_STACK: RefCell<Vec<(usize, DispatchNodeId)>>;
+    static ROUTE_STACK: RefCell<Vec<(usize, Arc<RouteIdentity>)>>;
 }
 
-thread_local! {
-    static POLL_STACK: RefCell<Vec<(usize, DispatchNodeId)>> = const { RefCell::new(Vec::new()) };
-    static ROUTE_STACK: RefCell<Vec<(usize, String, String)>> = const { RefCell::new(Vec::new()) };
+#[derive(Debug)]
+struct RouteIdentity {
+    provider_ref: String,
+    model: String,
 }
 
 fn collector_key(collector: &Arc<Mutex<CollectorState>>) -> usize {
@@ -28,8 +31,9 @@ fn collector_key(collector: &Arc<Mutex<CollectorState>>) -> usize {
 struct PollFrame(usize, DispatchNodeId);
 impl Drop for PollFrame {
     fn drop(&mut self) {
-        POLL_STACK.with(|stack| {
-            debug_assert_eq!(stack.borrow_mut().pop(), Some((self.0, self.1)));
+        let _ = POLL_STACK.try_with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            debug_assert_eq!(popped, Some((self.0, self.1)));
         });
     }
 }
@@ -38,7 +42,7 @@ struct RouteFrame(bool);
 impl Drop for RouteFrame {
     fn drop(&mut self) {
         if self.0 {
-            ROUTE_STACK.with(|routes| {
+            let _ = ROUTE_STACK.try_with(|routes| {
                 routes.borrow_mut().pop();
             });
         }
@@ -73,62 +77,59 @@ pub(crate) struct CallAccountingCollector {
 impl CallAccountingCollector {
     pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
         ACTIVE_COLLECTOR
-            .scope(Arc::clone(&self.state), future)
+            .scope(
+                Arc::clone(&self.state),
+                POLL_STACK.scope(
+                    RefCell::new(Vec::new()),
+                    ROUTE_STACK.scope(RefCell::new(Vec::new()), future),
+                ),
+            )
             .await
     }
 
-    pub(crate) fn close(&self) -> (Vec<AccountedAttempt>, Option<(String, String)>) {
+    pub(crate) fn mark_logical_success(&self) {
         let mut state = self.state.lock();
-        if state.closed {
-            return (Vec::new(), None);
+        if !state.closed {
+            state.logical_success = true;
         }
-        state.closed = true;
-        for node in &mut state.nodes {
-            if !node.finalized && !matches!(node.outcome, Some(AttemptUsageOutcome::Invalid { .. }))
-            {
-                node.outcome = Some(AttemptUsageOutcome::OutcomeUnknown {
-                    observed: node
-                        .outcome
-                        .as_ref()
-                        .and_then(AttemptUsageOutcome::observed_usage),
-                });
+    }
+
+    pub(crate) fn close(&self) -> (Vec<AccountedAttempt>, Option<(String, String)>) {
+        let (nodes, logical_success) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return (Vec::new(), None);
             }
-        }
-        let successful_route = if state.logical_success {
-            state
-                .nodes
+            state.closed = true;
+            for node in &mut state.nodes {
+                if !node.finalized {
+                    node.outcome = Some(AttemptUsageOutcome::OutcomeUnknown {
+                        observed: node
+                            .outcome
+                            .as_ref()
+                            .and_then(AttemptUsageOutcome::observed_usage),
+                    });
+                }
+            }
+            (std::mem::take(&mut state.nodes), state.logical_success)
+        };
+        let successful_route = if logical_success {
+            nodes
                 .iter()
-                .enumerate()
                 .rev()
-                .find_map(|(index, node)| {
-                    (node.finalized
-                        && !node.composite
-                        && !state
-                            .nodes
-                            .iter()
-                            .any(|child| child.parent == Some(DispatchNodeId(index))))
-                    .then(|| (node.provider_ref.clone(), node.model.clone()))
-                })
+                .find(|node| node.finalized && !node.composite)
+                .map(|node| (node.provider_ref.clone(), node.model.clone()))
         } else {
             None
         };
-        let attempts = state
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(index, node)| {
-                !node.composite
-                    && !state
-                        .nodes
-                        .iter()
-                        .any(|child| child.parent == Some(DispatchNodeId(*index)))
-            })
-            .map(|(_, node)| {
+        let attempts = nodes
+            .into_iter()
+            .filter(|node| !node.composite)
+            .map(|node| {
                 AccountedAttempt::new(
-                    node.provider_ref.clone(),
-                    node.model.clone(),
+                    node.provider_ref,
+                    node.model,
                     node.outcome
-                        .clone()
                         .unwrap_or(AttemptUsageOutcome::OutcomeUnknown { observed: None }),
                 )
             })
@@ -143,6 +144,45 @@ pub(crate) struct AttemptLease {
     node: DispatchNodeId,
 }
 
+pub(crate) enum AttemptState {
+    Unstarted { provider_ref: String, model: String },
+    Active(AttemptLease),
+    Disabled,
+}
+
+impl AttemptState {
+    pub(crate) fn unstarted(provider_ref: String, model: String) -> Self {
+        Self::Unstarted {
+            provider_ref,
+            model,
+        }
+    }
+
+    pub(crate) fn start(&mut self) {
+        if !matches!(self, Self::Unstarted { .. }) {
+            return;
+        }
+        let Self::Unstarted {
+            provider_ref,
+            model,
+        } = std::mem::replace(self, Self::Disabled)
+        else {
+            unreachable!("the unstarted guard above must hold");
+        };
+        *self = match AttemptLease::begin(provider_ref, model) {
+            Some(lease) => Self::Active(lease),
+            None => Self::Disabled,
+        };
+    }
+
+    pub(crate) fn lease(&self) -> Option<&AttemptLease> {
+        match self {
+            Self::Active(lease) => Some(lease),
+            Self::Unstarted { .. } | Self::Disabled => None,
+        }
+    }
+}
+
 impl AttemptLease {
     pub(crate) fn begin(provider_ref: String, model: String) -> Option<Self> {
         ACTIVE_COLLECTOR
@@ -152,24 +192,28 @@ impl AttemptLease {
                     return None;
                 }
                 let key = collector_key(collector);
-                let parent = POLL_STACK.with(|stack| {
-                    stack
-                        .borrow()
-                        .iter()
-                        .rev()
-                        .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
-                });
+                let synchronous_parent = POLL_STACK
+                    .try_with(|stack| {
+                        stack
+                            .borrow()
+                            .iter()
+                            .rev()
+                            .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
+                    })
+                    .ok()
+                    .flatten();
+                let parent = synchronous_parent;
                 let node = DispatchNodeId(state.nodes.len());
-                let (provider_ref, model) = ROUTE_STACK.with(|routes| {
-                    routes
-                        .borrow()
-                        .iter()
-                        .rev()
-                        .find_map(|(route_key, provider, model)| {
-                            (*route_key == key).then(|| (provider.clone(), model.clone()))
+                let route = ROUTE_STACK
+                    .try_with(|routes| {
+                        routes.borrow().iter().rev().find_map(|(route_key, route)| {
+                            (*route_key == key)
+                                .then(|| (route.provider_ref.clone(), route.model.clone()))
                         })
-                        .unwrap_or((provider_ref, model))
-                });
+                    })
+                    .ok()
+                    .flatten();
+                let (provider_ref, model) = route.unwrap_or((provider_ref, model));
                 state.nodes.push(Node {
                     parent,
                     provider_ref,
@@ -178,6 +222,9 @@ impl AttemptLease {
                     finalized: false,
                     outcome: None,
                 });
+                if let Some(parent) = parent {
+                    state.nodes[parent.0].composite = true;
+                }
                 Some(Self {
                     collector: Arc::clone(collector),
                     node,
@@ -189,7 +236,7 @@ impl AttemptLease {
 
     pub(crate) fn poll_scope<R>(&self, poll: impl FnOnce() -> R) -> R {
         let key = collector_key(&self.collector);
-        POLL_STACK.with(|stack| stack.borrow_mut().push((key, self.node)));
+        let _ = POLL_STACK.try_with(|stack| stack.borrow_mut().push((key, self.node)));
         let _frame = PollFrame(key, self.node);
         poll()
     }
@@ -202,14 +249,31 @@ impl AttemptLease {
         if let Some(node) = state.nodes.get_mut(self.node.0) {
             node.outcome = Some(classify_usage(response.usage.clone()));
             node.finalized = true;
-            if node.parent.is_none() {
-                state.logical_success = true;
-            }
         }
     }
 
-    pub(crate) fn finish_error(&self) {
-        self.set_unknown();
+    pub(crate) fn finish_missing_response(&self) {
+        let mut state = self.collector.lock();
+        if state.closed {
+            return;
+        }
+        if let Some(node) = state.nodes.get_mut(self.node.0) {
+            node.outcome = Some(AttemptUsageOutcome::Missing);
+            node.finalized = true;
+        }
+    }
+
+    pub(crate) fn finish_error_with_usage(&self, usage: Option<TokenUsage>) {
+        let Some(usage) = usage else {
+            self.set_unknown();
+            return;
+        };
+        match classify_usage(Some(usage)) {
+            AttemptUsageOutcome::Complete(usage) => self.set_unknown_with_observed(Some(usage)),
+            AttemptUsageOutcome::Invalid { .. }
+            | AttemptUsageOutcome::Missing
+            | AttemptUsageOutcome::OutcomeUnknown { .. } => self.set_unknown_with_observed(None),
+        }
     }
 
     pub(crate) fn observe_stream_usage(&self, usage: TokenUsage) {
@@ -234,6 +298,10 @@ impl AttemptLease {
     }
 
     pub(crate) fn set_unknown(&self) {
+        self.set_unknown_with_observed(None);
+    }
+
+    fn set_unknown_with_observed(&self, observed: Option<TokenUsage>) {
         let mut state = self.collector.lock();
         if state.closed {
             return;
@@ -241,12 +309,13 @@ impl AttemptLease {
         let Some(node) = state.nodes.get_mut(self.node.0) else {
             return;
         };
-        if !node.finalized && !matches!(node.outcome, Some(AttemptUsageOutcome::Invalid { .. })) {
+        if !node.finalized {
             node.outcome = Some(AttemptUsageOutcome::OutcomeUnknown {
-                observed: node
-                    .outcome
-                    .as_ref()
-                    .and_then(AttemptUsageOutcome::observed_usage),
+                observed: observed.or_else(|| {
+                    node.outcome
+                        .as_ref()
+                        .and_then(AttemptUsageOutcome::observed_usage)
+                }),
             });
         }
     }
@@ -273,15 +342,16 @@ where
     F: std::future::Future,
 {
     let mut future = Box::pin(future);
+    let route = Arc::new(RouteIdentity {
+        provider_ref,
+        model,
+    });
     futures_util::future::poll_fn(move |cx| {
         let key = ACTIVE_COLLECTOR.try_with(collector_key).ok();
         let pushed = if let Some(key) = key {
-            ROUTE_STACK.with(|routes| {
-                routes
-                    .borrow_mut()
-                    .push((key, provider_ref.clone(), model.clone()))
-            });
-            true
+            ROUTE_STACK
+                .try_with(|routes| routes.borrow_mut().push((key, Arc::clone(&route))))
+                .is_ok()
         } else {
             false
         };
@@ -299,15 +369,16 @@ where
     T: Send + 'static,
 {
     let mut stream = stream;
+    let route = Arc::new(RouteIdentity {
+        provider_ref,
+        model,
+    });
     futures_util::stream::poll_fn(move |cx| {
         let key = ACTIVE_COLLECTOR.try_with(collector_key).ok();
         let pushed = if let Some(key) = key {
-            ROUTE_STACK.with(|routes| {
-                routes
-                    .borrow_mut()
-                    .push((key, provider_ref.clone(), model.clone()))
-            });
-            true
+            ROUTE_STACK
+                .try_with(|routes| routes.borrow_mut().push((key, Arc::clone(&route))))
+                .is_ok()
         } else {
             false
         };
@@ -328,13 +399,16 @@ impl Drop for AttemptLease {
 pub(crate) fn mark_current_composite() {
     let _ = ACTIVE_COLLECTOR.try_with(|collector| {
         let key = collector_key(collector);
-        let node = POLL_STACK.with(|stack| {
-            stack
-                .borrow()
-                .iter()
-                .rev()
-                .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
-        });
+        let node = POLL_STACK
+            .try_with(|stack| {
+                stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
+            })
+            .ok()
+            .flatten();
         let Some(node) = node else {
             return;
         };
@@ -366,10 +440,9 @@ pub(crate) fn record_stream_interruption_usage(usage: TokenUsage) {
                 AttemptUsageOutcome::Complete(usage) => AttemptUsageOutcome::OutcomeUnknown {
                     observed: Some(usage),
                 },
-                // The stream's lifecycle is unresolved, but an invalid
-                // observation must remain typed and must never become a
-                // billable lower bound.
-                invalid @ AttemptUsageOutcome::Invalid { .. } => invalid,
+                AttemptUsageOutcome::Invalid { .. } => {
+                    AttemptUsageOutcome::OutcomeUnknown { observed: None }
+                }
                 AttemptUsageOutcome::Missing | AttemptUsageOutcome::OutcomeUnknown { .. } => {
                     AttemptUsageOutcome::OutcomeUnknown { observed: None }
                 }
@@ -388,6 +461,7 @@ pub(crate) fn record_stream_semantic_rejection_usage(usage: TokenUsage) {
         if state.closed {
             return;
         }
+        state.logical_success = false;
         if let Some(node) = state.nodes.iter_mut().rev().find(|node| !node.composite) {
             node.outcome = Some(match classify_usage(Some(usage)) {
                 AttemptUsageOutcome::Complete(usage) => AttemptUsageOutcome::OutcomeUnknown {
@@ -410,12 +484,8 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
         .try_with(|collector| {
             let state = collector.lock();
             let mut total: Option<TokenUsage> = None;
-            for (index, node) in state.nodes.iter().enumerate() {
-                let has_child = state
-                    .nodes
-                    .iter()
-                    .any(|child| child.parent == Some(DispatchNodeId(index)));
-                if node.composite || has_child {
+            for node in &state.nodes {
+                if node.composite {
                     continue;
                 }
                 let usage = match node.outcome.as_ref() {
@@ -600,6 +670,78 @@ mod tests {
                 })
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn close_turns_unfinished_invalid_usage_into_unknown_without_a_lower_bound() {
+        let collector = CallAccountingCollector::default();
+        let lease = collector
+            .scope(async {
+                AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                    .expect("scoped first poll creates a lease")
+            })
+            .await;
+        lease.observe_stream_usage(TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(2),
+            cached_input_tokens: None,
+        });
+
+        let (report, _) = collector.close();
+        assert!(matches!(
+            report[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_interruption_cannot_restore_invalid_usage_after_an_unresolved_stream_end() {
+        let collector = CallAccountingCollector::default();
+        collector
+            .scope(async {
+                let lease =
+                    AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                        .expect("scoped first poll creates a lease");
+                let invalid = TokenUsage {
+                    input_tokens: None,
+                    output_tokens: Some(2),
+                    cached_input_tokens: None,
+                };
+                lease.observe_stream_usage(invalid.clone());
+                lease.set_unknown();
+                record_stream_interruption_usage(invalid);
+            })
+            .await;
+
+        let (report, _) = collector.close();
+        assert!(matches!(
+            report[0].outcome(),
+            AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_scope_restores_the_stack_after_a_completed_poll() {
+        let collector = CallAccountingCollector::default();
+        collector
+            .scope(async {
+                let lease =
+                    AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                        .expect("scoped first poll creates a lease");
+                lease.poll_scope(|| ());
+                let key = collector_key(&lease.collector);
+                assert!(
+                    POLL_STACK
+                        .try_with(|stack| {
+                            stack
+                                .borrow()
+                                .iter()
+                                .all(|(stack_key, _)| *stack_key != key)
+                        })
+                        .expect("collector scope installs a poll stack")
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

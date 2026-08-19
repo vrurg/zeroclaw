@@ -49,12 +49,9 @@ pub enum CallAccountingState {
 impl AttemptUsageOutcome {
     fn observed_usage(&self) -> Option<crate::traits::TokenUsage> {
         match self {
-            Self::Complete(usage)
-            | Self::Invalid {
-                observed: usage, ..
-            } => Some(usage.clone()),
+            Self::Complete(usage) => Some(usage.clone()),
             Self::OutcomeUnknown { observed } => observed.clone(),
-            Self::Missing => None,
+            Self::Missing | Self::Invalid { .. } => None,
         }
     }
 }
@@ -381,6 +378,13 @@ impl AccountedChatScope {
         self.collector.scope(self.inner.scope(future)).await
     }
 
+    /// Mark the completed logical operation as accepted after its caller has
+    /// applied semantic validation. Physical leaf finalization remains owned
+    /// by dispatch adapters.
+    pub fn mark_logical_success(&self) {
+        self.collector.mark_logical_success();
+    }
+
     #[must_use]
     /// Consume the current report and reset this scope for no further reports.
     pub fn take(&self) -> AccountedCallReport {
@@ -430,12 +434,6 @@ pub fn commit_accepted_provider_route(route: Option<AcceptedRoute>) {
 /// dispatch an inner provider.
 pub(crate) fn mark_current_dispatch_composite() {
     accounting::mark_current_composite();
-}
-
-/// Preserve usage carried by a typed terminal provider error on the physical
-/// leaf that already ran.  It never allocates a wrapper or synthetic attempt.
-pub(crate) fn record_current_dispatch_error_usage(usage: crate::traits::TokenUsage) {
-    accounting::record_stream_interruption_usage(usage);
 }
 
 /// Mark a decorator/composite only when its returned stream is actually
@@ -514,22 +512,55 @@ where
     let provider_ref = provider_reference(provider);
     let model = model.to_string();
     let mut future = Box::pin(future);
-    let mut lease = None;
+    let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
     futures_util::future::poll_fn(move |cx| {
-        if lease.is_none() {
-            lease = accounting::AttemptLease::begin(provider_ref.clone(), model.clone());
-        }
+        attempt.start();
         let mut poll = || Pin::as_mut(&mut future).poll(cx);
-        let result = match &lease {
+        let result = match attempt.lease() {
             Some(lease) => lease.poll_scope(poll),
             None => poll(),
         };
         if let Poll::Ready(result) = &result
-            && let Some(lease) = &lease
+            && let Some(lease) = attempt.lease()
         {
             match result {
                 Ok(response) => lease.finish_response(response),
-                Err(_) => lease.finish_error(),
+                Err(error) => {
+                    lease.finish_error_with_usage(crate::reliable::terminal_error_usage(error))
+                }
+            }
+        }
+        result
+    })
+}
+
+fn accounted_string_call<'a, F>(
+    provider: &'a dyn ModelProvider,
+    model: &'a str,
+    future: F,
+) -> impl Future<Output = anyhow::Result<String>> + 'a
+where
+    F: Future<Output = anyhow::Result<String>> + 'a,
+{
+    let provider_ref = provider_reference(provider);
+    let model = model.to_string();
+    let mut future = Box::pin(future);
+    let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
+    futures_util::future::poll_fn(move |cx| {
+        attempt.start();
+        let mut poll = || Pin::as_mut(&mut future).poll(cx);
+        let result = match attempt.lease() {
+            Some(lease) => lease.poll_scope(poll),
+            None => poll(),
+        };
+        if let Poll::Ready(result) = &result
+            && let Some(lease) = attempt.lease()
+        {
+            match result {
+                Ok(_) => lease.finish_missing_response(),
+                Err(error) => {
+                    lease.finish_error_with_usage(crate::reliable::terminal_error_usage(error))
+                }
             }
         }
         result
@@ -583,6 +614,9 @@ impl ProviderDispatch {
     ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
         let result = scope.scope(self.chat(request, model, temperature)).await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         let rejected_attempt_usage = accounting.rejected_attempt_usage();
         result.map(|response| AccountedChatResponse {
@@ -614,18 +648,16 @@ impl ProviderDispatch {
         let inner_stream = self.inner.stream_chat(request, model, temperature, options);
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let _enter = model_scope.enter();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(StreamEvent::Usage(usage)))) => {
                         lease.observe_stream_usage(usage.clone());
@@ -655,17 +687,15 @@ impl ProviderDispatch {
         let mut inner_stream =
             self.inner
                 .stream_chat_with_system(system_prompt, message, model, temperature, options);
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(chunk))) if chunk.is_final => lease.finish_stream(),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => lease.set_unknown(),
@@ -689,17 +719,15 @@ impl ProviderDispatch {
         let mut inner_stream =
             self.inner
                 .stream_chat_with_history(messages, model, temperature, options);
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(chunk))) if chunk.is_final => lease.finish_stream(),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => lease.set_unknown(),
@@ -719,13 +747,13 @@ impl ProviderDispatch {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        async move {
+        accounted_string_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => (*self.inner).simple_chat(message, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -740,13 +768,13 @@ impl ProviderDispatch {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        async move {
+        accounted_string_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_system(system_prompt, message, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -760,13 +788,13 @@ impl ProviderDispatch {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        async move {
+        accounted_string_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_history(messages, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -805,6 +833,9 @@ impl ProviderDispatch {
         let result = scope
             .scope(self.chat_with_tools(messages, tools, model, temperature))
             .await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         let rejected_attempt_usage = accounting.rejected_attempt_usage();
         result.map(|response| AccountedChatResponse {
@@ -871,6 +902,9 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
         let result = scope.scope(self.chat(request, model, temperature)).await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         let rejected_attempt_usage = accounting.rejected_attempt_usage();
         result.map(|response| AccountedChatResponse {
@@ -888,6 +922,9 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> AccountedChatOutcome {
         let scope = AccountedChatScope::new();
         let result = scope.scope(self.chat(request, model, temperature)).await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         let rejected_attempt_usage = accounting.rejected_attempt_usage();
         AccountedChatOutcome {
@@ -918,18 +955,16 @@ impl<'a> ProviderDispatchRef<'a> {
         let inner_stream = self.inner.stream_chat(request, model, temperature, options);
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let _enter = model_scope.enter();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(StreamEvent::Usage(usage)))) => {
                         lease.observe_stream_usage(usage.clone());
@@ -957,17 +992,15 @@ impl<'a> ProviderDispatchRef<'a> {
         let mut inner_stream =
             self.inner
                 .stream_chat_with_system(system_prompt, message, model, temperature, options);
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(chunk))) if chunk.is_final => lease.finish_stream(),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => lease.set_unknown(),
@@ -991,17 +1024,15 @@ impl<'a> ProviderDispatchRef<'a> {
         let mut inner_stream =
             self.inner
                 .stream_chat_with_history(messages, model, temperature, options);
-        let mut lease = None;
+        let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
-            if lease.is_none() {
-                lease = accounting::AttemptLease::begin(provider_ref.clone(), model_name.clone());
-            }
+            attempt.start();
             let mut poll = || inner_stream.as_mut().poll_next(cx);
-            let result = match &lease {
+            let result = match attempt.lease() {
                 Some(lease) => lease.poll_scope(poll),
                 None => poll(),
             };
-            if let Some(lease) = &lease {
+            if let Some(lease) = attempt.lease() {
                 match &result {
                     Poll::Ready(Some(Ok(chunk))) if chunk.is_final => lease.finish_stream(),
                     Poll::Ready(Some(Err(_))) | Poll::Ready(None) => lease.set_unknown(),
@@ -1025,13 +1056,13 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        async move {
+        accounted_string_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.simple_chat(message, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -1046,13 +1077,13 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        async move {
+        accounted_string_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_system(system_prompt, message, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -1066,13 +1097,13 @@ impl<'a> ProviderDispatchRef<'a> {
     ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
-        async move {
+        accounted_string_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
                 => self.inner.chat_with_history(messages, model, temperature)
             )
             .await
-        }
+        })
         .instrument(span)
         .await
     }
@@ -1111,6 +1142,9 @@ impl<'a> ProviderDispatchRef<'a> {
         let result = scope
             .scope(self.chat_with_tools(messages, tools, model, temperature))
             .await;
+        if result.is_ok() {
+            scope.mark_logical_success();
+        }
         let accounting = scope.take();
         let rejected_attempt_usage = accounting.rejected_attempt_usage();
         result.map(|response| AccountedChatResponse {
@@ -1321,6 +1355,29 @@ mod tests {
                 AttemptUsageOutcome::OutcomeUnknown { observed: None }
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_system_chat_is_a_missing_usage_physical_attempt() {
+        let provider = UsageFake { usage: None };
+        let scope = AccountedChatScope::new();
+        let result = scope
+            .scope(async {
+                ProviderDispatch::from_ref(&provider)
+                    .chat_with_system(None, "hello", "served-model", None)
+                    .await
+            })
+            .await;
+        assert_eq!(result.expect("legacy call succeeds"), "ok");
+
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(report.attempts()[0].provider_ref(), "configured.usage");
+        assert_eq!(report.attempts()[0].model(), "served-model");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            AttemptUsageOutcome::Missing
+        ));
     }
 
     #[tokio::test]
