@@ -1590,6 +1590,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's deferred+pinned MCP prompt section (single-block
     /// shape, same as `run` / `process_message`).
     mcp_prompt_section: String,
+    /// The shell this step's runtime adapter will spawn, carried so the step's
+    /// system prompt reports the same dialect the step will execute under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1674,6 +1678,8 @@ pub(crate) async fn assemble_owned_execution(
         None,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // Capture before `runtime` is moved into `ScopedAssembly` below.
+    let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -1747,6 +1753,9 @@ pub(crate) async fn assemble_owned_execution(
         skills,
         mcp_tool_names,
         mcp_prompt_section,
+        // Captured from the same adapter this step's tools were built with, so
+        // the prompt names the shell the step will actually run under.
+        shell_profile,
     })
 }
 
@@ -1793,6 +1802,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        owned.shell_profile.as_ref(),
     )
 }
 
@@ -3098,6 +3108,7 @@ mod sop_step_reassembly_tests {
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
+            shell_profile: None,
         }
     }
 
@@ -3831,6 +3842,7 @@ mod sop_step_reassembly_tests {
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
+                shell_profile: None,
             },
         );
 

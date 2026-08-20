@@ -11368,6 +11368,7 @@ pub async fn start_channels(
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
+            runtime.shell_profile().as_ref(),
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -21993,6 +21994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -22451,6 +22453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -22484,6 +22487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(

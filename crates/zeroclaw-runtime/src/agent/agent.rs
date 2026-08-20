@@ -363,6 +363,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// The shell this agent's runtime adapter will spawn, so the system
+    /// prompt reports the dialect the agent actually executes under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     /// Cross-channel HITL: resolved from the active risk profile's
     /// `approval_route`. When set, the per-turn approval bridge asks the named
     /// approver channel (bounded + fail-closed) instead of the originating
@@ -515,6 +519,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
@@ -565,6 +570,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            shell_profile: None,
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
@@ -741,6 +747,19 @@ impl AgentBuilder {
 
     pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
         self.autonomy_level = Some(level);
+        self
+    }
+
+    /// Set the shell reported in the system prompt.
+    ///
+    /// Pass `RuntimeAdapter::shell_profile()` from the same adapter the
+    /// agent's tools were built with, so the prompt cannot name a shell other
+    /// than the one that will execute. Unset means no shell is reported.
+    pub fn shell_profile(
+        mut self,
+        profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    ) -> Self {
+        self.shell_profile = profile;
         self
     }
 
@@ -929,6 +948,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
@@ -1598,6 +1618,8 @@ impl Agent {
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Capture before `runtime` is moved into `ScopedAssembly`.
+        let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -1732,6 +1754,7 @@ impl Agent {
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())
+            .shell_profile(shell_profile)
             .config(
                 config
                     .resolved_agent_config(agent_alias)
@@ -1981,6 +2004,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
         let receipts = &self.config.resolved.tool_receipts;
