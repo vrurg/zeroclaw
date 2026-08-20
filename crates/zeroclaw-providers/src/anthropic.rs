@@ -2333,12 +2333,13 @@ impl AnthropicModelProvider {
                         .get("delta")
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str());
-                    let mut latched_terminal_reason = false;
-                    let mut conflicting_terminal_reason = false;
                     if let Some(stop_reason) = stop_reason {
                         if let Some(first_stop_reason) = last_stop_reason.as_deref() {
                             if first_stop_reason != stop_reason {
-                                conflicting_terminal_reason = true;
+                                if terminal_completion_error.is_none() {
+                                    terminal_completion_error =
+                                        Some(TerminalCompletionError::InvalidTerminalReason);
+                                }
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
@@ -2353,18 +2354,16 @@ impl AnthropicModelProvider {
                                             "later_stop_reason": stop_reason,
                                         })
                                     ),
-                                    "stream: conflicting message_delta stop_reason; preserving first reason"
+                                    "stream: conflicting message_delta stop_reason; stream remains non-final"
                                 );
                             }
                         } else {
                             terminal_completion_error =
                                 Self::terminal_completion_error(Some(stop_reason));
                             last_stop_reason = Some(stop_reason.to_string());
-                            latched_terminal_reason = true;
                         }
                     }
-                    // Anthropic's running-total: each `message_delta`
-                    // supersedes the previous one, so we always overwrite.
+                    // Anthropic usage is cumulative across `message_delta` events.
                     let observed_output = event
                         .get("usage")
                         .and_then(|u| u.get("output_tokens"))
@@ -2372,7 +2371,7 @@ impl AnthropicModelProvider {
                     if let Some(v) = observed_output {
                         output_tokens = Some(v);
                     }
-                    if latched_terminal_reason && stop_reason == Some("max_tokens") {
+                    if stop_reason == Some("max_tokens") {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -2383,7 +2382,7 @@ impl AnthropicModelProvider {
                             .with_attrs(::serde_json::json!({"output_tokens": observed_output})),
                             "response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
                         );
-                    } else if !conflicting_terminal_reason {
+                    } else {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"stop_reason": stop_reason.unwrap_or("missing"), "output_tokens": observed_output})), "stream: message_delta");
                     }
                 }
@@ -3578,7 +3577,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn streaming_preserves_first_terminal_reason_across_later_conflict() {
+    async fn streaming_preserves_first_incomplete_reason_across_later_conflict() {
         use std::io::Cursor;
 
         let bytes = b"event: message_start\n\
@@ -3619,7 +3618,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn streaming_preserves_first_complete_reason_across_later_conflict() {
+    async fn streaming_rejects_complete_then_incomplete_reason_conflict() {
         use std::io::Cursor;
 
         let bytes = b"event: message_start\n\
@@ -3635,25 +3634,36 @@ data: {\"type\":\"message_stop\"}\n\n";
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
         let mut saw_final = false;
-        let mut terminal_failure = None;
-        let mut observed_usage = None;
+        let mut terminal_failures = Vec::new();
         while let Ok(Some(event)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match event {
                 Ok(StreamEvent::Final) => saw_final = true,
-                Ok(StreamEvent::Usage(usage)) => observed_usage = Some(usage),
-                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failures.push(failure),
                 Ok(_) | Err(_) => {}
             }
         }
 
-        assert!(saw_final, "a later max_tokens must not erase end_turn");
         assert!(
-            terminal_failure.is_none(),
-            "end_turn remains a clean terminal reason"
+            !saw_final,
+            "a conflicting later max_tokens must not preserve an earlier clean completion"
         );
-        let usage = observed_usage.expect("final stream retains the latest observed usage");
+        assert_eq!(
+            terminal_failures.len(),
+            1,
+            "stream must emit one terminal failure"
+        );
+        let terminal_failure = terminal_failures
+            .pop()
+            .expect("terminal failure was counted");
+        assert_eq!(
+            terminal_failure.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        let usage = terminal_failure
+            .usage
+            .expect("terminal failure retains the latest observed usage");
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(5));
     }
