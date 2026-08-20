@@ -3645,14 +3645,15 @@ mod tests {
         let errors = super::apply_with_surface(submission, &mut config, Surface::Cli)
             .await
             .expect_err("config write must fail");
-        let error = errors
-            .iter()
-            .find(|error| error.message.contains("persist config"))
-            .expect("CLI persistence error");
-        assert_eq!(
-            error.message.matches("failed to persist config").count(),
-            1,
-            "the localized prefix must not be duplicated"
+        let [error] = errors.as_slice() else {
+            panic!("config persistence must produce exactly one error; got {errors:?}");
+        };
+        assert_eq!(error.step, QuickstartStep::Agent);
+        assert!(error.field.is_empty());
+        assert!(!error.rollback_failed);
+        assert!(
+            !error.message.is_empty(),
+            "the CLI persistence error must retain a user-visible message"
         );
         let profile = auth
             .get_profile("anthropic", Some("subscription"))
