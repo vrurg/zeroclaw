@@ -2329,10 +2329,8 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_delta" => {
-                    let stop_reason = event
-                        .get("delta")
-                        .and_then(|d| d.get("stop_reason"))
-                        .and_then(|s| s.as_str());
+                    let stop_reason_value = event.get("delta").and_then(|d| d.get("stop_reason"));
+                    let stop_reason = stop_reason_value.and_then(serde_json::Value::as_str);
                     if let Some(stop_reason) = stop_reason {
                         if let Some(first_stop_reason) = last_stop_reason.as_deref() {
                             if first_stop_reason != stop_reason {
@@ -2362,6 +2360,40 @@ impl AnthropicModelProvider {
                                 Self::terminal_completion_error(Some(stop_reason));
                             last_stop_reason = Some(stop_reason.to_string());
                         }
+                    } else if let Some(stop_reason_value) = stop_reason_value
+                        && !stop_reason_value.is_null()
+                    {
+                        // A present non-string terminal reason is malformed
+                        // protocol metadata, not an omitted observation. It
+                        // must fail closed, while a prior incomplete reason
+                        // remains the more specific terminal cause.
+                        if terminal_completion_error.is_none() {
+                            terminal_completion_error =
+                                Some(TerminalCompletionError::InvalidTerminalReason);
+                        }
+                        if last_stop_reason.is_none() {
+                            last_stop_reason = Some("invalid_non_string".to_string());
+                        }
+                        let stop_reason_type = match stop_reason_value {
+                            serde_json::Value::Bool(_) => "boolean",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            serde_json::Value::Null | serde_json::Value::String(_) => "other",
+                        };
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "stop_reason_type": stop_reason_type,
+                            })),
+                            "stream: non-string message_delta stop_reason; stream remains non-final"
+                        );
                     }
                     // Anthropic usage is cumulative across `message_delta` events.
                     let observed_output = event
@@ -3666,6 +3698,76 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("terminal failure retains the latest observed usage");
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(5));
+    }
+
+    async fn assert_non_string_stop_reason_is_rejected(bytes: &[u8]) {
+        use std::io::Cursor;
+
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut terminal_failures = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failures.push(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert!(
+            !saw_final,
+            "a non-string terminal reason must not emit Final"
+        );
+        assert_eq!(
+            terminal_failures.len(),
+            1,
+            "stream emits one terminal failure"
+        );
+        let failure = terminal_failures
+            .pop()
+            .expect("terminal failure was counted");
+        assert_eq!(
+            failure.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        let usage = failure
+            .usage
+            .expect("terminal failure retains the latest observed usage");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_non_string_stop_reason_before_end_turn() {
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":7},\"usage\":{\"output_tokens\":4}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        assert_non_string_stop_reason_is_rejected(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_non_string_stop_reason_after_end_turn() {
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":{\"unexpected\":true}},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        assert_non_string_stop_reason_is_rejected(bytes).await;
     }
 
     #[tokio::test]

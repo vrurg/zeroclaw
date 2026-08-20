@@ -149,19 +149,6 @@ pub struct TerminalCompletionContext {
 
 impl TerminalCompletionContext {
     #[must_use]
-    pub(crate) fn new(
-        failure: TerminalCompletionFailure,
-        policy: TerminalCompletionPolicy,
-        failed_candidate: Option<StreamProviderAttempt>,
-    ) -> Self {
-        Self {
-            failure,
-            policy,
-            failed_candidate,
-        }
-    }
-
-    #[must_use]
     pub fn failure(&self) -> &TerminalCompletionFailure {
         &self.failure
     }

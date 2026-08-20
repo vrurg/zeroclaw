@@ -303,6 +303,32 @@ fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> Str
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
 }
 
+fn append_provider_fallback_footer(
+    mut response: String,
+    fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+) -> String {
+    let Some(fallback) = fallback else {
+        return response;
+    };
+    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+    let same_family = requested_family == actual_family
+        || requested_family.starts_with(actual_family)
+        || actual_family.starts_with(requested_family);
+    if !same_family {
+        response.push_str("\n\n---\n");
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-fallback-footer",
+            &[
+                ("requested", fallback.requested_provider.as_str()),
+                ("actual", fallback.actual_provider.as_str()),
+                ("model", fallback.actual_model.as_str()),
+            ],
+        ));
+    }
+    response
+}
+
 fn channel_runtime_scope_label(scope: OverrideScope) -> String {
     match scope {
         OverrideScope::User => channel_runtime_cli_string("channel-runtime-scope-user"),
@@ -2350,6 +2376,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
+/// Select the user-facing channel failure after preserving the typed terminal
+/// cause. Substring-based transient hints remain a fallback only: an earlier
+/// transport failure in an aggregate must not mask the final terminal cause.
+fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+        .map(|message| format!("⚠️ Error: {message}"))
+        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
+}
+
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -2364,16 +2400,6 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|hint| lower.contains(hint))
-}
-
-fn channel_error_message(error: &anyhow::Error, safe_error: &str) -> String {
-    if let Some(message) = zeroclaw_runtime::agent::terminal_completion_error_message(error, None) {
-        return format!("⚠️ Error: {message}");
-    }
-
-    zeroclaw_providers::reliable::transient_error_hint(error)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
 }
 
 fn load_cached_model_preview(
@@ -3328,7 +3354,6 @@ impl AssistantChannelOutcome {
 
 async fn classify_channel_reply_intent(
     model_provider: &dyn ModelProvider,
-    provider_name: &str,
     system_prompt: &str,
     history: &[ChatMessage],
     model: &str,
@@ -3372,14 +3397,9 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = ResolvedModelAccess {
-        model_provider,
-        provider_name,
-        model,
-        temperature,
-    }
-    .run_text_query(Some(system_prompt), &convo)
-    .await?;
+    let response = ProviderDispatch::from_ref(model_provider)
+        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .await?;
     Ok(parse_reply_intent(&response))
 }
 
@@ -3425,7 +3445,7 @@ async fn resolve_classifier_route(
     ctx: &ChannelRuntimeContext,
     provider_ref: &zeroclaw_config::providers::ModelProviderRef,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
-) -> Option<(Arc<dyn ModelProvider>, String, String, Option<f64>)> {
+) -> Option<(Arc<dyn ModelProvider>, String, Option<f64>)> {
     let provider_str = provider_ref.as_str().trim();
     if provider_str.is_empty() {
         return None;
@@ -3506,7 +3526,7 @@ async fn resolve_classifier_route(
         "classifier_provider override active"
     );
 
-    Some((provider, provider_str.to_string(), model, temperature))
+    Some((provider, model, temperature))
 }
 
 fn outcome_for_no_reply(reason: &str, kind: NoReplyKind) -> AssistantChannelOutcome {
@@ -5084,18 +5104,6 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
-/// Whether a recovered request crossed provider families and needs a channel footer.
-///
-/// Exact configured aliases deliberately do not participate here: callers of this
-/// channel boundary receive stable provider-family display names only.
-fn fallback_crossed_provider_family(requested_provider: &str, actual_provider: &str) -> bool {
-    let requested_base = requested_provider.split(':').next().unwrap_or("");
-    let actual_base = actual_provider.split(':').next().unwrap_or("");
-    !(requested_base == actual_base
-        || requested_base.starts_with(actual_base)
-        || actual_base.starts_with(requested_base))
-}
-
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -5541,18 +5549,6 @@ async fn process_channel_message_body(
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
 
-    // The reply-intent classifier is a provider request within this turn. Open
-    // the same accounting context now and reuse it for the main tool loop, so
-    // a Reliable recovery cannot lose its rejected-attempt usage before the
-    // loop begins.
-    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
-        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
-            state.tracker,
-            state.model_provider_pricing,
-        )
-        .with_agent_alias(state.agent_alias.as_str())
-    });
-
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
         .as_ref()
@@ -5579,14 +5575,8 @@ async fn process_channel_message_body(
                 );
                 AssistantChannelOutcome::Reply(String::new())
             } else {
-                let (
-                    classifier_provider_arc,
-                    classifier_provider_name,
-                    classifier_model_owned,
-                    classifier_temperature,
-                ): (
+                let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
                     Arc<dyn ModelProvider>,
-                    String,
                     String,
                     Option<f64>,
                 ) = resolve_classifier_route(
@@ -5598,25 +5588,19 @@ async fn process_channel_message_body(
                 .unwrap_or_else(|| {
                     (
                         Arc::clone(&active_model_provider),
-                        route.model_provider.clone(),
                         route.model.clone(),
                         None,
                     )
                 });
 
                 let started = Instant::now();
-                let precheck_future =
-                    zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                        cost_tracking_context.clone(),
-                        classify_channel_reply_intent(
-                            classifier_provider_arc.as_ref(),
-                            classifier_provider_name.as_str(),
-                            history[0].content.as_str(),
-                            &history,
-                            classifier_model_owned.as_str(),
-                            classifier_temperature.or(runtime_defaults.defaults.temperature),
-                        ),
-                    );
+                let precheck_future = classify_channel_reply_intent(
+                    classifier_provider_arc.as_ref(),
+                    history[0].content.as_str(),
+                    &history,
+                    classifier_model_owned.as_str(),
+                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
                 {
@@ -5968,6 +5952,13 @@ async fn process_channel_message_body(
         ctx.max_tool_iterations,
         scale_cap,
     );
+    let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
+        zeroclaw_runtime::agent::loop_::ToolLoopCostTrackingContext::new(
+            state.tracker,
+            state.model_provider_pricing,
+        )
+        .with_agent_alias(state.agent_alias.as_str())
+    });
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -6418,21 +6409,10 @@ async fn process_channel_message_body(
                 &msg.reply_target,
             );
 
-            // Append a footer when the response was served by a different model_provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref()
-                && fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider)
-            {
-                delivered_response.push_str("\n\n---\n");
-                delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                    "channel-runtime-fallback-footer",
-                    &[
-                        ("requested", fb.requested_provider.as_str()),
-                        ("actual", fb.actual_provider.as_str()),
-                        ("model", fb.actual_model.as_str()),
-                    ],
-                ));
-            }
+            // The runtime commits this candidate only after semantic acceptance.
+            // This renderer must therefore receive only the final accepted route.
+            delivered_response =
+                append_provider_fallback_footer(delivered_response, fallback_info.as_ref());
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -6829,7 +6809,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = channel_error_message(&e, &safe_error);
+                    let user_msg = channel_user_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -11388,6 +11368,7 @@ pub async fn start_channels(
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
+            runtime.shell_profile().as_ref(),
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -12333,6 +12314,47 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
     #[test]
+    fn accepted_provider_fallback_footer_is_rendered_once_and_primary_has_none() {
+        let fallback = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "openai.primary".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic.backup".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered =
+            append_provider_fallback_footer("final response".to_string(), Some(&fallback));
+        assert!(delivered.starts_with("final response\n\n---\n"));
+        assert!(delivered.contains("openai.primary"));
+        assert!(delivered.contains("anthropic.backup"));
+        assert_eq!(delivered.matches("---").count(), 1);
+        assert_eq!(
+            append_provider_fallback_footer("primary final".to_string(), None),
+            "primary final"
+        );
+    }
+
+    #[test]
+    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+
+        let delivered = channel_user_error_message(&error, "safe fallback");
+
+        assert_eq!(
+            delivered,
+            format!(
+                "⚠️ Error: {}",
+                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+            )
+        );
+        assert!(
+            !delivered.contains("temporarily unavailable"),
+            "an aggregate's earlier transient hint must not mask terminal completion failure"
+        );
+    }
+
+    #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
         // `config_path` and `data_dir` deliberately live under unrelated
         // temp roots, so `config_path.parent()` (the old install-root-derived
@@ -13063,8 +13085,7 @@ temperature = 0.3
         )
         .await;
 
-        let (_, provider_name, _, temp) = result.expect("must resolve to alias");
-        assert_eq!(provider_name, "openai.my-classifier");
+        let (_, _, temp) = result.expect("must resolve to alias");
         assert_eq!(
             temp,
             Some(0.0),
@@ -13844,36 +13865,6 @@ api_key = "anthropic-key"
             "15551234567@s.whatsapp.net",
         );
         assert_eq!(result, "Hello");
-    }
-
-    #[test]
-    fn same_family_alias_fallback_does_not_need_channel_footer() {
-        // Reliable retains these family fields for the channel boundary even
-        // when delegate-local attribution distinguishes aliases such as
-        // `custom.primary` and `custom.backup`.
-        assert!(!fallback_crossed_provider_family("custom", "custom"));
-    }
-
-    #[test]
-    fn cross_family_fallback_needs_channel_footer() {
-        assert!(fallback_crossed_provider_family("anthropic", "openai"));
-    }
-
-    #[test]
-    fn channel_error_message_prefers_final_terminal_cause_over_transient_hint() {
-        let error = anyhow::Error::new(
-            zeroclaw_api::model_provider::TerminalCompletionFailure::from(
-                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
-            ),
-        )
-        .context("503 service unavailable");
-
-        let message = channel_error_message(&error, "sanitized provider error");
-
-        assert_eq!(
-            message,
-            "⚠️ Error: The provider reached its output token limit before completing the response."
-        );
     }
 
     #[test]
@@ -16349,18 +16340,6 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    fn is_reply_intent_classifier_request(messages: &[ChatMessage]) -> bool {
-        messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .is_some_and(|message| {
-                message
-                    .content
-                    .starts_with("Decide whether the assistant should send any visible reply")
-            })
-    }
-
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -16385,9 +16364,6 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            if is_reply_intent_classifier_request(messages) {
-                return Ok("REPLY".to_string());
-            }
             let snapshot = messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -16530,9 +16506,6 @@ BTC is currently around $65,000 based on latest tool output."#
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            if is_reply_intent_classifier_request(messages) {
-                return Ok("REPLY".to_string());
-            }
             let snapshot = messages
                 .iter()
                 .map(|m| (m.role.clone(), m.content.clone()))
@@ -16573,7 +16546,6 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
-        precheck_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
     }
 
@@ -16591,14 +16563,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn chat_with_history(
             &self,
-            messages: &[ChatMessage],
+            _messages: &[ChatMessage],
             model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            if is_reply_intent_classifier_request(messages) {
-                self.precheck_count.fetch_add(1, Ordering::SeqCst);
-                return Ok("REPLY".to_string());
-            }
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.models
                 .lock()
@@ -16639,18 +16607,10 @@ BTC is currently around $65,000 based on latest tool output."#
 
         async fn chat(
             &self,
-            request: zeroclaw_providers::ChatRequest<'_>,
+            _request: zeroclaw_providers::ChatRequest<'_>,
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
-            if is_reply_intent_classifier_request(request.messages) {
-                return Ok(zeroclaw_providers::ChatResponse {
-                    text: Some("REPLY".to_string()),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
-            }
             let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
             if call_index == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
@@ -16711,44 +16671,25 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: Option<f64>,
-        ) -> anyhow::Result<String> {
-            anyhow::bail!("precheck probe requires structured chat")
-        }
-
-        async fn chat(
-            &self,
-            request: zeroclaw_providers::ChatRequest<'_>,
+            message: &str,
             model: &str,
             _temperature: Option<f64>,
-        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+        ) -> anyhow::Result<String> {
             self.models
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
 
-            if is_reply_intent_classifier_request(request.messages) {
+            if message.starts_with("Decide whether the assistant should send any visible reply") {
                 self.precheck_calls.fetch_add(1, Ordering::SeqCst);
                 if let Some(delay) = self.precheck_delay {
                     tokio::time::sleep(delay).await;
                 }
-                return Ok(zeroclaw_providers::ChatResponse {
-                    text: Some("NO_REPLY[INFO]: background chatter".to_string()),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
+                return Ok("NO_REPLY[INFO]: background chatter".to_string());
             }
 
             self.main_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(zeroclaw_providers::ChatResponse {
-                text: Some("visible reply".to_string()),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            })
+            Ok("visible reply".to_string())
         }
     }
 
@@ -22053,6 +21994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -22511,6 +22453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -22544,6 +22487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -28134,19 +28078,7 @@ This is an example JSON object for profile settings."#;
             0
         );
         assert_eq!(
-            agent_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
-            vision_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -28299,19 +28231,7 @@ This is an example JSON object for profile settings."#;
             1
         );
         assert_eq!(
-            agent_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
-            vision_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
             0
         );
     }
@@ -28456,19 +28376,7 @@ This is an example JSON object for profile settings."#;
             1
         );
         assert_eq!(
-            agent_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
             vision_model_provider_impl.call_count.load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
-            vision_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
             0
         );
     }
@@ -28633,29 +28541,11 @@ This is an example JSON object for profile settings."#;
             0
         );
         assert_eq!(
-            agent_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
             fast_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
-            fast_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
             code_model_provider_impl.call_count.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
-            code_model_provider_impl
-                .precheck_count
-                .load(Ordering::SeqCst),
             1
         );
         assert_eq!(

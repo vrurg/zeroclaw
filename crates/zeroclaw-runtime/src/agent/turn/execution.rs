@@ -2,10 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse};
+use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{
-    ModelProvider, ProviderDispatch, multimodal, reliable_rejected_completion_usage,
+    ChatMessage, ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
 };
 
 use super::{LoopKnobs, ModelSwitchCallback};
@@ -49,11 +49,11 @@ impl ResolvedModelAccess<'_> {
             })
             .await?;
         if !response.tool_calls.is_empty() {
-            anyhow::bail!("text-only model query returned unexpected tool calls")
+            anyhow::bail!("text-only model query returned unexpected tool calls");
         }
-        response.text.ok_or_else(|| {
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
-        })
+        response
+            .text
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
     }
 
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
@@ -78,69 +78,68 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        let result = ProviderDispatch::from_ref(self.model_provider)
-            .chat_accounted(request, self.model, self.temperature)
+        let dispatcher = ProviderDispatch::from_ref(self.model_provider);
+        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let result = scope
+            .scope(dispatcher.chat(request, self.model, self.temperature))
             .await;
+        let accounting = scope.take();
 
+        // Extract before branching on the provider result: a terminal error
+        // may still contain billed rejected Reliable attempts.
+        let has_accounted_rejections = !accounting.rejected_attempts().is_empty();
+        for rejected in accounting.rejected_attempts() {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                rejected.provider_ref(),
+                rejected.model(),
+                rejected.usage(),
+            );
+        }
+
+        let accepted_route = accounting.accepted_route().cloned();
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
+            .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
         match result {
-            Ok(accounted) => {
-                // Rejected attempts were billed, but did not supply the accepted
-                // response. Record them first without updating context-window
-                // fill; the accepted response below remains its sole source.
-                if let Some(usage) = accounted.rejected_attempt_usage.as_ref() {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
-                        usage,
-                    );
-                }
-                // A direct provider can still return a semantic-empty response.
-                // Reject and account it before it can become accepted context
-                // fill or success telemetry in one-shot callers.
-                if accounted.response.is_semantically_empty_terminal() {
-                    if let Some(usage) = accounted.response.usage.as_ref() {
+            Ok(response) => {
+                // A terminal response without final text or tools was billed
+                // but cannot be accepted. Keep it out of context-window fill
+                // and successful response telemetry before returning its typed
+                // cause to every one-shot caller.
+                if response.is_semantically_empty_terminal() {
+                    if let Some(usage) = response.usage.as_ref() {
                         crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                            self.provider_name,
-                            self.model,
+                            &served_provider,
+                            &served_model,
                             usage,
                         );
                     }
-                    return Err(anyhow::Error::new(
-                        zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
-                    ));
+                    return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
-                // Only a semantically accepted response contributes context
-                // fill or successful-response accounting.
-                if let Some(usage) = accounted.response.usage.as_ref() {
+                zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+                // Only a semantically valid result controls accepted context
+                // usage and successful response telemetry.
+                if let Some(usage) = response.usage.as_ref() {
                     crate::agent::cost::record_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
+                        &served_provider,
+                        &served_model,
                         usage,
                     );
                 }
-                Ok(accounted.response)
+                Ok(response)
             }
             Err(error) => {
                 // Accounted dispatch carries rejected usage on failures in the
                 // typed Reliable error chain. Keep the original error intact so
                 // terminal-cause classification remains the provider's source
                 // of truth.
-                if let Some(usage) = reliable_rejected_completion_usage(&error) {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
-                        usage,
-                    );
-                } else if let Some(terminal) =
-                    zeroclaw_api::model_provider::terminal_completion_failure(&error)
-                    && zeroclaw_providers::terminal_completion_context(&error)
-                        .map(zeroclaw_providers::TerminalCompletionContext::policy)
-                        .unwrap_or_else(|| {
-                            zeroclaw_providers::default_terminal_policy(terminal.reason)
-                        })
-                        .usage_chargeability()
-                        == zeroclaw_providers::TerminalUsageChargeability::Billable
-                    && let Some(usage) = terminal.usage.as_ref()
+                if !has_accounted_rejections
+                    && let Some(usage) = error.chain().find_map(|cause| {
+                        cause
+                            .downcast_ref::<ReliableRejectedCompletionUsage>()
+                            .map(|rejected| &rejected.usage)
+                    })
                 {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         self.provider_name,
@@ -275,12 +274,12 @@ mod run_model_query_tests {
         atomic::{AtomicUsize, Ordering},
     };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, ToolCall,
+    };
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::TokenUsage;
-    use zeroclaw_providers::{
-        ChatMessage, ModelProvider, ReliableRejectedCompletionUsage, ToolCall,
-    };
+    use zeroclaw_providers::{ChatMessage, ModelProvider, ReliableRejectedCompletionUsage};
 
     /// Provider stub returning a fixed reply WITH token usage, so the seam's
     /// cost-recording path has something to record.
@@ -376,7 +375,52 @@ mod run_model_query_tests {
         }
     }
 
+    struct DirectResponseProvider {
+        response: ChatResponse,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DirectResponseProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(self.response.clone())
+        }
+    }
+
+    impl Attributable for DirectResponseProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "direct-response-test"
+        }
+    }
+
     fn access(provider: &UsageProvider) -> ResolvedModelAccess<'_> {
+        ResolvedModelAccess {
+            model_provider: provider,
+            provider_name: "custom",
+            model: "test-model",
+            temperature: None,
+        }
+    }
+
+    fn direct_access(provider: &DirectResponseProvider) -> ResolvedModelAccess<'_> {
         ResolvedModelAccess {
             model_provider: provider,
             provider_name: "custom",
@@ -433,108 +477,6 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
-    async fn run_model_query_rejects_direct_semantic_empty_before_context_accounting() {
-        let provider = SemanticEmptyThenTextProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            persist_empty: true,
-        };
-        let messages = [ChatMessage::user("hi")];
-        let ctx = ToolLoopCostTrackingContext::usage_only();
-        let turn_usage = Arc::clone(&ctx.turn_usage);
-
-        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
-            .scope(Some(ctx), async {
-                ResolvedModelAccess {
-                    model_provider: &provider,
-                    provider_name: "direct",
-                    model: "test-model",
-                    temperature: None,
-                }
-                .run_model_query(ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                })
-                .await
-                .expect_err("direct semantic-empty response must fail")
-            })
-            .await;
-
-        assert!(error.chain().any(|cause| {
-            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
-        }));
-        let recorded = *turn_usage.lock();
-        assert_eq!(recorded.input_tokens, 80);
-        assert_eq!(recorded.output_tokens, 5);
-        assert_eq!(recorded.last_input_tokens, 0);
-    }
-
-    #[tokio::test]
-    async fn run_model_query_keeps_tool_only_response_valid() {
-        struct ToolOnlyProvider;
-
-        #[async_trait]
-        impl ModelProvider for ToolOnlyProvider {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                anyhow::bail!("unused")
-            }
-
-            async fn chat(
-                &self,
-                _request: ChatRequest<'_>,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<ChatResponse> {
-                Ok(ChatResponse {
-                    text: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-1".to_string(),
-                        name: "read".to_string(),
-                        arguments: "{}".to_string(),
-                        extra_content: None,
-                    }],
-                    usage: None,
-                    reasoning_content: None,
-                })
-            }
-        }
-
-        impl Attributable for ToolOnlyProvider {
-            fn role(&self) -> Role {
-                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
-            }
-
-            fn alias(&self) -> &str {
-                "tool-only"
-            }
-        }
-
-        let provider = ToolOnlyProvider;
-        let messages = [ChatMessage::user("hi")];
-        let response = ResolvedModelAccess {
-            model_provider: &provider,
-            provider_name: "direct",
-            model: "test-model",
-            temperature: None,
-        }
-        .run_model_query(ChatRequest {
-            messages: &messages,
-            tools: None,
-            thinking: None,
-        })
-        .await
-        .expect("tool-only structured response remains valid");
-
-        assert_eq!(response.tool_calls.len(), 1);
-    }
-
-    #[tokio::test]
     async fn run_model_query_separates_rejected_reliable_usage_from_context_fill() {
         let calls = Arc::new(AtomicUsize::new(0));
         let reliable = ReliableModelProvider::new(
@@ -575,46 +517,6 @@ mod run_model_query_tests {
             response.usage.expect("accepted usage").output_tokens,
             Some(7)
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let recorded = *turn_usage.lock();
-        assert_eq!(recorded.input_tokens, 160);
-        assert_eq!(recorded.output_tokens, 12);
-        assert_eq!(recorded.last_input_tokens, 80);
-    }
-
-    #[tokio::test]
-    async fn run_text_query_preserves_rejected_reliable_usage() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let reliable = ReliableModelProvider::new(
-            "reliable",
-            vec![(
-                "primary".to_string(),
-                Box::new(SemanticEmptyThenTextProvider {
-                    calls: Arc::clone(&calls),
-                    persist_empty: false,
-                }) as Box<dyn ModelProvider>,
-            )],
-            1,
-            1,
-        );
-        let ctx = ToolLoopCostTrackingContext::usage_only();
-        let turn_usage = Arc::clone(&ctx.turn_usage);
-
-        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
-            .scope(Some(ctx), async {
-                ResolvedModelAccess {
-                    model_provider: &reliable,
-                    provider_name: "reliable",
-                    model: "test-model",
-                    temperature: None,
-                }
-                .run_text_query(Some("system"), "hi")
-                .await
-            })
-            .await
-            .expect("the second Reliable attempt succeeds");
-
-        assert_eq!(response, "recovered");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 160);
@@ -667,5 +569,91 @@ mod run_model_query_tests {
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
         assert_eq!(recorded.last_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
+        let messages = [ChatMessage::user("hi")];
+        for text in ["", " \n\t", "<think>internal reasoning</think>"] {
+            let provider = DirectResponseProvider {
+                response: ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(TokenUsage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                },
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+            let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    direct_access(&provider)
+                        .run_model_query(ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        })
+                        .await
+                        .expect_err("direct semantic-empty response must fail")
+                })
+                .await;
+
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+            let recorded = *turn_usage.lock();
+            assert_eq!(recorded.input_tokens, 80, "case {text:?}");
+            assert_eq!(recorded.output_tokens, 5, "case {text:?}");
+            assert_eq!(recorded.last_input_tokens, 0, "case {text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_model_query_keeps_direct_tool_only_response_valid() {
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            },
+        };
+        let messages = [ChatMessage::user("hi")];
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                direct_access(&provider)
+                    .run_model_query(ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    })
+                    .await
+            })
+            .await
+            .expect("a direct tool-only response remains valid");
+
+        assert!(response.has_tool_calls());
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 80);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 80);
     }
 }

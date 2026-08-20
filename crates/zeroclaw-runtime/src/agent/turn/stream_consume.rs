@@ -2,9 +2,9 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamFailureWithoutOutput, StreamInterruptedAfterOutput,
-    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
-    StreamTerminalCompletion, ToolLoopCancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
+    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
+    StreamSemanticEmptyCompletion, StreamTerminalCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -119,9 +119,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     // exactly like the pre-consolidation engine's
                     // committed-partial-on-cancel.
                     if forwarded_text.is_empty() {
-                        return Err(ToolLoopCancelled.into());
+                        return Err(StreamCancelledWithUsage::new(outcome.usage.clone()).into());
                     }
-                    return Err(StreamCancelledAfterOutput::new(forwarded_text).into());
+                    return Err(
+                        StreamCancelledAfterOutput::with_usage(
+                            forwarded_text,
+                            outcome.usage.clone(),
+                        )
+                        .into(),
+                    );
                 }
                 chunk = provider_stream.next() => chunk,
             }
@@ -153,15 +159,13 @@ pub(crate) async fn consume_provider_streaming_response(
                         } else {
                             forwarded_text
                         };
-                        return Err(StreamInterruptedAfterOutput {
-                            partial_text,
-                            message: format!(
-                                "model_provider stream incomplete: {}",
-                                failure.reason
-                            ),
-                            usage: outcome.usage.clone().or(failure.usage.clone()),
-                        }
-                        .into());
+                        let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            failure.reason,
+                            outcome.usage.clone().or(failure.usage),
+                        );
+                        return Err(
+                            StreamInterruptedAfterOutput::terminal(partial_text, failure).into(),
+                        );
                     }
                     if outcome.saw_pre_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
@@ -180,30 +184,16 @@ pub(crate) async fn consume_provider_streaming_response(
                             policy.usage_chargeability(),
                         );
                     }
-                    let failed_candidate = zeroclaw_providers::terminal_completion_context(&err)
-                        .and_then(|context| context.failed_candidate().cloned())
-                        .or_else(|| {
-                            err.downcast_ref::<zeroclaw_api::model_provider::StreamError>()
-                                .and_then(
-                                    zeroclaw_api::model_provider::StreamError::failed_candidate,
-                                )
-                                .cloned()
-                        });
-                    return Err(StreamTerminalCompletion {
-                        failure,
-                        policy,
-                        failed_candidate,
-                    }
-                    .into());
+                    return Err(StreamTerminalCompletion { failure, policy }.into());
                 }
 
                 let message = format!("model_provider stream error: {err}");
                 if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
-                    return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                    return Err(StreamInterruptedAfterOutput::transport(
+                        forwarded_text,
                         message,
-                        usage: outcome.usage,
-                    }
+                        outcome.usage,
+                    )
                     .into());
                 }
                 if outcome.saw_pre_executed_tool_activity {
@@ -217,14 +207,14 @@ pub(crate) async fn consume_provider_streaming_response(
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
                     // suppression-buffered output nobody received.
-                    return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                    return Err(StreamInterruptedAfterOutput::transport(
+                        forwarded_text,
                         message,
-                        usage: outcome.usage,
-                    }
+                        outcome.usage,
+                    )
                     .into());
                 }
-                return Err(StreamFailureWithoutOutput {
+                return Err(StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
                 }

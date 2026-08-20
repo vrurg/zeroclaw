@@ -263,12 +263,15 @@ impl ModelProvider for RouterModelProvider {
         request: ChatRequest<'_>,
         model: &str,
         temperature: Option<f64>,
-        failed_candidate: Option<&StreamProviderAttempt>,
+        _failed_candidate: Option<&StreamProviderAttempt>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, model_provider) = &self.model_providers[provider_idx];
         ProviderDispatch::from_ref(&**model_provider)
-            .chat_after_stream_failure(request, &resolved_model, temperature, failed_candidate)
+            // Reliable owns the exact selected stream entry in its active
+            // task-local accounting scope. Re-entering its normal chat path
+            // resumes after that entry without duplicating identity here.
+            .chat(request, &resolved_model, temperature)
             .await
     }
 
@@ -784,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_preserves_failed_reliable_candidate_for_stream_fallback() {
+    async fn router_reliable_stream_recovery_skips_the_selected_candidate() {
         let primary_stream_calls = Arc::new(AtomicUsize::new(0));
         let primary_chat_calls = Arc::new(AtomicUsize::new(0));
         let fallback = Arc::new(MockModelProvider::new("fallback response"));
@@ -822,39 +825,41 @@ mod tests {
             "default-model".to_string(),
         );
         let messages = vec![ChatMessage::user("hello")];
-        let mut stream = router.stream_chat(
-            ChatRequest {
-                messages: &messages,
-                tools: None,
-                thinking: None,
-            },
-            "hint:terminal",
-            Some(0.0),
-            StreamOptions::new(true),
-        );
-        let error = stream
-            .next()
-            .await
-            .expect("terminal stream emits an error")
-            .expect_err("terminal stream must not complete successfully");
-        let failed_candidate = error
-            .failed_candidate()
-            .cloned()
-            .expect("Reliable identifies the failed stream candidate");
+        let dispatcher = ProviderDispatch::from_ref(&router);
+        let scope = crate::dispatch::AccountedChatScope::new();
+        let response = scope
+            .scope(async {
+                let mut stream = dispatcher.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "hint:terminal",
+                    Some(0.0),
+                    StreamOptions::new(true),
+                );
+                stream
+                    .next()
+                    .await
+                    .expect("terminal stream emits an error")
+                    .expect_err("terminal stream must not complete successfully");
+                drop(stream);
 
-        let response = router
-            .chat_after_stream_failure(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                "hint:terminal",
-                Some(0.0),
-                Some(&failed_candidate),
-            )
+                dispatcher
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "hint:terminal",
+                        Some(0.0),
+                    )
+                    .await
+            })
             .await
-            .expect("Router forwards Reliable fallback context");
+            .expect("Router retains the Reliable recovery scope");
 
         assert_eq!(response.text.as_deref(), Some("fallback response"));
         assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
@@ -868,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_aware_router_stream_preserves_reliable_candidate_for_fallback() {
+    async fn terminal_aware_router_stream_skips_only_selected_reliable_candidate() {
         let skipped = Arc::new(MockModelProvider::new("skipped response"));
         let primary_stream_calls = Arc::new(AtomicUsize::new(0));
         let primary_chat_calls = Arc::new(AtomicUsize::new(0));
@@ -920,46 +925,50 @@ mod tests {
             thinking: None,
         };
         let dispatcher = ProviderDispatch::from_ref(&router);
-        let mut stream = dispatcher.stream_chat_terminal_aware(
-            request,
-            "hint:terminal",
-            Some(0.0),
-            StreamOptions::new(true),
-        );
-        let error = stream
-            .next()
-            .await
-            .expect("terminal stream emits an error")
-            .expect_err("terminal stream must not complete successfully");
-        let terminal = crate::terminal_completion_context(&error)
-            .expect("terminal-aware dispatch preserves the provider outcome");
-        let failed_candidate = terminal
-            .failed_candidate()
-            .expect("Reliable candidate identity survives Router and dispatch");
+        let scope = crate::dispatch::AccountedChatScope::new();
+        let response = scope
+            .scope(async {
+                let mut stream = dispatcher.stream_chat_terminal_aware(
+                    request,
+                    "hint:terminal",
+                    Some(0.0),
+                    StreamOptions::new(true),
+                );
+                let error = stream
+                    .next()
+                    .await
+                    .expect("terminal stream emits an error")
+                    .expect_err("terminal stream must not complete successfully");
+                assert!(
+                    crate::terminal_completion_context(&error).is_some(),
+                    "terminal-aware dispatch preserves the provider outcome"
+                );
+                drop(stream);
 
-        let response = dispatcher
-            .chat_after_stream_failure(
-                ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                },
-                "hint:terminal",
-                Some(0.0),
-                Some(failed_candidate),
-            )
+                dispatcher
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "hint:terminal",
+                        Some(0.0),
+                    )
+                    .await
+            })
             .await
             .expect("fallback after the exact candidate succeeds");
 
-        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(response.text.as_deref(), Some("skipped response"));
         assert_eq!(
             skipped.call_count(),
-            0,
-            "fallback must not restart at an earlier duplicate display name"
+            1,
+            "a stream-ineligible earlier entry remains eligible for non-stream recovery"
         );
         assert_eq!(primary_stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fallback.call_count(), 1);
+        assert_eq!(fallback.call_count(), 0);
     }
 
     #[tokio::test]
