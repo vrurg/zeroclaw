@@ -434,40 +434,6 @@ impl std::error::Error for TerminalCompletionFailure {
     }
 }
 
-/// Identifies the candidate that a composite provider selected for one stream.
-///
-/// The value is transient failure context: it is created by the composite
-/// provider when it wraps an inner stream error and lets that provider resume
-/// from the next candidate without persisting route state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamProviderAttempt {
-    pub provider_name: String,
-    pub model: String,
-    /// Exact candidate position within the composite provider that emitted this
-    /// transient failure context. Display names are diagnostic and need not be
-    /// unique, so the owning composite uses this position for continuation.
-    pub candidate_index: usize,
-}
-
-/// Wraps an inner stream error with the composite candidate that produced it.
-#[derive(Debug)]
-pub struct StreamCandidateFailure {
-    pub attempt: StreamProviderAttempt,
-    pub source: Box<StreamError>,
-}
-
-impl std::fmt::Display for StreamCandidateFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
-    }
-}
-
-impl std::error::Error for StreamCandidateFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.source.as_ref())
-    }
-}
-
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -486,10 +452,6 @@ pub enum StreamError {
     /// The provider reached a terminal state that does not yield a complete answer.
     #[error(transparent)]
     TerminalCompletion(#[from] TerminalCompletionFailure),
-
-    /// A composite provider records which candidate produced the inner error.
-    #[error(transparent)]
-    CandidateFailure(#[from] StreamCandidateFailure),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -522,24 +484,10 @@ impl StreamError {
     pub fn terminal_completion_failure(&self) -> Option<&TerminalCompletionFailure> {
         match self {
             Self::TerminalCompletion(failure) => Some(failure),
-            Self::CandidateFailure(candidate) => candidate.source.terminal_completion_failure(),
             Self::Http(_)
             | Self::Json(_)
             | Self::InvalidSse(_)
             | Self::ModelProvider(_)
-            | Self::Io(_) => None,
-        }
-    }
-
-    /// Returns the composite candidate that produced this stream error, if any.
-    pub fn failed_candidate(&self) -> Option<&StreamProviderAttempt> {
-        match self {
-            Self::CandidateFailure(candidate) => Some(&candidate.attempt),
-            Self::Http(_)
-            | Self::Json(_)
-            | Self::InvalidSse(_)
-            | Self::ModelProvider(_)
-            | Self::TerminalCompletion(_)
             | Self::Io(_) => None,
         }
     }
@@ -839,21 +787,6 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         })
     }
 
-    /// Continue a no-output streaming failure with a non-streaming request.
-    ///
-    /// Only composite providers that can authenticate `failed_candidate` may
-    /// continue. The default fails closed so a terminal response is never
-    /// replayed against the same provider.
-    async fn chat_after_stream_failure(
-        &self,
-        _request: ChatRequest<'_>,
-        _model: &str,
-        _temperature: Option<f64>,
-        _failed_candidate: Option<&StreamProviderAttempt>,
-    ) -> anyhow::Result<ChatResponse> {
-        anyhow::bail!("cannot continue terminal stream failure without an exact candidate chain")
-    }
-
     /// Whether model_provider supports native tool calls over API.
     fn supports_native_tools(&self) -> bool {
         self.capabilities().native_tool_calling
@@ -1029,18 +962,6 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         self.as_ref().chat(request, model, temperature).await
-    }
-
-    async fn chat_after_stream_failure(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: Option<f64>,
-        failed_candidate: Option<&StreamProviderAttempt>,
-    ) -> anyhow::Result<ChatResponse> {
-        self.as_ref()
-            .chat_after_stream_failure(request, model, temperature, failed_candidate)
-            .await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {

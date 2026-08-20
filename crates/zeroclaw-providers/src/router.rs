@@ -1,8 +1,7 @@
 use super::ModelProvider;
 use super::dispatch::ProviderDispatch;
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions,
-    StreamProviderAttempt, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -254,23 +253,6 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, model_provider) = &self.model_providers[provider_idx];
         ProviderDispatch::from_ref(&**model_provider)
-            .chat(request, &resolved_model, temperature)
-            .await
-    }
-
-    async fn chat_after_stream_failure(
-        &self,
-        request: ChatRequest<'_>,
-        model: &str,
-        temperature: Option<f64>,
-        _failed_candidate: Option<&StreamProviderAttempt>,
-    ) -> anyhow::Result<ChatResponse> {
-        let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        ProviderDispatch::from_ref(&**model_provider)
-            // Reliable owns the exact selected stream entry in its active
-            // task-local accounting scope. Re-entering its normal chat path
-            // resumes after that entry without duplicating identity here.
             .chat(request, &resolved_model, temperature)
             .await
     }

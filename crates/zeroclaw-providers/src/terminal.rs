@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{
-    StreamError, StreamProviderAttempt, TerminalCompletionError, TerminalCompletionFailure,
+    StreamError, TerminalCompletionError, TerminalCompletionFailure,
 };
 
 #[derive(Debug, Clone)]
@@ -63,19 +63,15 @@ pub(crate) fn contextualize_terminal_stream_error(
     error: StreamError,
 ) -> anyhow::Error {
     let failure = error.terminal_completion_failure().cloned();
-    let attempt = error.failed_candidate().cloned();
     let published = slot
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
     match (failure, published) {
-        (Some(failure), Some(published)) if failure.reason == published.reason => match attempt {
-            Some(attempt) => {
-                terminal_completion_context_error_with_attempt(failure, published.policy, attempt)
-            }
-            None => terminal_completion_context_error(failure, published.policy),
-        },
+        (Some(failure), Some(published)) if failure.reason == published.reason => {
+            terminal_completion_context_error(failure, published.policy)
+        }
         _ => anyhow::Error::from(error),
     }
 }
@@ -144,7 +140,6 @@ pub const fn default_terminal_policy(reason: TerminalCompletionError) -> Termina
 pub struct TerminalCompletionContext {
     failure: TerminalCompletionFailure,
     policy: TerminalCompletionPolicy,
-    failed_candidate: Option<StreamProviderAttempt>,
 }
 
 impl TerminalCompletionContext {
@@ -156,11 +151,6 @@ impl TerminalCompletionContext {
     #[must_use]
     pub const fn policy(&self) -> TerminalCompletionPolicy {
         self.policy
-    }
-
-    #[must_use]
-    pub fn failed_candidate(&self) -> Option<&StreamProviderAttempt> {
-        self.failed_candidate.as_ref()
     }
 }
 
@@ -181,24 +171,7 @@ pub(crate) fn terminal_completion_context_error(
     failure: TerminalCompletionFailure,
     policy: TerminalCompletionPolicy,
 ) -> anyhow::Error {
-    anyhow::Error::new(TerminalCompletionContext {
-        failure,
-        policy,
-        failed_candidate: None,
-    })
-}
-
-#[must_use]
-pub(crate) fn terminal_completion_context_error_with_attempt(
-    failure: TerminalCompletionFailure,
-    policy: TerminalCompletionPolicy,
-    failed_candidate: StreamProviderAttempt,
-) -> anyhow::Error {
-    anyhow::Error::new(TerminalCompletionContext {
-        failure,
-        policy,
-        failed_candidate: Some(failed_candidate),
-    })
+    anyhow::Error::new(TerminalCompletionContext { failure, policy })
 }
 
 #[must_use]
