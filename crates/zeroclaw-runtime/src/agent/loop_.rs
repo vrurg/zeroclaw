@@ -158,6 +158,26 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// The single autosave decision for a turn's user-side text, shared by both
+/// store sites in this file so the gates cannot drift apart.
+///
+/// Order matters for meaning, not correctness: the origin gate
+/// (`should_autosave_origin`) is the load-bearing check — scheduled and
+/// parent-composed origins are known internal synthetic producers, whatever
+/// their text looks like. The content filter remains as a backstop for
+/// synthetic shapes that arrive on autosave-eligible origins (e.g. replayed
+/// histories).
+fn should_autosave_user_message(
+    auto_save: bool,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    content: &str,
+) -> bool {
+    auto_save
+        && zeroclaw_memory::should_autosave_origin(origin)
+        && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(content)
+}
+
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -488,11 +508,15 @@ pub(crate) fn compute_excluded_mcp_tools(
 
 pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
+    model: &str,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<bool> {
-    if !model_provider.supports_native_tools() {
+    if !model_provider
+        .capabilities_for_model(model)
+        .native_tool_calling
+    {
         return Ok(false);
     }
 
@@ -597,10 +621,14 @@ pub(crate) fn build_system_prompt_for_turn(
     inject_memory: bool,
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
+    shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
 ) -> Result<String> {
-    let native_tools = model_provider.supports_native_tools();
+    let native_tools = model_provider
+        .capabilities_for_model(model_name)
+        .native_tool_calling;
     let native_tool_specs_present = native_tool_specs_present_for_turn(
         model_provider,
+        model_name,
         tools_registry,
         excluded_tools,
         activated_tools,
@@ -634,6 +662,7 @@ pub(crate) fn build_system_prompt_for_turn(
         max_system_prompt_chars,
         inject_memory,
         show_tool_calls,
+        shell_profile,
     );
 
     if expose_text_tool_protocol {
@@ -1301,12 +1330,13 @@ pub async fn run(
         // available on this path (CLI agent run). No channel map is wired on this
         // path, so the approval route adapter is the no-op (log-only); the daemon
         // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -1681,6 +1711,7 @@ pub async fn run(
             true,
             config.channels.show_tool_calls,
             None,
+            runtime.shell_profile().as_ref(),
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1775,6 +1806,7 @@ pub async fn run(
                 true,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
+                runtime.shell_profile().as_ref(),
             )?;
 
             let excluded_tool_names: HashSet<&str> =
@@ -1800,11 +1832,9 @@ pub async fn run(
                 return Ok(final_output);
             }
 
-            // Auto-save user message to memory (skip short/trivial messages)
-            if config.memory.auto_save
-                && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
-            {
+            // Auto-save user message to memory (skip autonomous origins
+            // and short/trivial or synthetic messages).
+            if should_autosave_user_message(config.memory.auto_save, origin, &effective_msg) {
                 let user_key = autosave_memory_key("user_msg");
                 let store_start = std::time::Instant::now();
                 let store_result = mem
@@ -1896,6 +1926,7 @@ pub async fn run(
                         true,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
+                        runtime.shell_profile().as_ref(),
                     )?;
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2318,11 +2349,9 @@ pub async fn run(
                     continue;
                 }
 
-                // Auto-save conversation turns (skip short/trivial messages)
-                if config.memory.auto_save
-                    && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                    && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-                {
+                // Auto-save conversation turns (skip autonomous origins
+                // and short/trivial or synthetic messages).
+                if should_autosave_user_message(config.memory.auto_save, origin, &effective_input) {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
                     let store_result = mem
@@ -2453,6 +2482,7 @@ pub async fn run(
                             true,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
+                            runtime.shell_profile().as_ref(),
                         )?;
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2909,12 +2939,13 @@ pub async fn process_message(
         // available on this path (process_message CLI agent). No channel map is
         // wired here, so the approval route adapter is the no-op (log-only); the
         // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -3155,9 +3186,12 @@ pub async fn process_message(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
+        let native_tools = model_provider
+            .capabilities_for_model(&model_name)
+            .native_tool_calling;
         let native_tool_specs_present = native_tool_specs_present_for_turn(
             model_provider.as_ref(),
+            &model_name,
             &tools_registry,
             &excluded_tools,
             activated_handle_pm.as_ref(),
@@ -3184,6 +3218,7 @@ pub async fn process_message(
                 eff_max_system_prompt_chars,
                 false,
                 config.channels.show_tool_calls,
+                runtime.shell_profile().as_ref(),
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -3370,6 +3405,64 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
+    /// One decision, four gates. The origin gate is the load-bearing one:
+    /// the heartbeat session-context shape defeats the content filter (it no
+    /// longer starts with `[Heartbeat Task`), and only the origin check
+    /// stops it. Interactive remains autosave-eligible for that same text,
+    /// which pins that the fix keys on trusted caller provenance, not on
+    /// smarter content sniffing or human-authorship detection.
+    #[test]
+    fn autosave_decision_keys_on_origin_before_content() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked_heartbeat_shape = "[Recent conversation history — use this for context \
+             when composing your message] (last message ~5 minutes ago)\nUser: how was the \
+             deploy?\n\n[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Daemon, leaked_heartbeat_shape),
+            "a heartbeat turn must not autosave its synthetic prompt, whatever its shape"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Cron, "[cron:job-1 build] check"),
+            "cron prompts stay suppressed (origin now, prefix as backstop)"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::SubTurn, leaked_heartbeat_shape),
+            "known parent-composed sub-turn text is not autosave-eligible"
+        );
+
+        assert!(
+            should_autosave_user_message(true, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "interactive provenance remains autosave-eligible regardless of prompt shape"
+        );
+        assert!(
+            should_autosave_user_message(
+                true,
+                TurnOrigin::Channel,
+                "please remember I prefer staged rollouts"
+            ),
+            "channel provenance remains autosave-eligible even when a peer may be automated"
+        );
+
+        assert!(
+            !should_autosave_user_message(false, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "auto_save off wins over everything"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Interactive, "short msg"),
+            "the length floor is unchanged"
+        );
+        assert!(
+            !should_autosave_user_message(
+                true,
+                TurnOrigin::Interactive,
+                "[cron:job-1 build] check the build status now"
+            ),
+            "the content backstop still filters synthetic shapes on user origins"
+        );
+    }
 
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
@@ -13014,9 +13107,14 @@ Let me check the result."#;
         let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
             vec![Box::new(CountingTool::new("shell", invocations))];
 
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &tools_registry, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &tools_registry,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
         assert!(native_tool_specs_present);
 
         let system_prompt = build_system_prompt_with_mode(
@@ -13054,6 +13152,7 @@ Let me check the result."#;
 
         let native_tool_specs_present = super::native_tool_specs_present_for_turn(
             &provider,
+            "test-model",
             &tools_registry,
             &excluded_tools,
             None,
@@ -13088,9 +13187,14 @@ Let me check the result."#;
         ));
 
         let no_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &no_tools, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &no_tools,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
 
         assert!(
             !native_tool_specs_present,
@@ -13144,6 +13248,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            None,
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13175,6 +13280,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("no-tools turn prompt should build");
@@ -13210,6 +13316,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("tools turn prompt should build");
@@ -13277,6 +13384,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("compact-mode text prompt should build");
