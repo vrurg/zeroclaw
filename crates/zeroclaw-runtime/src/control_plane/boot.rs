@@ -28,15 +28,19 @@ impl ControlPlaneHandle {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let sqlite_store = SqliteTaskStore::new(data_dir)?;
+        let goal_recovered = sqlite_store.recover_goal_state_on_boot(&boot_id)?;
+        let store: Arc<dyn TaskRegistry> = Arc::new(sqlite_store);
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
-        if reclaimed > 0 {
+        if reclaimed > 0 || goal_recovered > 0 {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(
-                        ::serde_json::json!({ "reclaimed": reclaimed, "boot_id": boot_id })
-                    ),
+                    .with_attrs(::serde_json::json!({
+                        "reclaimed": reclaimed,
+                        "goal_recovered": goal_recovered,
+                        "boot_id": boot_id,
+                    })),
                 "control-plane: reclaimed prior-boot orphan tasks at startup"
             );
         }
@@ -96,6 +100,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
