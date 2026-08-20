@@ -221,6 +221,15 @@ pub struct Config {
     #[group = "Agent"]
     pub reliability: ReliabilityConfig,
 
+    /// Experimental Goal Mode controller configuration (`[goal]`).
+    ///
+    /// The section is dormant by default. Configuration alone never starts
+    /// autonomous work or exposes a command surface.
+    #[serde(default, skip_serializing_if = "GoalConfig::is_disabled")]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: GoalConfig,
+
     /// Scheduler configuration for periodic task execution (`[scheduler]`).
     #[serde(default)]
     #[nested]
@@ -12985,6 +12994,56 @@ impl Default for ReliabilityConfig {
     }
 }
 
+// ── Goal Mode ────────────────────────────────────────────────────
+
+/// Experimental Goal Mode configuration (`[goal]`).
+///
+/// Limits are admission limits interpreted later against the canonical cost
+/// ledger; they are not mutable remaining-budget counters. The verifier keeps
+/// an independently configured provider reference.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal"]
+pub struct GoalConfig {
+    /// Enable experimental Goal Mode admission. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional positive total-token limit applied by `/goal start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_token_limit: Option<u64>,
+    /// Optional finite positive USD limit applied by `/goal start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cost_limit_usd: Option<f64>,
+    /// The isolated verifier selection used for each Goal candidate.
+    #[serde(default)]
+    #[nested]
+    pub verifier: GoalVerifierConfig,
+}
+
+impl GoalConfig {
+    /// Whether omitting this optional section preserves current behavior.
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+            && self.default_token_limit.is_none()
+            && self.default_cost_limit_usd.is_none()
+            && self.verifier.provider.is_empty()
+            && self.verifier.model.is_none()
+    }
+}
+
+/// Verifier provider/model selection (`[goal.verifier]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "goal.verifier"]
+pub struct GoalVerifierConfig {
+    /// Existing configured provider/profile reference.
+    #[serde(default)]
+    pub provider: String,
+    /// Optional verifier model override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 // ── Scheduler ────────────────────────────────────────────────────
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
@@ -18740,6 +18799,7 @@ impl Default for Config {
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
@@ -20833,6 +20893,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        validate_goal_config(&self.goal, &self.providers.models)?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -22893,6 +22954,64 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn validate_goal_config(
+    goal: &GoalConfig,
+    providers: &crate::providers::ModelProviders,
+) -> Result<()> {
+    if goal
+        .default_token_limit
+        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.default_token_limit",
+            "goal.default_token_limit must be between 1 and the SQLite INTEGER maximum"
+        );
+    }
+    if goal
+        .default_cost_limit_usd
+        .is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        validation_bail!(
+            InvalidNumericRange,
+            "goal.default_cost_limit_usd",
+            "goal.default_cost_limit_usd must be finite and greater than 0"
+        );
+    }
+    if goal
+        .verifier
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        validation_bail!(
+            RequiredFieldEmpty,
+            "goal.verifier.model",
+            "goal.verifier.model must not be empty when configured"
+        );
+    }
+    if !goal.enabled {
+        return Ok(());
+    }
+
+    let provider = goal.verifier.provider.trim();
+    if provider.is_empty() {
+        validation_bail!(
+            RequiredFieldEmpty,
+            "goal.verifier.provider",
+            "goal.enabled requires goal.verifier.provider"
+        );
+    }
+    if providers.find_by_name(provider).is_none() {
+        validation_bail!(
+            DanglingReference,
+            "goal.verifier.provider",
+            "goal.verifier.provider = {provider:?} does not resolve to a configured model provider"
+        );
+    }
+    Ok(())
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -27569,6 +27688,7 @@ auto_save = true
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -28595,6 +28715,7 @@ default_temperature = 0.7
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
+            goal: GoalConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
