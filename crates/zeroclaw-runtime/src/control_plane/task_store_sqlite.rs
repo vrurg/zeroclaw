@@ -4,14 +4,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 11;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -34,7 +34,7 @@ impl SqliteTaskStore {
         Self::init(Connection::open_in_memory().context("open in-memory control-plane DB")?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -69,7 +69,7 @@ impl SqliteTaskStore {
                 ON tasks(agent, kind, started_at DESC);",
         )
         .context("create control-plane base schema")?;
-        migrate_schema(&conn).context("migrate control-plane schema")?;
+        migrate_schema(&mut conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -97,9 +97,16 @@ impl SqliteTaskStore {
             .context("delete tasks by agent")?;
         Ok(n as u64)
     }
+
+    /// Goal-specific boot recovery runs before generic task reaping, so a
+    /// restart cannot reclassify a goal with an unsettled provider operation as
+    /// ordinary lost work.
+    pub(crate) fn recover_goal_state_on_boot(&self, boot_id: &str) -> Result<usize> {
+        goal::recover_on_boot(self, boot_id)
+    }
 }
 
-fn migrate_schema(conn: &Connection) -> Result<()> {
+fn migrate_schema(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
@@ -192,6 +199,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -232,8 +241,8 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
              parent_id, originator_route, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             session_id, execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -249,6 +258,8 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
@@ -301,8 +312,20 @@ fn claim_task_owner_record(
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
-        let conn = self.conn.lock();
-        insert_task_record(&conn, rec)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start idempotent task registration")?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            params![&rec.id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        insert_task_record(&tx, rec)?;
+        tx.commit().context("commit task registration")?;
         Ok(())
     }
 
@@ -418,6 +441,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
