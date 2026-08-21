@@ -962,9 +962,10 @@ async fn planned_non_streaming_payloads_for_provider_ref(
     model: &str,
     temperature: Option<f64>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
-    let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
-        anyhow::Error::msg("wire-payload planning requires a configured provider alias")
-    })?;
+    let (family, alias, configured_alias) = match provider_ref.split_once('.') {
+        Some((family, alias)) => (family, alias, true),
+        None => (provider_ref, "default", false),
+    };
     let provider_kind = options
         .provider_kind
         .as_deref()
@@ -973,7 +974,7 @@ async fn planned_non_streaming_payloads_for_provider_ref(
         .map(canonicalize_v2_model_provider_name)
         .unwrap_or_else(|| canonicalize_v2_model_provider_name(family));
     let payloads = factory::dispatch_family_payload_planner(
-        Some(config),
+        configured_alias.then_some(config),
         provider_kind,
         alias,
         options.provider_api_url.as_deref(),
@@ -5089,6 +5090,36 @@ mod tests {
 
         assert_eq!(payload_sizes.len(), 1);
         assert!(payload_sizes[0] > 48);
+    }
+
+    #[tokio::test]
+    async fn bare_openai_reference_uses_the_factory_default_wire_plan() {
+        use zeroclaw_config::schema::Config;
+
+        let config = Config::default();
+        let options = ModelProviderRuntimeOptions {
+            provider_max_tokens: Some(32),
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let messages = vec![ChatMessage::user("hello")];
+
+        let payload_sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            &config,
+            "openai",
+            &options,
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-5",
+            None,
+        )
+        .await
+        .expect("a bare OpenAI reference must plan through the factory default");
+
+        assert_eq!(payload_sizes.len(), 1);
+        assert!(payload_sizes[0] > 32);
     }
 
     #[test]
