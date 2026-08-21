@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
-    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalResumeSafety,
+    GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult,
+    TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -323,6 +324,121 @@ pub(super) fn migrate_schema(conn: &mut Connection, version: i64) -> Result<()> 
         .context("apply control-plane schema v11")?;
         tx.commit().context("commit control-plane schema v11")?;
     }
+    if version < 12 {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start control-plane schema v12")?;
+        add_column_if_missing(
+            &tx,
+            "goal_tasks",
+            "success_criteria",
+            "ALTER TABLE goal_tasks ADD COLUMN success_criteria TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "goal_tasks",
+            "pending_reserved_tokens",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_reserved_tokens INTEGER",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "goal_tasks",
+            "pending_reserved_cost_usd",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_reserved_cost_usd REAL",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "goal_tasks",
+            "resume_safety",
+            "ALTER TABLE goal_tasks ADD COLUMN resume_safety TEXT NOT NULL DEFAULT 'clean'",
+        )?;
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_goal_success_criteria_insert;
+             DROP TRIGGER IF EXISTS trg_goal_success_criteria_update;
+             DROP TRIGGER IF EXISTS trg_goal_session_objective_insert;
+             DROP TRIGGER IF EXISTS trg_goal_session_objective_update;
+             DROP TRIGGER IF EXISTS trg_goal_pending_reservation_insert;
+             DROP TRIGGER IF EXISTS trg_goal_pending_reservation_update;
+             DROP TRIGGER IF EXISTS trg_goal_resume_safety_insert;
+             DROP TRIGGER IF EXISTS trg_goal_resume_safety_update;
+             CREATE TRIGGER trg_goal_success_criteria_insert
+                BEFORE INSERT ON goal_tasks FOR EACH ROW
+                WHEN length(trim(NEW.success_criteria, char(9) || char(10) || char(11) || char(12) || char(13) || char(32) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288))) = 0
+                BEGIN SELECT RAISE(ABORT, 'goal success criteria must be nonblank'); END;
+             CREATE TRIGGER trg_goal_session_objective_insert
+                BEFORE INSERT ON goal_tasks FOR EACH ROW
+                WHEN length(trim(NEW.objective, char(9) || char(10) || char(11) || char(12) || char(13) || char(32) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288))) = 0
+                 AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND session_id IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'session goal objective must be nonblank'); END;
+             CREATE TRIGGER trg_goal_success_criteria_update
+                BEFORE UPDATE OF success_criteria ON goal_tasks FOR EACH ROW
+                WHEN NEW.success_criteria IS NOT OLD.success_criteria
+                BEGIN SELECT RAISE(ABORT, 'goal success criteria cannot be changed'); END;
+             CREATE TRIGGER trg_goal_session_objective_update
+                BEFORE UPDATE OF objective ON goal_tasks FOR EACH ROW
+                WHEN NEW.objective IS NOT OLD.objective
+                 AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = OLD.task_id AND kind = 'goal' AND session_id IS NOT NULL
+                 )
+                BEGIN SELECT RAISE(ABORT, 'session goal objective cannot be changed'); END;
+             CREATE TRIGGER trg_goal_pending_reservation_insert
+                BEFORE INSERT ON goal_tasks FOR EACH ROW
+                WHEN (NEW.pending_call_id IS NULL
+                      AND (NEW.pending_reserved_tokens IS NOT NULL
+                           OR NEW.pending_reserved_cost_usd IS NOT NULL))
+                  OR (NEW.pending_call_id IS NOT NULL
+                      AND (length(trim(NEW.pending_call_id)) = 0
+                           OR NEW.pending_call_epoch < 1
+                           OR (NEW.effective_token_limit IS NOT NULL
+                               AND NEW.pending_reserved_tokens IS NULL)
+                           OR (NEW.effective_cost_limit_usd IS NOT NULL
+                               AND NEW.pending_reserved_cost_usd IS NULL)))
+                  OR (NEW.pending_reserved_tokens IS NOT NULL
+                      AND NEW.pending_reserved_tokens < 0)
+                  OR (NEW.pending_reserved_cost_usd IS NOT NULL
+                      AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                               AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
+                BEGIN SELECT RAISE(ABORT, 'invalid goal pending reservation'); END;
+             CREATE TRIGGER trg_goal_pending_reservation_update
+                BEFORE UPDATE OF pending_call_id, pending_call_epoch, pending_reserved_tokens,
+                                 pending_reserved_cost_usd, effective_token_limit,
+                                 effective_cost_limit_usd ON goal_tasks FOR EACH ROW
+                WHEN (NEW.pending_call_id IS NULL
+                      AND (NEW.pending_reserved_tokens IS NOT NULL
+                           OR NEW.pending_reserved_cost_usd IS NOT NULL))
+                  OR (OLD.pending_call_id IS NULL AND NEW.pending_call_id IS NOT NULL
+                      AND (length(trim(NEW.pending_call_id)) = 0
+                           OR NEW.pending_call_epoch < 1
+                           OR (NEW.effective_token_limit IS NOT NULL
+                               AND NEW.pending_reserved_tokens IS NULL)
+                           OR (NEW.effective_cost_limit_usd IS NOT NULL
+                               AND NEW.pending_reserved_cost_usd IS NULL)))
+                  OR (OLD.pending_call_id IS NOT NULL AND NEW.pending_call_id IS NOT NULL
+                      AND (NEW.pending_call_id IS NOT OLD.pending_call_id
+                           OR NEW.pending_call_epoch IS NOT OLD.pending_call_epoch
+                           OR NEW.pending_reserved_tokens IS NOT OLD.pending_reserved_tokens
+                           OR NEW.pending_reserved_cost_usd IS NOT OLD.pending_reserved_cost_usd))
+                  OR (NEW.pending_reserved_tokens IS NOT NULL
+                      AND NEW.pending_reserved_tokens < 0)
+                  OR (NEW.pending_reserved_cost_usd IS NOT NULL
+                      AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                               AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
+                BEGIN SELECT RAISE(ABORT, 'invalid goal pending reservation'); END;
+             CREATE TRIGGER trg_goal_resume_safety_insert
+                BEFORE INSERT ON goal_tasks FOR EACH ROW
+                WHEN NEW.resume_safety NOT IN ('clean','tool_executed')
+                BEGIN SELECT RAISE(ABORT, 'invalid goal resume safety'); END;
+             CREATE TRIGGER trg_goal_resume_safety_update
+                BEFORE UPDATE OF resume_safety ON goal_tasks FOR EACH ROW
+                WHEN NEW.resume_safety NOT IN ('clean','tool_executed')
+                   OR (OLD.resume_safety = 'tool_executed' AND NEW.resume_safety != 'tool_executed')
+                BEGIN SELECT RAISE(ABORT, 'goal resume safety cannot be relaxed'); END;
+             PRAGMA user_version = 12;",
+        )
+        .context("apply control-plane schema v12")?;
+        tx.commit().context("commit control-plane schema v12")?;
+    }
     Ok(())
 }
 
@@ -340,6 +456,20 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
                 execution_epoch = execution_epoch + 1
           WHERE kind = 'goal' AND session_id IS NULL
             AND status IN ('running','paused')",
+        params![&now],
+    )?;
+    let legacy_missing_criteria = tx.execute(
+        "UPDATE tasks
+            SET status = 'failed', error = COALESCE(error, 'legacy_goal_missing_success_criteria'),
+                finished_at = COALESCE(finished_at, ?1),
+                execution_epoch = execution_epoch + 1
+          WHERE kind = 'goal' AND session_id IS NOT NULL
+            AND status IN ('running','paused')
+            AND EXISTS (
+                SELECT 1 FROM goal_tasks
+                 WHERE task_id = tasks.id
+                   AND length(trim(success_criteria, char(9) || char(10) || char(11) || char(12) || char(13) || char(32) || char(133) || char(160) || char(5760) || char(8192) || char(8193) || char(8194) || char(8195) || char(8196) || char(8197) || char(8198) || char(8199) || char(8200) || char(8201) || char(8202) || char(8232) || char(8233) || char(8239) || char(8287) || char(12288))) = 0
+            )",
         params![&now],
     )?;
     tx.execute(
@@ -406,7 +536,7 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
         params![boot_id],
     )?;
     tx.commit().context("commit goal boot recovery")?;
-    Ok(legacy + uncertain + paused)
+    Ok(legacy + legacy_missing_criteria + uncertain + paused)
 }
 
 fn ensure_goal_task_identity(task: &TaskRecord, goal: &GoalTaskRecord) -> Result<()> {
@@ -427,12 +557,17 @@ fn ensure_fresh_session_goal(task: &TaskRecord, goal: &GoalTaskRecord) -> Result
     if task.status != TaskStatus::Running || task.finished_at.is_some() {
         anyhow::bail!("new session goals must start running without terminal metadata");
     }
-    if goal.pause_reason.is_some()
+    if goal.objective.trim().is_empty()
+        || goal.success_criteria.trim().is_empty()
+        || goal.pause_reason.is_some()
         || goal.pause_description.is_some()
         || !goal.blockers.is_empty()
         || goal.pending_call_id.is_some()
         || goal.pending_call_epoch.is_some()
+        || goal.pending_reserved_tokens.is_some()
+        || goal.pending_reserved_cost_usd.is_some()
         || goal.accounting_state != GoalAccountingState::Complete
+        || goal.resume_safety != GoalResumeSafety::Clean
     {
         anyhow::bail!("new session goals must not include pause or accounting state");
     }
@@ -515,6 +650,14 @@ fn cost_limit_from_db(value: Option<f64>) -> rusqlite::Result<Option<f64>> {
     }
 }
 
+fn reservation_tokens_from_db(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
+    token_limit_from_db(value)
+}
+
+fn reservation_cost_from_db(value: Option<f64>) -> rusqlite::Result<Option<f64>> {
+    cost_limit_from_db(value)
+}
+
 fn goal_limits_to_db(
     token_limit: Option<u64>,
     cost_limit_usd: Option<f64>,
@@ -539,7 +682,11 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
         blockers: blockers_from_db(row.get("blockers_json")?)?,
         pending_call_id: row.get("pending_call_id")?,
         pending_call_epoch: row.get("pending_call_epoch")?,
+        pending_reserved_tokens: reservation_tokens_from_db(row.get("pending_reserved_tokens")?)?,
+        pending_reserved_cost_usd: reservation_cost_from_db(row.get("pending_reserved_cost_usd")?)?,
         accounting_state: accounting_state_from_db(row.get("accounting_state")?)?,
+        success_criteria: row.get("success_criteria")?,
+        resume_safety: resume_safety_from_db(row.get("resume_safety")?)?,
     })
 }
 
@@ -566,6 +713,25 @@ fn accounting_state_from_db(value: String) -> rusqlite::Result<GoalAccountingSta
     }
 }
 
+fn resume_safety_to_db(value: GoalResumeSafety) -> &'static str {
+    match value {
+        GoalResumeSafety::Clean => "clean",
+        GoalResumeSafety::ToolExecuted => "tool_executed",
+    }
+}
+
+fn resume_safety_from_db(value: String) -> rusqlite::Result<GoalResumeSafety> {
+    match value.as_str() {
+        "clean" => Ok(GoalResumeSafety::Clean),
+        "tool_executed" => Ok(GoalResumeSafety::ToolExecuted),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown goal resume safety {value:?}").into(),
+        )),
+    }
+}
+
 fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
@@ -573,14 +739,16 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
         goal_limits_to_db(rec.effective_token_limit, rec.effective_cost_limit_usd)?;
     conn.execute(
         "INSERT INTO goal_tasks
-            (task_id, objective, effective_token_limit, effective_cost_limit_usd,
+            (task_id, objective, success_criteria, effective_token_limit, effective_cost_limit_usd,
              pause_reason, pause_description, blockers_json, pending_call_id,
-             pending_call_epoch, accounting_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             pending_call_epoch, pending_reserved_tokens, pending_reserved_cost_usd,
+             accounting_state, resume_safety)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(task_id) DO NOTHING",
         params![
             rec.task_id,
             rec.objective,
+            rec.success_criteria,
             effective_token_limit,
             effective_cost_limit_usd,
             pause_reason,
@@ -588,7 +756,14 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
             blockers_json,
             rec.pending_call_id,
             rec.pending_call_epoch,
+            rec.pending_reserved_tokens
+                .map(token_limit_to_db)
+                .transpose()?,
+            rec.pending_reserved_cost_usd
+                .map(cost_limit_to_db)
+                .transpose()?,
             accounting_state_to_db(rec.accounting_state),
+            resume_safety_to_db(rec.resume_safety),
         ],
     )
     .context("insert goal task record")?;
@@ -774,9 +949,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
     async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
+            "SELECT task_id, objective, success_criteria, effective_token_limit, effective_cost_limit_usd,
                     pause_reason, pause_description, blockers_json, pending_call_id,
-                    pending_call_epoch, accounting_state
+                    pending_call_epoch, pending_reserved_tokens, pending_reserved_cost_usd,
+                    accounting_state, resume_safety
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
@@ -864,6 +1040,23 @@ impl GoalTaskRegistry for SqliteTaskStore {
             .transaction()
             .context("start resume goal task transaction")?;
         ensure_goal_task_row(&tx, task_id)?;
+        let resumable: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM goal_tasks
+                 WHERE task_id = ?1
+                   AND accounting_state = 'complete'
+                   AND pending_call_id IS NULL
+                   AND pending_call_epoch IS NULL
+                   AND pending_reserved_tokens IS NULL
+                   AND pending_reserved_cost_usd IS NULL
+                   AND resume_safety = 'clean'
+            )",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        if !resumable {
+            anyhow::bail!("goal task {task_id} is not safely resumable");
+        }
         if let Some(context) = continuation_context {
             upsert_continuation_context(&tx, task_id, &context)?;
         }
@@ -930,6 +1123,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("get current session goal")
     }
 
+    async fn current_goal_status_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GoalTaskStatus>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT tasks.*, tasks.error AS terminal_error, goal_tasks.*
+               FROM tasks JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+              WHERE tasks.kind = 'goal' AND tasks.session_id = ?1",
+            params![session_id],
+            |row| {
+                let terminal_error: Option<String> = row.get("terminal_error")?;
+                Ok(GoalTaskStatus {
+                    task: row_to_record(row)?,
+                    goal: row_to_goal_task(row)?,
+                    terminal_error: terminal_error
+                        .map(|error| zeroclaw_providers::sanitize_api_error(&error)),
+                })
+            },
+        )
+        .optional()
+        .context("get current session goal status")
+    }
+
     async fn create_or_replace_session_goal(
         &self,
         mut task: TaskRecord,
@@ -990,6 +1207,23 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ) {
                 return Ok(GoalTransitionResult::Stale);
             }
+            let pending: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM goal_tasks
+                         WHERE task_id = ?1
+                           AND (pending_call_id IS NOT NULL
+                                OR pending_call_epoch IS NOT NULL
+                                OR pending_reserved_tokens IS NOT NULL
+                                OR pending_reserved_cost_usd IS NOT NULL)
+                     )",
+                    params![&existing_id],
+                    |row| row.get(0),
+                )
+                .context("check terminal session goal settlement")?;
+            if pending {
+                return Ok(GoalTransitionResult::Stale);
+            }
             let deleted = tx
                 .execute("DELETE FROM tasks WHERE id = ?1", params![existing_id])
                 .context("dispose terminal session goal")?;
@@ -1016,7 +1250,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
             "UPDATE tasks
                 SET status = 'paused', execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
-                AND status = 'running' AND execution_epoch = ?3",
+                AND status = 'running' AND execution_epoch = ?3
+                AND execution_epoch < 9223372036854775807",
             params![task_id, session_id, expected_epoch],
         )?;
         if changed == 0 {
@@ -1045,10 +1280,13 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     heartbeat_at = NULL, execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                 AND status = 'paused' AND execution_epoch = ?3
+                AND execution_epoch < 9223372036854775807
                 AND EXISTS (
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id AND accounting_state = 'complete'
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                       AND pending_reserved_tokens IS NULL AND pending_reserved_cost_usd IS NULL
+                       AND resume_safety = 'clean'
                 )",
             params![
                 task_id,
@@ -1086,13 +1324,15 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     finished_at = COALESCE(finished_at, ?6),
                     execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
-                AND execution_epoch = ?3 AND status IN ('running','paused')
+                AND execution_epoch = ?3 AND execution_epoch < 9223372036854775807
+                AND status IN ('running','paused')
                 AND (?4 != 'completed' OR status = 'running')
                 AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = tasks.id)
                 AND (?4 != 'completed' OR EXISTS (
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id AND accounting_state = 'complete'
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                       AND pending_reserved_tokens IS NULL AND pending_reserved_cost_usd IS NULL
                 ))",
             params![
                 task_id,
@@ -1117,18 +1357,51 @@ impl GoalTaskRegistry for SqliteTaskStore {
         expected_epoch: i64,
         call_id: &str,
     ) -> Result<GoalTransitionResult> {
+        self.admit_pending_call_with_reservation(
+            task_id,
+            session_id,
+            expected_epoch,
+            call_id,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn admit_pending_call_with_reservation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        call_id: &str,
+        reserved_tokens: Option<u64>,
+        reserved_cost_usd: Option<f64>,
+    ) -> Result<GoalTransitionResult> {
+        let reserved_tokens = reserved_tokens.map(token_limit_to_db).transpose()?;
+        let reserved_cost_usd = reserved_cost_usd.map(cost_limit_to_db).transpose()?;
         let conn = self.conn.lock();
         let changed = conn.execute(
             "UPDATE goal_tasks
-                SET pending_call_id = ?4, pending_call_epoch = ?3
+                SET pending_call_id = ?4, pending_call_epoch = ?3,
+                    pending_reserved_tokens = ?5, pending_reserved_cost_usd = ?6
               WHERE task_id = ?1 AND accounting_state = 'complete'
                 AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                AND pending_reserved_tokens IS NULL AND pending_reserved_cost_usd IS NULL
+                AND (effective_token_limit IS NULL OR ?5 IS NOT NULL)
+                AND (effective_cost_limit_usd IS NULL OR ?6 IS NOT NULL)
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                        AND status = 'running' AND execution_epoch = ?3
                 )",
-            params![task_id, session_id, expected_epoch, call_id],
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                call_id,
+                reserved_tokens,
+                reserved_cost_usd,
+            ],
         )?;
         if changed == 1 {
             Ok(GoalTransitionResult::Applied)
@@ -1145,17 +1418,21 @@ impl GoalTaskRegistry for SqliteTaskStore {
         call_id: &str,
         accounting_state: GoalAccountingState,
     ) -> Result<GoalTransitionResult> {
-        let conn = self.conn.lock();
-        let changed = conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("start pending settlement")?;
+        let changed = tx.execute(
             "UPDATE goal_tasks
-                SET pending_call_id = NULL, pending_call_epoch = NULL,
+                SET pending_call_id = CASE WHEN ?5 = 'outcome_unknown' THEN pending_call_id ELSE NULL END,
+                    pending_call_epoch = CASE WHEN ?5 = 'outcome_unknown' THEN pending_call_epoch ELSE NULL END,
+                    pending_reserved_tokens = CASE WHEN ?5 = 'outcome_unknown' THEN pending_reserved_tokens ELSE NULL END,
+                    pending_reserved_cost_usd = CASE WHEN ?5 = 'outcome_unknown' THEN pending_reserved_cost_usd ELSE NULL END,
                     accounting_state = ?5
               WHERE task_id = ?1 AND pending_call_id = ?4
                 AND pending_call_epoch = ?3
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
-                       AND execution_epoch = ?3 AND status IN ('running','paused')
+                       AND execution_epoch >= ?3
                 )",
             params![
                 task_id,
@@ -1165,7 +1442,84 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 accounting_state_to_db(accounting_state),
             ],
         )?;
+        if changed == 0 {
+            return goal_transition_absence(&tx, task_id);
+        }
+        if accounting_state == GoalAccountingState::OutcomeUnknown {
+            tx.execute(
+                "UPDATE tasks
+                    SET status = 'failed', error = COALESCE(error, 'accounting_outcome_unknown'),
+                        finished_at = COALESCE(finished_at, ?3),
+                        execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                            THEN execution_epoch + 1 ELSE execution_epoch END
+                  WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                    AND status IN ('running', 'paused') AND execution_epoch >= ?4",
+                params![
+                    task_id,
+                    session_id,
+                    chrono::Utc::now().to_rfc3339(),
+                    expected_epoch
+                ],
+            )?;
+        }
+        tx.commit().context("commit pending settlement")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn mark_goal_tool_executed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE goal_tasks
+                SET resume_safety = 'tool_executed'
+              WHERE task_id = ?1 AND resume_safety = 'clean'
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                       AND status = 'running' AND execution_epoch = ?3
+                )",
+            params![task_id, session_id, expected_epoch],
+        )?;
         if changed == 1 {
+            Ok(GoalTransitionResult::Applied)
+        } else {
+            goal_transition_absence(&conn, task_id)
+        }
+    }
+
+    async fn mark_completed_session_goal_delivered(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "UPDATE tasks
+                SET delivered = 1
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'completed' AND execution_epoch = ?3 AND delivered = 0
+                AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = tasks.id)",
+            params![task_id, session_id, expected_epoch],
+        )?;
+        if changed == 1 {
+            return Ok(GoalTransitionResult::Applied);
+        }
+        let already_delivered = conn.query_row(
+            "SELECT EXISTS(
+                    SELECT 1 FROM tasks
+                     WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                       AND status = 'completed' AND execution_epoch = ?3 AND delivered = 1
+                       AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = tasks.id)
+                 )",
+            params![task_id, session_id, expected_epoch],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if already_delivered {
             Ok(GoalTransitionResult::Applied)
         } else {
             goal_transition_absence(&conn, task_id)
@@ -1210,7 +1564,15 @@ impl GoalTaskRegistry for SqliteTaskStore {
             "DELETE FROM tasks
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                 AND execution_epoch = ?3
-                AND status IN ('completed','failed','cancelled','lost','timed_out')",
+                AND status IN ('completed','failed','cancelled','lost','timed_out')
+                AND EXISTS (
+                    SELECT 1 FROM goal_tasks
+                     WHERE task_id = ?1
+                       AND pending_call_id IS NULL
+                       AND pending_call_epoch IS NULL
+                       AND pending_reserved_tokens IS NULL
+                       AND pending_reserved_cost_usd IS NULL
+                )",
             params![task_id, session_id, expected_epoch],
         )?;
         if changed == 1 {
@@ -1267,6 +1629,7 @@ mod tests {
         GoalTaskRecord {
             task_id: task_id.into(),
             objective: objective.into(),
+            success_criteria: "complete".into(),
             effective_token_limit: None,
             effective_cost_limit_usd: None,
             pause_reason: None,
@@ -1274,7 +1637,10 @@ mod tests {
             blockers: Vec::new(),
             pending_call_id: None,
             pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
             accounting_state: GoalAccountingState::Complete,
+            resume_safety: GoalResumeSafety::Clean,
         }
     }
 
@@ -1490,6 +1856,7 @@ mod tests {
             GoalTaskRecord {
                 task_id: "goal-1".into(),
                 objective: "ship goal mode".into(),
+                success_criteria: "complete".into(),
                 effective_token_limit: Some(10_000),
                 effective_cost_limit_usd: Some(1.25),
                 pause_reason: Some(GoalPauseReason::NeedsUserInput),
@@ -1501,7 +1868,10 @@ mod tests {
                 }],
                 pending_call_id: None,
                 pending_call_epoch: None,
+                pending_reserved_tokens: None,
+                pending_reserved_cost_usd: None,
                 accounting_state: GoalAccountingState::Complete,
+                resume_safety: GoalResumeSafety::Clean,
             },
             None,
         )
@@ -1535,11 +1905,15 @@ mod tests {
             "budget updates must not duplicate or rewrite objective state"
         );
 
-        s.update_goal_objective("goal-1", "ship amended goal mode")
+        let err = s
+            .update_goal_objective("goal-1", "ship amended goal mode")
             .await
-            .unwrap();
-        let amended = s.get_goal_task("goal-1").await.unwrap().unwrap();
-        assert_eq!(amended.objective, "ship amended goal mode");
+            .expect_err("session-bound Goal objectives are immutable");
+        assert!(format!("{err:#}").contains("objective cannot be changed"));
+        assert_eq!(
+            s.get_goal_task("goal-1").await.unwrap().unwrap().objective,
+            "ship goal mode"
+        );
 
         s.update_goal_pause("goal-1", None).await.unwrap();
         let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();
@@ -1558,6 +1932,7 @@ mod tests {
                 GoalTaskRecord {
                     task_id: "missing".into(),
                     objective: "orphan objective".into(),
+                    success_criteria: "complete".into(),
                     effective_token_limit: None,
                     effective_cost_limit_usd: None,
                     pause_reason: None,
@@ -1565,7 +1940,10 @@ mod tests {
                     blockers: Vec::new(),
                     pending_call_id: None,
                     pending_call_epoch: None,
+                    pending_reserved_tokens: None,
+                    pending_reserved_cost_usd: None,
                     accounting_state: GoalAccountingState::Complete,
+                    resume_safety: GoalResumeSafety::Clean,
                 },
             )
         }
@@ -1588,6 +1966,7 @@ mod tests {
                 GoalTaskRecord {
                     task_id: "delegate-1".into(),
                     objective: "must not attach to a delegate".into(),
+                    success_criteria: "complete".into(),
                     effective_token_limit: None,
                     effective_cost_limit_usd: None,
                     pause_reason: None,
@@ -1595,7 +1974,10 @@ mod tests {
                     blockers: Vec::new(),
                     pending_call_id: None,
                     pending_call_epoch: None,
+                    pending_reserved_tokens: None,
+                    pending_reserved_cost_usd: None,
                     accounting_state: GoalAccountingState::Complete,
+                    resume_safety: GoalResumeSafety::Clean,
                 },
             )
         }
@@ -1615,6 +1997,7 @@ mod tests {
                 GoalTaskRecord {
                     task_id: "delegate-goal".into(),
                     objective: "should fail before insert".into(),
+                    success_criteria: "complete".into(),
                     effective_token_limit: None,
                     effective_cost_limit_usd: None,
                     pause_reason: None,
@@ -1622,7 +2005,10 @@ mod tests {
                     blockers: Vec::new(),
                     pending_call_id: None,
                     pending_call_epoch: None,
+                    pending_reserved_tokens: None,
+                    pending_reserved_cost_usd: None,
                     accounting_state: GoalAccountingState::Complete,
+                    resume_safety: GoalResumeSafety::Clean,
                 },
                 None,
             )
@@ -1648,6 +2034,7 @@ mod tests {
                 GoalTaskRecord {
                     task_id: "missing-extension-parent".into(),
                     objective: "should roll back".into(),
+                    success_criteria: "complete".into(),
                     effective_token_limit: None,
                     effective_cost_limit_usd: None,
                     pause_reason: None,
@@ -1655,7 +2042,10 @@ mod tests {
                     blockers: Vec::new(),
                     pending_call_id: None,
                     pending_call_epoch: None,
+                    pending_reserved_tokens: None,
+                    pending_reserved_cost_usd: None,
                     accounting_state: GoalAccountingState::Complete,
+                    resume_safety: GoalResumeSafety::Clean,
                 },
                 None,
             )
@@ -1845,6 +2235,7 @@ mod tests {
             GoalTaskRecord {
                 task_id: "goal-paused".into(),
                 objective: "pause me".into(),
+                success_criteria: "complete".into(),
                 effective_token_limit: None,
                 effective_cost_limit_usd: None,
                 pause_reason: None,
@@ -1852,7 +2243,10 @@ mod tests {
                 blockers: Vec::new(),
                 pending_call_id: None,
                 pending_call_epoch: None,
+                pending_reserved_tokens: None,
+                pending_reserved_cost_usd: None,
                 accounting_state: GoalAccountingState::Complete,
+                resume_safety: GoalResumeSafety::Clean,
             },
             None,
         )
@@ -1892,6 +2286,7 @@ mod tests {
             GoalTaskRecord {
                 task_id: "goal-operator-paused".into(),
                 objective: "pause from operator command".into(),
+                success_criteria: "complete".into(),
                 effective_token_limit: None,
                 effective_cost_limit_usd: None,
                 pause_reason: None,
@@ -1899,7 +2294,10 @@ mod tests {
                 blockers: Vec::new(),
                 pending_call_id: None,
                 pending_call_epoch: None,
+                pending_reserved_tokens: None,
+                pending_reserved_cost_usd: None,
                 accounting_state: GoalAccountingState::Complete,
+                resume_safety: GoalResumeSafety::Clean,
             },
             None,
         )
@@ -1972,6 +2370,7 @@ mod tests {
             GoalTaskRecord {
                 task_id: "goal-resume".into(),
                 objective: "resume me".into(),
+                success_criteria: "complete".into(),
                 effective_token_limit: None,
                 effective_cost_limit_usd: None,
                 pause_reason: Some(GoalPauseReason::NeedsUserInput),
@@ -1983,7 +2382,10 @@ mod tests {
                 }],
                 pending_call_id: None,
                 pending_call_epoch: None,
+                pending_reserved_tokens: None,
+                pending_reserved_cost_usd: None,
                 accounting_state: GoalAccountingState::Complete,
+                resume_safety: GoalResumeSafety::Clean,
             },
             None,
         )
@@ -2002,5 +2404,46 @@ mod tests {
         assert!(goal.pause_reason.is_none());
         assert!(goal.pause_description.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_goal_task_rejects_tool_executed_goal() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-tool-executed", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.status = TaskStatus::Paused;
+        s.create_goal(
+            task,
+            GoalTaskRecord {
+                task_id: "goal-tool-executed".into(),
+                objective: "resume me".into(),
+                success_criteria: "complete".into(),
+                effective_token_limit: None,
+                effective_cost_limit_usd: None,
+                pause_reason: Some(GoalPauseReason::OperatorPaused),
+                pause_description: None,
+                blockers: Vec::new(),
+                pending_call_id: None,
+                pending_call_epoch: None,
+                pending_reserved_tokens: None,
+                pending_reserved_cost_usd: None,
+                accounting_state: GoalAccountingState::Complete,
+                resume_safety: GoalResumeSafety::ToolExecuted,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = s
+            .resume_goal_task("goal-tool-executed", 42, "boot-2", None)
+            .await
+            .expect_err("tool-executed goal must not resume");
+
+        assert!(format!("{err:#}").contains("not safely resumable"));
+        assert_eq!(
+            s.get("goal-tool-executed").await.unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
     }
 }

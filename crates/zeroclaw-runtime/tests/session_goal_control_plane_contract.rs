@@ -3,7 +3,7 @@
 use std::sync::{Arc, Barrier};
 
 use zeroclaw_runtime::control_plane::{
-    ControlPlaneHandle, GoalAccountingState, GoalTaskRecord, GoalTaskRegistry,
+    ControlPlaneHandle, GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 
@@ -31,6 +31,7 @@ fn session_goal(id: &str, session_id: &str) -> (TaskRecord, GoalTaskRecord) {
         GoalTaskRecord {
             task_id: id.into(),
             objective: "finish the task".into(),
+            success_criteria: "the task is complete".into(),
             effective_token_limit: Some(10),
             effective_cost_limit_usd: None,
             pause_reason: None,
@@ -38,7 +39,10 @@ fn session_goal(id: &str, session_id: &str) -> (TaskRecord, GoalTaskRecord) {
             blockers: Vec::new(),
             pending_call_id: None,
             pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
             accounting_state: GoalAccountingState::Complete,
+            resume_safety: GoalResumeSafety::Clean,
         },
     )
 }
@@ -76,7 +80,7 @@ async fn session_goal_admission_is_unique_and_epoch_fenced() {
 
     assert_eq!(
         store
-            .admit_pending_call("first", "session-a", 1, "call-a")
+            .admit_pending_call_with_reservation("first", "session-a", 1, "call-a", Some(10), None,)
             .await
             .unwrap(),
         GoalTransitionResult::Applied
@@ -108,7 +112,315 @@ async fn session_goal_admission_is_unique_and_epoch_fenced() {
             )
             .await
             .unwrap(),
+        GoalTransitionResult::Applied,
+        "a pause fence prevents response effects but must not strand the admitted accounting settlement"
+    );
+}
+
+#[tokio::test]
+async fn resume_refuses_execution_epoch_overflow() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("epoch-max", "session-epoch-max");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    drop(store);
+
+    let database = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    database
+        .execute(
+            "UPDATE tasks
+                SET status = 'paused', execution_epoch = 9223372036854775807
+              WHERE id = 'epoch-max'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .resume_session_goal("epoch-max", "session-epoch-max", i64::MAX, 2, "boot-b",)
+            .await
+            .unwrap(),
         GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .get("epoch-max")
+            .await
+            .unwrap()
+            .unwrap()
+            .execution_epoch,
+        i64::MAX
+    );
+}
+
+#[tokio::test]
+async fn session_goal_persists_criteria_reservation_and_monotonic_tool_safety() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, mut goal) = session_goal("criteria", "session-criteria");
+    goal.success_criteria = "The release notes are complete".into();
+    store
+        .create_or_replace_session_goal(task.clone(), goal)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .admit_pending_call_with_reservation(
+                "criteria",
+                "session-criteria",
+                1,
+                "reservation-a",
+                Some(100),
+                Some(1.25),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let admitted = store.get_goal_task("criteria").await.unwrap().unwrap();
+    assert_eq!(admitted.success_criteria, "The release notes are complete");
+    assert_eq!(admitted.pending_reserved_tokens, Some(100));
+    assert_eq!(admitted.pending_reserved_cost_usd, Some(1.25));
+    assert_eq!(admitted.resume_safety, GoalResumeSafety::Clean);
+
+    assert_eq!(
+        store
+            .mark_goal_tool_executed("criteria", "session-criteria", 1)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_call(
+                "criteria",
+                "session-criteria",
+                1,
+                "reservation-a",
+                GoalAccountingState::Complete,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .pause_session_goal(
+                "criteria",
+                "session-criteria",
+                1,
+                zeroclaw_runtime::control_plane::GoalPauseState {
+                    reason: zeroclaw_runtime::control_plane::GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .resume_session_goal("criteria", "session-criteria", 2, 2, "boot-b")
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale,
+        "a tool-executed Goal may not be resumed after its executor ends"
+    );
+
+    let persisted = store.get_goal_task("criteria").await.unwrap().unwrap();
+    assert_eq!(persisted.resume_safety, GoalResumeSafety::ToolExecuted);
+    assert!(persisted.pending_call_id.is_none());
+    assert!(persisted.pending_reserved_tokens.is_none());
+    assert!(persisted.pending_reserved_cost_usd.is_none());
+}
+
+#[tokio::test]
+async fn terminal_replacement_never_deletes_an_unsettled_operation_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("pending-terminal", "session-pending-terminal");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .admit_pending_call_with_reservation(
+                "pending-terminal",
+                "session-pending-terminal",
+                1,
+                "call-pending-terminal",
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let database = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    database
+        .execute(
+            "UPDATE tasks SET status = 'failed', execution_epoch = 2 WHERE id = 'pending-terminal'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .delete_session_goal("pending-terminal", "session-pending-terminal", 2)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale,
+        "hard deletion must retain unsettled accounting until it is classified"
+    );
+    let (replacement, replacement_goal) =
+        session_goal("pending-terminal-replacement", "session-pending-terminal");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(replacement, replacement_goal)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale
+    );
+    assert!(store.get("pending-terminal").await.unwrap().is_some());
+    assert_eq!(
+        store
+            .get_goal_task("pending-terminal")
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_call_id
+            .as_deref(),
+        Some("call-pending-terminal")
+    );
+}
+
+#[tokio::test]
+async fn cancellation_fence_allows_only_matching_pending_settlement() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("cancelled-settlement", "session-cancelled-settlement");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .admit_pending_call_with_reservation(
+            "cancelled-settlement",
+            "session-cancelled-settlement",
+            1,
+            "call-cancelled",
+            Some(10),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "cancelled-settlement",
+                "session-cancelled-settlement",
+                1,
+                TaskStatus::Cancelled,
+                Some("operator_cancelled".into()),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_call(
+                "cancelled-settlement",
+                "session-cancelled-settlement",
+                1,
+                "different-call",
+                GoalAccountingState::Complete,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .settle_pending_call(
+                "cancelled-settlement",
+                "session-cancelled-settlement",
+                1,
+                "call-cancelled",
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let unsettled = store
+        .get_goal_task("cancelled-settlement")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unsettled.accounting_state,
+        GoalAccountingState::OutcomeUnknown
+    );
+    assert_eq!(unsettled.pending_call_id.as_deref(), Some("call-cancelled"));
+    assert_eq!(unsettled.pending_call_epoch, Some(1));
+    assert_eq!(unsettled.pending_reserved_tokens, Some(10));
+}
+
+#[tokio::test]
+async fn completed_goal_delivery_mark_is_exact_and_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("completed-delivery", "session-completed-delivery");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "completed-delivery",
+                "session-completed-delivery",
+                1,
+                TaskStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .mark_completed_session_goal_delivered(
+                    "completed-delivery",
+                    "session-completed-delivery",
+                    2,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+    assert!(
+        store
+            .get("completed-delivery")
+            .await
+            .unwrap()
+            .unwrap()
+            .delivered
     );
 }
 
@@ -139,8 +451,8 @@ fn sqlite_rejects_invalid_session_and_pending_operation_rows() {
     assert!(
         database
             .execute(
-                "INSERT INTO goal_tasks (task_id, objective, pending_call_id)
-             VALUES ('goal-a', 'objective', 'call-a')",
+                "INSERT INTO goal_tasks (task_id, objective, success_criteria, pending_call_id)
+             VALUES ('goal-a', 'objective', 'criteria', 'call-a')",
                 [],
             )
             .is_err()
@@ -148,11 +460,79 @@ fn sqlite_rejects_invalid_session_and_pending_operation_rows() {
     database
         .execute(
             "INSERT INTO goal_tasks
-                (task_id, objective, pending_call_id, pending_call_epoch)
-             VALUES ('goal-a', 'objective', 'call-a', 1)",
+                (task_id, objective, success_criteria, pending_call_id, pending_call_epoch)
+             VALUES ('goal-a', 'objective', 'criteria', 'call-a', 1)",
             [],
         )
         .unwrap();
+    database
+        .execute(
+            "INSERT INTO tasks
+                (id, kind, agent, status, session_id, execution_epoch, started_at)
+             VALUES ('goal-finite', 'goal', 'main', 'running', 'session-finite', 1, 'now')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "INSERT INTO goal_tasks
+                    (task_id, objective, success_criteria, effective_token_limit,
+                     pending_call_id, pending_call_epoch)
+                 VALUES ('goal-finite', 'objective', 'criteria', 10, 'call-finite', 1)",
+                [],
+            )
+            .is_err(),
+        "a finite Goal pending operation must carry its reservation"
+    );
+    database
+        .execute(
+            "INSERT INTO tasks
+                (id, kind, agent, status, session_id, execution_epoch, started_at)
+             VALUES ('goal-whitespace', 'goal', 'main', 'running', 'session-whitespace', 1, 'now')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "INSERT INTO goal_tasks (task_id, objective, success_criteria)
+                 VALUES ('goal-whitespace', 'objective', char(9) || char(10) || ' ')",
+                [],
+            )
+            .is_err(),
+        "success criteria must contain a non-whitespace character"
+    );
+    assert!(
+        database
+            .execute(
+                "INSERT INTO goal_tasks (task_id, objective, success_criteria)
+                 VALUES ('goal-whitespace', 'objective', char(160))",
+                [],
+            )
+            .is_err(),
+        "success criteria reject Unicode nonbreaking whitespace"
+    );
+    assert!(
+        database
+            .execute(
+                "INSERT INTO goal_tasks (task_id, objective, success_criteria)
+                 VALUES ('goal-whitespace', char(8195), char(8195))",
+                [],
+            )
+            .is_err(),
+        "objective and criteria reject Unicode em-space whitespace"
+    );
+    assert!(
+        database
+            .execute(
+                "INSERT INTO goal_tasks (task_id, objective, success_criteria)
+                 VALUES ('goal-whitespace', char(133), char(133))",
+                [],
+            )
+            .is_err(),
+        "objective and criteria reject Unicode next-line whitespace"
+    );
     assert!(
         database
             .execute(
@@ -160,6 +540,54 @@ fn sqlite_rejects_invalid_session_and_pending_operation_rows() {
                 [],
             )
             .is_err()
+    );
+    assert!(
+        database
+            .execute(
+                "UPDATE goal_tasks SET success_criteria = 'replacement' WHERE task_id = 'goal-a'",
+                [],
+            )
+            .is_err(),
+        "success criteria are immutable after Goal creation"
+    );
+    assert!(
+        database
+            .execute(
+                "UPDATE goal_tasks SET objective = 'replacement' WHERE task_id = 'goal-a'",
+                [],
+            )
+            .is_err(),
+        "session Goal objectives are immutable after creation"
+    );
+    database
+        .execute(
+            "UPDATE goal_tasks SET pending_call_id = NULL, pending_call_epoch = NULL WHERE task_id = 'goal-a'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "UPDATE goal_tasks SET pending_reserved_tokens = 1 WHERE task_id = 'goal-a'",
+                [],
+            )
+            .is_err(),
+        "a reservation cannot exist without its pending operation"
+    );
+    database
+        .execute(
+            "UPDATE goal_tasks SET resume_safety = 'tool_executed' WHERE task_id = 'goal-a'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        database
+            .execute(
+                "UPDATE goal_tasks SET resume_safety = 'clean' WHERE task_id = 'goal-a'",
+                [],
+            )
+            .is_err(),
+        "the tool-executed marker cannot be reset through raw SQL"
     );
     assert!(
         database
@@ -366,7 +794,7 @@ async fn migration_installs_identity_guards_before_reopening_a_goal_database() {
     let version: i64 = database
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     database
         .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA recursive_triggers = OFF;")
         .unwrap();
@@ -456,7 +884,7 @@ fn v8_migration_failure_rolls_back_and_reopens_after_the_source_is_repaired() {
     let version: i64 = database
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -501,6 +929,68 @@ fn independent_connections_admit_exactly_one_goal_for_a_session() {
 }
 
 #[tokio::test]
+async fn independent_connections_reserve_exactly_one_pending_operation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("reserve-race", "session-reserve-race");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for call_id in ["reserve-left", "reserve-right"] {
+        let data_dir = directory.path().to_owned();
+        let barrier = Arc::clone(&barrier);
+        workers.push(std::thread::spawn(move || {
+            let store = SqliteTaskStore::new(&data_dir).unwrap();
+            barrier.wait();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(store.admit_pending_call_with_reservation(
+                    "reserve-race",
+                    "session-reserve-race",
+                    1,
+                    call_id,
+                    Some(10),
+                    None,
+                ))
+                .unwrap()
+        }));
+    }
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == GoalTransitionResult::Applied)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == GoalTransitionResult::Stale)
+            .count(),
+        1
+    );
+
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let goal = store.get_goal_task("reserve-race").await.unwrap().unwrap();
+    assert!(matches!(
+        goal.pending_call_id.as_deref(),
+        Some("reserve-left" | "reserve-right")
+    ));
+    assert_eq!(goal.pending_reserved_tokens, Some(10));
+}
+
+#[tokio::test]
 async fn restart_pauses_settled_goals_and_fails_unsettled_operations() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();
@@ -515,7 +1005,14 @@ async fn restart_pauses_settled_goals_and_fails_unsettled_operations() {
         .await
         .unwrap();
     store
-        .admit_pending_call("unsettled", "session-unsettled", 1, "call-unsettled")
+        .admit_pending_call_with_reservation(
+            "unsettled",
+            "session-unsettled",
+            1,
+            "call-unsettled",
+            Some(10),
+            None,
+        )
         .await
         .unwrap();
     drop(store);
@@ -553,7 +1050,14 @@ async fn restart_marks_pending_accounting_unknown_even_with_a_prior_error() {
         .await
         .unwrap();
     store
-        .admit_pending_call("preerrored", "session-preerrored", 1, "pending-1")
+        .admit_pending_call_with_reservation(
+            "preerrored",
+            "session-preerrored",
+            1,
+            "pending-1",
+            Some(10),
+            None,
+        )
         .await
         .unwrap();
     drop(store);
@@ -636,6 +1140,26 @@ async fn terminal_goal_remains_current_until_replacement_and_sessions_are_indepe
     assert_eq!(terminal.id, "first");
     assert_eq!(terminal.status, TaskStatus::Failed);
     assert_eq!(terminal.execution_epoch, 2);
+    let status = store
+        .current_goal_status_for_session("session-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.task.id, "first");
+    assert_eq!(status.goal.task_id, "first");
+    assert_eq!(
+        status.terminal_error.as_deref(),
+        Some("test terminal transition"),
+        "status joins the canonical task error rather than copying it into Goal state"
+    );
+    assert_eq!(
+        store
+            .mark_completed_session_goal_delivered("first", "session-a", 2)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale,
+        "only a completed Goal can receive a completion delivery mark"
+    );
 
     let (replacement, replacement_goal) = session_goal("replacement", "session-a");
     assert_eq!(
@@ -726,6 +1250,59 @@ async fn migration_preserves_legacy_goal_rows_but_boot_fails_legacy_active_work(
         )
         .unwrap();
     assert_eq!(error, "legacy_goal_missing_session");
+}
+
+#[tokio::test]
+async fn boot_fails_session_bound_legacy_goal_without_success_criteria() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("control_plane.db");
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, agent TEXT NOT NULL,
+                 status TEXT NOT NULL, owner_pid INTEGER NOT NULL DEFAULT 0,
+                 owner_boot_id TEXT NOT NULL DEFAULT '', heartbeat_at TEXT,
+                 depth INTEGER NOT NULL DEFAULT 0, parent_id TEXT,
+                 originator_route TEXT, delivered INTEGER NOT NULL DEFAULT 0,
+                 idem_key TEXT, principal_id TEXT, session_id TEXT,
+                 execution_epoch INTEGER NOT NULL DEFAULT 0, started_at TEXT NOT NULL,
+                 finished_at TEXT, output TEXT, error TEXT
+             );
+             CREATE TABLE goal_tasks (
+                 task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                 objective TEXT NOT NULL, effective_token_limit INTEGER,
+                 effective_cost_limit_usd REAL, pause_reason TEXT,
+                 pause_description TEXT, blockers_json TEXT NOT NULL DEFAULT '[]',
+                 pending_call_id TEXT, pending_call_epoch INTEGER,
+                 accounting_state TEXT NOT NULL DEFAULT 'complete'
+             );
+             INSERT INTO tasks
+                 (id, kind, agent, status, session_id, execution_epoch, owner_boot_id, started_at)
+             VALUES ('legacy-criteria', 'goal', 'main', 'running', 'session-legacy', 1, 'old-boot', 'now');
+             INSERT INTO goal_tasks (task_id, objective)
+             VALUES ('legacy-criteria', 'old objective');
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    drop(database);
+
+    let handle = ControlPlaneHandle::start_with_boot_id(directory.path(), "new-boot".into())
+        .await
+        .unwrap();
+    let legacy = handle.store.get("legacy-criteria").await.unwrap().unwrap();
+    assert_eq!(legacy.status, TaskStatus::Failed);
+    drop(handle);
+
+    let database = rusqlite::Connection::open(path).unwrap();
+    let error: String = database
+        .query_row(
+            "SELECT error FROM tasks WHERE id = 'legacy-criteria'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(error, "legacy_goal_missing_success_criteria");
 }
 
 #[tokio::test]

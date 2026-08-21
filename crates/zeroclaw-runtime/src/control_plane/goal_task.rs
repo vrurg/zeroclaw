@@ -12,6 +12,11 @@ pub struct GoalTaskRecord {
     /// Operator/model-supplied objective text. Treated as prompt input, not as
     /// trusted policy data.
     pub objective: String,
+    /// Immutable operator-supplied completion criteria. This is untrusted
+    /// prompt input, but is durable so verification never relies on a
+    /// reconstructed or model-inferred success condition.
+    #[serde(default)]
+    pub success_criteria: String,
     #[serde(default)]
     pub effective_token_limit: Option<u64>,
     #[serde(default)]
@@ -36,10 +41,22 @@ pub struct GoalTaskRecord {
     pub pending_call_id: Option<String>,
     #[serde(default)]
     pub pending_call_epoch: Option<i64>,
+    /// Conservative token reservation for the pending logical operation.
+    /// This is transient admission state, not consumed usage.
+    #[serde(default)]
+    pub pending_reserved_tokens: Option<u64>,
+    /// Conservative cost reservation for the pending logical operation.
+    /// This is transient admission state, not consumed usage.
+    #[serde(default)]
+    pub pending_reserved_cost_usd: Option<f64>,
     /// Whether all known goal consumption is safely settled. Totals remain in
     /// the canonical cost ledger and are never duplicated here.
     #[serde(default)]
     pub accounting_state: GoalAccountingState,
+    /// A Goal whose executor has started a tool phase cannot be resumed after
+    /// interruption because V1 does not persist a tool checkpoint.
+    #[serde(default)]
+    pub resume_safety: GoalResumeSafety,
 }
 
 /// Durable accounting completeness for Goal lifecycle admission.
@@ -51,6 +68,15 @@ pub enum GoalAccountingState {
     Missing,
     Invalid,
     OutcomeUnknown,
+}
+
+/// Whether a paused Goal may safely begin a fresh executor in V1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalResumeSafety {
+    #[default]
+    Clean,
+    ToolExecuted,
 }
 
 /// Result of a guarded Goal control-plane mutation.
@@ -67,6 +93,16 @@ pub struct TaskGoal {
     task: TaskRecord,
     /// Goal extension row: objective, effective limits, pause/blocker detail.
     goal: GoalTaskRecord,
+}
+
+/// Canonical current-Goal projection for operator status. Lifecycle and its
+/// terminal error stay owned by `tasks`; goal-specific state stays in the
+/// extension row.
+#[derive(Debug, Clone)]
+pub struct GoalTaskStatus {
+    pub task: TaskRecord,
+    pub goal: GoalTaskRecord,
+    pub terminal_error: Option<String>,
 }
 
 impl TaskGoal {
@@ -327,6 +363,13 @@ pub trait GoalTaskRegistry: Send + Sync {
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>>;
 
+    /// Read the exact current Goal and its canonical terminal error in one
+    /// join. Callers must not reconstruct a historical Goal by task lookup.
+    async fn current_goal_status_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<GoalTaskStatus>>;
+
     /// Create the first Goal for a session or atomically replace its terminal
     /// predecessor. A running or paused predecessor is never replaced.
     async fn create_or_replace_session_goal(
@@ -373,6 +416,18 @@ pub trait GoalTaskRegistry: Send + Sync {
         call_id: &str,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Guard one serialized logical provider operation admission together with
+    /// its conservative reservation snapshot.
+    async fn admit_pending_call_with_reservation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        call_id: &str,
+        reserved_tokens: Option<u64>,
+        reserved_cost_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     /// Settle precisely the operation admitted for the supplied epoch.
     async fn settle_pending_call(
         &self,
@@ -381,6 +436,25 @@ pub trait GoalTaskRegistry: Send + Sync {
         expected_epoch: i64,
         call_id: &str,
         accounting_state: GoalAccountingState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Irreversibly mark the exact running Goal as having entered a tool
+    /// phase. The marker is intentionally not reset by settlement or budget
+    /// changes, because V1 has no durable tool checkpoint.
+    async fn mark_goal_tool_executed(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Mark a completed exact Goal as delivered. Existing task delivery facts
+    /// remain canonical; this only supplies the Goal-specific race guard.
+    async fn mark_completed_session_goal_delivered(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Replace effective limits without storing consumed or remaining usage.
