@@ -913,26 +913,33 @@ impl GoalExecutor for SessionGoalExecutor {
         // provider spend but before normal settlement. Preserve the pending
         // ID/reservation and classify it fail-closed rather than leaving an
         // apparently resumable Goal behind.
-        if let Ok(Some(current)) = self.goals.current_goal_status_for_session(session_id).await
-            && current.task.id == task_id
-            && let Some(call_id) = current.goal.pending_call_id
-        {
-            match self
-                .goals
-                .settle_pending_call(
-                    task_id,
-                    session_id,
-                    epoch,
-                    &call_id,
-                    GoalAccountingState::OutcomeUnknown,
-                )
-                .await
-            {
-                Ok(GoalTransitionResult::Applied) => {}
-                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) | Err(_) => {
-                    self.executors.lock().await.remove(task_id);
-                    return Err(());
+        match self.goals.current_goal_status_for_session(session_id).await {
+            Ok(Some(current)) if current.task.id == task_id => {
+                if let Some(call_id) = current.goal.pending_call_id {
+                    match self
+                        .goals
+                        .settle_pending_call(
+                            task_id,
+                            session_id,
+                            epoch,
+                            &call_id,
+                            GoalAccountingState::OutcomeUnknown,
+                        )
+                        .await
+                    {
+                        Ok(GoalTransitionResult::Applied) => {}
+                        Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
+                        | Err(_) => {
+                            self.executors.lock().await.remove(task_id);
+                            return Err(());
+                        }
+                    }
                 }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => {
+                self.executors.lock().await.remove(task_id);
+                return Err(());
             }
         }
         self.executors.lock().await.remove(task_id);

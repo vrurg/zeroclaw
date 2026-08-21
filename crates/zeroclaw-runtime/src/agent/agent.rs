@@ -40,6 +40,8 @@ const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
     "codex_cli",
     "gemini_cli",
     "opencode_cli",
+    "send_message_to_peer",
+    "cron_run",
 ];
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
@@ -10569,6 +10571,8 @@ mod tests {
             Box::new(NamedMockTool::new("codex_cli")),
             Box::new(NamedMockTool::new("gemini_cli")),
             Box::new(NamedMockTool::new("opencode_cli")),
+            Box::new(NamedMockTool::new("send_message_to_peer")),
+            Box::new(NamedMockTool::new("cron_run")),
             Box::new(NamedMockTool::new("file_read")),
         ];
         tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));
