@@ -4,12 +4,15 @@
 //! session owner, Reliable accounting report, control-plane pending slot, and
 //! canonical JSONL ledger without introducing another provider or task layer.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -22,19 +25,40 @@ use crate::agent::cost::{
     goal_usage_from_provider_attempt,
 };
 use crate::control_plane::{
-    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRegistry, GoalTransitionResult,
-    TaskStatus,
+    GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
+    GoalTaskRegistry, GoalTransitionResult, TaskStatus,
 };
 use crate::rpc::session::SessionStore;
 
 const VERIFIER_REASON_MAX_BYTES: usize = 2_048;
+const VERIFIER_JSON_MAX_BYTES: usize = 65_536;
+const VERIFIER_BLOCKER_MAX_COUNT: usize = 16;
+const VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS: usize = 1_024;
+const GOAL_EXECUTOR_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GoalVerifierResponse {
     decision: GoalVerifierDecision,
     reason: String,
-    blockers: Option<Vec<crate::control_plane::GoalBlocker>>,
+    #[serde(default, deserialize_with = "deserialize_verifier_blockers")]
+    blockers: VerifierBlockers,
+}
+
+/// Preserve the difference between an omitted field and JSON `null`: the
+/// verifier protocol permits blockers only as a real array for `blocked`.
+#[derive(Debug, Default)]
+enum VerifierBlockers {
+    #[default]
+    Missing,
+    Present(Vec<GoalBlocker>),
+}
+
+fn deserialize_verifier_blockers<'de, D>(deserializer: D) -> Result<VerifierBlockers, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<GoalBlocker>::deserialize(deserializer).map(VerifierBlockers::Present)
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +91,14 @@ pub(crate) struct SessionGoalExecutor {
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
+    executors: Arc<Mutex<HashMap<String, RegisteredGoalExecutor>>>,
+}
+
+struct RegisteredGoalExecutor {
+    session_id: String,
+    epoch: i64,
+    cancellation: tokio_util::sync::CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 impl SessionGoalExecutor {
@@ -81,7 +113,16 @@ impl SessionGoalExecutor {
             goals,
             config,
             cost_tracker,
+            executors: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn session_executor_is_active(&self, session_id: &str) -> bool {
+        let mut executors = self.executors.lock().await;
+        executors.retain(|_, executor| !executor.handle.is_finished());
+        executors
+            .values()
+            .any(|executor| executor.session_id == session_id)
     }
 }
 
@@ -172,9 +213,9 @@ impl GoalOperationAccountant {
             ChatRequest {
                 messages: &request.messages,
                 tools: (!request.tools.is_empty()).then_some(request.tools.as_slice()),
-                thinking: None,
+                thinking: request.thinking,
             },
-            None,
+            request.temperature,
         )
         .await
         .context("goal operation wire plan is unavailable")?;
@@ -461,28 +502,30 @@ async fn verify_goal_candidate(
 }
 
 fn parse_goal_verifier_response(text: &str) -> anyhow::Result<GoalVerifierOutcome> {
+    if text.len() > VERIFIER_JSON_MAX_BYTES {
+        anyhow::bail!("goal verifier response exceeds the protocol size limit");
+    }
     let parsed: GoalVerifierResponse =
         serde_json::from_str(text).context("goal verifier returned malformed JSON")?;
-    if parsed.reason.trim().is_empty() || parsed.reason.len() > VERIFIER_REASON_MAX_BYTES {
+    if parsed.reason.trim().is_empty() || parsed.reason.chars().count() > VERIFIER_REASON_MAX_BYTES
+    {
         anyhow::bail!("goal verifier reason is invalid");
     }
     match parsed.decision {
-        GoalVerifierDecision::Complete if parsed.blockers.is_none() => {
+        GoalVerifierDecision::Complete if matches!(parsed.blockers, VerifierBlockers::Missing) => {
             Ok(GoalVerifierOutcome::Complete)
         }
-        GoalVerifierDecision::Continue if parsed.blockers.is_none() => {
+        GoalVerifierDecision::Continue if matches!(parsed.blockers, VerifierBlockers::Missing) => {
             Ok(GoalVerifierOutcome::Continue(parsed.reason))
         }
         GoalVerifierDecision::Blocked
-            if parsed
-                .blockers
-                .as_ref()
-                .is_some_and(|value| !value.is_empty()) =>
+            if matches!(parsed.blockers, VerifierBlockers::Present(_)) =>
         {
-            Ok(GoalVerifierOutcome::Blocked(
-                parsed.reason,
-                parsed.blockers.expect("checked non-empty blockers"),
-            ))
+            let VerifierBlockers::Present(blockers) = parsed.blockers else {
+                unreachable!("guarded by match")
+            };
+            validate_verifier_blockers(&blockers)?;
+            Ok(GoalVerifierOutcome::Blocked(parsed.reason, blockers))
         }
         GoalVerifierDecision::Complete
         | GoalVerifierDecision::Continue
@@ -492,11 +535,83 @@ fn parse_goal_verifier_response(text: &str) -> anyhow::Result<GoalVerifierOutcom
     }
 }
 
+fn validate_verifier_blockers(blockers: &[GoalBlocker]) -> anyhow::Result<()> {
+    if blockers.is_empty() || blockers.len() > VERIFIER_BLOCKER_MAX_COUNT {
+        anyhow::bail!("goal verifier blockers are invalid");
+    }
+    for blocker in blockers {
+        if blocker.payload.is_some()
+            || blocker.message.trim().is_empty()
+            || blocker.message.chars().count() > VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS
+            || !matches!(
+                blocker.kind,
+                GoalBlockerKind::NeedsUserInput
+                    | GoalBlockerKind::HumanEscalation
+                    | GoalBlockerKind::ExternalDependency
+            )
+        {
+            anyhow::bail!("goal verifier blocker is invalid");
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl GoalExecutor for SessionGoalExecutor {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
-        if self.sessions.get_agent(&request.session_id).await.is_none() {
+        if self.session_executor_is_active(&request.session_id).await {
+            return GoalExecutionReadiness::ExecutorBusy;
+        }
+        if self
+            .sessions
+            .get_agent_alias(&request.session_id)
+            .await
+            .as_deref()
+            != Some(request.agent.as_str())
+        {
+            return GoalExecutionReadiness::BindingUnavailable;
+        }
+        let Some(agent) = self.sessions.get_agent(&request.session_id).await else {
+            return GoalExecutionReadiness::BindingUnavailable;
+        };
+        if build_session_model_provider(
+            &self.config,
+            self.config.goal.verifier.provider.trim(),
+            self.config.goal.verifier.model.as_deref(),
+        )
+        .is_err()
+        {
             return GoalExecutionReadiness::VerifierUnavailable;
+        }
+        if request.cost_limit_usd.is_some() {
+            let (provider_ref, model, _temperature) = agent.lock().await.goal_model_binding();
+            let fallback_options = zeroclaw_providers::provider_runtime_options_for_agent(
+                &self.config,
+                &request.agent,
+            );
+            let options = zeroclaw_providers::options_for_provider_ref(
+                &self.config,
+                &provider_ref,
+                &fallback_options,
+            );
+            let Ok(plan) = zeroclaw_providers::resolve_routed_model_operation_plan_with_options(
+                &self.config,
+                &provider_ref,
+                &self.config.reliability,
+                &self.config.model_routes,
+                &model,
+                &options,
+                &model,
+            ) else {
+                return GoalExecutionReadiness::PricingUnavailable;
+            };
+            if plan.candidates.iter().any(|candidate| {
+                let rates =
+                    goal_pricing_rates(&self.config, &candidate.provider_ref, &candidate.model);
+                rates.input_per_mtok.is_none() || rates.output_per_mtok.is_none()
+            }) {
+                return GoalExecutionReadiness::PricingUnavailable;
+            }
         }
         GoalExecutionReadiness::Ready
     }
@@ -522,7 +637,15 @@ impl GoalExecutor for SessionGoalExecutor {
             .ok_or(())?;
         let agent = sessions.get_agent(&scope.session_id).await.ok_or(())?;
         let agent_guard = agent.lock_owned().await;
-        zeroclaw_spawn::spawn!(async move {
+        let executor_key = scope.task_id.clone();
+        let mut executors = self.executors.lock().await;
+        executors.retain(|_, executor| !executor.handle.is_finished());
+        if executors.contains_key(&executor_key) {
+            return Err(());
+        }
+        let worker_scope = scope.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            let scope = worker_scope;
             let _queue_guard = queue_guard;
             let accountant: Arc<dyn GoalOperationAccounting> =
                 Arc::new(GoalOperationAccountant::new(
@@ -658,6 +781,39 @@ impl GoalExecutor for SessionGoalExecutor {
                 }
             }
         });
+        executors.insert(
+            executor_key,
+            RegisteredGoalExecutor {
+                session_id: scope.session_id.clone(),
+                epoch: scope.execution_epoch,
+                cancellation: scope.cancellation,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+        let executor = self.executors.lock().await.remove(task_id);
+        let Some(mut executor) = executor else {
+            return Ok(());
+        };
+        if executor.session_id != session_id || executor.epoch != epoch {
+            self.executors
+                .lock()
+                .await
+                .insert(task_id.to_string(), executor);
+            return Err(());
+        }
+        executor.cancellation.cancel();
+        match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut executor.handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(()),
+            Err(_) => {
+                executor.handle.abort();
+                executor.handle.await.map_err(|_| ())?;
+            }
+        }
         Ok(())
     }
 }
@@ -689,6 +845,12 @@ mod tests {
             r#"{"decision":"complete","reason":"criteria met","blockers":[{"kind":"provider","message":"no"}]}"#,
         )
         .is_err());
+        assert!(
+            parse_goal_verifier_response(
+                r#"{"decision":"complete","reason":"criteria met","blockers":null}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -699,12 +861,17 @@ mod tests {
             "x".repeat(super::VERIFIER_REASON_MAX_BYTES + 1)
         );
         assert!(parse_goal_verifier_response(&response).is_err());
+        let response = format!(
+            r#"{{"decision":"continue","reason":"ok{}"}}"#,
+            "x".repeat(super::VERIFIER_JSON_MAX_BYTES)
+        );
+        assert!(parse_goal_verifier_response(&response).is_err());
     }
 
     #[test]
     fn verifier_blocked_requires_nonempty_structured_blockers() {
         let outcome = parse_goal_verifier_response(
-            r#"{"decision":"blocked","reason":"needs provider access","blockers":[{"kind":"provider","message":"configure verifier"}]}"#,
+            r#"{"decision":"blocked","reason":"needs user input","blockers":[{"kind":"needs_user_input","message":"choose a deployment target"}]}"#,
         )
         .expect("blocked response with a structured blocker must parse");
         assert!(
@@ -719,6 +886,18 @@ mod tests {
         assert!(
             parse_goal_verifier_response(
                 r#"{"decision":"blocked","reason":"needs provider access","blockers":[]}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_goal_verifier_response(
+                r#"{"decision":"blocked","reason":"needs provider access","blockers":[{"kind":"provider","message":"configure verifier"}]}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_goal_verifier_response(
+                r#"{"decision":"blocked","reason":"needs input","blockers":[{"kind":"needs_user_input","message":"choose","payload":{"untrusted":true}}]}"#,
             )
             .is_err()
         );

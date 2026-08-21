@@ -21,6 +21,20 @@ use zeroclaw_providers::{
     self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
 
+/// Goal-owned calls cannot start independent model work until foreground child
+/// propagation owns their lifecycle and accounting.
+/// V1 Goal work has no child/supervisor propagation and no approval
+/// continuation. Keep tools that can create child work or advance an SOP
+/// execution out of the model-visible registry until that propagation exists.
+const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
+    "delegate",
+    "spawn_subagent",
+    "sop_execute",
+    "sop_advance",
+    "sop_approve",
+    "sop_workshop",
+];
+
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
@@ -1063,6 +1077,18 @@ impl Agent {
         Ok(self.tool_dispatcher.to_provider_messages(&self.history))
     }
 
+    /// Return the currently resolved parent binding used by Goal preflight.
+    /// The executor still plans the exact prepared request immediately before
+    /// dispatch; this only rejects a known-unpriced base/fallback path before
+    /// creating a Running Goal record.
+    pub(crate) fn goal_model_binding(&self) -> (String, String, Option<f64>) {
+        (
+            self.model_provider_name.clone(),
+            self.model_name.clone(),
+            self.temperature,
+        )
+    }
+
     /// Append the sole verified Goal completion to canonical session history.
     ///
     /// The Goal executor calls this only after its guarded `Completed`
@@ -1098,6 +1124,10 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
         let agent_alias_for_loop = self.observer_agent_alias();
+        let goal_excluded_tools = GOAL_UNSUPPORTED_CHILD_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
         let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()),
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
@@ -1125,7 +1155,7 @@ impl Agent {
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: self.config.resolved.max_tool_iterations,
-                        excluded_tools: &[],
+                        excluded_tools: &goal_excluded_tools,
                         dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                         pacing: &pacing,
                         strict_tool_parsing: self.config.resolved.strict_tool_parsing,
@@ -10514,6 +10544,23 @@ mod tests {
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, &["web_search"]);
+    }
+
+    #[test]
+    fn goal_turns_exclude_child_and_sop_execution_tools() {
+        let mut tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool::new("delegate")),
+            Box::new(NamedMockTool::new("spawn_subagent")),
+            Box::new(NamedMockTool::new("sop_execute")),
+            Box::new(NamedMockTool::new("sop_advance")),
+            Box::new(NamedMockTool::new("sop_approve")),
+            Box::new(NamedMockTool::new("sop_workshop")),
+            Box::new(NamedMockTool::new("file_read")),
+        ];
+        tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+        assert_eq!(names, ["file_read"]);
     }
 
     #[test]

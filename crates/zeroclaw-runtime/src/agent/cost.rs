@@ -200,6 +200,8 @@ tokio::task_local! {
 pub(crate) struct GoalOperationRequest {
     pub model_provider: String,
     pub model: String,
+    pub temperature: Option<f64>,
+    pub thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolSpec>,
 }
