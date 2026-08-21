@@ -3,6 +3,7 @@
 //! focused prompt, and returns the response. Cron's `JobType::Agent`
 //! dispatch is the other SubAgent spawn site; both funnel through
 
+use crate::agent::cost::GOAL_CHILD_SCOPE;
 use crate::agent::loop_::AgentRunOverrides;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -193,6 +194,7 @@ impl Tool for SpawnSubagentTool {
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
+        let goal_parent = GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten();
         if let Some(cp) = crate::control_plane::control_plane() {
             let _ = cp
                 .store
@@ -205,13 +207,15 @@ impl Tool for SpawnSubagentTool {
                     owner_boot_id: cp.boot_id.clone(),
                     heartbeat_at: None,
                     depth: u32::from(self.is_subagent_caller),
-                    parent_id: None,
+                    parent_id: goal_parent.as_ref().map(|scope| scope.task_id.clone()),
                     originator_route: None,
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
-                    session_id: None,
-                    execution_epoch: 0,
+                    session_id: goal_parent.as_ref().map(|scope| scope.session_id.clone()),
+                    execution_epoch: goal_parent
+                        .as_ref()
+                        .map_or(0, |scope| scope.execution_epoch),
                     started_at: chrono::Utc::now().to_rfc3339(),
                     finished_at: None,
                 })
