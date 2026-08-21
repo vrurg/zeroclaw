@@ -212,8 +212,10 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         temperature: Option<f64>,
     ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
         if self.wire_api() == Some(zeroclaw_config::schema::WireApi::Responses) {
-            return Box::pin(async {
-                anyhow::bail!("Responses wire payload planning is not implemented")
+            let provider =
+                build_responses_provider(alias, api_url.or(Some(Self::DEFAULT_URL)), key, opts);
+            return Box::pin(async move {
+                provider.planned_non_streaming_payloads(request, model, temperature)
             });
         }
         let provider =
@@ -360,6 +362,17 @@ fn build_responses_provider_if_requested(
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
+    Some(Box::new(build_responses_provider(
+        alias, base_url, key, opts,
+    )))
+}
+
+fn build_responses_provider(
+    alias: &str,
+    base_url: Option<&str>,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> crate::openai::OpenAiResponsesModelProvider {
     let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias).credential(key);
     if let Some(url) = base_url {
         builder = builder.api_url(url);
@@ -376,7 +389,7 @@ fn build_responses_provider_if_requested(
     if !opts.extra_headers.is_empty() {
         builder = builder.extra_headers(opts.extra_headers.clone());
     }
-    Some(Box::new(builder.build()))
+    builder.build()
 }
 
 pub(crate) fn build_kimi_code_compat(
@@ -1194,6 +1207,30 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         Ok(Box::new(b.build()))
     }
+
+    fn planned_non_streaming_payloads<'a>(
+        &'a self,
+        alias: &'a str,
+        _key: Option<&'a str>,
+        api_url: Option<&'a str>,
+        opts: &'a ModelProviderRuntimeOptions,
+        request: ProviderChatRequest<'a>,
+        model: &'a str,
+        temperature: Option<f64>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+        let mut builder = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
+        if let Some(max_tokens) = opts.provider_max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
+        if let Some(timeout_secs) = opts.provider_timeout_secs {
+            builder = builder.timeout_secs(timeout_secs);
+        }
+        let provider = builder.build();
+        Box::pin(
+            async move { provider.planned_non_streaming_payloads(request, model, temperature) },
+        )
+    }
 }
 
 /// Config used when the `openai` family is dispatched with **no persisted
@@ -1277,8 +1314,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             });
         }
         if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
-            return Box::pin(async {
-                anyhow::bail!("OpenAI Responses wire payload planning is not implemented")
+            let provider = build_responses_provider(alias, api_url, None, opts);
+            return Box::pin(async move {
+                provider.planned_non_streaming_payloads(request, model, temperature)
             });
         }
         let mut builder = crate::openai::OpenAiModelProvider::builder(alias);
