@@ -196,7 +196,7 @@ impl Tool for SpawnSubagentTool {
         let cp_task_id = run_id.clone();
         let goal_parent = GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten();
         if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
+            let create = cp
                 .store
                 .create(crate::control_plane::TaskRecord {
                     id: cp_task_id.clone(),
@@ -220,6 +220,11 @@ impl Tool for SpawnSubagentTool {
                     finished_at: None,
                 })
                 .await;
+            if goal_parent.is_some() && create.is_err() {
+                anyhow::bail!("goal subagent durable task creation failed");
+            }
+        } else if goal_parent.is_some() {
+            anyhow::bail!("goal subagent requires the control plane");
         }
 
         let run_result = Box::pin(scope!(
@@ -257,20 +262,24 @@ impl Tool for SpawnSubagentTool {
                     Some(format!("subagent run failed: {e}")),
                 ),
             };
-            let _ = cp
+            let update = cp
                 .store
                 .update_status(&cp_task_id, status, output, error)
                 .await;
+            if goal_parent.is_some() && update.is_err() {
+                anyhow::bail!("goal subagent durable task completion update failed");
+            }
         }
 
         match run_result {
+            Ok(response) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some("subagent completed with empty output".into()),
+            }),
             Ok(response) => Ok(ToolResult {
                 success: true,
-                output: if response.trim().is_empty() {
-                    "subagent completed without output".to_string().into()
-                } else {
-                    response.into()
-                },
+                output: response.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
