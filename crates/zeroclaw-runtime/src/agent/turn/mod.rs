@@ -119,7 +119,7 @@ tokio::task_local! {
 
 /// Scope complete prompt variants around an Agent turn. This remains transient
 /// request state: durable history keeps the caller-owned canonical prompt.
-pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future + Send>(
     prompts: Arc<ToolProtocolPrompts>,
     future: F,
 ) -> F::Output {
@@ -955,7 +955,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None);
+                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1010,7 +1010,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None);
+            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1067,13 +1067,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // Earlier physical leaves are rejected routing/retry work. The final
-        // accepted response remains settled by `record_accepted_chat_response`
-        // so only it updates context-window telemetry.
-        crate::agent::cost::settle_provider_attempts(
-            &attempts[..attempts.len().saturating_sub(1)],
-            None,
-        );
+        // Goal scope settles the entire immutable report before response
+        // handling. Ordinary turns retain their established split settlement:
+        // rejected leaves here, accepted usage through response telemetry.
+        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts,
+                Some(attempts.len().saturating_sub(1)),
+            )
+            .await?;
+        } else {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts[..attempts.len().saturating_sub(1)],
+                None,
+            )
+            .await?;
+        }
         record_accepted_chat_response(
             &ctx,
             served_provider,
@@ -1198,6 +1207,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+
+        if !executable_calls.is_empty() {
+            crate::agent::cost::mark_goal_tool_execution_if_scoped().await?;
+        }
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =

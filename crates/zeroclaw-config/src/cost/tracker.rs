@@ -439,13 +439,29 @@ impl CostTracker {
     /// later reload flipping `enabled` to `true` constructs it on demand.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
         let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
-        Self::resolve_global(slot, config, workspace_dir)
+        Self::resolve_global(slot, config, workspace_dir, false)
+    }
+
+    /// Open the existing canonical tracker for a Goal-owned operation without
+    /// changing ordinary `[cost].enabled` behavior.
+    ///
+    /// Goal Mode uses task-attributed records even when ordinary cost
+    /// reporting is disabled. This creates the same process-global tracker
+    /// with its original disabled policy intact; Goal writes use the scoped
+    /// recording API that intentionally bypasses only that policy gate.
+    pub fn get_or_init_global_for_goal(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::resolve_global(slot, config, workspace_dir, true)
     }
 
     fn resolve_global(
         slot: &RwLock<Option<Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
+        force_initialize: bool,
     ) -> Option<Arc<Self>> {
         let storage_path = match resolve_storage_path(workspace_dir) {
             Ok(path) => path,
@@ -468,7 +484,7 @@ impl CostTracker {
             return Some(ct);
         }
 
-        if !config.enabled {
+        if !config.enabled && !force_initialize {
             return None;
         }
 
@@ -1551,7 +1567,7 @@ mod tests {
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first = CostTracker::resolve_global(&slot, boot, tmp.path())
+        let first = CostTracker::resolve_global(&slot, boot, tmp.path(), false)
             .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
@@ -1559,7 +1575,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path())
+        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path(), false)
             .expect("reload yields a tracker");
 
         assert_eq!(
@@ -1579,9 +1595,9 @@ mod tests {
         let second_tmp = TempDir::new().unwrap();
         let slot = RwLock::new(None);
 
-        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path())
+        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path(), false)
             .expect("first init yields a tracker");
-        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path())
+        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path(), false)
             .expect("data-dir change yields a tracker");
 
         assert!(
@@ -1609,7 +1625,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&slot, disabled_boot, tmp.path()).is_none(),
+            CostTracker::resolve_global(&slot, disabled_boot, tmp.path(), false).is_none(),
             "disabled boot must not construct a tracker"
         );
 
@@ -1618,7 +1634,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path())
+        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path(), false)
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
@@ -1634,6 +1650,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            false,
         )
         .expect("subsequent call yields a tracker");
         assert!(
@@ -1652,7 +1669,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path())
+        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path(), false)
             .expect("enabled boot yields a tracker");
 
         let disable = CostConfig {
@@ -1660,7 +1677,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, disable, tmp.path())
+        let after = CostTracker::resolve_global(&slot, disable, tmp.path(), false)
             .expect("disable reload leaves the tracker resident");
         assert!(
             Arc::ptr_eq(&tracker, &after),

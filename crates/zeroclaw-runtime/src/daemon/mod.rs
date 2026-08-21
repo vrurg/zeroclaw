@@ -741,19 +741,35 @@ pub async fn run(
             None
         };
 
+        let cost_tracker = if config.goal.enabled {
+            crate::cost::CostTracker::get_or_init_global_for_goal(
+                config.cost.clone(),
+                &config.data_dir,
+            )
+        } else {
+            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        };
+        let goal_executor = crate::control_plane::control_plane()
+            .zip(cost_tracker.as_ref())
+            .map(|(control_plane, cost_tracker)| {
+                std::sync::Arc::new(crate::goal_mode::SessionGoalExecutor::new(
+                    std::sync::Arc::clone(&sessions),
+                    std::sync::Arc::clone(&control_plane.goals),
+                    std::sync::Arc::new(config.clone()),
+                    std::sync::Arc::clone(cost_tracker),
+                )) as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>
+            });
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            sessions,
+            sessions: std::sync::Arc::clone(&sessions),
             session_backend,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
             // supervisor. Without this the RPC/zerocode-TUI turn path has no
             // tracker to record into and model cost is silently dropped
-            cost_tracker: crate::cost::CostTracker::get_or_init_global(
-                config.cost.clone(),
-                &config.data_dir,
-            ),
+            cost_tracker,
+            goal_executor,
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
