@@ -4889,6 +4889,82 @@ mod tests {
         assert_eq!(plan.conservative_token_reservation(1).unwrap(), expected);
     }
 
+    #[tokio::test]
+    async fn anthropic_wire_planning_bounds_both_credential_selected_body_shapes() {
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "planning".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(32),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "anthropic", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+
+        let payload_sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            &config,
+            "anthropic.planning",
+            &options,
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-test",
+            None,
+        )
+        .await
+        .expect("Anthropic planning must cover the regular and OAuth wire bodies");
+
+        assert_eq!(payload_sizes.len(), 2);
+        assert!(payload_sizes.iter().all(|size| *size > 0));
+        assert_ne!(payload_sizes[0], payload_sizes[1]);
+    }
+
+    #[tokio::test]
+    async fn openai_responses_factory_plans_its_exact_wire_payload() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "planning".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    wire_api: Some(WireApi::Responses),
+                    max_tokens: Some(48),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+
+        let payload_sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            &config,
+            "openai.planning",
+            &options,
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-5",
+            None,
+        )
+        .await
+        .expect("configured Responses wire must use its ordinary request builder");
+
+        assert_eq!(payload_sizes.len(), 1);
+        assert!(payload_sizes[0] > 48);
+    }
+
     #[test]
     fn routed_model_provider_credential_precedence_uses_route_key_first() {
         let config = config_with_openai_alias();

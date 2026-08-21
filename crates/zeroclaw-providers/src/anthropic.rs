@@ -1914,6 +1914,81 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Build the non-streaming Messages API body used by both execution and
+    /// reservation planning. `oauth_system_prompt` is an input rather than a
+    /// credential so planning can conservatively enumerate the two stable body
+    /// shapes without exposing or resolving a credential.
+    fn build_non_streaming_chat_request(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        oauth_system_prompt: bool,
+    ) -> NativeChatRequest {
+        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+
+        // Auto-cache last message if conversation is long.
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages);
+        }
+
+        // Check for tool_choice override from the agent loop (e.g. "any"
+        // to force tool use for hardware requests).
+        let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = self.convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        let system = if oauth_system_prompt {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
+        let (effective_temperature, thinking_config, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
+
+        NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: effective_max_tokens,
+            system,
+            messages,
+            temperature: effective_temperature,
+            tools: native_tools,
+            tool_choice,
+            stream: None,
+            thinking: thinking_config,
+        }
+    }
+
+    /// Serialize every stable non-streaming Messages API request shape this
+    /// provider can emit for one call. OAuth changes the system prompt, so a
+    /// credential-free planner conservatively includes both forms.
+    pub(crate) fn planned_non_streaming_payloads(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        [false, true]
+            .into_iter()
+            .map(|oauth_system_prompt| {
+                serde_json::to_vec(&self.build_non_streaming_chat_request(
+                    request,
+                    model,
+                    temperature,
+                    oauth_system_prompt,
+                ))
+                .context("Failed to serialize Anthropic Messages request for planning")
+            })
+            .collect()
+    }
+
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.anthropic",
@@ -2328,36 +2403,13 @@ impl ModelProvider for AnthropicModelProvider {
             )
         })?;
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
-
-        // Auto-cache last message if conversation is long
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
-        }
-
-        // Check for tool_choice override from the agent loop (e.g. "any"
-        // to force tool use for hardware requests).
-        let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten();
-        let native_tools = self.convert_tools(request.tools);
-        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
-        } else {
-            None
-        };
-
-        // For OAuth tokens, prepend Claude Code identity to system prompt
-        let system_prompt = if Self::is_setup_token(credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
-        } else {
-            system_prompt
-        };
-
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
+        let native_request = self.build_non_streaming_chat_request(
+            request,
+            model,
+            temperature,
+            Self::is_setup_token(credential),
+        );
+        let tools_count = native_request.tools.as_ref().map_or(0, Vec::len);
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -2369,26 +2421,14 @@ impl ModelProvider for AnthropicModelProvider {
                         "request_api": "messages",
                         "model": model,
                         "stream": false,
-                        "max_tokens": effective_max_tokens,
+                        "max_tokens": native_request.max_tokens,
                         "tools_count": tools_count,
-                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "tool_choice": native_request.tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "thinking_enabled": native_request.thinking.is_some(),
                     })),
                 "anthropic provider request prepared"
             );
         }
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            max_tokens: effective_max_tokens,
-            system: system_prompt,
-            messages,
-            temperature: effective_temperature,
-            tools: native_tools,
-            tool_choice,
-            stream: None,
-            thinking: thinking_config,
-        };
-
         let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))

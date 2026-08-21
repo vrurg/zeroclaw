@@ -8,6 +8,7 @@ use crate::traits::{
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::stream;
@@ -1142,6 +1143,39 @@ impl OpenAiResponsesModelProvider {
         }
     }
 
+    /// Build the exact non-streaming Responses body used by `chat` and by
+    /// provider-internal reservation planning.
+    fn build_non_streaming_chat_request(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> ResponsesApiRequest {
+        let (instructions, input) = build_responses_input(request.messages);
+        self.build_request(
+            (!instructions.is_empty()).then_some(instructions),
+            input,
+            convert_tools(request.tools),
+            model,
+            temperature,
+            false,
+        )
+    }
+
+    /// Serialize the exact non-streaming Responses request body. The adapter
+    /// has no credential-selected request-body variants.
+    pub(crate) fn planned_non_streaming_payloads(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(vec![
+            serde_json::to_vec(&self.build_non_streaming_chat_request(request, model, temperature))
+                .context("Failed to serialize OpenAI Responses request for planning")?,
+        ])
+    }
+
     fn build_default_headers(&self) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (key, value) in &self.extra_headers {
@@ -1282,15 +1316,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
-        let (instructions, input) = build_responses_input(request.messages);
-        let instructions = if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions)
-        };
-        let tools = convert_tools(request.tools);
-        let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let req = self.build_request(instructions, input, tools, model, temperature, false);
+        let req = self.build_non_streaming_chat_request(request, model, temperature);
+        let tools_count = req.tools.as_ref().map_or(0, Vec::len);
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
