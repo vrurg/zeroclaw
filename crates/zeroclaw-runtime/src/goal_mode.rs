@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -556,6 +557,9 @@ pub struct GoalExecutionScope {
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
+    /// Process-local serialization for one Goal's logical model operations.
+    /// The durable pending slot remains the authoritative cross-process fence.
+    pub operation_permit: Arc<Semaphore>,
 }
 
 /// Preflight input used before a durable Goal is admitted to execution.
@@ -965,6 +969,7 @@ impl GoalRuntime {
             execution_epoch: task.execution_epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
+            operation_permit: Arc::new(Semaphore::new(1)),
         };
         if self.executor.launch(scope).await.is_ok() {
             return Ok(GoalResponse::message(match turn_kind {
