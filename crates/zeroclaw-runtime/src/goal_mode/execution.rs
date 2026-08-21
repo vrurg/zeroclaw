@@ -744,6 +744,9 @@ impl GoalExecutor for SessionGoalExecutor {
                                 task_id: scope.task_id.clone(),
                                 session_id: scope.session_id.clone(),
                                 execution_epoch: scope.execution_epoch,
+                                originator_route: current.task.originator_route.clone(),
+                                principal_id: current.task.principal_id.clone(),
+                                cancellation: scope.cancellation.clone(),
                             }),
                             crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE.scope(
                                 Some(Arc::clone(&tool_execution_fence)),

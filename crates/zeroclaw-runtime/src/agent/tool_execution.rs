@@ -473,6 +473,14 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // A foreground subagent is joined by its parent, but its setup and
+    // non-model work can still have side effects. Keep any batch containing
+    // child creation ordered; Goal Mode relies on this before it can hand the
+    // child an exact parent scope.
+    if tool_calls.iter().any(|call| call.name == "spawn_subagent") {
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -816,6 +824,22 @@ mod tests {
         assert!(
             !should_execute_tools_in_parallel(&calls, Some(&approval_mgr)),
             "tool_search in a mixed approval batch must still force sequential execution"
+        );
+    }
+
+    #[test]
+    fn spawn_subagent_in_batch_forces_serial() {
+        // A foreground child is joined, but it can create durable task state
+        // and perform non-model work. A batch containing child creation must
+        // therefore keep source order before the Goal overlay is considered.
+        let calls = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("spawn_subagent"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "spawn_subagent in a batch must force sequential execution"
         );
     }
 

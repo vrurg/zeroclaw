@@ -756,10 +756,6 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(is_subagent_caller),
-        ),
         Arc::new(SendMessageToPeerTool::new(
             Arc::new(root_config.clone()),
             agent_alias,
@@ -789,6 +785,11 @@ pub fn all_tools_with_runtime(
     // model out from under the parent (the switch signal is process-wide).
     if is_subagent_caller {
         tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
+    } else {
+        tool_arcs.push(Arc::new(
+            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
+                .with_subagent_caller(false),
+        ));
     }
 
     // Register discord_search if any configured Discord alias has
@@ -3351,6 +3352,14 @@ const = true
         assert!(
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
+        );
+        assert!(
+            !subagent.iter().any(|n| n == SpawnSubagentTool::NAME),
+            "subagent must not receive child-creation capability"
+        );
+        assert!(
+            top.iter().any(|n| n == SpawnSubagentTool::NAME),
+            "top-level agent retains foreground child capability"
         );
     }
 

@@ -29,6 +29,10 @@ pub struct SpawnSubagentTool {
     is_subagent_caller: bool,
 }
 
+fn current_goal_parent_scope() -> Option<crate::agent::cost::GoalChildScope> {
+    GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten()
+}
+
 impl SpawnSubagentTool {
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
@@ -174,10 +178,14 @@ impl Tool for SpawnSubagentTool {
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
+        let goal_parent = current_goal_parent_scope();
 
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
+            cancellation_token: goal_parent
+                .as_ref()
+                .map(|scope| scope.cancellation.child_token()),
             is_subagent: true,
             // Sub-turn origin already skips memory injection; explicit for
             // the same future-proofing reason as `is_subagent` above.
@@ -194,7 +202,6 @@ impl Tool for SpawnSubagentTool {
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
-        let goal_parent = GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten();
         if let Some(cp) = crate::control_plane::control_plane() {
             let create = cp
                 .store
@@ -208,10 +215,14 @@ impl Tool for SpawnSubagentTool {
                     heartbeat_at: None,
                     depth: u32::from(self.is_subagent_caller),
                     parent_id: goal_parent.as_ref().map(|scope| scope.task_id.clone()),
-                    originator_route: None,
+                    originator_route: goal_parent
+                        .as_ref()
+                        .and_then(|scope| scope.originator_route.clone()),
                     delivered: false,
                     idem_key: None,
-                    principal_id: None,
+                    principal_id: goal_parent
+                        .as_ref()
+                        .and_then(|scope| scope.principal_id.clone()),
                     session_id: goal_parent.as_ref().map(|scope| scope.session_id.clone()),
                     execution_epoch: goal_parent
                         .as_ref()
@@ -567,6 +578,39 @@ mod tests {
             !overrides.is_subagent,
             "AgentRunOverrides::default().is_subagent must be false so cron paths inherit a top-level shape"
         );
+        assert!(
+            overrides.cancellation_token.is_none(),
+            "top-level runs must not gain a parent cancellation scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_child_cancellation_is_derived_from_parent_scope() {
+        let parent = tokio_util::sync::CancellationToken::new();
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: Some("route".into()),
+            principal_id: Some("principal".into()),
+            cancellation: parent.clone(),
+        };
+
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                let child = current_goal_parent_scope()
+                    .expect("Goal scope must be visible to foreground child setup")
+                    .cancellation
+                    .child_token();
+                child.cancel();
+                assert!(
+                    !parent.is_cancelled(),
+                    "a child cancellation token must not be able to cancel its parent"
+                );
+                parent.cancel();
+                child.cancelled().await;
+            })
+            .await;
     }
 
     #[test]
