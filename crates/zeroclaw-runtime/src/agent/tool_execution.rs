@@ -235,10 +235,12 @@ pub(crate) async fn execute_one_tool(
     // a durable child row and must run its cancellation cleanup. The child
     // receives a derived token and stops promptly; the outer tool loop must
     // join it instead of dropping that cleanup future mid-flight.
-    let goal_child_supervision = call_name == crate::tools::SpawnSubagentTool::NAME
-        && crate::agent::cost::GOAL_CHILD_SCOPE
-            .try_with(|scope| scope.is_some())
-            .unwrap_or(false);
+    let goal_child_supervision = matches!(
+        call_name,
+        crate::tools::SpawnSubagentTool::NAME | crate::tools::DelegateTool::NAME
+    ) && crate::agent::cost::GOAL_CHILD_SCOPE
+        .try_with(|scope| scope.is_some())
+        .unwrap_or(false);
     if goal_child_supervision && cancellation_token.is_some_and(CancellationToken::is_cancelled) {
         return Err(ToolLoopCancelled.into());
     }
@@ -493,7 +495,11 @@ pub fn should_execute_tools_in_parallel(
     // non-model work can still have side effects. Keep any batch containing
     // child creation ordered; Goal Mode relies on this before it can hand the
     // child an exact parent scope.
-    if tool_calls.iter().any(|call| call.name == "spawn_subagent") {
+    let goal_scoped = crate::agent::cost::current_goal_child_scope().is_some();
+    if tool_calls.iter().any(|call| {
+        call.name == crate::tools::SpawnSubagentTool::NAME
+            || (goal_scoped && call.name == crate::tools::DelegateTool::NAME)
+    }) {
         return false;
     }
 
@@ -965,6 +971,38 @@ mod tests {
             !should_execute_tools_in_parallel(&calls, None),
             "spawn_subagent in a batch must force sequential execution"
         );
+    }
+
+    #[test]
+    fn ordinary_delegate_batch_remains_parallel_eligible() {
+        let calls = vec![parsed_tool_call("file_read"), parsed_tool_call("delegate")];
+
+        assert!(
+            should_execute_tools_in_parallel(&calls, None),
+            "ordinary delegate batching must retain its existing parallel behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_delegate_in_batch_forces_serial() {
+        let calls = vec![parsed_tool_call("file_read"), parsed_tool_call("delegate")];
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                assert!(
+                    !should_execute_tools_in_parallel(&calls, None),
+                    "Goal delegate in a batch must force sequential execution"
+                );
+            })
+            .await;
     }
 
     #[test]

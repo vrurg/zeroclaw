@@ -21,13 +21,10 @@ use zeroclaw_providers::{
     self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
 
-/// Goal-owned calls cannot start independent model work until foreground child
-/// propagation owns its lifecycle and accounting. `spawn_subagent` is the one
-/// exception: it is synchronous and carries the scoped Goal binding.
-/// Keep independent child work and approval continuation out of the
-/// model-visible registry until their propagation exists.
-const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
-    "delegate",
+/// Goal-owned parents cannot start independent model work until foreground
+/// child propagation owns its lifecycle and accounting. Foreground `delegate`
+/// and `spawn_subagent` are handled separately and are not listed here.
+const GOAL_PARENT_UNSUPPORTED_TOOLS: &[&str] = &[
     "sop_execute",
     "sop_advance",
     "sop_approve",
@@ -42,6 +39,14 @@ const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
     "send_message_to_peer",
     "cron_run",
 ];
+
+/// A Goal foreground child must not recursively create or supervise another
+/// child. Keep this predicate shared by both delegate registry construction
+/// modes so a target cannot recover a parent-only tool through a different
+/// registry path.
+pub(crate) fn is_goal_child_excluded_tool(name: &str) -> bool {
+    matches!(name, "delegate" | "spawn_subagent") || GOAL_PARENT_UNSUPPORTED_TOOLS.contains(&name)
+}
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
@@ -1132,7 +1137,7 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
         let agent_alias_for_loop = self.observer_agent_alias();
-        let goal_excluded_tools = GOAL_UNSUPPORTED_CHILD_TOOLS
+        let goal_excluded_tools = GOAL_PARENT_UNSUPPORTED_TOOLS
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
@@ -10574,10 +10579,24 @@ mod tests {
             Box::new(NamedMockTool::new("cron_run")),
             Box::new(NamedMockTool::new("file_read")),
         ];
-        tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));
+        tools.retain(|tool| !GOAL_PARENT_UNSUPPORTED_TOOLS.contains(&tool.name()));
 
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, ["spawn_subagent", "file_read"]);
+        assert_eq!(names, ["delegate", "spawn_subagent", "file_read"]);
+    }
+
+    #[test]
+    fn goal_children_exclude_recursive_and_parent_only_tools() {
+        for tool in [
+            "delegate",
+            "spawn_subagent",
+            "sop_execute",
+            "llm_task",
+            "cron_run",
+        ] {
+            assert!(is_goal_child_excluded_tool(tool), "{tool} must be excluded");
+        }
+        assert!(!is_goal_child_excluded_tool("file_read"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::model_provider::ChatRequest;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ModelProviderConfig,
@@ -40,6 +41,60 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
     crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
+}
+
+#[derive(Clone)]
+struct GoalDelegateChild {
+    task_id: String,
+    cancellation: CancellationToken,
+}
+
+/// Goal Mode permits only one joined foreground delegation. Validate this at
+/// both the prepared-call boundary and the tool boundary: the former prevents
+/// rejected modes from crossing the Goal tool-executed fence; the latter keeps
+/// direct tool callers fail-closed.
+pub(crate) fn goal_foreground_delegate_argument_error(
+    args: &serde_json::Value,
+) -> Option<&'static str> {
+    let Some(object) = args.as_object() else {
+        return Some("Goal delegation arguments must be an object");
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "action" | "agent" | "prompt" | "context" | "background"
+        )
+    }) {
+        return Some("Goal delegation only permits one foreground delegate action");
+    }
+    if object
+        .get("action")
+        .is_some_and(|value| value.as_str() != Some(DelegateAction::Delegate.as_str()))
+    {
+        return Some("Goal delegation only permits the delegate action");
+    }
+    if object
+        .get("background")
+        .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return Some("Goal delegation must run in the foreground");
+    }
+    for required in ["agent", "prompt"] {
+        if !object
+            .get(required)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Some("Goal delegation requires nonblank agent and prompt");
+        }
+    }
+    if object
+        .get("context")
+        .is_some_and(|value| value.as_str().is_none())
+    {
+        return Some("Goal delegation context must be text");
+    }
+    None
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -231,6 +286,79 @@ pub(crate) struct IndependentTargetTools {
 }
 
 impl DelegateTool {
+    async fn create_goal_delegate_child(
+        &self,
+        agent_name: &str,
+    ) -> anyhow::Result<Option<GoalDelegateChild>> {
+        let Some(parent) = crate::agent::cost::current_goal_child_scope() else {
+            return Ok(None);
+        };
+        let control_plane = crate::control_plane::control_plane()
+            .ok_or_else(|| anyhow::Error::msg("goal delegate requires the control plane"))?;
+        let task_id = uuid::Uuid::new_v4().to_string();
+        control_plane
+            .store
+            .create(crate::control_plane::TaskRecord {
+                id: task_id.clone(),
+                kind: crate::control_plane::TaskKind::Delegate,
+                agent: agent_name.to_string(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: control_plane.boot_id.clone(),
+                heartbeat_at: None,
+                depth: self.depth,
+                parent_id: Some(parent.task_id),
+                originator_route: parent.originator_route,
+                delivered: false,
+                idem_key: None,
+                principal_id: parent.principal_id,
+                session_id: Some(parent.session_id),
+                execution_epoch: parent.execution_epoch,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .map_err(|error| error.context("goal delegate durable task creation failed"))?;
+        Ok(Some(GoalDelegateChild {
+            task_id,
+            cancellation: parent.cancellation,
+        }))
+    }
+
+    async fn settle_goal_delegate_child(
+        child: Option<GoalDelegateChild>,
+        result: &ToolResult,
+    ) -> anyhow::Result<()> {
+        let Some(child) = child else {
+            return Ok(());
+        };
+        let control_plane = crate::control_plane::control_plane()
+            .ok_or_else(|| anyhow::Error::msg("goal delegate requires the control plane"))?;
+        let status = if child.cancellation.is_cancelled() {
+            crate::control_plane::TaskStatus::Cancelled
+        } else if result.success && !result.output.trim().is_empty() {
+            crate::control_plane::TaskStatus::Completed
+        } else if result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(" timed out after "))
+        {
+            crate::control_plane::TaskStatus::TimedOut
+        } else {
+            crate::control_plane::TaskStatus::Failed
+        };
+        control_plane
+            .store
+            .update_status(
+                &child.task_id,
+                status,
+                result.success.then(|| result.output.to_string()),
+                result.error.clone(),
+            )
+            .await
+            .map_err(|error| error.context("goal delegate durable task settlement failed"))
+    }
+
     /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
     /// rename cannot desync the two.
     pub const NAME: &'static str = "delegate";
@@ -830,7 +958,11 @@ impl DelegateTool {
             ..
         } = assembled;
         let mut tools = registry.into_inner();
-        tools.retain(|tool| tool.name() != Self::NAME);
+        if crate::agent::cost::current_goal_child_scope().is_some() {
+            tools.retain(|tool| !crate::agent::agent::is_goal_child_excluded_tool(tool.name()));
+        } else {
+            tools.retain(|tool| tool.name() != Self::NAME);
+        }
         Ok(IndependentTargetTools {
             tools,
             deferred_section,
@@ -1126,6 +1258,15 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if crate::agent::cost::current_goal_child_scope().is_some()
+            && let Some(error) = goal_foreground_delegate_argument_error(&args)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error.to_string()),
+            });
+        }
         let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1361,6 +1502,12 @@ impl DelegateTool {
             }
         }
 
+        // The ordinary policy path above remains the authority for whether a
+        // target may run. Once it has admitted a Goal-scoped delegate, create
+        // the direct child record before constructing or invoking the target
+        // provider so cancellation/disposal can classify it deterministically.
+        let goal_child = self.create_goal_delegate_child(agent_name).await?;
+
         // Create model_provider for this agent
         let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
@@ -1369,13 +1516,15 @@ impl DelegateTool {
         ) {
             Ok(provider) => provider,
             Err(e) => {
-                return Ok(ToolResult {
+                let result = ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
                         "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
                     )),
-                });
+                };
+                Self::settle_goal_delegate_child(goal_child, &result).await?;
+                return Ok(result);
             }
         };
 
@@ -1387,8 +1536,8 @@ impl DelegateTool {
         };
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
-        if agentic {
-            return self
+        let result = if agentic {
+            match self
                 .execute_agentic_with_admission(
                     agent_name,
                     agent_config,
@@ -1399,51 +1548,82 @@ impl DelegateTool {
                     temperature,
                     admission,
                 )
-                .await;
-        }
-
-        // Build enriched system prompt for non-agentic sub-agent.
-        let enriched_system_prompt = self.build_enriched_system_prompt(
-            agent_name,
-            agent_config,
-            &model,
-            &[],
-            &self.workspace_dir,
-            false,
-            None,
-        );
-        let system_prompt_ref = enriched_system_prompt.as_deref();
-
-        // Wrap the model_provider call in a timeout to prevent indefinite blocking
-        let timeout_secs = self
-            .resolve_delegation_timeout(&agent_config.runtime_profile)
-            .unwrap_or(self.delegate_config.timeout_secs);
-        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
-        )
-        .await;
-
-        let result = match result {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                return Ok(ToolResult {
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {timeout_secs}s"
-                    )),
-                });
+                    error: Some(delegate_failure_error(agent_name, &error)),
+                },
+            }
+        } else {
+            // Build enriched system prompt for non-agentic sub-agent.
+            let enriched_system_prompt = self.build_enriched_system_prompt(
+                agent_name,
+                agent_config,
+                &model,
+                &[],
+                &self.workspace_dir,
+                false,
+                None,
+            );
+            // Goal-scoped calls use the same resolved high-level provider path
+            // as the parent turn, so Reliable accounting and the one shared
+            // Goal admission/settlement wrapper observe every attempt. The
+            // ordinary delegate path retains its established timeout/dispatch.
+            let timeout_secs = self
+                .resolve_delegation_timeout(&agent_config.runtime_profile)
+                .unwrap_or(self.delegate_config.timeout_secs);
+            if goal_child.is_some() {
+                let mut messages = Vec::with_capacity(2);
+                if let Some(system_prompt) = enriched_system_prompt {
+                    messages.push(ChatMessage::system(system_prompt));
+                }
+                messages.push(ChatMessage::user(full_prompt.clone()));
+                let response = ResolvedModelAccess {
+                    model_provider: &*model_provider,
+                    provider_name: &provider_type,
+                    model: &model,
+                    temperature,
+                }
+                .run_model_query(ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                })
+                .await
+                .map(|response| response.text.unwrap_or_default());
+                Self::render_non_agentic_result(agent_name, &provider_type, &model, response)
+            } else {
+                let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    dispatcher.chat_with_system(
+                        enriched_system_prompt.as_deref(),
+                        &full_prompt,
+                        &model,
+                        temperature,
+                    ),
+                )
+                .await;
+
+                match result {
+                    Ok(inner) => {
+                        Self::render_non_agentic_result(agent_name, &provider_type, &model, inner)
+                    }
+                    Err(_elapsed) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Agent '{agent_name}' timed out after {timeout_secs}s"
+                        )),
+                    },
+                }
             }
         };
-
-        Ok(Self::render_non_agentic_result(
-            agent_name,
-            &provider_type,
-            &model,
-            result,
-        ))
+        Self::settle_goal_delegate_child(goal_child, &result).await?;
+        Ok(result)
     }
 
     fn render_non_agentic_result(
@@ -2677,7 +2857,13 @@ impl DelegateTool {
                 let parent_tools = self.parent_tools.read();
                 parent_tools
                     .iter()
-                    .filter(|tool| tool.name() != Self::NAME)
+                    .filter(|tool| {
+                        if crate::agent::cost::current_goal_child_scope().is_some() {
+                            !crate::agent::agent::is_goal_child_excluded_tool(tool.name())
+                        } else {
+                            tool.name() != Self::NAME
+                        }
+                    })
                     .filter(|tool| self.security.is_tool_allowed(tool.name()))
                     .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                     .map(|tool| {
@@ -2813,7 +2999,11 @@ impl DelegateTool {
                 history: &mut history,
                 channel_name: "delegate",
                 channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
+                cancellation_token: Some(
+                    crate::agent::cost::current_goal_child_scope()
+                        .map(|scope| scope.cancellation.child_token())
+                        .unwrap_or_else(|| self.cancellation_token.child_token()),
+                ),
                 on_delta: None,
                 shared_budget: None,
                 // TODO thread from parent in future
@@ -7505,6 +7695,28 @@ mod tests {
                     .as_deref()
                     .unwrap_or("")
                     .contains("Unknown action")
+        );
+    }
+
+    #[test]
+    fn goal_foreground_delegate_arguments_reject_non_foreground_modes() {
+        for args in [
+            json!({"action": "cancel_task", "task_id": "task"}),
+            json!({"agent": "researcher", "prompt": "work", "background": true}),
+            json!({"agent": "researcher", "prompt": "work", "parallel": ["other"]}),
+            json!({"agent": "researcher", "prompt": "work", "timeout_ms": 1}),
+            json!({"agent": " ", "prompt": "work"}),
+        ] {
+            assert!(goal_foreground_delegate_argument_error(&args).is_some());
+        }
+        assert!(
+            goal_foreground_delegate_argument_error(&json!({
+                "agent": "researcher",
+                "prompt": "work",
+                "context": "background",
+                "background": false,
+            }))
+            .is_none()
         );
     }
 
