@@ -2124,6 +2124,11 @@ impl AnthropicModelProvider {
         let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
         let mut last_stop_reason: Option<String> = None;
         let mut content_block_count = 0usize;
+        // Anthropic emits a `content_block_stop` for every block it starts.
+        // `message_stop` is only a clean terminal marker after that lifecycle
+        // has closed. This parser-local counter is the canonical observation;
+        // it deliberately does not retain block payloads or identifiers.
+        let mut open_content_blocks = 0usize;
         let mut content_block_types =
             collect_debug_metadata.then(std::collections::BTreeMap::<String, usize>::new);
         loop {
@@ -2235,6 +2240,7 @@ impl AnthropicModelProvider {
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model": model, "input_tokens": observed_input, "cached_input_tokens": observed_cached, "cache_creation_input_tokens": observed_cache_create})), "stream: message_start");
                 }
                 "content_block_start" => {
+                    open_content_blocks = open_content_blocks.saturating_add(1);
                     if let Some(block) = event.get("content_block") {
                         let block_type = block
                             .get("type")
@@ -2321,6 +2327,15 @@ impl AnthropicModelProvider {
                     }
                 }
                 "content_block_stop" => {
+                    if let Some(remaining) = open_content_blocks.checked_sub(1) {
+                        open_content_blocks = remaining;
+                    } else if terminal_completion_error.is_none() {
+                        // A stop without a matching start is malformed terminal
+                        // framing too. Keep an earlier incomplete cause when one
+                        // has already established the terminal outcome.
+                        terminal_completion_error =
+                            Some(TerminalCompletionError::InvalidTerminalReason);
+                    }
                     if let Some(id) = tool_id.take() {
                         let name = tool_name.take().unwrap_or_default();
                         let input = std::mem::take(&mut tool_input_json);
@@ -2435,6 +2450,7 @@ impl AnthropicModelProvider {
                             .with_attrs(::serde_json::json!({
                                 "stop_reason": last_stop_reason.as_deref().unwrap_or("unknown"),
                                 "content_block_count": content_block_count,
+                                "open_content_block_count": open_content_blocks,
                                 "content_block_types": content_block_types,
                             })),
                             "stream: message_stop"
@@ -2446,11 +2462,16 @@ impl AnthropicModelProvider {
                         cached_input_tokens,
                         cache_creation_input_tokens,
                     );
-                    let error = terminal_completion_error.or_else(|| {
-                        last_stop_reason
-                            .is_none()
-                            .then_some(TerminalCompletionError::InvalidTerminalReason)
-                    });
+                    let error = terminal_completion_error
+                        .or_else(|| {
+                            (open_content_blocks != 0)
+                                .then_some(TerminalCompletionError::InvalidTerminalReason)
+                        })
+                        .or_else(|| {
+                            last_stop_reason
+                                .is_none()
+                                .then_some(TerminalCompletionError::InvalidTerminalReason)
+                        });
                     if let Some(error) = error {
                         Self::emit_terminal_completion_failure(
                             tx,
@@ -4002,6 +4023,48 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             Some(1),
             "parser failures after usage must retain observed output tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn message_stop_with_open_content_block_is_not_a_clean_completion() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut final_count = 0;
+        let mut usage_count = 0;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => final_count += 1,
+                Ok(StreamEvent::Usage(_)) => usage_count += 1,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(final_count, 0, "open content blocks must not emit Final");
+        assert_eq!(usage_count, 1, "observed usage must be emitted once");
+        let failure = failure.expect("open content block must be terminal failure");
+        assert_eq!(
+            failure.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(1));
     }
 
     #[tokio::test]

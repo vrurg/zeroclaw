@@ -2,7 +2,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
+use zeroclaw_api::model_provider::{
+    ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, SemanticEmptyTerminalFailure,
+    terminal_completion_failure,
+};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{
     ChatMessage, ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
@@ -14,6 +17,30 @@ use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
 use crate::tools::{ActivatedToolSet, Tool};
+
+/// Return the billable usage carried by a failed one-shot call when its
+/// accounting scope did not already own rejected attempts. Reliable's wrapper
+/// remains authoritative when present; direct providers retain usage in the
+/// existing typed terminal errors instead of gaining Reliable routing policy.
+fn rejected_terminal_usage(
+    error: &anyhow::Error,
+) -> Option<&zeroclaw_providers::traits::TokenUsage> {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ReliableRejectedCompletionUsage>()
+                .map(|rejected| &rejected.usage)
+        })
+        .or_else(|| terminal_completion_failure(error).and_then(|failure| failure.usage.as_ref()))
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<SemanticEmptyTerminalFailure>()
+                    .and_then(|failure| failure.usage.as_ref())
+            })
+        })
+}
 
 /// The resolved model binding: which provider, model, and temperature a turn
 /// uses. The base layer any LLM call needs; [`ResolvedAgentExecution`] composes
@@ -134,13 +161,7 @@ impl ResolvedModelAccess<'_> {
                 // typed Reliable error chain. Keep the original error intact so
                 // terminal-cause classification remains the provider's source
                 // of truth.
-                if !has_accounted_rejections
-                    && let Some(usage) = error.chain().find_map(|cause| {
-                        cause
-                            .downcast_ref::<ReliableRejectedCompletionUsage>()
-                            .map(|rejected| &rejected.usage)
-                    })
-                {
+                if !has_accounted_rejections && let Some(usage) = rejected_terminal_usage(&error) {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         self.provider_name,
                         self.model,
@@ -275,8 +296,10 @@ mod run_model_query_tests {
     };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
-        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, ToolCall,
+        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, SemanticEmptyTerminalFailure,
+        TerminalCompletionError, TerminalCompletionFailure, ToolCall,
     };
+    use zeroclaw_api::tool::ToolSpec;
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider, ReliableRejectedCompletionUsage};
@@ -411,6 +434,80 @@ mod run_model_query_tests {
         }
     }
 
+    struct DirectTerminalFailureProvider {
+        failure: TerminalCompletionFailure,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DirectTerminalFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::Error::new(self.failure.clone()))
+        }
+    }
+
+    impl Attributable for DirectTerminalFailureProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "direct-terminal-failure-test"
+        }
+    }
+
+    struct DirectSemanticEmptyFailureProvider {
+        usage: TokenUsage,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DirectSemanticEmptyFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::Error::new(SemanticEmptyTerminalFailure::new(Some(
+                self.usage.clone(),
+            ))))
+        }
+    }
+
+    impl Attributable for DirectSemanticEmptyFailureProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "direct-semantic-empty-failure-test"
+        }
+    }
+
     fn access(provider: &UsageProvider) -> ResolvedModelAccess<'_> {
         ResolvedModelAccess {
             model_provider: provider,
@@ -420,7 +517,7 @@ mod run_model_query_tests {
         }
     }
 
-    fn direct_access(provider: &DirectResponseProvider) -> ResolvedModelAccess<'_> {
+    fn direct_access(provider: &dyn ModelProvider) -> ResolvedModelAccess<'_> {
         ResolvedModelAccess {
             model_provider: provider,
             provider_name: "custom",
@@ -655,5 +752,100 @@ mod run_model_query_tests {
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
         assert_eq!(recorded.last_input_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn run_model_query_records_direct_terminal_error_usage_without_reliable() {
+        let messages = [ChatMessage::user("hi")];
+        let tools = [ToolSpec::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({}),
+        )];
+
+        for request_tools in [None, Some(&tools[..])] {
+            let provider = DirectTerminalFailureProvider {
+                failure: TerminalCompletionFailure::new(
+                    TerminalCompletionError::OutputTokenLimit,
+                    Some(TokenUsage {
+                        input_tokens: Some(80),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    }),
+                ),
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+
+            let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    direct_access(&provider)
+                        .run_model_query(ChatRequest {
+                            messages: &messages,
+                            tools: request_tools,
+                            thinking: None,
+                        })
+                        .await
+                        .expect_err("direct terminal failure must fail")
+                })
+                .await;
+
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<TerminalCompletionFailure>()),
+                "typed direct terminal failure must remain discoverable"
+            );
+            let recorded = *turn_usage.lock();
+            assert_eq!(recorded.input_tokens, 80);
+            assert_eq!(recorded.output_tokens, 5);
+            assert_eq!(recorded.last_input_tokens, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_model_query_records_direct_semantic_empty_error_usage_without_reliable() {
+        let messages = [ChatMessage::user("hi")];
+        let tools = [ToolSpec::new(
+            "read_file",
+            "Read a file",
+            serde_json::json!({}),
+        )];
+
+        for request_tools in [None, Some(&tools[..])] {
+            let provider = DirectSemanticEmptyFailureProvider {
+                usage: TokenUsage {
+                    input_tokens: Some(80),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                },
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let turn_usage = Arc::clone(&ctx.turn_usage);
+
+            let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    direct_access(&provider)
+                        .run_model_query(ChatRequest {
+                            messages: &messages,
+                            tools: request_tools,
+                            thinking: None,
+                        })
+                        .await
+                        .expect_err("direct semantic-empty failure must fail")
+                })
+                .await;
+
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalFailure>()),
+                "typed direct semantic-empty failure must remain discoverable"
+            );
+            let recorded = *turn_usage.lock();
+            assert_eq!(recorded.input_tokens, 80);
+            assert_eq!(recorded.output_tokens, 5);
+            assert_eq!(recorded.last_input_tokens, 0);
+        }
     }
 }

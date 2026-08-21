@@ -169,6 +169,21 @@ impl SopCapability for LlmGenerateCapability {
                 )));
             }
         };
+        // Narrow compatibility guard: external `LlmGenerateAdapter`
+        // implementations still expose only `String`, so this boundary must
+        // reject semantic-empty output before capability success is serialized.
+        // A typed adapter-result contract would express this upstream, but that
+        // public API change needs a separate compatibility decision.
+        let semantic_text = zeroclaw_api::model_provider::strip_think_tags(&text);
+        if semantic_text.is_empty() {
+            let error =
+                anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+            let message = crate::agent::terminal_completion_error_message(&error, None)
+                .unwrap_or_else(|| error.to_string());
+            return Ok(CapabilityResult::failure(format!(
+                "llm.generate: model call failed: {message}"
+            )));
+        }
 
         // Output = generated text + echoed payload fields (single-hop piping means
         // downstream steps only see THIS step's output, so identifiers like
@@ -504,6 +519,44 @@ mod tests {
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
         assert!(!out.success);
         assert!(out.error.unwrap().contains("provider down"));
+    }
+
+    #[test]
+    fn legacy_adapter_semantic_empty_output_fails_closed() {
+        for output in ["", " \n\t", "<think>internal reasoning</think>"] {
+            let adapter = Arc::new(RecordingLlm {
+                calls: Mutex::new(Vec::new()),
+                result: Ok(output.to_string()),
+            });
+            let cap = LlmGenerateCapability::new(Some(adapter));
+
+            let out = cap
+                .execute(ctx(), json!({"instruction": "summarize"}))
+                .expect("capability result");
+            assert!(!out.success, "semantic-empty output {output:?} must fail");
+            assert!(
+                out.error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("llm.generate: model call failed:")),
+                "semantic-empty output must use the normal model failure path: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_adapter_keeps_valid_output_byte_for_byte() {
+        let output = " <think>internal reasoning</think> final ";
+        let adapter = Arc::new(RecordingLlm {
+            calls: Mutex::new(Vec::new()),
+            result: Ok(output.to_string()),
+        });
+        let cap = LlmGenerateCapability::new(Some(adapter));
+
+        let out = cap
+            .execute(ctx(), json!({"instruction": "summarize"}))
+            .expect("capability result");
+        assert!(out.success);
+        assert_eq!(out.output["text"], output);
     }
 
     struct SemanticEmptyProvider;
