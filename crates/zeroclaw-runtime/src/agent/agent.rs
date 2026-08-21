@@ -22,13 +22,12 @@ use zeroclaw_providers::{
 };
 
 /// Goal-owned calls cannot start independent model work until foreground child
-/// propagation owns their lifecycle and accounting.
-/// V1 Goal work has no child/supervisor propagation and no approval
-/// continuation. Keep tools that can create child work or advance an SOP
-/// execution out of the model-visible registry until that propagation exists.
+/// propagation owns its lifecycle and accounting. `spawn_subagent` is the one
+/// exception: it is synchronous and carries the scoped Goal binding.
+/// Keep independent child work and approval continuation out of the
+/// model-visible registry until their propagation exists.
 const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
     "delegate",
-    "spawn_subagent",
     "sop_execute",
     "sop_advance",
     "sop_approve",
@@ -10578,7 +10577,7 @@ mod tests {
         tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));
 
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-        assert_eq!(names, ["file_read"]);
+        assert_eq!(names, ["spawn_subagent", "file_read"]);
     }
 
     #[test]
