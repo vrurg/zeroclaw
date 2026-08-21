@@ -238,6 +238,14 @@ tokio::task_local! {
     pub(crate) static GOAL_CHILD_SCOPE: Option<GoalChildScope>;
 }
 
+/// Return the exact Goal parent binding carried by a synchronous child tool.
+///
+/// The durable task registry remains the lifecycle authority; this only avoids
+/// each foreground-child implementation reinterpreting task-local state.
+pub(crate) fn current_goal_child_scope() -> Option<GoalChildScope> {
+    GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten()
+}
+
 /// One Goal execution scope's monotonic tool-phase fence. It stays internal
 /// to the ordinary tool loop: no tool receives Goal authority or identifiers.
 pub(crate) struct GoalToolExecutionFence {

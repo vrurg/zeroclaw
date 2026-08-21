@@ -173,6 +173,29 @@ pub(crate) async fn prepare_tool_calls(
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
 
+        // Reject unsupported Goal delegate modes before the surrounding turn
+        // advances its monotonic tool-executed fence. The Delegate tool repeats
+        // the same guard for direct callers that do not use prepared calls.
+        if tool_name == crate::tools::DelegateTool::NAME
+            && crate::agent::cost::current_goal_child_scope().is_some()
+            && let Some(reason) =
+                crate::tools::delegate::goal_foreground_delegate_argument_error(&tool_args)
+        {
+            let outcome = ToolExecutionOutcome {
+                output: reason.to_string(),
+                success: false,
+                error_reason: Some(reason.to_string()),
+                duration: Duration::ZERO,
+                receipt: None,
+                output_data: None,
+            };
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((tool_name, call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
         let requires_prompt = ctx
             .approval
             .map(|mgr| mgr.needs_approval(&tool_name))

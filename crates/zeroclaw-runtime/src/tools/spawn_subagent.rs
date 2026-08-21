@@ -3,7 +3,7 @@
 //! focused prompt, and returns the response. Cron's `JobType::Agent`
 //! dispatch is the other SubAgent spawn site; both funnel through
 
-use crate::agent::cost::GOAL_CHILD_SCOPE;
+use crate::agent::cost::current_goal_child_scope;
 use crate::agent::loop_::AgentRunOverrides;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -27,10 +27,6 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
-}
-
-fn current_goal_parent_scope() -> Option<crate::agent::cost::GoalChildScope> {
-    GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten()
 }
 
 impl SpawnSubagentTool {
@@ -178,7 +174,7 @@ impl Tool for SpawnSubagentTool {
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
-        let goal_parent = current_goal_parent_scope();
+        let goal_parent = current_goal_child_scope();
 
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
@@ -606,7 +602,7 @@ mod tests {
 
         crate::agent::cost::GOAL_CHILD_SCOPE
             .scope(Some(scope), async {
-                let child = current_goal_parent_scope()
+                let child = current_goal_child_scope()
                     .expect("Goal scope must be visible to foreground child setup")
                     .cancellation
                     .child_token();
