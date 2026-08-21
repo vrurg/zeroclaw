@@ -580,6 +580,8 @@ pub enum GoalExecutionReadiness {
     Ready,
     PricingUnavailable,
     VerifierUnavailable,
+    BindingUnavailable,
+    ExecutorBusy,
 }
 
 /// Dormant execution seam. This stage performs no provider work.
@@ -587,6 +589,12 @@ pub enum GoalExecutionReadiness {
 pub trait GoalExecutor: Send + Sync {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
+
+    /// Signal and quiesce an owned exact executor after the caller has
+    /// committed its durable epoch fence. Dormant/fake executors need no work.
+    async fn cancel(&self, _task_id: &str, _session_id: &str, _epoch: i64) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 /// The sole transport-neutral Goal controller facade.
@@ -859,6 +867,16 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            self.executor
+                .cancel(&task.id, ingress.session_id(), task.execution_epoch)
+                .await
+                .map_err(|_| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "goal executor did not quiesce after pause",
+                    ))
+                })?;
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Paused,
@@ -943,6 +961,16 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            self.executor
+                .cancel(&task.id, ingress.session_id(), task.execution_epoch)
+                .await
+                .map_err(|_| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "goal executor did not quiesce after cancellation",
+                    ))
+                })?;
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Cancelled,
@@ -1082,6 +1110,9 @@ fn readiness_message_key(readiness: GoalExecutionReadiness) -> GoalMessageKey {
         GoalExecutionReadiness::Ready => GoalMessageKey::Started,
         GoalExecutionReadiness::PricingUnavailable => GoalMessageKey::PricingUnavailable,
         GoalExecutionReadiness::VerifierUnavailable => GoalMessageKey::VerifierUnavailable,
+        GoalExecutionReadiness::BindingUnavailable | GoalExecutionReadiness::ExecutorBusy => {
+            GoalMessageKey::Stale
+        }
     }
 }
 

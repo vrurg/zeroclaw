@@ -52,6 +52,8 @@ impl ResolvedModelAccess<'_> {
         admit_goal_operation_if_scoped(GoalOperationRequest {
             model_provider: self.provider_name.to_string(),
             model: self.model.to_string(),
+            temperature: self.temperature,
+            thinking,
             messages: sanitized.to_vec(),
             tools: tools.map_or_else(Vec::new, ToOwned::to_owned),
         })

@@ -154,15 +154,22 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
+    let thinking = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     admit_goal_operation_if_scoped(GoalOperationRequest {
-        model_provider: ctx.provider_name.to_string(),
+        model_provider: active_model_provider_name.to_string(),
         model: active_model.to_string(),
+        temperature: ctx.temperature,
+        thinking,
         messages: prepared_messages.to_vec(),
         tools: request_tools.map_or_else(Vec::new, ToOwned::to_owned),
     })
@@ -273,16 +280,13 @@ pub(crate) async fn call_provider(
                             scope.clear_provisional_provider_route();
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
                             let recovery = with_exact_dispatch_route(
-                                ctx.provider_name.to_string(),
+                                active_model_provider_name.to_string(),
                                 active_model.to_string(),
                                 dispatcher.chat(
                                 ChatRequest {
                                     messages: prepared_messages,
                                     tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                    thinking,
                                 },
                                 active_model,
                                 ctx.temperature,
@@ -316,16 +320,13 @@ pub(crate) async fn call_provider(
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let chat_future = scope.scope(Box::pin(with_exact_dispatch_route(
-            ctx.provider_name.to_string(),
+            active_model_provider_name.to_string(),
             active_model.to_string(),
             dispatcher.chat(
                 ChatRequest {
                     messages: prepared_messages,
                     tools: request_tools,
-                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .try_with(Clone::clone)
-                        .ok()
-                        .flatten(),
+                    thinking,
                 },
                 active_model,
                 ctx.temperature,
@@ -627,13 +628,18 @@ mod streaming_fallback_tests {
     use super::super::context::TurnCtx;
     use super::*;
     use crate::agent::cost::{
+        GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
         TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
         TurnUsage,
     };
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::Arc,
+        sync::Mutex,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::StreamEvent;
     use zeroclaw_config::schema::PacingConfig;
@@ -651,6 +657,27 @@ mod streaming_fallback_tests {
 
     struct EmptyThenPendingProvider {
         calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct RecordingGoalOperationAccounting {
+        admitted: Mutex<Vec<GoalOperationRequest>>,
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for RecordingGoalOperationAccounting {
+        async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()> {
+            self.admitted.lock().expect("recording mutex").push(request);
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            _attempts: Vec<zeroclaw_providers::dispatch::AccountedAttempt>,
+            _accepted_attempt: Option<usize>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -857,6 +884,7 @@ mod streaming_fallback_tests {
                     call_provider(
                         &ctx,
                         &provider,
+                        "test-provider",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -881,6 +909,73 @@ mod streaming_fallback_tests {
                 observed: Some(usage),
             } if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_admission_uses_the_exact_active_request_binding() {
+        let provider = EmptyStreamThenTextProvider {
+            non_stream_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "ordinary-provider",
+            model: "ordinary-model",
+            temperature: Some(0.7),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+        let accounting = Arc::new(RecordingGoalOperationAccounting::default());
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(
+                Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 2048,
+                }),
+                GOAL_OPERATION_ACCOUNTING.scope(
+                    Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "vision-provider",
+                        "vision-model",
+                        &[ChatMessage::user("inspect image")],
+                        None,
+                        false,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider outcome");
+
+        let admitted = accounting.admitted.lock().expect("recording mutex");
+        assert_eq!(admitted.len(), 1);
+        let request = &admitted[0];
+        assert_eq!(request.model_provider, "vision-provider");
+        assert_eq!(request.model, "vision-model");
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(
+            request.thinking.map(|params| params.budget_tokens),
+            Some(2048)
+        );
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, "user");
+        assert_eq!(request.messages[0].content, "inspect image");
     }
 
     #[tokio::test]
@@ -915,6 +1010,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -980,6 +1076,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1046,6 +1143,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
