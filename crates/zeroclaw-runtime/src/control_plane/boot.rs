@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::goal_task::GoalTaskRegistry;
 use super::reaper;
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
@@ -16,6 +17,9 @@ use super::task_store_sqlite::SqliteTaskStore;
 #[derive(Clone)]
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
+    /// Same SQLite store as [`Self::store`], viewed through the session-bound
+    /// Goal control-plane contract. This is not a second persistence owner.
+    pub goals: Arc<dyn GoalTaskRegistry>,
     pub boot_id: String,
 }
 
@@ -28,9 +32,10 @@ impl ControlPlaneHandle {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let sqlite_store = SqliteTaskStore::new(data_dir)?;
+        let sqlite_store = Arc::new(SqliteTaskStore::new(data_dir)?);
         let goal_recovered = sqlite_store.recover_goal_state_on_boot(&boot_id)?;
-        let store: Arc<dyn TaskRegistry> = Arc::new(sqlite_store);
+        let goals: Arc<dyn GoalTaskRegistry> = sqlite_store.clone();
+        let store: Arc<dyn TaskRegistry> = sqlite_store;
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
         if reclaimed > 0 || goal_recovered > 0 {
             ::zeroclaw_log::record!(
@@ -44,7 +49,11 @@ impl ControlPlaneHandle {
                 "control-plane: reclaimed prior-boot orphan tasks at startup"
             );
         }
-        Ok(Self { store, boot_id })
+        Ok(Self {
+            store,
+            goals,
+            boot_id,
+        })
     }
 
     pub fn spawn_reaper(&self, max_runtime_secs: i64, cancel: CancellationToken) -> JoinHandle<()> {
@@ -70,6 +79,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = ControlPlaneHandle::start(dir.path()).await.unwrap();
         assert!(!h.boot_id.is_empty());
+        assert!(
+            h.goals
+                .current_goal_for_session("missing-session")
+                .await
+                .unwrap()
+                .is_none(),
+            "the daemon control plane must expose the same canonical store through the Goal registry"
+        );
         // a reaper spawns and stops cleanly on cancel
         let cancel = CancellationToken::new();
         let jh = h.spawn_reaper(600, cancel.clone());
