@@ -1585,6 +1585,28 @@ impl GoalTaskRegistry for SqliteTaskStore {
             goal_transition_absence(&conn, task_id)
         }
     }
+
+    async fn cancel_running_goal_children(&self, task_id: &str, session_id: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE tasks
+                SET status = 'cancelled',
+                    error = 'goal_parent_cancelled_before_child_completion',
+                    finished_at = ?3
+              WHERE parent_id = ?1
+                AND session_id = ?2
+                AND status = 'running'
+                AND EXISTS (
+                    SELECT 1 FROM tasks AS goal_parent
+                     WHERE goal_parent.id = ?1
+                       AND goal_parent.kind = 'goal'
+                       AND goal_parent.session_id = ?2
+                )",
+            params![task_id, session_id, now],
+        )?;
+        Ok(changed)
+    }
 }
 
 fn goal_transition_absence(conn: &Connection, task_id: &str) -> Result<GoalTransitionResult> {
@@ -2448,6 +2470,43 @@ mod tests {
         assert_eq!(
             s.get("goal-tool-executed").await.unwrap().unwrap().status,
             TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_goal_quiescence_cancels_only_its_running_direct_children() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut goal = rec("goal-parent", "main", 1, "boot-1");
+        goal.kind = TaskKind::Goal;
+        goal.session_id = Some("goal-session".into());
+        s.create_goal(goal, goal_record("goal-parent", "criteria"), None)
+            .await
+            .unwrap();
+
+        let mut child = rec("goal-child", "main", 1, "boot-1");
+        child.parent_id = Some("goal-parent".into());
+        child.session_id = Some("goal-session".into());
+        child.kind = TaskKind::Subagent;
+        s.create(child).await.unwrap();
+
+        let mut unrelated = rec("unrelated-child", "main", 1, "boot-1");
+        unrelated.parent_id = Some("other-parent".into());
+        unrelated.session_id = Some("goal-session".into());
+        unrelated.kind = TaskKind::Subagent;
+        s.create(unrelated).await.unwrap();
+
+        assert_eq!(
+            s.cancel_running_goal_children("goal-parent", "goal-session")
+                .await
+                .unwrap(),
+            1
+        );
+        let child = s.get("goal-child").await.unwrap().unwrap();
+        assert_eq!(child.status, TaskStatus::Cancelled);
+        assert!(child.finished_at.is_some());
+        assert_eq!(
+            s.get("unrelated-child").await.unwrap().unwrap().status,
+            TaskStatus::Running
         );
     }
 }

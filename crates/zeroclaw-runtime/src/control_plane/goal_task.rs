@@ -475,6 +475,15 @@ pub trait GoalTaskRegistry: Send + Sync {
         session_id: &str,
         expected_epoch: i64,
     ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Terminally classify direct foreground children that remain Running
+    /// after their exact Goal executor has been forced to quiesce. This is a
+    /// lifecycle repair, not child supervision or a second task store.
+    async fn cancel_running_goal_children(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<usize>;
 }
 
 #[cfg(test)]

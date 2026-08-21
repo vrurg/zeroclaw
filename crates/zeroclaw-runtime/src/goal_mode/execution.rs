@@ -945,6 +945,19 @@ impl GoalExecutor for SessionGoalExecutor {
                 false
             }
         };
+        // If forced quiescence dropped a non-cooperative foreground child
+        // wrapper, its direct durable row must not remain falsely Running.
+        // Cooperative children have already settled their own terminal row,
+        // so this is an idempotent no-op on the normal path.
+        if self
+            .goals
+            .cancel_running_goal_children(task_id, session_id)
+            .await
+            .is_err()
+        {
+            self.executors.lock().await.remove(task_id);
+            return Err(());
+        }
         // A durable fence may have interrupted a dispatched operation after
         // provider spend but before normal settlement. Preserve the pending
         // ID/reservation and classify it fail-closed rather than leaving an
