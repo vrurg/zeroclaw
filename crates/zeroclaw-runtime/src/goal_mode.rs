@@ -19,6 +19,9 @@ use crate::control_plane::{
     TaskStatus,
 };
 
+mod execution;
+pub(crate) use execution::SessionGoalExecutor;
+
 const INITIAL_GOAL_EXECUTION_EPOCH: i64 = 1;
 
 /// Parsed Goal Mode commands accepted by the V1 grammar.

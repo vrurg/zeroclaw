@@ -12,6 +12,7 @@ use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -1048,6 +1049,119 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Build the provider-visible prefix for one Goal-owned working transcript.
+    ///
+    /// The returned messages are detached from canonical session history. Goal
+    /// execution appends its directive, candidates, and tool transcript only to
+    /// this copy; it never swaps or mutates [`Self::history`].
+    pub(crate) fn goal_working_history(&self) -> Result<Vec<ChatMessage>> {
+        if self.history.is_empty() {
+            return Ok(vec![ChatMessage::system(self.build_system_prompt()?)]);
+        }
+        Ok(self.tool_dispatcher.to_provider_messages(&self.history))
+    }
+
+    /// Append the sole verified Goal completion to canonical session history.
+    ///
+    /// The Goal executor calls this only after its guarded `Completed`
+    /// transition. Working transcripts, candidates rejected by the verifier,
+    /// and verifier feedback never reach this history.
+    pub(crate) fn append_verified_goal_candidate(&mut self, candidate: String) {
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(candidate)));
+    }
+
+    /// Run one Goal parent turn against caller-owned provider history.
+    ///
+    /// This intentionally excludes canonical-history replay, conversation
+    /// autosave, response-cache access, steering, and transport event sinks.
+    /// The caller owns the mutable transcript and discards it on every
+    /// non-complete Goal exit.
+    pub(crate) async fn run_goal_tool_turn(
+        &mut self,
+        mut working_history: Vec<ChatMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<(String, Vec<ChatMessage>)> {
+        let turn_id = Self::new_turn_id();
+        let effective_model = self.model_name.clone();
+        let tool_protocol_prompts = self.tool_protocol_prompts()?;
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+        };
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let agent_alias_for_loop = self.observer_agent_alias();
+        let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()),
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                    crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: self.model_provider.as_ref(),
+                        provider_name: &self.model_provider_name,
+                        model: &effective_model,
+                        temperature: self.temperature,
+                    },
+                    crate::agent::loop_::ResolvedIo {
+                        tools_registry: &self.tools,
+                        observer: self.observer.as_ref(),
+                        silent: false,
+                        approval: self.approval_manager.as_deref(),
+                        multimodal_config: &self.multimodal_config,
+                        config: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|config| config.config.as_deref()),
+                        hooks: self.hook_runner.as_deref(),
+                        activated_tools: self.activated_tools.as_ref(),
+                        model_switch_callback: None,
+                        receipt_generator: None,
+                    },
+                    crate::agent::loop_::ResolvedRuntimeKnobs {
+                        max_tool_iterations: self.config.resolved.max_tool_iterations,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                        pacing: &pacing,
+                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                        parallel_tools: self.config.resolved.parallel_tools,
+                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                        context_token_budget: self.config.resolved.effective_context_budget(),
+                        knobs: &knobs,
+                    },
+                ),
+                history: &mut working_history,
+                channel_name: &self.channel_name,
+                channel_reply_target: None,
+                cancellation_token: Some(cancellation),
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: Some(&mut self.image_cache),
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                agent_alias: agent_alias_for_loop.as_deref(),
+                parent_agent_alias: None,
+                turn_id: &turn_id,
+                sop_reassembly: None,
+            }),
+        );
+        let turn_loop = Box::pin(turn_loop);
+        let response = crate::agent::turn::scope_tool_protocol_prompts(
+            Arc::clone(&tool_protocol_prompts),
+            turn_loop,
+        )
+        .await?;
+        Ok((response, working_history))
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {

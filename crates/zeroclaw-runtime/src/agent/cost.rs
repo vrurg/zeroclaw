@@ -1,10 +1,18 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
+use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::pricing::ModelRates;
+
+use crate::control_plane::{GoalTaskRegistry, GoalTransitionResult};
 
 // ── Cost tracking via task-local ──
 
@@ -188,6 +196,112 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
+#[derive(Clone)]
+pub(crate) struct GoalOperationRequest {
+    pub model_provider: String,
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolSpec>,
+}
+
+#[async_trait]
+pub(crate) trait GoalOperationAccounting: Send + Sync {
+    async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+
+    async fn settle(
+        &self,
+        attempts: Vec<zeroclaw_providers::dispatch::AccountedAttempt>,
+        accepted_attempt: Option<usize>,
+    ) -> anyhow::Result<()>;
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
+}
+
+/// One Goal execution scope's monotonic tool-phase fence. It stays internal
+/// to the ordinary tool loop: no tool receives Goal authority or identifiers.
+pub(crate) struct GoalToolExecutionFence {
+    goals: Arc<dyn GoalTaskRegistry>,
+    task_id: String,
+    session_id: String,
+    epoch: i64,
+    marked: AtomicBool,
+}
+
+impl GoalToolExecutionFence {
+    pub(crate) fn new(
+        goals: Arc<dyn GoalTaskRegistry>,
+        task_id: String,
+        session_id: String,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            goals,
+            task_id,
+            session_id,
+            epoch,
+            marked: AtomicBool::new(false),
+        }
+    }
+
+    async fn mark_before_execution(&self) -> anyhow::Result<()> {
+        if self.marked.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        match self
+            .goals
+            .mark_goal_tool_executed(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                self.marked.store(false, Ordering::Release);
+                anyhow::bail!("goal tool execution fence is stale")
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_TOOL_EXECUTION_FENCE: Option<Arc<GoalToolExecutionFence>>;
+}
+
+/// Fence a scoped Goal exactly before the first prepared tool is dispatched.
+/// No-op for ordinary turns and for model outputs that contain no executable
+/// tool call.
+pub(crate) async fn mark_goal_tool_execution_if_scoped() -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_EXECUTION_FENCE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        fence.mark_before_execution().await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn admit_goal_operation_if_scoped(
+    request: GoalOperationRequest,
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.admit(request).await?;
+    }
+    Ok(())
+}
+
+/// Whether the current task owns strict Goal accounting for this provider
+/// operation. Ordinary turns remain on the existing best-effort path.
+pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
+    GOAL_OPERATION_ACCOUNTING
+        .try_with(|accounting| accounting.is_some())
+        .unwrap_or(false)
+}
+
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
@@ -213,6 +327,86 @@ fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates 
 fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
     let snapshot = zeroclaw_providers::pricing::current_snapshot();
     zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
+}
+
+/// Resolve the canonical rate view for one actually served provider route.
+///
+/// Goal accounting uses this same config/live/catalog precedence as ordinary
+/// turn accounting, but it keeps the `Option` dimensions intact so a finite
+/// Goal limit can distinguish an explicit zero rate from unavailable pricing.
+pub(crate) fn goal_pricing_rates(
+    config: &Config,
+    model_provider_name: &str,
+    model: &str,
+) -> ModelRates {
+    let pricing = build_model_provider_pricing(config);
+    let configured = provider_pricing(&pricing, model_provider_name)
+        .map(|rates| resolve_rates_opt(rates, model))
+        .unwrap_or_default();
+    let live = (!configured.is_complete())
+        .then(|| live_pricing_for(model_provider_name, model))
+        .flatten();
+    let resolved = configured.or(live.unwrap_or_default());
+    if !resolved.is_empty() {
+        return resolved;
+    }
+    if let Some((input, output, cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        return ModelRates {
+            input_per_mtok: Some(input),
+            output_per_mtok: Some(output),
+            cached_input_per_mtok: Some(cached),
+        };
+    }
+    resolved
+}
+
+/// Convert one provider-supplied usage observation into a strict, canonical
+/// ledger record. The caller decides whether unavailable pricing is permitted
+/// for the current Goal limit.
+pub(crate) fn goal_usage_from_provider_attempt(
+    config: &Config,
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> anyhow::Result<CostTokenUsage> {
+    let input_tokens = usage
+        .input_tokens
+        .ok_or_else(|| anyhow::Error::msg("goal provider attempt lacks input usage"))?;
+    let output_tokens = usage
+        .output_tokens
+        .ok_or_else(|| anyhow::Error::msg("goal provider attempt lacks output usage"))?;
+    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+    if cached_input_tokens > input_tokens {
+        anyhow::bail!("goal provider attempt cached input exceeds input usage");
+    }
+    let total_tokens = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| anyhow::Error::msg("goal provider attempt usage overflows"))?;
+    if total_tokens == 0 {
+        anyhow::bail!("goal provider attempt usage is all zero");
+    }
+
+    let rates = goal_pricing_rates(config, model_provider_name, model);
+    let pricing_available = rates.input_per_mtok.is_some()
+        && rates.output_per_mtok.is_some()
+        && (cached_input_tokens == 0
+            || rates.cached_input_per_mtok.is_some()
+            || rates.input_per_mtok.is_some());
+    let mut record = CostTokenUsage::new_with_cache(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        rates.input_per_mtok.unwrap_or(0.0),
+        rates
+            .cached_input_per_mtok
+            .unwrap_or_else(|| rates.input_per_mtok.unwrap_or(0.0)),
+        rates.output_per_mtok.unwrap_or(0.0),
+    );
+    record.pricing_available = pricing_available;
+    Ok(record)
 }
 
 /// Flatten config rates merged with the live-price fallback into the
@@ -288,10 +482,17 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub(crate) fn settle_provider_attempts(
+pub(crate) async fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
-) {
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        return accounting.settle(attempts.to_vec(), accepted_attempt).await;
+    }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -301,6 +502,7 @@ pub(crate) fn settle_provider_attempts(
             updates_context_window_fill,
         );
     }
+    Ok(())
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -472,6 +674,10 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{
+        GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTransitionResult,
+        SqliteTaskStore, TaskKind, TaskRecord, TaskStatus,
+    };
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
@@ -556,7 +762,9 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), None);
+                settle_provider_attempts(report.attempts(), None)
+                    .await
+                    .unwrap();
             })
             .await;
 
@@ -1157,5 +1365,95 @@ mod tests {
         );
 
         assert_eq!(ctx.agent_alias, Some("peer-recipient".to_string()));
+    }
+
+    #[tokio::test]
+    async fn goal_tool_execution_fence_is_monotonic_and_epoch_guarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let task = TaskRecord {
+            id: "goal-tool-fence".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route-a".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("principal-a".into()),
+            session_id: Some("session-a".into()),
+            execution_epoch: 0,
+            started_at: "2026-08-21T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "finish".into(),
+            success_criteria: "verified".into(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+            pending_call_id: None,
+            pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            resume_safety: GoalResumeSafety::Clean,
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let fence = Arc::new(GoalToolExecutionFence::new(
+            store.clone(),
+            "goal-tool-fence".into(),
+            "session-a".into(),
+            1,
+        ));
+        GOAL_TOOL_EXECUTION_FENCE
+            .scope(Some(Arc::clone(&fence)), async {
+                mark_goal_tool_execution_if_scoped().await.unwrap();
+                mark_goal_tool_execution_if_scoped().await.unwrap();
+            })
+            .await;
+        assert_eq!(
+            store
+                .get_goal_task("goal-tool-fence")
+                .await
+                .unwrap()
+                .unwrap()
+                .resume_safety,
+            GoalResumeSafety::ToolExecuted
+        );
+
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    "goal-tool-fence",
+                    "session-a",
+                    1,
+                    crate::control_plane::GoalPauseState {
+                        reason: crate::control_plane::GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let stale_fence =
+            GoalToolExecutionFence::new(store, "goal-tool-fence".into(), "session-a".into(), 1);
+        assert!(stale_fence.mark_before_execution().await.is_err());
     }
 }
