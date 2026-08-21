@@ -671,21 +671,20 @@ impl ResolvedModelOperationPlan {
                 );
             }
             let output_tokens = candidate.max_output_tokens.ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow::Error::msg(format!(
                     "model operation candidate {}/{} has no explicit output cap",
-                    candidate.provider_ref,
-                    candidate.model
-                )
+                    candidate.provider_ref, candidate.model
+                ))
             })?;
             let per_attempt = input_tokens
                 .checked_add(u64::from(output_tokens))
-                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))?;
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
             let candidate_total = per_attempt
                 .checked_mul(u64::from(candidate.attempt_count))
-                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))?;
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
             total
                 .checked_add(candidate_total)
-                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))
         })
     }
 }
@@ -842,6 +841,50 @@ pub fn options_for_provider_ref(
             options
         }
     }
+}
+
+/// Serialize the exact non-streaming JSON bodies a configured provider family
+/// can emit for one `chat` call and return their byte lengths.
+///
+/// This is a provider-internal planning seam: callers receive only lengths,
+/// never prompt contents or credentials. A family without a planner returns
+/// an error, allowing a finite-budget caller to refuse admission before spend.
+pub async fn planned_non_streaming_payload_sizes_for_provider_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    options: &ModelProviderRuntimeOptions,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: Option<f64>,
+) -> anyhow::Result<Vec<u64>> {
+    let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
+        anyhow::Error::msg("wire-payload planning requires a configured provider alias")
+    })?;
+    let provider_kind = options
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(canonicalize_v2_model_provider_name)
+        .unwrap_or_else(|| canonicalize_v2_model_provider_name(family));
+    let payloads = factory::dispatch_family_payload_planner(
+        Some(config),
+        provider_kind,
+        alias,
+        options.provider_api_url.as_deref(),
+        options,
+        request,
+        model,
+        temperature,
+    )
+    .await?;
+    payloads
+        .into_iter()
+        .map(|payload| {
+            u64::try_from(payload.len())
+                .map_err(|_| anyhow::Error::msg("wire-payload length exceeds u64"))
+        })
+        .collect()
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -4587,6 +4630,42 @@ mod tests {
                 attempt_count: config.reliability.provider_retries + 1,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn typed_compat_factory_plans_each_possible_wire_payload_without_credentials() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, VercelModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.vercel.insert(
+            "planning".to_string(),
+            VercelModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(32),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "vercel", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+
+        let sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            &config,
+            "vercel.planning",
+            &options,
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-5",
+            None,
+        )
+        .await
+        .expect("compat family should provide a wire payload plan");
+
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0] > 0);
     }
 
     #[test]

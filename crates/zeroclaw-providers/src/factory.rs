@@ -24,8 +24,9 @@
 
 use crate::ModelProviderRuntimeOptions;
 use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
-use crate::traits::ModelProvider;
+use crate::traits::{ChatRequest as ProviderChatRequest, ModelProvider};
 use anyhow::Result;
+use futures_util::future::BoxFuture;
 
 const XAI_DEFAULT_URL: &str = "https://api.x.ai/v1";
 const OLLAMA_COMPAT_DEFAULT_URL: &str = "http://localhost:11434/v1";
@@ -72,6 +73,22 @@ pub(crate) trait FamilyProviderFactory {
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key)
+    }
+
+    /// Plan every exact non-streaming request body this family can emit for
+    /// one provider call. Families without a wire-payload planner remain
+    /// explicitly unavailable to finite reservation callers.
+    fn planned_non_streaming_payloads<'a>(
+        &'a self,
+        _alias: &'a str,
+        _key: Option<&'a str>,
+        _api_url: Option<&'a str>,
+        _opts: &'a ModelProviderRuntimeOptions,
+        _request: ProviderChatRequest<'a>,
+        _model: &'a str,
+        _temperature: Option<f64>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+        Box::pin(async { anyhow::bail!("provider family has no wire-payload planner") })
     }
 }
 
@@ -183,6 +200,30 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || T::FALLBACK_ALLOWS_MISSING_API_KEY
     }
+
+    fn planned_non_streaming_payloads<'a>(
+        &'a self,
+        alias: &'a str,
+        key: Option<&'a str>,
+        api_url: Option<&'a str>,
+        opts: &'a ModelProviderRuntimeOptions,
+        request: ProviderChatRequest<'a>,
+        model: &'a str,
+        temperature: Option<f64>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+        if self.wire_api() == Some(zeroclaw_config::schema::WireApi::Responses) {
+            return Box::pin(async {
+                anyhow::bail!("Responses wire payload planning is not implemented")
+            });
+        }
+        let provider =
+            apply_compat_options_builder(self.build_compat(alias, key, api_url), opts).build();
+        Box::pin(async move {
+            provider
+                .planned_non_streaming_payloads(request, model, temperature)
+                .await
+        })
+    }
 }
 
 fn has_api_key(key: Option<&str>) -> bool {
@@ -226,10 +267,10 @@ fn merge_extra_body(
 /// `chat_template_kwargs`) to a compat builder before calling `.build()` and
 /// boxing the trait object. Single source of the override chain — every compat
 /// impl funnels through here.
-pub fn apply_compat_options(
+pub(crate) fn apply_compat_options_builder(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
-) -> Box<dyn ModelProvider> {
+) -> crate::compatible::OpenAiCompatibleBuilder {
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
@@ -266,7 +307,14 @@ pub fn apply_compat_options(
     ) {
         b = b.extra_body(extra);
     }
-    let p = b.build();
+    b
+}
+
+pub fn apply_compat_options(
+    b: crate::compatible::OpenAiCompatibleBuilder,
+    opts: &ModelProviderRuntimeOptions,
+) -> Box<dyn ModelProvider> {
+    let p = apply_compat_options_builder(b, opts).build();
     if let Some(extra) = &opts.provider_extra
         && !extra.is_object()
     {
@@ -407,6 +455,62 @@ pub fn dispatch_family_factory(
         }
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
+}
+
+/// Build exact non-streaming JSON payloads through the same typed family
+/// configuration dispatch that constructs a provider. This is planning only:
+/// it neither resolves credentials nor sends a request.
+pub(crate) async fn dispatch_family_payload_planner(
+    config: Option<&zeroclaw_config::schema::Config>,
+    family: &str,
+    alias: &str,
+    api_url: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+    request: ProviderChatRequest<'_>,
+    model: &str,
+    temperature: Option<f64>,
+) -> Result<Vec<Vec<u8>>> {
+    if family == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.openai.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg
+            .planned_non_streaming_payloads(alias, None, api_url, opts, request, model, temperature)
+            .await;
+    }
+    macro_rules! emit_payload_planner {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match family {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .and_then(|c| c.providers.models.find("openai", alias))
+                        .unwrap_or(&default_cfg);
+                    cfg.planned_non_streaming_payloads(
+                        alias, None, api_url, opts, request, model, temperature,
+                    ).await
+                }
+                $(
+                    $type_str => {
+                        let default_cfg: $cfg_ty;
+                        let cfg: &$cfg_ty = match config.and_then(|c| c.providers.models.$field.get(alias)) {
+                            Some(c) => c,
+                            None => {
+                                default_cfg = <$cfg_ty>::default();
+                                &default_cfg
+                            }
+                        };
+                        cfg.planned_non_streaming_payloads(
+                            alias, None, api_url, opts, request, model, temperature,
+                        ).await
+                    }
+                )+
+                _ => anyhow::bail!("unknown provider family `{family}` for wire-payload planning"),
+            }
+        }
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_payload_planner)
 }
 
 pub(crate) fn fallback_auth_ready_for_alias(
