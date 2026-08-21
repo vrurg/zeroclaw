@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::{cost::CostTracker, schema::Config};
 
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalResumeSafety,
@@ -485,8 +485,8 @@ impl GoalResponse {
     }
 }
 
-/// Read-only current-Goal projection. Usage totals remain absent until the
-/// execution/accounting stage derives them from the canonical ledger.
+/// Read-only current-Goal projection derived from durable control state and
+/// the canonical cost ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalStatusProjection {
     pub task_id: String,
@@ -494,6 +494,16 @@ pub struct GoalStatusProjection {
     pub resumable: bool,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
+    /// Known durable token usage. When accounting is incomplete, this remains
+    /// a lower bound and no remaining budget is advertised.
+    pub known_token_usage: u64,
+    /// Known durable cost in USD. When pricing is incomplete, this remains a
+    /// lower bound and no remaining cost budget is advertised.
+    pub known_cost_usd: f64,
+    pub token_accounting_complete: bool,
+    pub cost_accounting_complete: bool,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pending_reserved_tokens: Option<u64>,
     pub pending_reserved_cost_usd: Option<f64>,
@@ -576,6 +586,7 @@ pub trait GoalExecutor: Send + Sync {
 pub struct GoalRuntime {
     config: Arc<Config>,
     goals: Arc<dyn GoalTaskRegistry>,
+    cost_tracker: Arc<CostTracker>,
     executor: Arc<dyn GoalExecutor>,
     boot_id: String,
 }
@@ -588,12 +599,14 @@ impl GoalRuntime {
     pub fn new(
         config: Arc<Config>,
         goals: Arc<dyn GoalTaskRegistry>,
+        cost_tracker: Arc<CostTracker>,
         executor: Arc<dyn GoalExecutor>,
         boot_id: impl Into<String>,
     ) -> Result<Self, GoalIngressError> {
         Ok(Self {
             config,
             goals,
+            cost_tracker,
             executor,
             boot_id: required_ingress_value(boot_id.into())?,
         })
@@ -754,7 +767,7 @@ impl GoalRuntime {
         };
         Ok(GoalResponse::status(
             GoalMessageKey::Status,
-            status_projection(&current),
+            self.status_projection(current).await?,
         ))
     }
 
@@ -764,7 +777,7 @@ impl GoalRuntime {
         };
         Ok(GoalResponse::status(
             GoalMessageKey::Budget,
-            status_projection(&current),
+            self.status_projection(current).await?,
         ))
     }
 
@@ -1017,6 +1030,20 @@ impl GoalRuntime {
         }
         Ok(Some(current))
     }
+
+    async fn status_projection(
+        &self,
+        current: GoalTaskStatus,
+    ) -> Result<GoalStatusProjection, GoalRuntimeError> {
+        let task_id = current.task.id.clone();
+        let tracker = Arc::clone(&self.cost_tracker);
+        let totals =
+            tokio::task::spawn_blocking(move || tracker.get_strict_usage_totals_for_task(&task_id))
+                .await
+                .map_err(GoalRuntimeError::accounting)?
+                .map_err(GoalRuntimeError::accounting)?;
+        Ok(status_projection(&current, totals))
+    }
 }
 
 /// Non-user-facing controller errors. Adapters receive typed responses only.
@@ -1028,11 +1055,17 @@ pub enum GoalRuntimeError {
     BudgetRequired,
     #[error("goal_invalid_budget")]
     InvalidBudget,
+    #[error("goal_accounting_unavailable")]
+    Accounting(#[source] anyhow::Error),
 }
 
 impl GoalRuntimeError {
     fn control_plane(error: anyhow::Error) -> Self {
         Self::ControlPlane(error)
+    }
+
+    fn accounting(error: impl Into<anyhow::Error>) -> Self {
+        Self::Accounting(error.into())
     }
 }
 
@@ -1060,9 +1093,19 @@ fn transition_message(result: GoalTransitionResult, applied: GoalMessageKey) -> 
     }
 }
 
-fn status_projection(current: &GoalTaskStatus) -> GoalStatusProjection {
+fn status_projection(
+    current: &GoalTaskStatus,
+    totals: zeroclaw_config::cost::StrictTaskUsageTotals,
+) -> GoalStatusProjection {
     let task = &current.task;
     let goal = &current.goal;
+    let settled = goal.accounting_state == GoalAccountingState::Complete
+        && goal.pending_call_id.is_none()
+        && goal.pending_call_epoch.is_none()
+        && goal.pending_reserved_tokens.is_none()
+        && goal.pending_reserved_cost_usd.is_none();
+    let token_accounting_complete = settled;
+    let cost_accounting_complete = settled && totals.pricing_available;
     GoalStatusProjection {
         task_id: task.id.clone(),
         status: task.status,
@@ -1076,6 +1119,18 @@ fn status_projection(current: &GoalTaskStatus) -> GoalStatusProjection {
             && goal.resume_safety == GoalResumeSafety::Clean,
         token_limit: goal.effective_token_limit,
         cost_limit_usd: goal.effective_cost_limit_usd,
+        known_token_usage: totals.total_tokens,
+        known_cost_usd: totals.cost_usd,
+        token_accounting_complete,
+        cost_accounting_complete,
+        remaining_tokens: token_accounting_complete
+            .then_some(goal.effective_token_limit)
+            .flatten()
+            .map(|limit| limit.saturating_sub(totals.total_tokens)),
+        remaining_cost_usd: cost_accounting_complete
+            .then_some(goal.effective_cost_limit_usd)
+            .flatten()
+            .map(|limit| (limit - totals.cost_usd).max(0.0)),
         accounting_state: goal.accounting_state,
         pending_reserved_tokens: goal.pending_reserved_tokens,
         pending_reserved_cost_usd: goal.pending_reserved_cost_usd,
