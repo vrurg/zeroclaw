@@ -1507,6 +1507,7 @@ impl DelegateTool {
         // the direct child record before constructing or invoking the target
         // provider so cancellation/disposal can classify it deterministically.
         let goal_child = self.create_goal_delegate_child(agent_name).await?;
+        let goal_scoped = goal_child.is_some();
 
         // Create model_provider for this agent
         let (model_provider, provider_type, model) = match self.build_target_provider(
@@ -1524,6 +1525,9 @@ impl DelegateTool {
                     )),
                 };
                 Self::settle_goal_delegate_child(goal_child, &result).await?;
+                if goal_scoped {
+                    anyhow::bail!("goal delegate provider construction failed");
+                }
                 return Ok(result);
             }
         };
@@ -1575,26 +1579,50 @@ impl DelegateTool {
             let timeout_secs = self
                 .resolve_delegation_timeout(&agent_config.runtime_profile)
                 .unwrap_or(self.delegate_config.timeout_secs);
-            if goal_child.is_some() {
+            if goal_scoped {
                 let mut messages = Vec::with_capacity(2);
                 if let Some(system_prompt) = enriched_system_prompt {
                     messages.push(ChatMessage::system(system_prompt));
                 }
                 messages.push(ChatMessage::user(full_prompt.clone()));
+                let cancellation = goal_child
+                    .as_ref()
+                    .map(|child| child.cancellation.child_token())
+                    .ok_or_else(|| anyhow::Error::msg("goal delegate child scope was lost"))?;
                 let response = ResolvedModelAccess {
                     model_provider: &*model_provider,
                     provider_name: &provider_type,
                     model: &model,
                     temperature,
                 }
-                .run_model_query(ChatRequest {
-                    messages: &messages,
-                    tools: None,
-                    thinking: None,
-                })
+                .run_model_query_with_control(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    Some(&cancellation),
+                    Some(Duration::from_secs(timeout_secs)),
+                )
                 .await
                 .map(|response| response.text.unwrap_or_default());
-                Self::render_non_agentic_result(agent_name, &provider_type, &model, response)
+                match response {
+                    Err(error) if error.to_string() == "resolved model operation timed out" => {
+                        ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Agent '{agent_name}' timed out after {timeout_secs}s"
+                            )),
+                        }
+                    }
+                    response => Self::render_non_agentic_result(
+                        agent_name,
+                        &provider_type,
+                        &model,
+                        response,
+                    ),
+                }
             } else {
                 let dispatcher = ProviderDispatch::from_ref(&*model_provider);
                 let result = tokio::time::timeout(
@@ -1623,6 +1651,15 @@ impl DelegateTool {
             }
         };
         Self::settle_goal_delegate_child(goal_child, &result).await?;
+        if goal_scoped && !result.success {
+            anyhow::bail!(
+                "goal delegate failed: {}",
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_else(|| result.output.as_str())
+            );
+        }
         Ok(result)
     }
 
@@ -2950,97 +2987,130 @@ impl DelegateTool {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
-        let execution = tokio::time::timeout(
-            Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(ToolLoop {
-                sop_reassembly: None,
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider,
-                        provider_name: provider_type,
-                        model,
-                        temperature: effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: &sub_tools,
-                        observer: &noop_observer,
-                        silent: true,
-                        approval: None,
-                        multimodal_config: &self.multimodal_config,
-                        // Full config so the delegated sub-agent's vision route
-                        // resolves the configured `vision_model_provider`'s alias
-                        // options (the `vision` override, endpoint URI, credentials),
-                        // exactly as the parent turn does. `None` only on the
-                        // configless test builder (`root_config` unset).
-                        config: self.root_config.as_deref(),
-                        hooks: None,
-                        // Thread the target's deferred-MCP activated set so `tool_search`
-                        // can activate the target's deferred tools mid-turn (Some only for
-                        // an independent target with granted deferred-MCP bundles).
-                        activated_tools: sub_activated.as_ref(),
-                        model_switch_callback: None,
-                        // delegate subagents don't support approval
-                        receipt_generator,
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: loop_runtime.max_tool_iterations,
-                        excluded_tools: &[],
-                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &pacing,
-                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                        parallel_tools: loop_runtime.parallel_tools,
-                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &loop_knobs,
-                    },
-                ),
-                history: &mut history,
-                channel_name: "delegate",
-                channel_reply_target: None,
-                cancellation_token: Some(
-                    crate::agent::cost::current_goal_child_scope()
-                        .map(|scope| scope.cancellation.child_token())
-                        .unwrap_or_else(|| self.cancellation_token.child_token()),
-                ),
-                on_delta: None,
-                shared_budget: None,
-                // TODO thread from parent in future
-                channel: None,
-                collected_receipts,
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Per-transport
-                // stamping lands in a later phase.
-                memory: None,
-                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
-                agent_alias: Some(agent_name),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-            })
-            .instrument(::zeroclaw_log::attribution_span!(
-                &crate::agent::AgentAttribution(agent_name)
-            )),
-        );
-        let result = match thinking_params {
-            Some(params) => {
+        let goal_cancellation = crate::agent::cost::current_goal_child_scope()
+            .map(|scope| scope.cancellation.child_token());
+        let loop_cancellation = goal_cancellation
+            .clone()
+            .unwrap_or_else(|| self.cancellation_token.child_token());
+        let run = run_tool_call_loop(ToolLoop {
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider,
+                    provider_name: provider_type,
+                    model,
+                    temperature: effective_temperature,
+                },
+                ResolvedIo {
+                    tools_registry: &sub_tools,
+                    observer: &noop_observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &self.multimodal_config,
+                    // Full config so the delegated sub-agent's vision route
+                    // resolves the configured `vision_model_provider`'s alias
+                    // options (the `vision` override, endpoint URI, credentials),
+                    // exactly as the parent turn does. `None` only on the
+                    // configless test builder (`root_config` unset).
+                    config: self.root_config.as_deref(),
+                    hooks: None,
+                    // Thread the target's deferred-MCP activated set so `tool_search`
+                    // can activate the target's deferred tools mid-turn (Some only for
+                    // an independent target with granted deferred-MCP bundles).
+                    activated_tools: sub_activated.as_ref(),
+                    model_switch_callback: None,
+                    // delegate subagents don't support approval
+                    receipt_generator,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: loop_runtime.max_tool_iterations,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                    pacing: &pacing,
+                    strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                    parallel_tools: loop_runtime.parallel_tools,
+                    max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                    // Keep delegate subagent context pruning aligned with top-level
+                    // agents instead of preserving the old disabled-by-zero path.
+                    context_token_budget: loop_runtime.max_context_tokens,
+                    knobs: &loop_knobs,
+                },
+            ),
+            history: &mut history,
+            channel_name: "delegate",
+            channel_reply_target: None,
+            cancellation_token: Some(loop_cancellation),
+            on_delta: None,
+            shared_budget: None,
+            // TODO thread from parent in future
+            channel: None,
+            collected_receipts,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Per-transport
+            // stamping lands in a later phase.
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+            agent_alias: Some(agent_name),
+            parent_agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .instrument(::zeroclaw_log::attribution_span!(
+            &crate::agent::AgentAttribution(agent_name)
+        ));
+        let execution = async {
+            if let Some(params) = thinking_params {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .scope(params.native_thinking, execution)
+                    .scope(params.native_thinking, run)
                     .await
+            } else {
+                run.await
             }
-            None => execution.await,
+        };
+        tokio::pin!(execution);
+        let (result, timed_out) = if let Some(goal_cancellation) = goal_cancellation {
+            tokio::select! {
+                result = &mut execution => (result, false),
+                () = tokio::time::sleep(Duration::from_secs(agentic_timeout_secs)) => {
+                    // Do not drop an admitted Goal operation. Signal its child
+                    // token and await the normal loop/accounting cleanup.
+                    goal_cancellation.cancel();
+                    (execution.await, true)
+                }
+            }
+        } else {
+            match tokio::time::timeout(Duration::from_secs(agentic_timeout_secs), &mut execution)
+                .await
+            {
+                Ok(result) => (result, false),
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
+                        )),
+                    });
+                }
+            }
         };
 
-        match result {
-            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+        match (timed_out, result) {
+            (true, _) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
+                )),
+            }),
+            (false, Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(invalid_semantic_completion_error(agent_name)),
             }),
-            Ok(Ok(response)) => Ok(ToolResult {
+            (false, Ok(response)) => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
@@ -3048,17 +3118,10 @@ impl DelegateTool {
                 .into(),
                 error: None,
             }),
-            Ok(Err(e)) => Ok(ToolResult {
+            (false, Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(delegate_failure_error(agent_name, &e)),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
-                )),
             }),
         }
     }
