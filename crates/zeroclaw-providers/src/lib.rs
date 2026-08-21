@@ -651,6 +651,45 @@ pub struct ResolvedModelOperationPlan {
     pub candidates: Vec<ResolvedModelOperationCandidate>,
 }
 
+impl ResolvedModelOperationPlan {
+    /// Return a checked token bound for every physical candidate attempt that
+    /// this logical operation may make.
+    ///
+    /// Finite autonomous callers use this before admission. An omitted output
+    /// cap cannot supply a conservative reservation and is therefore an error,
+    /// rather than an invitation to guess a provider-specific default.
+    pub fn conservative_token_reservation(&self, input_tokens: u64) -> anyhow::Result<u64> {
+        if self.candidates.is_empty() {
+            anyhow::bail!("model operation plan has no candidates");
+        }
+        self.candidates.iter().try_fold(0_u64, |total, candidate| {
+            if candidate.attempt_count == 0 {
+                anyhow::bail!(
+                    "model operation candidate {}/{} has zero attempts",
+                    candidate.provider_ref,
+                    candidate.model
+                );
+            }
+            let output_tokens = candidate.max_output_tokens.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "model operation candidate {}/{} has no explicit output cap",
+                    candidate.provider_ref,
+                    candidate.model
+                )
+            })?;
+            let per_attempt = input_tokens
+                .checked_add(u64::from(output_tokens))
+                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))?;
+            let candidate_total = per_attempt
+                .checked_mul(u64::from(candidate.attempt_count))
+                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))?;
+            total
+                .checked_add(candidate_total)
+                .ok_or_else(|| anyhow::anyhow!("model operation reservation overflows"))
+        })
+    }
+}
+
 impl Default for ModelProviderRuntimeOptions {
     fn default() -> Self {
         Self {
@@ -2375,6 +2414,46 @@ pub mod test_util {
 mod tests {
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
+
+    #[test]
+    fn operation_plan_reservation_covers_every_candidate_retry() {
+        let plan = ResolvedModelOperationPlan {
+            candidates: vec![
+                ResolvedModelOperationCandidate {
+                    provider_ref: "first".into(),
+                    model: "model-a".into(),
+                    max_output_tokens: Some(10),
+                    attempt_count: 2,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "fallback".into(),
+                    model: "model-b".into(),
+                    max_output_tokens: Some(20),
+                    attempt_count: 1,
+                },
+            ],
+        };
+
+        assert_eq!(plan.conservative_token_reservation(100).unwrap(), 340);
+        let unbounded = ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: "unbounded".into(),
+                model: "model-c".into(),
+                max_output_tokens: None,
+                attempt_count: 1,
+            }],
+        };
+        assert!(unbounded.conservative_token_reservation(100).is_err());
+        let zero_attempts = ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: "invalid".into(),
+                model: "model-d".into(),
+                max_output_tokens: Some(10),
+                attempt_count: 0,
+            }],
+        };
+        assert!(zero_attempts.conservative_token_reservation(100).is_err());
+    }
 
     #[test]
     fn runtime_recommendations_distinguish_local_backends_from_cli_shims() {
