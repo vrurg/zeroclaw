@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, Notify, OwnedSemaphorePermit},
+    sync::{Mutex, OwnedSemaphorePermit},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -119,7 +119,6 @@ struct RegisteredGoalExecutor {
     epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
     handle: Option<JoinHandle<()>>,
-    handle_published: Arc<Notify>,
 }
 
 impl SessionGoalExecutor {
@@ -653,37 +652,25 @@ impl GoalExecutor for SessionGoalExecutor {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let executor_key = scope.task_id.clone();
-        {
-            let mut executors = self.executors.lock().await;
-            executors.retain(|_, executor| {
-                executor
-                    .handle
-                    .as_ref()
-                    .is_none_or(|handle| !handle.is_finished())
-            });
-            if executors.contains_key(&executor_key) {
-                return Err(());
-            }
-            // Install the cancellation authority before the worker can await a
-            // queue or session lock. A concurrent pause/cancel can therefore
-            // always fence this exact scope before it performs provider work.
-            executors.insert(
-                executor_key.clone(),
-                RegisteredGoalExecutor {
-                    session_id: scope.session_id.clone(),
-                    epoch: scope.execution_epoch,
-                    cancellation: scope.cancellation.clone(),
-                    handle: None,
-                    handle_published: Arc::new(Notify::new()),
-                },
-            );
-        }
         let sessions = Arc::clone(&self.sessions);
         let goals = Arc::clone(&self.goals);
         let config = Arc::clone(&self.config);
         let cost_tracker = Arc::clone(&self.cost_tracker);
         let session_queue = Arc::clone(&self.sessions.session_queue);
         let worker_scope = scope.clone();
+        // Hold the registry lock across spawn and publication. `spawn` does
+        // not await, and the worker never locks this registry, so pause/cancel
+        // cannot observe an owned worker without its join handle.
+        let mut executors = self.executors.lock().await;
+        executors.retain(|_, executor| {
+            executor
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+        });
+        if executors.contains_key(&executor_key) {
+            return Err(());
+        }
         let handle = zeroclaw_spawn::spawn!(async move {
             let scope = worker_scope;
             let queue_guard =
@@ -883,28 +870,20 @@ impl GoalExecutor for SessionGoalExecutor {
                 }
             }
         });
-        let mut executors = self.executors.lock().await;
-        let Some(executor) = executors.get_mut(&executor_key) else {
-            handle.abort();
-            let _ = handle.await;
-            return Err(());
-        };
-        if executor.session_id != scope.session_id
-            || executor.epoch != scope.execution_epoch
-            || executor.cancellation.is_cancelled()
-        {
-            handle.abort();
-            let _ = handle.await;
-            executors.remove(&executor_key);
-            return Err(());
-        }
-        executor.handle = Some(handle);
-        executor.handle_published.notify_waiters();
+        executors.insert(
+            executor_key,
+            RegisteredGoalExecutor {
+                session_id: scope.session_id.clone(),
+                epoch: scope.execution_epoch,
+                cancellation: scope.cancellation,
+                handle: Some(handle),
+            },
+        );
         Ok(())
     }
 
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
-        let (cancellation, handle, handle_published) = {
+        let (cancellation, handle) = {
             let mut executors = self.executors.lock().await;
             let Some(executor) = executors.get_mut(task_id) else {
                 return Ok(());
@@ -912,36 +891,24 @@ impl GoalExecutor for SessionGoalExecutor {
             if executor.session_id != session_id || executor.epoch != epoch {
                 return Err(());
             }
-            (
-                executor.cancellation.clone(),
-                executor.handle.take(),
-                Arc::clone(&executor.handle_published),
-            )
+            (executor.cancellation.clone(), executor.handle.take())
         };
         cancellation.cancel();
-        let mut handle = if let Some(handle) = handle {
-            handle
-        } else {
-            // `launch` inserted this exact cancellation authority before it
-            // could await queue/session state. Wait until it publishes the
-            // handle, then take and join that same worker.
-            handle_published.notified().await;
-            let mut executors = self.executors.lock().await;
-            let Some(executor) = executors.get_mut(task_id) else {
-                return Err(());
-            };
-            executor.handle.take().ok_or(())?
+        let Some(mut handle) = handle else {
+            return Err(());
         };
-        match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(()),
+        let join_failed = match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await
+        {
+            Ok(Ok(())) => false,
+            Ok(Err(_)) => true,
             Err(_) => {
                 handle.abort();
                 // Abort-induced cancellation is the expected forced-quiesce
                 // result; it is not a second controller failure.
                 let _ = handle.await;
+                false
             }
-        }
+        };
         // A durable fence may have interrupted a dispatched operation after
         // provider spend but before normal settlement. Preserve the pending
         // ID/reservation and classify it fail-closed rather than leaving an
@@ -950,7 +917,7 @@ impl GoalExecutor for SessionGoalExecutor {
             && current.task.id == task_id
             && let Some(call_id) = current.goal.pending_call_id
         {
-            let _ = self
+            match self
                 .goals
                 .settle_pending_call(
                     task_id,
@@ -959,10 +926,17 @@ impl GoalExecutor for SessionGoalExecutor {
                     &call_id,
                     GoalAccountingState::OutcomeUnknown,
                 )
-                .await;
+                .await
+            {
+                Ok(GoalTransitionResult::Applied) => {}
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) | Err(_) => {
+                    self.executors.lock().await.remove(task_id);
+                    return Err(());
+                }
+            }
         }
         self.executors.lock().await.remove(task_id);
-        Ok(())
+        if join_failed { Err(()) } else { Ok(()) }
     }
 }
 
