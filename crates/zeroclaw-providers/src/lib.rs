@@ -625,6 +625,32 @@ pub struct ModelProviderRuntimeOptions {
     pub tls_ca_cert_path: Option<String>,
 }
 
+/// One provider/model leaf that Reliable can select while serving a logical
+/// operation. This is configuration-derived planning data: it deliberately
+/// exposes neither credentials nor a provider handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationCandidate {
+    /// Exact configured provider reference used for route attribution.
+    pub provider_ref: String,
+    /// Model served by this candidate after profile and route pinning.
+    pub model: String,
+    /// Explicit configured output bound, when the provider declares one.
+    pub max_output_tokens: Option<u32>,
+    /// Maximum physical attempts Reliable may make for this candidate.
+    pub attempt_count: u32,
+}
+
+/// Read-only plan for the candidate chain serving one routed model operation.
+///
+/// Construction and accounting reservation share the factory traversal below,
+/// so a configuration change cannot make the operation execute a candidate the
+/// plan did not expose. The plan is intentionally provider-agnostic and can be
+/// consumed by any caller that needs a conservative bound before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationPlan {
+    pub candidates: Vec<ResolvedModelOperationCandidate>,
+}
+
 impl Default for ModelProviderRuntimeOptions {
     fn default() -> Self {
         Self {
@@ -1411,6 +1437,116 @@ pub fn create_resilient_model_provider_for_alias(
     )
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedCandidateSpec {
+    provider_ref: String,
+    pinned_model: Option<String>,
+    max_output_tokens: Option<u32>,
+}
+
+fn candidate_specs_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    primary_model_override: Option<&str>,
+    max_output_tokens: Option<u32>,
+) -> Vec<ResolvedCandidateSpec> {
+    let entry = config.providers.models.find(family, alias);
+    let primary_model = primary_model_override
+        .and_then(|model| {
+            let trimmed = model.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .or_else(|| entry.and_then(|entry| entry.model.as_deref()));
+    let fallback_models: &[String] = entry
+        .map(|entry| entry.fallback_models.as_slice())
+        .unwrap_or_default();
+    let provider_ref = format!("{family}.{alias}");
+
+    let Some(primary_model) = primary_model else {
+        return vec![ResolvedCandidateSpec {
+            provider_ref,
+            pinned_model: None,
+            max_output_tokens,
+        }];
+    };
+
+    let mut specs = vec![ResolvedCandidateSpec {
+        provider_ref: provider_ref.clone(),
+        pinned_model: Some(primary_model.to_string()),
+        max_output_tokens,
+    }];
+    for model in fallback_models {
+        if model.trim().is_empty() || model == primary_model {
+            continue;
+        }
+        specs.push(ResolvedCandidateSpec {
+            provider_ref: provider_ref.clone(),
+            pinned_model: Some(model.to_string()),
+            max_output_tokens,
+        });
+    }
+    specs
+}
+
+fn visit_fallback_chain<F>(
+    config: &zeroclaw_config::schema::Config,
+    refs: &[zeroclaw_config::providers::ModelProviderRef],
+    visited: &mut Vec<String>,
+    depth: usize,
+    visit: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str, &str, &zeroclaw_config::schema::ModelProviderConfig, &str) -> anyhow::Result<()>,
+{
+    if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                        "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+                })),
+            "fallback chain exceeds max depth; pruning"
+        );
+        return Ok(());
+    }
+
+    for fallback_ref in refs {
+        let raw = fallback_ref.as_str().trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Some((family, alias, entry)) = config.providers.models.find_by_name(raw) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"fallback": raw})),
+                "fallback ref does not resolve; skipping"
+            );
+            continue;
+        };
+        let resolved = format!("{family}.{alias}");
+        if visited.iter().any(|value| value == &resolved) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"fallback": resolved})),
+                "fallback ref closes a cycle; pruning"
+            );
+            continue;
+        }
+
+        visit(family, &alias, entry, raw)?;
+        visited.push(resolved);
+        visit_fallback_chain(config, &entry.fallback, visited, depth + 1, visit)?;
+        visited.pop();
+    }
+    Ok(())
+}
+
 fn create_resilient_model_provider_for_alias_with_model_override(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1432,6 +1568,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         alias,
         primary_model_provider,
         primary_model_override,
+        options.provider_max_tokens,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1463,18 +1600,20 @@ fn push_pinned_entries(
     alias: &str,
     built: Box<dyn ModelProvider>,
     primary_model_override: Option<&str>,
+    max_output_tokens: Option<u32>,
 ) {
-    let entry = config.providers.models.find(family, alias);
-    let primary_model = primary_model_override
-        .and_then(|model| {
-            let trimmed = model.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .or_else(|| entry.and_then(|e| e.model.as_deref()));
-    let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
     let cooldown_key = format!("{family}.{alias}");
-
-    let Some(primary_model) = primary_model else {
+    let specs = candidate_specs_for_alias(
+        config,
+        family,
+        alias,
+        primary_model_override,
+        max_output_tokens,
+    );
+    if specs
+        .first()
+        .is_some_and(|spec| spec.pinned_model.is_none())
+    {
         out.push(ReliableModelProviderEntry::new_with_candidate(
             family,
             cooldown_key.clone(),
@@ -1482,25 +1621,19 @@ fn push_pinned_entries(
             built,
         ));
         return;
-    };
+    }
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(ReliableModelProviderEntry::new_pinned(
-        family,
-        cooldown_key.clone(),
-        alias,
-        primary_model,
-        Box::new(std::sync::Arc::clone(&built)),
-    ));
-    for model in extra_models {
-        if model.trim().is_empty() || model == primary_model {
-            continue;
-        }
+    for spec in specs {
+        let pinned_model = spec
+            .pinned_model
+            .as_deref()
+            .expect("candidate spec is pinned after unpinned early return");
         out.push(ReliableModelProviderEntry::new_pinned(
             family,
             cooldown_key.clone(),
             alias,
-            model,
+            pinned_model,
             Box::new(std::sync::Arc::clone(&built)),
         ));
     }
@@ -1513,84 +1646,190 @@ fn append_fallback_chain(
     visited: &mut Vec<String>,
     depth: usize,
 ) -> anyhow::Result<()> {
-    if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                        "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
-                })),
-            "fallback chain exceeds max depth; pruning"
-        );
-        return Ok(());
-    }
-    for fallback_ref in refs {
-        let raw = fallback_ref.as_str().trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let Some((family, alias, entry)) = config.providers.models.find_by_name(raw) else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"fallback": raw})),
-                "fallback ref does not resolve; skipping"
-            );
-            continue;
-        };
-        let resolved = format!("{family}.{alias}");
-        if visited.iter().any(|v| v == &resolved) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"fallback": resolved})),
-                "fallback ref closes a cycle; pruning"
-            );
-            continue;
-        }
-
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
-        if !factory::fallback_auth_ready_for_alias(
-            config,
-            family,
-            &alias,
-            entry.api_key.as_deref(),
-            &opts,
-        ) {
-            let profile = format!("[providers.models.{family}.{alias}]");
-            anyhow::bail!(
-                "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) but no \
-                 profile-resolved credential exists. Set `api_key` on {profile}, configure \
-                 the alias's external auth flow, or remove it from `fallback`."
-            );
-        }
-
-        match create_model_provider_inner(
-            Some(config),
-            family,
-            &alias,
-            entry.api_key.as_deref(),
-            entry.uri.as_deref(),
-            &opts,
-        ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
-            Err(e) => {
+    visit_fallback_chain(
+        config,
+        refs,
+        visited,
+        depth,
+        &mut |family, alias, entry, raw| {
+            let opts = provider_runtime_options_for_alias(config, family, alias);
+            let resolved = format!("{family}.{alias}");
+            if !factory::fallback_auth_ready_for_alias(
+                config,
+                family,
+                alias,
+                entry.api_key.as_deref(),
+                &opts,
+            ) {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
-                    "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) failed to \
-                     build: {e}"
+                    "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) but no \
+                 profile-resolved credential exists. Set `api_key` on {profile}, configure \
+                 the alias's external auth flow, or remove it from `fallback`."
                 );
             }
-        }
 
-        visited.push(resolved.clone());
-        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1)?;
-        visited.pop();
+            match create_model_provider_inner(
+                Some(config),
+                family,
+                alias,
+                entry.api_key.as_deref(),
+                entry.uri.as_deref(),
+                &opts,
+            ) {
+                Ok(built) => push_pinned_entries(
+                    out,
+                    config,
+                    family,
+                    alias,
+                    built,
+                    None,
+                    opts.provider_max_tokens,
+                ),
+                Err(e) => {
+                    let profile = format!("[providers.models.{family}.{alias}]");
+                    anyhow::bail!(
+                        "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) failed to \
+                     build: {e}"
+                    );
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+fn operation_plan_for_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    requested_model: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<ResolvedModelOperationPlan> {
+    let Some(attempt_count) = reliability.provider_retries.checked_add(1) else {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "provider retry count overflows operation planning"
+        );
+        anyhow::bail!("provider retry count overflows operation planning");
+    };
+    let mut candidates = Vec::new();
+
+    let mut add_alias = |family: &str,
+                         alias: &str,
+                         max_output_tokens: Option<u32>,
+                         primary_override: Option<&str>| {
+        candidates.extend(
+            candidate_specs_for_alias(config, family, alias, primary_override, max_output_tokens)
+                .into_iter()
+                .map(|spec| ResolvedModelOperationCandidate {
+                    provider_ref: spec.provider_ref,
+                    model: spec
+                        .pinned_model
+                        .unwrap_or_else(|| requested_model.to_string()),
+                    max_output_tokens: spec.max_output_tokens,
+                    attempt_count,
+                }),
+        );
+    };
+
+    let Some((family, alias)) = provider_ref.split_once('.') else {
+        return Ok(ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: provider_ref.to_string(),
+                model: requested_model.to_string(),
+                max_output_tokens: options.provider_max_tokens,
+                attempt_count,
+            }],
+        });
+    };
+
+    if config.providers.models.find(family, alias).is_none() {
+        return Ok(ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: provider_ref.to_string(),
+                model: requested_model.to_string(),
+                max_output_tokens: options.provider_max_tokens,
+                attempt_count,
+            }],
+        });
     }
-    Ok(())
+
+    add_alias(
+        family,
+        alias,
+        options.provider_max_tokens,
+        primary_model_override,
+    );
+    let mut visited = vec![format!("{family}.{alias}")];
+    let entry = config
+        .providers
+        .models
+        .find(family, alias)
+        .expect("configured alias was checked above");
+    visit_fallback_chain(
+        config,
+        &entry.fallback,
+        &mut visited,
+        1,
+        &mut |fallback_family, fallback_alias, _entry, _raw| {
+            let fallback_options =
+                provider_runtime_options_for_alias(config, fallback_family, fallback_alias);
+            add_alias(
+                fallback_family,
+                fallback_alias,
+                fallback_options.provider_max_tokens,
+                None,
+            );
+            Ok(())
+        },
+    )?;
+
+    Ok(ResolvedModelOperationPlan { candidates })
+}
+
+/// Resolve the exact Reliable candidate chain for one configured routed call.
+///
+/// The result uses the same alias/fallback materialization as provider
+/// construction. It is a read-only planning view; it neither constructs a
+/// provider nor resolves credentials. `requested_model` is the model the
+/// caller will pass to the routed provider, including a `hint:<name>` route.
+pub fn resolve_routed_model_operation_plan_with_options(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+    requested_model: &str,
+) -> anyhow::Result<ResolvedModelOperationPlan> {
+    let (provider_ref, operation_model, is_primary) = if model_routes.is_empty() {
+        (primary_name, requested_model, true)
+    } else if let Some(hint) = requested_model.strip_prefix("hint:") {
+        if let Some(route) = model_routes.iter().find(|route| route.hint == hint) {
+            (route.model_provider.as_str(), route.model.as_str(), false)
+        } else {
+            (primary_name, default_model, true)
+        }
+    } else {
+        (primary_name, requested_model, true)
+    };
+    let provider_options = if is_primary {
+        options.clone()
+    } else {
+        options_for_provider_ref(config, provider_ref, options)
+    };
+    operation_plan_for_ref(
+        config,
+        provider_ref,
+        operation_model,
+        reliability,
+        &provider_options,
+        is_primary.then_some(default_model),
+    )
 }
 
 pub fn create_resilient_model_provider_from_ref(
@@ -4117,6 +4356,158 @@ mod tests {
         };
         config.agents.insert("test_agent".to_string(), agent);
         config
+    }
+
+    #[test]
+    fn operation_plan_matches_primary_and_recursive_fallback_candidates() {
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, ReliabilityConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("ignored-by-primary-route".to_string()),
+                    fallback_models: vec!["primary-small".to_string()],
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    max_tokens: Some(40),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("backup-default".to_string()),
+                    fallback_models: vec!["backup-small".to_string()],
+                    fallback: vec![ModelProviderRef::new("openai.last")],
+                    max_tokens: Some(30),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "last".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("last-model".to_string()),
+                    max_tokens: Some(20),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let reliability = ReliabilityConfig {
+            provider_retries: 2,
+            ..ReliabilityConfig::default()
+        };
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+
+        let plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &reliability,
+            &[],
+            "primary-route-model",
+            &options,
+            "primary-route-model",
+        )
+        .expect("configured fallback chain should plan");
+
+        assert_eq!(
+            plan.candidates,
+            vec![
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.primary".to_string(),
+                    model: "primary-route-model".to_string(),
+                    max_output_tokens: Some(40),
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.primary".to_string(),
+                    model: "primary-small".to_string(),
+                    max_output_tokens: Some(40),
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.backup".to_string(),
+                    model: "backup-default".to_string(),
+                    max_output_tokens: Some(30),
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.backup".to_string(),
+                    model: "backup-small".to_string(),
+                    max_output_tokens: Some(30),
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.last".to_string(),
+                    model: "last-model".to_string(),
+                    max_output_tokens: Some(20),
+                    attempt_count: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_plan_uses_the_selected_router_pin() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(40),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("fast-profile-pin".to_string()),
+                    max_tokens: Some(12),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+        let routes = [ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openai.fast".to_string(),
+            model: "fast-route-model".to_string(),
+            api_key: None,
+        }];
+
+        let plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &config.reliability,
+            &routes,
+            "primary-route-model",
+            &options,
+            "hint:fast",
+        )
+        .expect("configured route should plan");
+
+        assert_eq!(
+            plan.candidates,
+            vec![ResolvedModelOperationCandidate {
+                provider_ref: "openai.fast".to_string(),
+                model: "fast-profile-pin".to_string(),
+                max_output_tokens: Some(12),
+                attempt_count: config.reliability.provider_retries + 1,
+            }]
+        );
     }
 
     #[test]
