@@ -221,6 +221,20 @@ tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
+/// Process-local metadata for a foreground child running inside one exact Goal
+/// executor. Durable lifecycle authority stays in `GoalTaskRegistry`; this
+/// only carries the parent binding across synchronous child tool boundaries.
+#[derive(Clone)]
+pub(crate) struct GoalChildScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_CHILD_SCOPE: Option<GoalChildScope>;
+}
+
 /// One Goal execution scope's monotonic tool-phase fence. It stays internal
 /// to the ordinary tool loop: no tool receives Goal authority or identifiers.
 pub(crate) struct GoalToolExecutionFence {

@@ -739,9 +739,16 @@ impl GoalExecutor for SessionGoalExecutor {
                 let parent_result = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
                     .scope(
                         Some(Arc::clone(&accountant)),
-                        crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE.scope(
-                            Some(Arc::clone(&tool_execution_fence)),
-                            agent.run_goal_tool_turn(transcript, scope.cancellation.clone()),
+                        crate::agent::cost::GOAL_CHILD_SCOPE.scope(
+                            Some(crate::agent::cost::GoalChildScope {
+                                task_id: scope.task_id.clone(),
+                                session_id: scope.session_id.clone(),
+                                execution_epoch: scope.execution_epoch,
+                            }),
+                            crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE.scope(
+                                Some(Arc::clone(&tool_execution_fence)),
+                                agent.run_goal_tool_turn(transcript, scope.cancellation.clone()),
+                            ),
                         ),
                     )
                     .await;
