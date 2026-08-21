@@ -231,6 +231,18 @@ pub(crate) async fn execute_one_tool(
         ));
     }
 
+    // Once a Goal-owned foreground child has been admitted, its wrapper owns
+    // a durable child row and must run its cancellation cleanup. The child
+    // receives a derived token and stops promptly; the outer tool loop must
+    // join it instead of dropping that cleanup future mid-flight.
+    let goal_child_supervision = call_name == crate::tools::SpawnSubagentTool::NAME
+        && crate::agent::cost::GOAL_CHILD_SCOPE
+            .try_with(|scope| scope.is_some())
+            .unwrap_or(false);
+    if goal_child_supervision && cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolLoopCancelled.into());
+    }
+
     use ::zeroclaw_log::Instrument;
     let tool_span = ::zeroclaw_log::info_span!(
         target: "zeroclaw_log_internal_scope",
@@ -278,9 +290,13 @@ pub(crate) async fn execute_one_tool(
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+            if goal_child_supervision {
+                Ok(tool_future.await)
+            } else {
+                tokio::select! {
+                    () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                    result = tool_future => Ok(result),
+                }
             }
         } else {
             Ok(tool_future.await)
@@ -591,6 +607,52 @@ mod tests {
         invocations: Arc<AtomicUsize>,
     }
 
+    /// A child-shaped tool that lets the test observe whether the outer
+    /// cancellation select drops the admitted tool wrapper before it can
+    /// perform durable cleanup.
+    struct GoalChildGateTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalChildGateTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-goal-child-gate"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for GoalChildGateTool {
+        fn name(&self) -> &str {
+            crate::tools::SpawnSubagentTool::NAME
+        }
+
+        fn description(&self) -> &str {
+            "Goal child cancellation gate"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "child cleanup complete".into(),
+                error: None,
+            })
+        }
+    }
+
     impl CountingTool {
         fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
             Self {
@@ -767,6 +829,68 @@ mod tests {
             "Tool not available in this turn: extract_text"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn goal_child_cancellation_joins_admitted_tool_cleanup() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(GoalChildGateTool {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })];
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-child-cancellation",
+            channel_name: "test",
+        };
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: cancellation.clone(),
+        };
+        let run = crate::agent::cost::GOAL_CHILD_SCOPE.scope(
+            Some(scope),
+            execute_one_tool(
+                crate::tools::SpawnSubagentTool::NAME,
+                serde_json::json!({}),
+                None,
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                Some(&cancellation),
+                None,
+                None,
+            ),
+        );
+        tokio::pin!(run);
+
+        tokio::select! {
+            _ = started.notified() => {}
+            _result = &mut run => panic!("child gate completed before cancellation"),
+        }
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut run)
+                .await
+                .is_err(),
+            "outer cancellation must await the admitted Goal child cleanup"
+        );
+        release.notify_one();
+        assert!(
+            run.await.expect("joined child cleanup succeeds").success,
+            "the admitted Goal child completes after its cleanup gate releases"
+        );
     }
 
     use super::should_execute_tools_in_parallel;

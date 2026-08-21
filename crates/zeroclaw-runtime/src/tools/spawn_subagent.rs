@@ -259,9 +259,17 @@ impl Tool for SpawnSubagentTool {
         ))
         .await;
 
-        // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
+        // Mirror the semantic child result into the durable task before
+        // returning it to the parent. In particular, blank output is a child
+        // failure, never a completed task whose ToolResult happens to fail.
+        let blank_response = matches!(&run_result, Ok(response) if response.trim().is_empty());
         if let Some(cp) = crate::control_plane::control_plane() {
             let (status, output, error) = match &run_result {
+                Ok(_) if blank_response => (
+                    crate::control_plane::TaskStatus::Failed,
+                    None,
+                    Some("subagent completed with empty output".into()),
+                ),
                 Ok(resp) => (
                     crate::control_plane::TaskStatus::Completed,
                     Some(resp.clone()),
@@ -283,7 +291,7 @@ impl Tool for SpawnSubagentTool {
         }
 
         match run_result {
-            Ok(response) if response.trim().is_empty() => Ok(ToolResult {
+            Ok(_) if blank_response => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("subagent completed with empty output".into()),
