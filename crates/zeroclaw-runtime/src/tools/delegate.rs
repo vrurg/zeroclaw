@@ -1540,7 +1540,9 @@ impl DelegateTool {
         };
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
-        let result = if agentic {
+        // Keep a typed failure separate from its durable child projection so
+        // the Goal controller can distinguish a budget pause from a failure.
+        let (result, terminal_error): (ToolResult, Option<anyhow::Error>) = if agentic {
             match self
                 .execute_agentic_with_admission(
                     agent_name,
@@ -1554,12 +1556,15 @@ impl DelegateTool {
                 )
                 .await
             {
-                Ok(result) => result,
-                Err(error) => ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(delegate_failure_error(agent_name, &error)),
-                },
+                Ok(result) => (result, None),
+                Err(error) => (
+                    ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(delegate_failure_error(agent_name, &error)),
+                    },
+                    Some(error),
+                ),
             }
         } else {
             // Build enriched system prompt for non-agentic sub-agent.
@@ -1607,20 +1612,32 @@ impl DelegateTool {
                 .await
                 .map(|response| response.text.unwrap_or_default());
                 match response {
-                    Err(error) if error.to_string() == "resolved model operation timed out" => {
+                    Err(error) if error.to_string() == "resolved model operation timed out" => (
                         ToolResult {
                             success: false,
                             output: ToolOutput::default(),
                             error: Some(format!(
                                 "Agent '{agent_name}' timed out after {timeout_secs}s"
                             )),
-                        }
-                    }
-                    response => Self::render_non_agentic_result(
-                        agent_name,
-                        &provider_type,
-                        &model,
-                        response,
+                        },
+                        Some(error),
+                    ),
+                    Err(error) => (
+                        ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(delegate_failure_error(agent_name, &error)),
+                        },
+                        Some(error),
+                    ),
+                    Ok(response) => (
+                        Self::render_non_agentic_result(
+                            agent_name,
+                            &provider_type,
+                            &model,
+                            Ok(response),
+                        ),
+                        None,
                     ),
                 }
             } else {
@@ -1637,20 +1654,27 @@ impl DelegateTool {
                 .await;
 
                 match result {
-                    Ok(inner) => {
-                        Self::render_non_agentic_result(agent_name, &provider_type, &model, inner)
-                    }
-                    Err(_elapsed) => ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Agent '{agent_name}' timed out after {timeout_secs}s"
-                        )),
-                    },
+                    Ok(inner) => (
+                        Self::render_non_agentic_result(agent_name, &provider_type, &model, inner),
+                        None,
+                    ),
+                    Err(_elapsed) => (
+                        ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "Agent '{agent_name}' timed out after {timeout_secs}s"
+                            )),
+                        },
+                        None,
+                    ),
                 }
             }
         };
         Self::settle_goal_delegate_child(goal_child, &result).await?;
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
         if goal_scoped && !result.success {
             anyhow::bail!(
                 "goal delegate failed: {}",
@@ -3118,6 +3142,7 @@ impl DelegateTool {
                 .into(),
                 error: None,
             }),
+            (false, Err(e)) if crate::agent::cost::current_goal_child_scope().is_some() => Err(e),
             (false, Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
