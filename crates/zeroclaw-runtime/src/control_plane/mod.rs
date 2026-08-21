@@ -14,8 +14,8 @@ pub use boot::ControlPlaneHandle;
 pub use global::{control_plane, init_control_plane};
 pub use goal_task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
-    TaskContinuationConversationScope, TaskGoal,
+    GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult,
+    TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
 };
 pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 pub use task_store_sqlite::SqliteTaskStore;
