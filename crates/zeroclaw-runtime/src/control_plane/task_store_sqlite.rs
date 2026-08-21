@@ -11,7 +11,7 @@ use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 11;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 12;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -446,6 +446,18 @@ mod tests {
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
+    }
+
+    #[test]
+    fn fresh_schema_reports_the_declared_current_version() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let version: i64 = store
+            .conn
+            .lock()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
     }
 
     #[tokio::test]
