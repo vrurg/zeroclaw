@@ -1260,6 +1260,42 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || self.base.requires_openai_auth
     }
+
+    fn planned_non_streaming_payloads<'a>(
+        &'a self,
+        alias: &'a str,
+        _key: Option<&'a str>,
+        api_url: Option<&'a str>,
+        opts: &'a ModelProviderRuntimeOptions,
+        request: ProviderChatRequest<'a>,
+        model: &'a str,
+        temperature: Option<f64>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+        if self.base.requires_openai_auth {
+            return Box::pin(async {
+                anyhow::bail!("OpenAI Codex wire payload planning is not implemented")
+            });
+        }
+        if self.base.wire_api == Some(zeroclaw_config::schema::WireApi::Responses) {
+            return Box::pin(async {
+                anyhow::bail!("OpenAI Responses wire payload planning is not implemented")
+            });
+        }
+        let mut builder = crate::openai::OpenAiModelProvider::builder(alias);
+        if let Some(url) = api_url {
+            builder = builder.base_url(url);
+        }
+        if let Some(timeout_secs) = opts.provider_timeout_secs {
+            builder = builder.timeout_secs(timeout_secs);
+        }
+        if let Some(max_tokens) = opts.provider_max_tokens {
+            builder = builder.max_tokens(Some(max_tokens));
+        }
+        let provider = builder.build();
+        Box::pin(
+            async move { provider.planned_non_streaming_payloads(request, model, temperature) },
+        )
+    }
 }
 
 fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {

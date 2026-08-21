@@ -4668,6 +4668,43 @@ mod tests {
         assert!(sizes[0] > 0);
     }
 
+    #[tokio::test]
+    async fn openai_chat_completions_factory_plans_its_exact_wire_payload() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "planning".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(64),
+                    wire_api: None,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "openai", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+
+        let sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            &config,
+            "openai.planning",
+            &options,
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "gpt-5",
+            None,
+        )
+        .await
+        .expect("chat-completions wire should provide a payload plan");
+
+        assert_eq!(sizes.len(), 1);
+        assert!(sizes[0] > 0);
+    }
+
     #[test]
     fn routed_model_provider_credential_precedence_uses_route_key_first() {
         let config = config_with_openai_alias();

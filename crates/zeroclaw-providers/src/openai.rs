@@ -462,6 +462,42 @@ impl OpenAiModelProvider {
             10,
         )
     }
+
+    /// Build the exact native chat-completions body sent by [`ModelProvider::chat`].
+    fn build_non_streaming_chat_request(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> NativeChatRequest {
+        let adjusted_temperature =
+            temperature.map(|value| Self::adjust_temperature_for_model(model, value));
+        let tools = Self::convert_tools(request.tools);
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature: adjusted_temperature,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|tools| (!tools.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: self.max_tokens,
+        }
+    }
+
+    /// Serialize the one non-streaming body this chat-completions adapter can
+    /// emit for a `chat` call. The adapter has no internal request-recovery
+    /// branch, so the returned list has exactly one entry.
+    pub(crate) fn planned_non_streaming_payloads(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        Ok(vec![serde_json::to_vec(
+            &self.build_non_streaming_chat_request(request, model, temperature),
+        )?])
+    }
 }
 
 #[async_trait]
@@ -561,21 +597,8 @@ impl ModelProvider for OpenAiModelProvider {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
 
-        let adjusted_temperature =
-            temperature.map(|t| Self::adjust_temperature_for_model(model, t));
-
-        let tools = Self::convert_tools(request.tools);
-        let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature: adjusted_temperature,
-            tool_choice: tools
-                .as_ref()
-                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
-            tools,
-            max_tokens: self.max_tokens,
-        };
+        let native_request = self.build_non_streaming_chat_request(request, model, temperature);
+        let tools_count = native_request.tools.as_ref().map_or(0, Vec::len);
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -2386,6 +2409,51 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(2048),
             "max_tokens configured on the provider must survive into max_output_tokens on the wire body"
+        );
+    }
+
+    #[test]
+    fn planned_chat_completion_payload_matches_the_native_request() {
+        let provider = OpenAiModelProvider::builder("planning")
+            .credential(Some("test-key"))
+            .max_tokens(Some(64))
+            .build();
+        let messages = vec![
+            ChatMessage::system("system instruction"),
+            ChatMessage::user("inspect data:image/png;base64,aGVsbG8="),
+        ];
+        let tools = vec![ToolSpec::new(
+            "inspect",
+            "Inspect a payload",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )];
+
+        let payloads = provider
+            .planned_non_streaming_payloads(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                Some(0.2),
+            )
+            .expect("payload planning should use the ordinary request builder");
+
+        assert_eq!(payloads.len(), 1);
+        let payload: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+        assert_eq!(payload["model"], "gpt-5");
+        assert_eq!(payload["max_tokens"], 64);
+        assert_eq!(payload["temperature"], 1.0);
+        assert_eq!(payload["tools"][0]["function"]["name"], "inspect");
+        assert!(
+            payload["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message
+                    .to_string()
+                    .contains("data:image/png;base64,aGVsbG8="))
         );
     }
 
