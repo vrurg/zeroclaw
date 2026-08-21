@@ -7,13 +7,13 @@ use parking_lot::Mutex;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::{
     control_plane::{
-        GoalPauseReason, GoalPauseState, GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore,
-        TaskStatus,
+        GoalPauseReason, GoalPauseState, GoalResumeSafety, GoalTaskRegistry, GoalTransitionResult,
+        SqliteTaskStore, TaskStatus,
     },
     goal_mode::{
-        GoalBudgetRequest, GoalCommand, GoalExecutionPreflight, GoalExecutionReadiness,
-        GoalExecutionScope, GoalExecutor, GoalIngressContext, GoalMessageKey, GoalRuntime,
-        parse_goal_command,
+        GoalBudgetRequest, GoalCommand, GoalCommandErrorKey, GoalExecutionPreflight,
+        GoalExecutionReadiness, GoalExecutionScope, GoalExecutor, GoalIngressContext,
+        GoalMessageKey, GoalRuntime, parse_goal_command,
     },
 };
 
@@ -108,9 +108,9 @@ fn controller(executor: Arc<FakeExecutor>) -> (GoalRuntime, Arc<SqliteTaskStore>
 }
 
 #[test]
-fn start_requires_the_delimiter_and_preserves_the_objective_verbatim() {
+fn start_requires_delimiters_and_preserves_criteria_and_objective_verbatim() {
     let command = parse_goal_command(
-        "/goal start --tokens 250 --cost-usd 1.25 -- Ship the release -- safely",
+        "  /goal start --tokens 250 --cost-usd 1.25 --success-criteria  Ship the release safely   --  Ship the release -- safely  ",
     )
     .expect("the V1 start grammar should parse");
 
@@ -121,7 +121,8 @@ fn start_requires_the_delimiter_and_preserves_the_objective_verbatim() {
                 token_limit: Some(250),
                 cost_limit_usd: Some(1.25),
             },
-            objective: "Ship the release -- safely".into(),
+            success_criteria: "  Ship the release safely   ".into(),
+            objective: "  Ship the release -- safely  ".into(),
         }
     );
 }
@@ -130,7 +131,7 @@ fn start_requires_the_delimiter_and_preserves_the_objective_verbatim() {
 fn no_legacy_goal_syntax_or_extra_authority_input_is_accepted() {
     for input in [
         "/goal objective mutate this",
-        "/goal start --tokens=42 -- objective",
+        "/goal start --tokens=42 --success-criteria complete -- objective",
         "/goal status task-id",
         "/goal pause because",
         "/goal start objective without delimiter",
@@ -140,15 +141,37 @@ fn no_legacy_goal_syntax_or_extra_authority_input_is_accepted() {
 }
 
 #[test]
-fn grammar_rejects_every_disallowed_budget_and_objective_form() {
+fn start_without_criteria_has_a_stable_typed_error() {
+    assert_eq!(
+        parse_goal_command("/goal start -- objective")
+            .unwrap_err()
+            .key,
+        GoalCommandErrorKey::SuccessCriteriaRequired
+    );
+    assert_eq!(
+        parse_goal_command("/goal start --success-criteria complete")
+            .unwrap_err()
+            .key,
+        GoalCommandErrorKey::ObjectiveRequired
+    );
+}
+
+#[test]
+fn grammar_rejects_every_disallowed_budget_criteria_and_objective_form() {
     for input in [
         "/goal start --",
-        "/goal start --tokens 0 -- objective",
-        "/goal start --tokens 42 --tokens 43 -- objective",
-        "/goal start --cost-usd NaN -- objective",
-        "/goal start --cost-usd inf -- objective",
-        "/goal start --unlimited --tokens 42 -- objective",
-        "/goal start --unknown 42 -- objective",
+        "/goal start --tokens 0 --success-criteria complete -- objective",
+        "/goal start --tokens 42 --tokens 43 --success-criteria complete -- objective",
+        "/goal start --cost-usd NaN --success-criteria complete -- objective",
+        "/goal start --cost-usd inf --success-criteria complete -- objective",
+        "/goal start --unlimited --tokens 42 --success-criteria complete -- objective",
+        "/goal start --unknown 42 --success-criteria complete -- objective",
+        "/goal start -- objective without criteria",
+        "/goal start --success-criteria -- objective",
+        "/goal start --success-criteria complete objective without delimiter",
+        "/goal start --success-criteria complete --success-criteria duplicate -- objective",
+        "/goal start --success-criteria complete --tokens 42 -- objective",
+        "/goal start --success-criteria=complete -- objective",
         "/goal budget set",
         "/goal budget set --tokens 42 trailing",
         "/goal budget set --cost-usd=1.25",
@@ -180,17 +203,19 @@ fn every_permitted_non_start_command_has_one_exact_shape() {
             GoalCommand::SetBudget(GoalBudgetRequest::Unlimited),
         ),
         (
-            "/goal start --unlimited -- retained objective",
+            "/goal start --unlimited --success-criteria All checks pass -- retained objective",
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Unlimited,
-                objective: "retained objective".into(),
+                success_criteria: " All checks pass ".into(),
+                objective: " retained objective".into(),
             },
         ),
         (
-            "/goal start -- defaulted objective",
+            "/goal start --success-criteria completion is verified -- defaulted objective",
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Defaults,
-                objective: "defaulted objective".into(),
+                success_criteria: " completion is verified ".into(),
+                objective: " defaulted objective".into(),
             },
         ),
     ];
@@ -213,6 +238,7 @@ async fn commands_follow_the_session_bound_state_table() {
             matrix("session-a"),
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete".into(),
                 objective: "finish the migration".into(),
             },
         )
@@ -220,6 +246,19 @@ async fn commands_follow_the_session_bound_state_table() {
         .unwrap();
     assert_eq!(started.key, GoalMessageKey::Started);
     assert_eq!(executor.launches.lock().len(), 1);
+    let goal = store
+        .get_goal_task(
+            &store
+                .current_goal_for_session("session-a")
+                .await
+                .unwrap()
+                .expect("current goal")
+                .id,
+        )
+        .await
+        .unwrap()
+        .expect("goal extension");
+    assert_eq!(goal.success_criteria, "complete");
 
     assert_eq!(
         runtime
@@ -287,6 +326,7 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
                         token_limit: Some(0),
                         cost_limit_usd: None,
                     },
+                    success_criteria: "complete".into(),
                     objective: "invalid".into(),
                 },
             )
@@ -304,6 +344,7 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
                         token_limit: None,
                         cost_limit_usd: None,
                     },
+                    success_criteria: "complete".into(),
                     objective: "must not become unlimited".into(),
                 },
             )
@@ -331,6 +372,7 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
                 matrix("session-a"),
                 GoalCommand::Start {
                     budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "complete".into(),
                     objective: " \t ".into(),
                 },
             )
@@ -346,6 +388,7 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
             matrix("session-a"),
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete".into(),
                 objective: "will fail to launch".into(),
             },
         )
@@ -358,6 +401,174 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
         .unwrap()
         .expect("failed goal remains visible");
     assert_eq!(task.status, TaskStatus::Failed);
+
+    assert_eq!(
+        runtime
+            .submit(
+                matrix("session-empty-criteria"),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Defaults,
+                    success_criteria: " \t ".into(),
+                    objective: "must retain explicit completion criteria".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .key,
+        GoalMessageKey::SuccessCriteriaRequired,
+        "typed commands must not bypass the nonblank-criteria grammar invariant"
+    );
+}
+
+#[tokio::test]
+async fn status_projects_pending_reservations_and_nonresumable_tool_phase() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store) = controller(executor.clone());
+
+    runtime
+        .submit(
+            matrix("session-a"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "the work is complete".into(),
+                objective: "perform the work".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let current = store
+        .current_goal_for_session("session-a")
+        .await
+        .unwrap()
+        .expect("current goal");
+    assert_eq!(
+        store
+            .admit_pending_call_with_reservation(
+                &current.id,
+                "session-a",
+                current.execution_epoch,
+                "pending-operation",
+                Some(32),
+                None,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let status = runtime
+        .submit(matrix("session-a"), GoalCommand::Status)
+        .await
+        .unwrap()
+        .status
+        .expect("status projection");
+    assert_eq!(status.pending_reserved_tokens, Some(32));
+    assert!(!status.resumable);
+
+    assert_eq!(
+        store
+            .settle_pending_call(
+                &current.id,
+                "session-a",
+                current.execution_epoch,
+                "pending-operation",
+                zeroclaw_runtime::control_plane::GoalAccountingState::Complete,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .mark_goal_tool_executed(&current.id, "session-a", current.execution_epoch)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .pause_session_goal(
+                &current.id,
+                "session-a",
+                current.execution_epoch,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    let status = runtime
+        .submit(matrix("session-a"), GoalCommand::Status)
+        .await
+        .unwrap()
+        .status
+        .expect("status projection");
+    assert_eq!(status.resume_safety, GoalResumeSafety::ToolExecuted);
+    assert!(!status.resumable);
+    assert_eq!(
+        runtime
+            .submit(matrix("session-a"), GoalCommand::Resume)
+            .await
+            .unwrap()
+            .key,
+        GoalMessageKey::ToolPhaseNonResumable
+    );
+    assert_eq!(executor.launches.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn status_never_advertises_resume_at_the_execution_epoch_limit() {
+    let directory = tempfile::tempdir().expect("temporary control-plane directory");
+    let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("test storage"));
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+    let runtime =
+        GoalRuntime::new(enabled_config(), goals, executor, "test-boot").expect("controller");
+
+    runtime
+        .submit(
+            matrix("session-max-epoch"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "the work is complete".into(),
+                objective: "perform the work".into(),
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .submit(matrix("session-max-epoch"), GoalCommand::Pause)
+        .await
+        .unwrap();
+    let current = store
+        .current_goal_for_session("session-max-epoch")
+        .await
+        .unwrap()
+        .expect("current Goal");
+    rusqlite::Connection::open(directory.path().join("control_plane.db"))
+        .expect("raw connection")
+        .execute(
+            "UPDATE tasks SET execution_epoch = ?1 WHERE id = ?2",
+            rusqlite::params![i64::MAX, current.id],
+        )
+        .expect("test epoch mutation");
+
+    let status = runtime
+        .submit(matrix("session-max-epoch"), GoalCommand::Status)
+        .await
+        .unwrap()
+        .status
+        .expect("status projection");
+    assert!(!status.resumable);
 }
 
 #[tokio::test]
@@ -374,6 +585,7 @@ async fn typed_empty_budget_replacement_does_not_become_unlimited() {
                 matrix("session-a"),
                 GoalCommand::Start {
                     budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "complete".into(),
                     objective: "retain the finite default".into(),
                 },
             )
@@ -427,6 +639,7 @@ async fn stale_executor_failure_cannot_overwrite_a_newer_fence() {
             matrix("session-a"),
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete".into(),
                 objective: "be fenced during launch".into(),
             },
         )
@@ -457,6 +670,7 @@ async fn disabled_mode_and_untrusted_session_rebinding_fail_closed() {
                 matrix("session-a"),
                 GoalCommand::Start {
                     budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "complete".into(),
                     objective: "must not start".into(),
                 },
             )
@@ -476,6 +690,7 @@ async fn disabled_mode_and_untrusted_session_rebinding_fail_closed() {
             matrix("session-a"),
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete".into(),
                 objective: "bound to Alice".into(),
             },
         )
@@ -505,6 +720,7 @@ async fn pricing_readiness_only_blocks_cost_limited_admission() {
                         token_limit: Some(10),
                         cost_limit_usd: None,
                     },
+                    success_criteria: "complete".into(),
                     objective: "token only".into(),
                 },
             )
@@ -534,6 +750,7 @@ async fn pricing_readiness_only_blocks_cost_limited_admission() {
                         token_limit: None,
                         cost_limit_usd: Some(1.0),
                     },
+                    success_criteria: "complete".into(),
                     objective: "cost limited".into(),
                 },
             )
