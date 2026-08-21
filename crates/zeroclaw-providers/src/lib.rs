@@ -659,6 +659,10 @@ pub struct ResolvedModelOperationWireCandidate {
     /// UTF-8 JSON byte lengths of every bounded adapter-level request branch.
     /// A byte is a deliberately conservative upper bound for one input token.
     pub payload_sizes: Vec<u64>,
+    /// Largest explicit output cap emitted by the covered wire bodies. This is
+    /// derived from the serialized request, not copied from configuration:
+    /// adapters may raise an effective cap while constructing their body.
+    pub effective_max_output_tokens: u32,
 }
 
 /// Read-only exact-wire reservation plan for one configured non-streaming
@@ -681,12 +685,14 @@ impl ResolvedModelOperationWirePlan {
             anyhow::bail!("model operation wire plan has no candidates");
         }
         self.candidates.iter().try_fold(0_u64, |total, candidate| {
-            let output_tokens = candidate.operation.max_output_tokens.ok_or_else(|| {
-                anyhow::Error::msg(format!(
-                    "model operation candidate {}/{} has no explicit output cap",
-                    candidate.operation.provider_ref, candidate.operation.model
-                ))
-            })?;
+            let output_tokens = candidate.effective_max_output_tokens;
+            if output_tokens == 0 {
+                anyhow::bail!(
+                    "model operation candidate {}/{} has zero wire output cap",
+                    candidate.operation.provider_ref,
+                    candidate.operation.model
+                );
+            }
             if candidate.operation.attempt_count == 0 {
                 anyhow::bail!(
                     "model operation candidate {}/{} has zero attempts",
@@ -931,6 +937,31 @@ pub async fn planned_non_streaming_payload_sizes_for_provider_ref(
     model: &str,
     temperature: Option<f64>,
 ) -> anyhow::Result<Vec<u64>> {
+    planned_non_streaming_payloads_for_provider_ref(
+        config,
+        provider_ref,
+        options,
+        request,
+        model,
+        temperature,
+    )
+    .await?
+    .into_iter()
+    .map(|payload| {
+        u64::try_from(payload.len())
+            .map_err(|_| anyhow::Error::msg("wire-payload length exceeds u64"))
+    })
+    .collect()
+}
+
+async fn planned_non_streaming_payloads_for_provider_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    options: &ModelProviderRuntimeOptions,
+    request: ChatRequest<'_>,
+    model: &str,
+    temperature: Option<f64>,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
         anyhow::Error::msg("wire-payload planning requires a configured provider alias")
     })?;
@@ -952,13 +983,50 @@ pub async fn planned_non_streaming_payload_sizes_for_provider_ref(
         temperature,
     )
     .await?;
-    payloads
-        .into_iter()
-        .map(|payload| {
-            u64::try_from(payload.len())
-                .map_err(|_| anyhow::Error::msg("wire-payload length exceeds u64"))
-        })
-        .collect()
+    Ok(payloads)
+}
+
+fn exact_wire_output_cap(
+    payloads: &[Vec<u8>],
+    candidate: &ResolvedModelOperationCandidate,
+) -> anyhow::Result<u32> {
+    if candidate.max_output_tokens.is_none() {
+        anyhow::bail!(
+            "model operation candidate {}/{} has no configured output cap",
+            candidate.provider_ref,
+            candidate.model
+        );
+    }
+    payloads.iter().try_fold(0_u32, |maximum, payload| {
+        let value: serde_json::Value = serde_json::from_slice(payload).map_err(|error| {
+            anyhow::Error::msg(format!(
+                "model operation candidate {}/{} produced invalid planned JSON: {error}",
+                candidate.provider_ref, candidate.model
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "model operation candidate {}/{} produced a non-object wire payload",
+                candidate.provider_ref, candidate.model
+            ))
+        })?;
+        let cap = ["max_tokens", "max_output_tokens"]
+            .into_iter()
+            .filter_map(|field| object.get(field).and_then(serde_json::Value::as_u64))
+            .map(|value| {
+                u32::try_from(value).map_err(|_| anyhow::Error::msg("wire output cap exceeds u32"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "model operation candidate {}/{} emitted no explicit wire output cap",
+                    candidate.provider_ref, candidate.model
+                ))
+            })?;
+        Ok(maximum.max(cap))
+    })
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -2032,7 +2100,7 @@ pub async fn resolve_routed_model_operation_wire_plan_with_options(
         } else {
             options_for_provider_ref(config, &candidate.provider_ref, options)
         };
-        let payload_sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+        let payloads = planned_non_streaming_payloads_for_provider_ref(
             config,
             &candidate.provider_ref,
             &candidate_options,
@@ -2041,9 +2109,18 @@ pub async fn resolve_routed_model_operation_wire_plan_with_options(
             temperature,
         )
         .await?;
+        let effective_max_output_tokens = exact_wire_output_cap(&payloads, &candidate)?;
+        let payload_sizes = payloads
+            .into_iter()
+            .map(|payload| {
+                u64::try_from(payload.len())
+                    .map_err(|_| anyhow::Error::msg("wire-payload length exceeds u64"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         candidates.push(ResolvedModelOperationWireCandidate {
             operation: candidate,
             payload_sizes,
+            effective_max_output_tokens,
         });
     }
     Ok(ResolvedModelOperationWirePlan { candidates })
@@ -4924,6 +5001,55 @@ mod tests {
         assert_eq!(payload_sizes.len(), 2);
         assert!(payload_sizes.iter().all(|size| *size > 0));
         assert_ne!(payload_sizes[0], payload_sizes[1]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_thinking_reservation_uses_the_wire_output_cap() {
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, Config, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "planning".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(32),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "anthropic", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+        let plan = resolve_routed_model_operation_wire_plan_with_options(
+            &config,
+            "anthropic.planning",
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &[],
+            "claude-test",
+            &options,
+            "claude-test",
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 1024,
+                }),
+            },
+            None,
+        )
+        .await
+        .expect("Anthropic thinking request should produce a finite wire plan");
+
+        let candidate = &plan.candidates[0];
+        let expected_minimum = candidate
+            .payload_sizes
+            .iter()
+            .map(|payload| payload + 1025)
+            .sum::<u64>();
+        assert!(
+            plan.conservative_token_reservation(1).unwrap() >= expected_minimum,
+            "the reservation must use the raised max_tokens emitted for native thinking"
+        );
     }
 
     #[tokio::test]
