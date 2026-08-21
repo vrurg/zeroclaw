@@ -242,6 +242,20 @@ pub struct CostSummary {
     pub by_agent: std::collections::HashMap<String, AgentCostStats>,
 }
 
+/// Checked usage totals derived from the canonical ledger for one durable task.
+///
+/// Unlike ordinary reporting summaries, this projection rejects malformed
+/// ledger input and internally inconsistent usage before returning a value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrictTaskUsageTotals {
+    /// Sum of every persisted input and output token count for the task.
+    pub total_tokens: u64,
+    /// Sum of every persisted cost value for the task.
+    pub cost_usd: f64,
+    /// Whether every persisted task row had a resolved price.
+    pub pricing_available: bool,
+}
+
 /// Statistics for a specific agent alias.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCostStats {

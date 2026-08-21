@@ -1,10 +1,13 @@
 //! Contract coverage for the dormant, transport-neutral Goal controller.
 
-use std::sync::Arc;
+use std::{fs::OpenOptions, io::Write, sync::Arc};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::{
+    cost::{CostTracker, TokenUsage},
+    schema::{Config, CostConfig},
+};
 use zeroclaw_runtime::{
     control_plane::{
         GoalPauseReason, GoalPauseState, GoalResumeSafety, GoalTaskRegistry, GoalTransitionResult,
@@ -13,7 +16,7 @@ use zeroclaw_runtime::{
     goal_mode::{
         GoalBudgetRequest, GoalCommand, GoalCommandErrorKey, GoalExecutionPreflight,
         GoalExecutionReadiness, GoalExecutionScope, GoalExecutor, GoalIngressContext,
-        GoalMessageKey, GoalRuntime, parse_goal_command,
+        GoalMessageKey, GoalRuntime, GoalRuntimeError, parse_goal_command,
     },
 };
 
@@ -94,17 +97,44 @@ fn matrix(session_id: &str) -> GoalIngressContext {
 fn controller_with_config(
     config: Arc<Config>,
     executor: Arc<FakeExecutor>,
-) -> (GoalRuntime, Arc<SqliteTaskStore>) {
+) -> (
+    GoalRuntime,
+    Arc<SqliteTaskStore>,
+    Arc<CostTracker>,
+    tempfile::TempDir,
+) {
     let store = Arc::new(SqliteTaskStore::new_in_memory().expect("test storage"));
     let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+    let cost_dir = tempfile::tempdir().expect("temporary canonical cost ledger");
+    let tracker = Arc::new(
+        CostTracker::new(CostConfig::default(), cost_dir.path()).expect("canonical cost tracker"),
+    );
     (
-        GoalRuntime::new(config, goals, executor, "test-boot").expect("controller"),
+        GoalRuntime::new(config, goals, tracker.clone(), executor, "test-boot")
+            .expect("controller"),
         store,
+        tracker,
+        cost_dir,
     )
 }
 
-fn controller(executor: Arc<FakeExecutor>) -> (GoalRuntime, Arc<SqliteTaskStore>) {
+fn controller(
+    executor: Arc<FakeExecutor>,
+) -> (
+    GoalRuntime,
+    Arc<SqliteTaskStore>,
+    Arc<CostTracker>,
+    tempfile::TempDir,
+) {
     controller_with_config(enabled_config(), executor)
+}
+
+fn test_tracker() -> (Arc<CostTracker>, tempfile::TempDir) {
+    let cost_dir = tempfile::tempdir().expect("temporary canonical cost ledger");
+    let tracker = Arc::new(
+        CostTracker::new(CostConfig::default(), cost_dir.path()).expect("canonical cost tracker"),
+    );
+    (tracker, cost_dir)
 }
 
 #[test]
@@ -231,7 +261,7 @@ async fn commands_follow_the_session_bound_state_table() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Succeed,
     ));
-    let (runtime, store) = controller(executor.clone());
+    let (runtime, store, _, _) = controller(executor.clone());
 
     let started = runtime
         .submit(
@@ -315,7 +345,7 @@ async fn invalid_typed_budget_and_executor_failure_fail_closed() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Fail,
     ));
-    let (runtime, store) = controller(executor);
+    let (runtime, store, _, _) = controller(executor);
 
     assert_eq!(
         runtime
@@ -426,7 +456,7 @@ async fn status_projects_pending_reservations_and_nonresumable_tool_phase() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Succeed,
     ));
-    let (runtime, store) = controller(executor.clone());
+    let (runtime, store, tracker, _cost_dir) = controller(executor.clone());
 
     runtime
         .submit(
@@ -444,6 +474,13 @@ async fn status_projects_pending_reservations_and_nonresumable_tool_phase() {
         .await
         .unwrap()
         .expect("current goal");
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(
+            TokenUsage::new("test/model", 8, 2, 0, 0.0, 0.0, 0.0),
+            Some("main"),
+            Some(current.id.clone()),
+        )
+        .expect("known lower-bound usage");
     assert_eq!(
         store
             .admit_pending_call_with_reservation(
@@ -465,6 +502,11 @@ async fn status_projects_pending_reservations_and_nonresumable_tool_phase() {
         .status
         .expect("status projection");
     assert_eq!(status.pending_reserved_tokens, Some(32));
+    assert_eq!(status.known_token_usage, 10);
+    assert!(!status.token_accounting_complete);
+    assert!(!status.cost_accounting_complete);
+    assert_eq!(status.remaining_tokens, None);
+    assert_eq!(status.remaining_cost_usd, None);
     assert!(!status.resumable);
 
     assert_eq!(
@@ -531,8 +573,9 @@ async fn status_never_advertises_resume_at_the_execution_epoch_limit() {
         LaunchAction::Succeed,
     ));
     let goals: Arc<dyn GoalTaskRegistry> = store.clone();
-    let runtime =
-        GoalRuntime::new(enabled_config(), goals, executor, "test-boot").expect("controller");
+    let (tracker, _cost_dir) = test_tracker();
+    let runtime = GoalRuntime::new(enabled_config(), goals, tracker, executor, "test-boot")
+        .expect("controller");
 
     runtime
         .submit(
@@ -577,7 +620,7 @@ async fn typed_empty_budget_replacement_does_not_become_unlimited() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Succeed,
     ));
-    let (runtime, store) = controller(executor);
+    let (runtime, store, _, _) = controller(executor);
 
     assert_eq!(
         runtime
@@ -632,7 +675,9 @@ async fn stale_executor_failure_cannot_overwrite_a_newer_fence() {
         LaunchAction::FenceThenFail(store.clone()),
     ));
     let goals: Arc<dyn GoalTaskRegistry> = store.clone();
-    let runtime = GoalRuntime::new(enabled_config(), goals, executor, "test-boot").unwrap();
+    let (tracker, _cost_dir) = test_tracker();
+    let runtime =
+        GoalRuntime::new(enabled_config(), goals, tracker, executor, "test-boot").unwrap();
 
     let response = runtime
         .submit(
@@ -663,7 +708,7 @@ async fn disabled_mode_and_untrusted_session_rebinding_fail_closed() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Succeed,
     ));
-    let (disabled_runtime, _) = controller_with_config(Arc::new(Config::default()), executor);
+    let (disabled_runtime, _, _, _) = controller_with_config(Arc::new(Config::default()), executor);
     assert_eq!(
         disabled_runtime
             .submit(
@@ -684,7 +729,7 @@ async fn disabled_mode_and_untrusted_session_rebinding_fail_closed() {
         GoalExecutionReadiness::Ready,
         LaunchAction::Succeed,
     ));
-    let (runtime, _) = controller(executor);
+    let (runtime, _, _, _) = controller(executor);
     runtime
         .submit(
             matrix("session-a"),
@@ -710,7 +755,7 @@ async fn pricing_readiness_only_blocks_cost_limited_admission() {
         GoalExecutionReadiness::PricingUnavailable,
         LaunchAction::Succeed,
     ));
-    let (runtime, store) = controller(executor);
+    let (runtime, store, _, _) = controller(executor);
     assert_eq!(
         runtime
             .submit(
@@ -737,7 +782,7 @@ async fn pricing_readiness_only_blocks_cost_limited_admission() {
             .is_some()
     );
 
-    let (runtime, store) = controller(Arc::new(FakeExecutor::new(
+    let (runtime, store, _, _) = controller(Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::PricingUnavailable,
         LaunchAction::Succeed,
     )));
@@ -766,4 +811,357 @@ async fn pricing_readiness_only_blocks_cost_limited_admission() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn status_and_budget_derive_complete_remaining_limits_from_the_canonical_ledger() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, _store, tracker, _cost_dir) = controller(executor);
+    runtime
+        .submit(
+            matrix("session-ledger"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: Some(100),
+                    cost_limit_usd: Some(1.0),
+                },
+                success_criteria: "all required work is complete".into(),
+                objective: "derive status from durable usage".into(),
+            },
+        )
+        .await
+        .expect("Goal starts");
+
+    let task_id = runtime
+        .submit(matrix("session-ledger"), GoalCommand::Status)
+        .await
+        .expect("initial status")
+        .status
+        .expect("status projection")
+        .task_id;
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(
+            TokenUsage::new("test/model", 30, 20, 0, 1_000.0, 1_000.0, 0.0),
+            Some("main"),
+            Some(task_id),
+        )
+        .expect("durable usage record");
+
+    for command in [GoalCommand::Status, GoalCommand::Budget] {
+        let projection = runtime
+            .submit(matrix("session-ledger"), command)
+            .await
+            .expect("read-only projection")
+            .status
+            .expect("status projection");
+        assert_eq!(projection.known_token_usage, 50);
+        assert!((projection.known_cost_usd - 0.05).abs() < f64::EPSILON);
+        assert!(projection.token_accounting_complete);
+        assert!(projection.cost_accounting_complete);
+        assert_eq!(projection.remaining_tokens, Some(50));
+        assert!(
+            (projection.remaining_cost_usd.expect("cost remaining") - 0.95).abs() < f64::EPSILON
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_with_unpriced_usage_keeps_known_tokens_but_hides_cost_remaining() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, _store, tracker, _cost_dir) = controller(executor);
+    runtime
+        .submit(
+            matrix("session-unpriced"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: Some(100),
+                    cost_limit_usd: Some(1.0),
+                },
+                success_criteria: "all required work is complete".into(),
+                objective: "surface only complete budget dimensions".into(),
+            },
+        )
+        .await
+        .expect("Goal starts");
+    let task_id = runtime
+        .submit(matrix("session-unpriced"), GoalCommand::Status)
+        .await
+        .expect("initial status")
+        .status
+        .expect("status projection")
+        .task_id;
+    let mut usage = TokenUsage::new("test/unpriced", 40, 10, 0, 0.0, 0.0, 0.0);
+    usage.pricing_available = false;
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(usage, Some("main"), Some(task_id))
+        .expect("durable unpriced usage");
+
+    let projection = runtime
+        .submit(matrix("session-unpriced"), GoalCommand::Status)
+        .await
+        .expect("status")
+        .status
+        .expect("status projection");
+    assert_eq!(projection.known_token_usage, 50);
+    assert!(projection.token_accounting_complete);
+    assert!(!projection.cost_accounting_complete);
+    assert_eq!(projection.remaining_tokens, Some(50));
+    assert_eq!(projection.remaining_cost_usd, None);
+}
+
+#[tokio::test]
+async fn malformed_canonical_usage_fails_status_without_claiming_zero_consumption() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, tracker, cost_dir) = controller(executor);
+    runtime
+        .submit(
+            matrix("session-malformed-ledger"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "all required work is complete".into(),
+                objective: "reject malformed durable usage".into(),
+            },
+        )
+        .await
+        .expect("Goal starts");
+    let task_id = runtime
+        .submit(matrix("session-malformed-ledger"), GoalCommand::Status)
+        .await
+        .expect("initial status")
+        .status
+        .expect("status projection")
+        .task_id;
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(
+            TokenUsage::new("test/model", 1, 1, 0, 0.0, 0.0, 0.0),
+            Some("main"),
+            Some(task_id),
+        )
+        .expect("canonical ledger exists");
+    let before = store
+        .current_goal_for_session("session-malformed-ledger")
+        .await
+        .expect("current Goal lookup")
+        .expect("current Goal");
+    let mut ledger = OpenOptions::new()
+        .append(true)
+        .open(cost_dir.path().join("state/costs.jsonl"))
+        .expect("canonical ledger");
+    writeln!(ledger, "not-json").expect("corrupt fixture");
+    ledger.sync_all().expect("fixture sync");
+
+    assert!(matches!(
+        runtime
+            .submit(matrix("session-malformed-ledger"), GoalCommand::Status)
+            .await,
+        Err(GoalRuntimeError::Accounting(_))
+    ));
+    let after = store
+        .current_goal_for_session("session-malformed-ledger")
+        .await
+        .expect("current Goal lookup")
+        .expect("current Goal");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.execution_epoch, before.execution_epoch);
+}
+
+#[tokio::test]
+async fn status_covers_no_usage_unlimited_exact_limit_and_overshoot() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, _store, tracker, _cost_dir) = controller(executor);
+
+    runtime
+        .submit(
+            matrix("session-no-usage"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "all required work is complete".into(),
+                objective: "show a clean no-usage projection".into(),
+            },
+        )
+        .await
+        .expect("Goal starts");
+    let no_usage = runtime
+        .submit(matrix("session-no-usage"), GoalCommand::Status)
+        .await
+        .expect("no-usage status")
+        .status
+        .expect("projection");
+    assert_eq!(no_usage.known_token_usage, 0);
+    assert!(no_usage.token_accounting_complete);
+    assert_eq!(no_usage.remaining_tokens, Some(64));
+
+    runtime
+        .submit(
+            matrix("session-unlimited-status"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Unlimited,
+                success_criteria: "all required work is complete".into(),
+                objective: "show unlimited dimensions as unbounded".into(),
+            },
+        )
+        .await
+        .expect("unlimited Goal starts");
+    let unlimited = runtime
+        .submit(matrix("session-unlimited-status"), GoalCommand::Status)
+        .await
+        .expect("unlimited status")
+        .status
+        .expect("projection");
+    assert!(unlimited.token_accounting_complete);
+    assert!(unlimited.cost_accounting_complete);
+    assert_eq!(unlimited.remaining_tokens, None);
+    assert_eq!(unlimited.remaining_cost_usd, None);
+
+    runtime
+        .submit(
+            matrix("session-limit-edges"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: Some(10),
+                    cost_limit_usd: Some(0.01),
+                },
+                success_criteria: "all required work is complete".into(),
+                objective: "show exact-limit and overshoot behavior".into(),
+            },
+        )
+        .await
+        .expect("finite Goal starts");
+    let task_id = runtime
+        .submit(matrix("session-limit-edges"), GoalCommand::Status)
+        .await
+        .expect("initial finite status")
+        .status
+        .expect("projection")
+        .task_id;
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(
+            TokenUsage::new("test/model", 5, 5, 0, 1_000.0, 1_000.0, 0.0),
+            Some("main"),
+            Some(task_id.clone()),
+        )
+        .expect("exact-limit usage");
+    let exact = runtime
+        .submit(matrix("session-limit-edges"), GoalCommand::Status)
+        .await
+        .expect("exact-limit status")
+        .status
+        .expect("projection");
+    assert_eq!(exact.remaining_tokens, Some(0));
+    assert_eq!(exact.remaining_cost_usd, Some(0.0));
+    tracker
+        .record_scoped_usage_with_owned_task_attribution(
+            TokenUsage::new("test/model", 1, 0, 0, 1_000.0, 1_000.0, 0.0),
+            Some("main"),
+            Some(task_id),
+        )
+        .expect("overshoot usage");
+    let overshot = runtime
+        .submit(matrix("session-limit-edges"), GoalCommand::Status)
+        .await
+        .expect("overshoot status")
+        .status
+        .expect("projection");
+    assert_eq!(overshot.known_token_usage, 11);
+    assert_eq!(overshot.remaining_tokens, Some(0));
+    assert_eq!(overshot.remaining_cost_usd, Some(0.0));
+}
+
+#[tokio::test]
+async fn incomplete_accounting_states_preserve_known_totals_but_hide_remaining_budget() {
+    for (suffix, accounting_state) in [
+        (
+            "missing",
+            zeroclaw_runtime::control_plane::GoalAccountingState::Missing,
+        ),
+        (
+            "invalid",
+            zeroclaw_runtime::control_plane::GoalAccountingState::Invalid,
+        ),
+        (
+            "outcome-unknown",
+            zeroclaw_runtime::control_plane::GoalAccountingState::OutcomeUnknown,
+        ),
+    ] {
+        let executor = Arc::new(FakeExecutor::new(
+            GoalExecutionReadiness::Ready,
+            LaunchAction::Succeed,
+        ));
+        let (runtime, store, tracker, _cost_dir) = controller(executor);
+        let session = format!("session-{suffix}");
+        runtime
+            .submit(
+                matrix(&session),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Limits {
+                        token_limit: Some(20),
+                        cost_limit_usd: Some(1.0),
+                    },
+                    success_criteria: "all required work is complete".into(),
+                    objective: "retain lower-bound usage after accounting failure".into(),
+                },
+            )
+            .await
+            .expect("Goal starts");
+        let current = store
+            .current_goal_for_session(&session)
+            .await
+            .expect("current Goal lookup")
+            .expect("current Goal");
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 6, 4, 0, 0.0, 0.0, 0.0),
+                Some("main"),
+                Some(current.id.clone()),
+            )
+            .expect("known lower-bound usage");
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    &current.id,
+                    &session,
+                    current.execution_epoch,
+                    "pending-operation",
+                    Some(20),
+                    Some(1.0),
+                )
+                .await
+                .expect("admit pending"),
+            GoalTransitionResult::Applied
+        );
+        store
+            .settle_pending_call(
+                &current.id,
+                &session,
+                current.execution_epoch,
+                "pending-operation",
+                accounting_state,
+            )
+            .await
+            .expect("settle accounting state");
+
+        let projection = runtime
+            .submit(matrix(&session), GoalCommand::Status)
+            .await
+            .expect("status")
+            .status
+            .expect("projection");
+        assert_eq!(projection.known_token_usage, 10, "{suffix}");
+        assert!(!projection.token_accounting_complete, "{suffix}");
+        assert!(!projection.cost_accounting_complete, "{suffix}");
+        assert_eq!(projection.remaining_tokens, None, "{suffix}");
+        assert_eq!(projection.remaining_cost_usd, None, "{suffix}");
+    }
 }

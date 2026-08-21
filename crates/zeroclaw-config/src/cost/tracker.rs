@@ -1,5 +1,6 @@
 use super::types::{
-    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, StrictTaskUsageTotals,
+    TokenUsage, UsagePeriod,
 };
 use crate::schema::CostConfig;
 use anyhow::{Context, Result};
@@ -329,6 +330,16 @@ impl CostTracker {
     ) -> Result<(u64, f64, bool)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task_with_pricing(task_id)
+    }
+
+    /// Derive task totals through the strict canonical-ledger path.
+    ///
+    /// Ordinary reporting keeps its tolerant parser so historical dashboards
+    /// remain available. Goal control uses this method so damaged ledger input
+    /// cannot silently become known-zero consumption.
+    pub fn get_strict_usage_totals_for_task(&self, task_id: &str) -> Result<StrictTaskUsageTotals> {
+        let storage = self.lock_storage();
+        storage.strict_usage_totals_for_task(task_id)
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -908,6 +919,80 @@ impl CostStorage {
             }
         })?;
         Ok((total_tokens, cost_usd, pricing_available))
+    }
+
+    /// Visit canonical records without legacy recovery. Consumers that make
+    /// lifecycle or admission decisions must fail closed on malformed JSONL.
+    fn try_for_each_record_strict<F>(&self, mut on_record: F) -> Result<()>
+    where
+        F: FnMut(CostRecord) -> Result<()>,
+    {
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+        let reader = BufReader::new(file);
+        for (line_number, line) in reader.lines().enumerate() {
+            let raw_line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from cost storage {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let record = serde_json::from_str::<CostRecord>(trimmed).with_context(|| {
+                format!(
+                    "malformed cost record at line {} in {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            on_record(record)?;
+        }
+        Ok(())
+    }
+
+    fn strict_usage_totals_for_task(&self, task_id: &str) -> Result<StrictTaskUsageTotals> {
+        let mut totals = StrictTaskUsageTotals {
+            total_tokens: 0,
+            cost_usd: 0.0,
+            pricing_available: true,
+        };
+        self.try_for_each_record_strict(|record| {
+            let usage = &record.usage;
+            let expected_total = usage
+                .input_tokens
+                .checked_add(usage.output_tokens)
+                .context("cost record total token overflow")?;
+            if usage.total_tokens != expected_total {
+                anyhow::bail!("cost record total_tokens does not match input plus output");
+            }
+            if usage.cached_input_tokens > usage.input_tokens {
+                anyhow::bail!("cost record cached input tokens exceed input tokens");
+            }
+            if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
+                anyhow::bail!("cost record cost is not finite or is negative");
+            }
+            if record.task_id.as_deref() == Some(task_id) {
+                totals.total_tokens = totals
+                    .total_tokens
+                    .checked_add(usage.total_tokens)
+                    .context("task usage total token overflow")?;
+                totals.cost_usd += usage.cost_usd;
+                if !totals.cost_usd.is_finite() {
+                    anyhow::bail!("task usage total cost is not finite");
+                }
+                totals.pricing_available &= usage.pricing_available;
+            }
+            Ok(())
+        })?;
+        Ok(totals)
     }
 
     /// Get cost for a specific date.
@@ -1589,5 +1674,121 @@ mod tests {
             matches!(after.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "a disabled resident tracker must short-circuit enforcement"
         );
+    }
+
+    #[test]
+    fn strict_task_totals_reject_malformed_canonical_ledger_rows() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_usage_with_task_attribution(
+                TokenUsage::new("test/model", 1_000, 500, 0, 1.0, 2.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a"),
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "not-a-json-line").unwrap();
+        file.sync_all().unwrap();
+
+        let error = tracker
+            .get_strict_usage_totals_for_task("goal-a")
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed cost record"));
+    }
+
+    #[test]
+    fn strict_task_totals_preserve_zero_price_and_reject_inconsistent_usage() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/free", 1_000, 500, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+
+        let totals = tracker.get_strict_usage_totals_for_task("goal-a").unwrap();
+        assert_eq!(totals.total_tokens, 1_500);
+        assert_eq!(totals.cost_usd, 0.0);
+        assert!(totals.pricing_available);
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let corrupt = CostRecord::with_attribution(
+            "corrupt",
+            None,
+            Some("goal-a".into()),
+            TokenUsage {
+                model: "test/corrupt".into(),
+                input_tokens: u64::MAX,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                total_tokens: u64::MAX,
+                cost_usd: 0.0,
+                pricing_available: true,
+                timestamp: Utc::now(),
+            },
+        );
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&corrupt).unwrap()).unwrap();
+        file.sync_all().unwrap();
+
+        let error = tracker
+            .get_strict_usage_totals_for_task("goal-a")
+            .unwrap_err();
+        assert!(error.to_string().contains("total token overflow"));
+    }
+
+    #[test]
+    fn strict_task_totals_reject_cached_input_and_negative_cost() {
+        for (usage, expected) in [
+            (
+                TokenUsage {
+                    model: "test/cached-input".into(),
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    cached_input_tokens: 11,
+                    total_tokens: 10,
+                    cost_usd: 0.0,
+                    pricing_available: true,
+                    timestamp: Utc::now(),
+                },
+                "cached input tokens exceed",
+            ),
+            (
+                TokenUsage {
+                    model: "test/negative-cost".into(),
+                    input_tokens: 10,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    total_tokens: 10,
+                    cost_usd: -0.01,
+                    pricing_available: true,
+                    timestamp: Utc::now(),
+                },
+                "cost is not finite or is negative",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+            let record =
+                CostRecord::with_attribution("corrupt", None, Some("goal-a".into()), usage);
+            let path = resolve_storage_path(tmp.path()).unwrap();
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            writeln!(file, "{}", serde_json::to_string(&record).unwrap()).unwrap();
+            file.sync_all().unwrap();
+
+            let error = tracker
+                .get_strict_usage_totals_for_task("goal-a")
+                .unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
     }
 }
