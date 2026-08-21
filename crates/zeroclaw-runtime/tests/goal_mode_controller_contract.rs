@@ -137,6 +137,38 @@ fn test_tracker() -> (Arc<CostTracker>, tempfile::TempDir) {
     (tracker, cost_dir)
 }
 
+#[tokio::test]
+async fn launched_goal_scope_owns_one_logical_operation_permit() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, _, _, _) = controller(Arc::clone(&executor));
+
+    runtime
+        .submit(
+            matrix("session-permit"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: Some(64),
+                    cost_limit_usd: None,
+                },
+                success_criteria: "return a verified result".into(),
+                objective: "exercise the operation permit".into(),
+            },
+        )
+        .await
+        .expect("start should launch the scope");
+
+    let scope = executor.launches.lock()[0].clone();
+    let permit = scope
+        .operation_permit
+        .try_acquire()
+        .expect("first operation owns the only permit");
+    assert!(scope.operation_permit.try_acquire().is_err());
+    drop(permit);
+}
+
 #[test]
 fn start_requires_delimiters_and_preserves_criteria_and_objective_verbatim() {
     let command = parse_goal_command(
