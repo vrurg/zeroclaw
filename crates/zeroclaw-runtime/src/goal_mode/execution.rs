@@ -36,6 +36,17 @@ const VERIFIER_BLOCKER_MAX_COUNT: usize = 16;
 const VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS: usize = 1_024;
 const GOAL_EXECUTOR_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug)]
+struct GoalBudgetExhausted;
+
+impl std::fmt::Display for GoalBudgetExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("goal budget is exhausted")
+    }
+}
+
+impl std::error::Error for GoalBudgetExhausted {}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GoalVerifierResponse {
@@ -45,20 +56,29 @@ struct GoalVerifierResponse {
     blockers: VerifierBlockers,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalVerifierBlockerResponse {
+    kind: GoalBlockerKind,
+    message: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
 /// Preserve the difference between an omitted field and JSON `null`: the
 /// verifier protocol permits blockers only as a real array for `blocked`.
 #[derive(Debug, Default)]
 enum VerifierBlockers {
     #[default]
     Missing,
-    Present(Vec<GoalBlocker>),
+    Present(Vec<GoalVerifierBlockerResponse>),
 }
 
 fn deserialize_verifier_blockers<'de, D>(deserializer: D) -> Result<VerifierBlockers, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Vec::<GoalBlocker>::deserialize(deserializer).map(VerifierBlockers::Present)
+    Vec::<GoalVerifierBlockerResponse>::deserialize(deserializer).map(VerifierBlockers::Present)
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,7 +118,7 @@ struct RegisteredGoalExecutor {
     session_id: String,
     epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl SessionGoalExecutor {
@@ -119,7 +139,12 @@ impl SessionGoalExecutor {
 
     async fn session_executor_is_active(&self, session_id: &str) -> bool {
         let mut executors = self.executors.lock().await;
-        executors.retain(|_, executor| !executor.handle.is_finished());
+        executors.retain(|_, executor| {
+            executor
+                .handle
+                .as_ref()
+                .is_none_or(|handle| !handle.is_finished())
+        });
         executors
             .values()
             .any(|executor| executor.session_id == session_id)
@@ -324,13 +349,13 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .checked_add(reserved)
                 .is_none_or(|total| total > limit)
             {
-                anyhow::bail!("goal token budget is exhausted");
+                return Err(GoalBudgetExhausted.into());
             }
         }
         if let Some(limit) = current.goal.effective_cost_limit_usd {
             let reserved = reserved_cost_usd.context("goal cost reservation is missing")?;
             if !reserved.is_finite() || totals.cost_usd + reserved > limit {
-                anyhow::bail!("goal cost budget is exhausted");
+                return Err(GoalBudgetExhausted.into());
             }
         }
         let call_id = Uuid::new_v4().to_string();
@@ -524,7 +549,7 @@ fn parse_goal_verifier_response(text: &str) -> anyhow::Result<GoalVerifierOutcom
             let VerifierBlockers::Present(blockers) = parsed.blockers else {
                 unreachable!("guarded by match")
             };
-            validate_verifier_blockers(&blockers)?;
+            let blockers = validate_verifier_blockers(blockers)?;
             Ok(GoalVerifierOutcome::Blocked(parsed.reason, blockers))
         }
         GoalVerifierDecision::Complete
@@ -535,11 +560,13 @@ fn parse_goal_verifier_response(text: &str) -> anyhow::Result<GoalVerifierOutcom
     }
 }
 
-fn validate_verifier_blockers(blockers: &[GoalBlocker]) -> anyhow::Result<()> {
+fn validate_verifier_blockers(
+    blockers: Vec<GoalVerifierBlockerResponse>,
+) -> anyhow::Result<Vec<GoalBlocker>> {
     if blockers.is_empty() || blockers.len() > VERIFIER_BLOCKER_MAX_COUNT {
         anyhow::bail!("goal verifier blockers are invalid");
     }
-    for blocker in blockers {
+    for blocker in &blockers {
         if blocker.payload.is_some()
             || blocker.message.trim().is_empty()
             || blocker.message.chars().count() > VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS
@@ -553,7 +580,14 @@ fn validate_verifier_blockers(blockers: &[GoalBlocker]) -> anyhow::Result<()> {
             anyhow::bail!("goal verifier blocker is invalid");
         }
     }
-    Ok(())
+    Ok(blockers
+        .into_iter()
+        .map(|blocker| GoalBlocker {
+            kind: blocker.kind,
+            message: blocker.message,
+            payload: blocker.payload,
+        })
+        .collect())
 }
 
 #[async_trait]
@@ -617,35 +651,67 @@ impl GoalExecutor for SessionGoalExecutor {
     }
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
+        let executor_key = scope.task_id.clone();
+        {
+            let mut executors = self.executors.lock().await;
+            executors.retain(|_, executor| {
+                executor
+                    .handle
+                    .as_ref()
+                    .is_none_or(|handle| !handle.is_finished())
+            });
+            if executors.contains_key(&executor_key) {
+                return Err(());
+            }
+            // Install the cancellation authority before the worker can await a
+            // queue or session lock. A concurrent pause/cancel can therefore
+            // always fence this exact scope before it performs provider work.
+            executors.insert(
+                executor_key.clone(),
+                RegisteredGoalExecutor {
+                    session_id: scope.session_id.clone(),
+                    epoch: scope.execution_epoch,
+                    cancellation: scope.cancellation.clone(),
+                    handle: None,
+                },
+            );
+        }
         let sessions = Arc::clone(&self.sessions);
         let goals = Arc::clone(&self.goals);
         let config = Arc::clone(&self.config);
         let cost_tracker = Arc::clone(&self.cost_tracker);
         let session_queue = Arc::clone(&self.sessions.session_queue);
-        let queue_guard = acquire_session_slot(session_queue, scope.session_id.clone())
-            .await
-            .map_err(|_| ())?;
-        let current = goals
-            .current_goal_status_for_session(&scope.session_id)
-            .await
-            .map_err(|_| ())?
-            .filter(|current| {
-                current.task.id == scope.task_id
-                    && current.task.execution_epoch == scope.execution_epoch
-                    && current.task.status == TaskStatus::Running
-            })
-            .ok_or(())?;
-        let agent = sessions.get_agent(&scope.session_id).await.ok_or(())?;
-        let agent_guard = agent.lock_owned().await;
-        let executor_key = scope.task_id.clone();
-        let mut executors = self.executors.lock().await;
-        executors.retain(|_, executor| !executor.handle.is_finished());
-        if executors.contains_key(&executor_key) {
-            return Err(());
-        }
         let worker_scope = scope.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
             let scope = worker_scope;
+            let queue_guard =
+                match acquire_session_slot(session_queue, scope.session_id.clone()).await {
+                    Ok(queue_guard) => queue_guard,
+                    Err(_) => return,
+                };
+            if scope.cancellation.is_cancelled() {
+                return;
+            }
+            let Some(current) = goals
+                .current_goal_status_for_session(&scope.session_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|current| {
+                    current.task.id == scope.task_id
+                        && current.task.execution_epoch == scope.execution_epoch
+                        && current.task.status == TaskStatus::Running
+                })
+            else {
+                return;
+            };
+            let Some(agent) = sessions.get_agent(&scope.session_id).await else {
+                return;
+            };
+            let agent_guard = agent.lock_owned().await;
+            if scope.cancellation.is_cancelled() {
+                return;
+            }
             let _queue_guard = queue_guard;
             let accountant: Arc<dyn GoalOperationAccounting> =
                 Arc::new(GoalOperationAccountant::new(
@@ -692,7 +758,22 @@ impl GoalExecutor for SessionGoalExecutor {
                     .await;
                 let (candidate, next_transcript) = match parent_result {
                     Ok(result) => result,
-                    Err(_) => {
+                    Err(error) => {
+                        if error.downcast_ref::<GoalBudgetExhausted>().is_some() {
+                            let _ = goals
+                                .pause_session_goal(
+                                    &scope.task_id,
+                                    &scope.session_id,
+                                    scope.execution_epoch,
+                                    GoalPauseState {
+                                        reason: GoalPauseReason::BudgetExhausted,
+                                        description: None,
+                                        blockers: Vec::new(),
+                                    },
+                                )
+                                .await;
+                            return;
+                        }
                         let _ = goals
                             .finish_session_goal(
                                 &scope.task_id,
@@ -739,6 +820,16 @@ impl GoalExecutor for SessionGoalExecutor {
                         {
                             Ok(GoalTransitionResult::Applied) => {
                                 agent.append_verified_goal_candidate(candidate);
+                                // The history path is currently session-owned;
+                                // record its guarded delivery fact only after
+                                // that exact append succeeds.
+                                let _ = goals
+                                    .mark_completed_session_goal_delivered(
+                                        &scope.task_id,
+                                        &scope.session_id,
+                                        scope.execution_epoch.saturating_add(1),
+                                    )
+                                    .await;
                             }
                             Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
                             | Err(_) => {}
@@ -766,7 +857,22 @@ impl GoalExecutor for SessionGoalExecutor {
                             .await;
                         return;
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        if error.downcast_ref::<GoalBudgetExhausted>().is_some() {
+                            let _ = goals
+                                .pause_session_goal(
+                                    &scope.task_id,
+                                    &scope.session_id,
+                                    scope.execution_epoch,
+                                    GoalPauseState {
+                                        reason: GoalPauseReason::BudgetExhausted,
+                                        description: None,
+                                        blockers: Vec::new(),
+                                    },
+                                )
+                                .await;
+                            return;
+                        }
                         let _ = goals
                             .finish_session_goal(
                                 &scope.task_id,
@@ -781,39 +887,70 @@ impl GoalExecutor for SessionGoalExecutor {
                 }
             }
         });
-        executors.insert(
-            executor_key,
-            RegisteredGoalExecutor {
-                session_id: scope.session_id.clone(),
-                epoch: scope.execution_epoch,
-                cancellation: scope.cancellation,
-                handle,
-            },
-        );
+        let mut executors = self.executors.lock().await;
+        let Some(executor) = executors.get_mut(&executor_key) else {
+            handle.abort();
+            let _ = handle.await;
+            return Err(());
+        };
+        if executor.session_id != scope.session_id
+            || executor.epoch != scope.execution_epoch
+            || executor.cancellation.is_cancelled()
+        {
+            handle.abort();
+            let _ = handle.await;
+            executors.remove(&executor_key);
+            return Err(());
+        }
+        executor.handle = Some(handle);
         Ok(())
     }
 
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
-        let executor = self.executors.lock().await.remove(task_id);
-        let Some(mut executor) = executor else {
+        let (cancellation, handle) = {
+            let mut executors = self.executors.lock().await;
+            let Some(executor) = executors.get_mut(task_id) else {
+                return Ok(());
+            };
+            if executor.session_id != session_id || executor.epoch != epoch {
+                return Err(());
+            }
+            (executor.cancellation.clone(), executor.handle.take())
+        };
+        cancellation.cancel();
+        let Some(mut handle) = handle else {
             return Ok(());
         };
-        if executor.session_id != session_id || executor.epoch != epoch {
-            self.executors
-                .lock()
-                .await
-                .insert(task_id.to_string(), executor);
-            return Err(());
-        }
-        executor.cancellation.cancel();
-        match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut executor.handle).await {
+        match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(()),
             Err(_) => {
-                executor.handle.abort();
-                executor.handle.await.map_err(|_| ())?;
+                handle.abort();
+                // Abort-induced cancellation is the expected forced-quiesce
+                // result; it is not a second controller failure.
+                let _ = handle.await;
             }
         }
+        // A durable fence may have interrupted a dispatched operation after
+        // provider spend but before normal settlement. Preserve the pending
+        // ID/reservation and classify it fail-closed rather than leaving an
+        // apparently resumable Goal behind.
+        if let Ok(Some(current)) = self.goals.current_goal_status_for_session(session_id).await
+            && current.task.id == task_id
+            && let Some(call_id) = current.goal.pending_call_id
+        {
+            let _ = self
+                .goals
+                .settle_pending_call(
+                    task_id,
+                    session_id,
+                    epoch,
+                    &call_id,
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await;
+        }
+        self.executors.lock().await.remove(task_id);
         Ok(())
     }
 }
@@ -843,6 +980,10 @@ mod tests {
         );
         assert!(parse_goal_verifier_response(
             r#"{"decision":"complete","reason":"criteria met","blockers":[{"kind":"provider","message":"no"}]}"#,
+        )
+        .is_err());
+        assert!(parse_goal_verifier_response(
+            r#"{"decision":"blocked","reason":"needs input","blockers":[{"kind":"needs_user_input","message":"choose","unexpected":true}]}"#,
         )
         .is_err());
         assert!(

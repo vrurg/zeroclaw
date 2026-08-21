@@ -33,6 +33,7 @@ const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
     "sop_advance",
     "sop_approve",
     "sop_workshop",
+    "llm_task",
 ];
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
@@ -10555,6 +10556,7 @@ mod tests {
             Box::new(NamedMockTool::new("sop_advance")),
             Box::new(NamedMockTool::new("sop_approve")),
             Box::new(NamedMockTool::new("sop_workshop")),
+            Box::new(NamedMockTool::new("llm_task")),
             Box::new(NamedMockTool::new("file_read")),
         ];
         tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));
