@@ -34,6 +34,12 @@ const GOAL_UNSUPPORTED_CHILD_TOOLS: &[&str] = &[
     "sop_approve",
     "sop_workshop",
     "llm_task",
+    "browser_delegate",
+    "claude_code",
+    "claude_code_runner",
+    "codex_cli",
+    "gemini_cli",
+    "opencode_cli",
 ];
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
@@ -10557,6 +10563,12 @@ mod tests {
             Box::new(NamedMockTool::new("sop_approve")),
             Box::new(NamedMockTool::new("sop_workshop")),
             Box::new(NamedMockTool::new("llm_task")),
+            Box::new(NamedMockTool::new("browser_delegate")),
+            Box::new(NamedMockTool::new("claude_code")),
+            Box::new(NamedMockTool::new("claude_code_runner")),
+            Box::new(NamedMockTool::new("codex_cli")),
+            Box::new(NamedMockTool::new("gemini_cli")),
+            Box::new(NamedMockTool::new("opencode_cli")),
             Box::new(NamedMockTool::new("file_read")),
         ];
         tools.retain(|tool| !GOAL_UNSUPPORTED_CHILD_TOOLS.contains(&tool.name()));

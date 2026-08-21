@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit},
+    sync::{Mutex, Notify, OwnedSemaphorePermit},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -119,6 +119,7 @@ struct RegisteredGoalExecutor {
     epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
     handle: Option<JoinHandle<()>>,
+    handle_published: Arc<Notify>,
 }
 
 impl SessionGoalExecutor {
@@ -673,6 +674,7 @@ impl GoalExecutor for SessionGoalExecutor {
                     epoch: scope.execution_epoch,
                     cancellation: scope.cancellation.clone(),
                     handle: None,
+                    handle_published: Arc::new(Notify::new()),
                 },
             );
         }
@@ -820,16 +822,10 @@ impl GoalExecutor for SessionGoalExecutor {
                         {
                             Ok(GoalTransitionResult::Applied) => {
                                 agent.append_verified_goal_candidate(candidate);
-                                // The history path is currently session-owned;
-                                // record its guarded delivery fact only after
-                                // that exact append succeeds.
-                                let _ = goals
-                                    .mark_completed_session_goal_delivered(
-                                        &scope.task_id,
-                                        &scope.session_id,
-                                        scope.execution_epoch.saturating_add(1),
-                                    )
-                                    .await;
+                                // Transport delivery is owned by the adapters
+                                // introduced later in the stack. Do not claim
+                                // the durable delivery fact merely because the
+                                // session-local history append succeeded.
                             }
                             Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
                             | Err(_) => {}
@@ -903,11 +899,12 @@ impl GoalExecutor for SessionGoalExecutor {
             return Err(());
         }
         executor.handle = Some(handle);
+        executor.handle_published.notify_waiters();
         Ok(())
     }
 
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
-        let (cancellation, handle) = {
+        let (cancellation, handle, handle_published) = {
             let mut executors = self.executors.lock().await;
             let Some(executor) = executors.get_mut(task_id) else {
                 return Ok(());
@@ -915,11 +912,25 @@ impl GoalExecutor for SessionGoalExecutor {
             if executor.session_id != session_id || executor.epoch != epoch {
                 return Err(());
             }
-            (executor.cancellation.clone(), executor.handle.take())
+            (
+                executor.cancellation.clone(),
+                executor.handle.take(),
+                Arc::clone(&executor.handle_published),
+            )
         };
         cancellation.cancel();
-        let Some(mut handle) = handle else {
-            return Ok(());
+        let mut handle = if let Some(handle) = handle {
+            handle
+        } else {
+            // `launch` inserted this exact cancellation authority before it
+            // could await queue/session state. Wait until it publishes the
+            // handle, then take and join that same worker.
+            handle_published.notified().await;
+            let mut executors = self.executors.lock().await;
+            let Some(executor) = executors.get_mut(task_id) else {
+                return Err(());
+            };
+            executor.handle.take().ok_or(())?
         };
         match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await {
             Ok(Ok(())) => {}
