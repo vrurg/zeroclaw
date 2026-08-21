@@ -170,6 +170,40 @@ impl std::fmt::Display for SemanticEmptyTerminalCompletion {
 
 impl std::error::Error for SemanticEmptyTerminalCompletion {}
 
+/// A semantic-empty terminal failure plus the usage reported by the provider.
+///
+/// The marker remains the error source so delivery surfaces can classify this
+/// failure without parsing diagnostics. The usage is kept separately for the
+/// rejected-attempt accounting owner; it must not become accepted-response
+/// context usage.
+#[derive(Debug)]
+pub struct SemanticEmptyTerminalFailure {
+    pub usage: Option<TokenUsage>,
+    cause: SemanticEmptyTerminalCompletion,
+}
+
+impl SemanticEmptyTerminalFailure {
+    #[must_use]
+    pub const fn new(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+}
+
+impl std::fmt::Display for SemanticEmptyTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {

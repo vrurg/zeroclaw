@@ -236,6 +236,12 @@ impl AccountedChatScope {
         crate::reliable::record_rejected_stream_usage(usage)
     }
 
+    /// Whether the active stream belongs to an exact Reliable candidate that
+    /// may be advanced after a replay-safe terminal failure.
+    pub fn has_pending_reliable_stream_attempt(&self) -> bool {
+        crate::reliable::has_pending_reliable_stream_attempt()
+    }
+
     /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
     pub fn mark_stream_recovery_semantic_empty(&self) {
         crate::reliable::mark_stream_recovery_semantic_empty();

@@ -1912,24 +1912,6 @@ impl AnthropicModelProvider {
             reasoning_content,
         };
 
-        if parsed.is_semantically_empty_terminal() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "provider": "anthropic",
-                        "stop_reason": diagnostic_stop_reason,
-                        "content_block_count": content_block_count,
-                        "content_block_types": content_block_types,
-                        "native_tool_call_count": parsed.tool_calls.len(),
-                        "has_reasoning": parsed.reasoning_content.is_some(),
-                    })),
-                "Anthropic response completed without final text or tool calls"
-            );
-        }
-
         if let Some(error) = Self::terminal_completion_error(stop_reason) {
             // A fallback can only replace an untouched request. Replaying a
             // response that exposed text or any client/server tool activity
@@ -1964,6 +1946,30 @@ impl AnthropicModelProvider {
                 TerminalCompletionFailure::new(error, parsed.usage.clone()),
                 Self::terminal_completion_policy(error, replay_safe),
             ));
+        }
+
+        if parsed.is_semantically_empty_terminal() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "stop_reason": diagnostic_stop_reason,
+                        "content_block_count": content_block_count,
+                        "content_block_types": content_block_types,
+                        "native_tool_call_count": parsed.tool_calls.len(),
+                        "has_reasoning": parsed.reasoning_content.is_some(),
+                    })),
+                "Anthropic response completed without final text or tool calls"
+            );
+            return Err(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(
+                    parsed.usage.clone(),
+                )
+                .into(),
+            );
         }
 
         Ok(parsed)
@@ -2606,13 +2612,10 @@ impl ModelProvider for AnthropicModelProvider {
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response)?;
         parsed.text.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "anthropic: empty text in response"
-            );
-            anyhow::Error::msg("No response from Anthropic")
+            // `parse_native_response` rejects semantic-empty responses. This
+            // guard only protects future response-model changes from erasing
+            // that typed terminal cause at the legacy string boundary.
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion.into()
         })
     }
 
@@ -4338,6 +4341,64 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn chat_with_system_preserves_typed_semantic_empty_terminal_error() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "claude-test",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 0}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server serves requests");
+        });
+        let provider = AnthropicModelProvider {
+            alias: "test".to_string(),
+            credential: Some("test-key".to_string()),
+            base_url: format!("http://{addr}"),
+            max_tokens: 4096,
+            timeout_secs: 120,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+        };
+
+        let error = provider
+            .chat_with_system(None, "hello", "claude-test", Some(0.0))
+            .await
+            .expect_err("semantic-empty native response must fail");
+
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
+        let failure = error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
+            })
+            .expect("semantic-empty failure retains provider usage");
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+        server_handle.abort();
+    }
+
     #[test]
     fn chat_request_serializes_without_system() {
         let req = ChatRequest {
@@ -5351,19 +5412,36 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_with_only_nonterminal_blocks_is_semantically_empty() {
+    fn native_response_with_only_nonterminal_blocks_is_a_typed_semantic_empty_error() {
         let json = r#"{
             "stop_reason": "end_turn",
             "content": [
                 {"type": "thinking", "thinking": "internal only", "signature": "sig"},
                 {"type": "unknown_future_block"}
-            ]
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 3}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp).expect("valid response");
+        let error = AnthropicModelProvider::parse_native_response(resp)
+            .expect_err("a terminal without visible text or tools must fail");
 
-        assert!(result.is_semantically_empty_terminal());
-        assert!(result.reasoning_content.is_some());
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
+        let failure = error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
+            })
+            .expect("semantic-empty failure retains provider usage");
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(10)
+        );
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
     }
 
     #[test]
