@@ -651,6 +651,80 @@ pub struct ResolvedModelOperationPlan {
     pub candidates: Vec<ResolvedModelOperationCandidate>,
 }
 
+/// One Reliable candidate paired with the exact JSON request sizes its
+/// provider family can emit for one non-streaming provider call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationWireCandidate {
+    pub operation: ResolvedModelOperationCandidate,
+    /// UTF-8 JSON byte lengths of every bounded adapter-level request branch.
+    /// A byte is a deliberately conservative upper bound for one input token.
+    pub payload_sizes: Vec<u64>,
+}
+
+/// Read-only exact-wire reservation plan for one configured non-streaming
+/// operation. It shares Reliable candidate selection with
+/// [`ResolvedModelOperationPlan`] and contains no provider handle or prompt
+/// contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationWirePlan {
+    pub candidates: Vec<ResolvedModelOperationWireCandidate>,
+}
+
+impl ResolvedModelOperationWirePlan {
+    /// Return a checked token reservation for every possible provider request,
+    /// Reliable retry, and runtime call phase.
+    pub fn conservative_token_reservation(&self, phase_count: u64) -> anyhow::Result<u64> {
+        if phase_count == 0 {
+            anyhow::bail!("model operation wire plan has zero runtime phases");
+        }
+        if self.candidates.is_empty() {
+            anyhow::bail!("model operation wire plan has no candidates");
+        }
+        self.candidates.iter().try_fold(0_u64, |total, candidate| {
+            let output_tokens = candidate.operation.max_output_tokens.ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "model operation candidate {}/{} has no explicit output cap",
+                    candidate.operation.provider_ref, candidate.operation.model
+                ))
+            })?;
+            if candidate.operation.attempt_count == 0 {
+                anyhow::bail!(
+                    "model operation candidate {}/{} has zero attempts",
+                    candidate.operation.provider_ref,
+                    candidate.operation.model
+                );
+            }
+            if candidate.payload_sizes.is_empty() {
+                anyhow::bail!(
+                    "model operation candidate {}/{} has no wire payload plan",
+                    candidate.operation.provider_ref,
+                    candidate.operation.model
+                );
+            }
+            let per_call = candidate
+                .payload_sizes
+                .iter()
+                .try_fold(0_u64, |sum, payload| {
+                    let one_request =
+                        payload
+                            .checked_add(u64::from(output_tokens))
+                            .ok_or_else(|| {
+                                anyhow::Error::msg("model operation reservation overflows")
+                            })?;
+                    sum.checked_add(one_request)
+                        .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))
+                })?;
+            let candidate_total = per_call
+                .checked_mul(u64::from(candidate.operation.attempt_count))
+                .and_then(|value| value.checked_mul(phase_count))
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
+            total
+                .checked_add(candidate_total)
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))
+        })
+    }
+}
+
 impl ResolvedModelOperationPlan {
     /// Return a checked token bound for every physical candidate attempt that
     /// this logical operation may make.
@@ -1873,6 +1947,24 @@ fn operation_plan_for_ref(
     Ok(ResolvedModelOperationPlan { candidates })
 }
 
+fn resolve_routed_operation_target<'a>(
+    primary_name: &'a str,
+    model_routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &'a str,
+    requested_model: &'a str,
+) -> (&'a str, &'a str, bool) {
+    if model_routes.is_empty() {
+        return (primary_name, requested_model, true);
+    }
+    if let Some(hint) = requested_model.strip_prefix("hint:") {
+        if let Some(route) = model_routes.iter().find(|route| route.hint == hint) {
+            return (route.model_provider.as_str(), route.model.as_str(), false);
+        }
+        return (primary_name, default_model, true);
+    }
+    (primary_name, requested_model, true)
+}
+
 /// Resolve the exact Reliable candidate chain for one configured routed call.
 ///
 /// The result uses the same alias/fallback materialization as provider
@@ -1888,17 +1980,8 @@ pub fn resolve_routed_model_operation_plan_with_options(
     options: &ModelProviderRuntimeOptions,
     requested_model: &str,
 ) -> anyhow::Result<ResolvedModelOperationPlan> {
-    let (provider_ref, operation_model, is_primary) = if model_routes.is_empty() {
-        (primary_name, requested_model, true)
-    } else if let Some(hint) = requested_model.strip_prefix("hint:") {
-        if let Some(route) = model_routes.iter().find(|route| route.hint == hint) {
-            (route.model_provider.as_str(), route.model.as_str(), false)
-        } else {
-            (primary_name, default_model, true)
-        }
-    } else {
-        (primary_name, requested_model, true)
-    };
+    let (provider_ref, operation_model, is_primary) =
+        resolve_routed_operation_target(primary_name, model_routes, default_model, requested_model);
     let provider_options = if is_primary {
         options.clone()
     } else {
@@ -1912,6 +1995,58 @@ pub fn resolve_routed_model_operation_plan_with_options(
         &provider_options,
         is_primary.then_some(default_model),
     )
+}
+
+/// Resolve exact non-streaming wire-payload sizes for every Reliable candidate
+/// selected by the existing routed operation planner.
+pub async fn resolve_routed_model_operation_wire_plan_with_options(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+    requested_model: &str,
+    request: ChatRequest<'_>,
+    temperature: Option<f64>,
+) -> anyhow::Result<ResolvedModelOperationWirePlan> {
+    let (provider_ref, operation_model, is_primary) =
+        resolve_routed_operation_target(primary_name, model_routes, default_model, requested_model);
+    let provider_options = if is_primary {
+        options.clone()
+    } else {
+        options_for_provider_ref(config, provider_ref, options)
+    };
+    let operation = operation_plan_for_ref(
+        config,
+        provider_ref,
+        operation_model,
+        reliability,
+        &provider_options,
+        is_primary.then_some(default_model),
+    )?;
+    let mut candidates = Vec::with_capacity(operation.candidates.len());
+    for candidate in operation.candidates {
+        let candidate_options = if is_primary && candidate.provider_ref == provider_ref {
+            provider_options.clone()
+        } else {
+            options_for_provider_ref(config, &candidate.provider_ref, options)
+        };
+        let payload_sizes = planned_non_streaming_payload_sizes_for_provider_ref(
+            config,
+            &candidate.provider_ref,
+            &candidate_options,
+            request,
+            &candidate.model,
+            temperature,
+        )
+        .await?;
+        candidates.push(ResolvedModelOperationWireCandidate {
+            operation: candidate,
+            payload_sizes,
+        });
+    }
+    Ok(ResolvedModelOperationWirePlan { candidates })
 }
 
 pub fn create_resilient_model_provider_from_ref(
@@ -4703,6 +4838,55 @@ mod tests {
 
         assert_eq!(sizes.len(), 1);
         assert!(sizes[0] > 0);
+    }
+
+    #[tokio::test]
+    async fn routed_wire_plan_reserves_each_reliable_attempt_from_exact_payload_bytes() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, ReliabilityConfig, VercelModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.vercel.insert(
+            "planning".to_string(),
+            VercelModelProviderConfig {
+                base: ModelProviderConfig {
+                    max_tokens: Some(32),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let reliability = ReliabilityConfig {
+            provider_retries: 1,
+            ..ReliabilityConfig::default()
+        };
+        let options = provider_runtime_options_for_alias(&config, "vercel", "planning");
+        let messages = vec![ChatMessage::user("hello")];
+
+        let plan = resolve_routed_model_operation_wire_plan_with_options(
+            &config,
+            "vercel.planning",
+            &reliability,
+            &[],
+            "gpt-5",
+            &options,
+            "gpt-5",
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            None,
+        )
+        .await
+        .expect("configured compat route should plan its exact wire payload");
+
+        assert_eq!(plan.candidates.len(), 1);
+        let candidate = &plan.candidates[0];
+        assert_eq!(candidate.operation.attempt_count, 2);
+        assert_eq!(candidate.payload_sizes.len(), 1);
+        let expected = (candidate.payload_sizes[0] + 32) * 2;
+        assert_eq!(plan.conservative_token_reservation(1).unwrap(), expected);
     }
 
     #[test]
