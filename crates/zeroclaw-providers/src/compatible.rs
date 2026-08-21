@@ -2236,6 +2236,66 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Build the exact JSON value sent by the ordinary non-streaming chat path.
+    ///
+    /// Keeping this construction in one place lets provider-internal callers
+    /// inspect the same outbound body before dispatch without inventing a
+    /// second prompt representation.
+    async fn build_non_streaming_chat_payload(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
+        let merge = self.effective_merge_system(model);
+        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let effective_messages = if self.native_tool_calling {
+            effective_messages
+        } else {
+            self.strip_native_tool_messages(&effective_messages)
+        };
+        let tools = self.convert_tool_specs_for_model(request.tools, model);
+        let native_request = self.build_native_tool_chat_request(
+            &effective_messages,
+            tools,
+            model,
+            temperature,
+            !merge,
+        );
+        Ok(serde_json::to_value(native_request)?)
+    }
+
+    /// Serialize every bounded non-streaming payload this provider can send
+    /// for one logical `chat` invocation.
+    ///
+    /// The first body is the ordinary request. OpenAI-compatible endpoints can
+    /// reject tools plus a reasoning effort and trigger exactly one internal
+    /// retry with `reasoning_effort = "none"`; include that concrete body as a
+    /// second possible dispatch without changing the ordinary retry behavior.
+    pub(crate) async fn planned_non_streaming_payloads(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let payload = self
+            .build_non_streaming_chat_payload(request, model, temperature)
+            .await?;
+        let mut payloads = vec![serde_json::to_vec(&payload)?];
+        let has_tools = payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if has_tools {
+            let mut recovery_payload = payload;
+            if ensure_reasoning_effort_none(&mut recovery_payload) {
+                payloads.push(serde_json::to_vec(&recovery_payload)?);
+            }
+        }
+        Ok(payloads)
+    }
+
     async fn normalize_messages_for_upstream(
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
@@ -3112,24 +3172,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
-        let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
-        let effective_messages = if self.native_tool_calling {
-            effective_messages
-        } else {
-            self.strip_native_tool_messages(&effective_messages)
-        };
-
-        let tools = self.convert_tool_specs_for_model(request.tools, model);
-        let native_request = self.build_native_tool_chat_request(
-            &effective_messages,
-            tools,
-            model,
-            temperature,
-            !merge,
-        );
-        let mut payload = serde_json::to_value(native_request)?;
+        let mut payload = self
+            .build_non_streaming_chat_payload(request, model, temperature)
+            .await?;
         let tools_count = payload
             .get("tools")
             .and_then(serde_json::Value::as_array)
@@ -5137,6 +5182,60 @@ mod tests {
         assert!(
             value.get("extra_body").is_none(),
             "extra_body key itself must not appear in serialized JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_non_streaming_payloads_match_the_wire_request_and_recovery_variant() {
+        let provider = OpenAiCompatibleModelProvider::builder("planning")
+            .display_name("Planning")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .max_tokens(Some(32))
+            .reasoning_effort(Some("high".to_string()))
+            .extra_body(serde_json::json!({"provider_option": "enabled"}))
+            .build();
+        let messages = vec![
+            ChatMessage::system("system instruction"),
+            ChatMessage::user("inspect data:image/png;base64,aGVsbG8="),
+        ];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "inspect",
+            "Inspect a payload",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )];
+
+        let planned = provider
+            .planned_non_streaming_payloads(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                Some(0.2),
+            )
+            .await
+            .expect("payload planning should use the same request construction");
+
+        assert_eq!(planned.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&planned[0]).unwrap();
+        let recovery: serde_json::Value = serde_json::from_slice(&planned[1]).unwrap();
+        assert_eq!(first["model"], "gpt-5");
+        assert_eq!(first["provider_option"], "enabled");
+        assert!(first["messages"].as_array().unwrap().iter().any(|message| {
+            message
+                .to_string()
+                .contains("data:image/png;base64,aGVsbG8=")
+        }));
+        assert_eq!(first["tools"][0]["function"]["name"], "inspect");
+        assert_eq!(first["reasoning_effort"], "high");
+        assert_eq!(recovery["reasoning_effort"], "none");
+        assert_eq!(
+            recovery.as_object().unwrap().len(),
+            first.as_object().unwrap().len(),
+            "recovery must differ only by the same bounded wire-field repair"
         );
     }
 
