@@ -13,8 +13,9 @@ use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 
 use crate::control_plane::{
-    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalResumeSafety,
+    GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult, TaskKind, TaskRecord,
+    TaskStatus,
 };
 
 const INITIAL_GOAL_EXECUTION_EPOCH: i64 = 1;
@@ -22,10 +23,13 @@ const INITIAL_GOAL_EXECUTION_EPOCH: i64 = 1;
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GoalCommand {
-    /// Start a new session-bound Goal with its immutable objective.
+    /// Start a new session-bound Goal with immutable completion criteria and
+    /// objective text.
     Start {
         /// Effective budget selection supplied by the command.
         budget: GoalBudgetRequest,
+        /// Immutable operator-declared completion criteria.
+        success_criteria: String,
         /// Objective text following the required delimiter.
         objective: String,
     },
@@ -66,8 +70,10 @@ pub enum GoalBudgetRequest {
 pub enum GoalCommandErrorKey {
     /// The input did not match the `/goal` grammar.
     InvalidGrammar,
-    /// `start` omitted the delimiter or a nonblank objective.
+    /// `start` omitted the objective delimiter or a nonblank objective.
     ObjectiveRequired,
+    /// `start` omitted the criteria delimiter or nonblank criteria.
+    SuccessCriteriaRequired,
     /// A budget value was absent, malformed, zero, or non-finite.
     InvalidBudget,
     /// Incompatible flags or unsupported extra arguments were supplied.
@@ -86,6 +92,7 @@ impl std::fmt::Display for GoalCommandParseError {
         formatter.write_str(match self.key {
             GoalCommandErrorKey::InvalidGrammar => "goal_invalid_grammar",
             GoalCommandErrorKey::ObjectiveRequired => "goal_objective_required",
+            GoalCommandErrorKey::SuccessCriteriaRequired => "goal_success_criteria_required",
             GoalCommandErrorKey::InvalidBudget => "goal_invalid_budget",
             GoalCommandErrorKey::InvalidArguments => "goal_invalid_arguments",
         })
@@ -96,7 +103,9 @@ impl std::error::Error for GoalCommandParseError {}
 
 /// Parse one raw Goal Mode command using the exact V1 grammar.
 pub fn parse_goal_command(input: &str) -> Result<GoalCommand, GoalCommandParseError> {
-    let input = input.trim();
+    // Leading command whitespace is syntax; text after the two start delimiters
+    // remains operator-supplied data and must not be normalized.
+    let input = input.trim_start();
     let command = input
         .strip_prefix("/goal")
         .filter(|suffix| {
@@ -123,21 +132,51 @@ fn parse_start(input: &str) -> Result<GoalCommand, GoalCommandParseError> {
     let mut flags = Vec::new();
 
     loop {
-        let (token, rest) = take_token(remainder).ok_or_else(objective_required)?;
-        if token == "--" {
-            let objective = rest.trim();
-            if objective.is_empty() {
+        let (token, rest) = take_token(remainder).ok_or_else(success_criteria_required)?;
+        if token == "--success-criteria" {
+            let Some((criteria, objective)) = split_standalone_objective_delimiter(rest) else {
+                return Err(objective_required());
+            };
+            if criteria.trim().is_empty() {
+                return Err(success_criteria_required());
+            }
+            if criteria
+                .split_whitespace()
+                .any(|token| token.starts_with("--"))
+            {
+                return Err(invalid_arguments());
+            }
+            if objective.trim().is_empty() {
                 return Err(objective_required());
             }
             return Ok(GoalCommand::Start {
                 budget: parse_budget_flags(&flags, true)?,
+                success_criteria: criteria.to_string(),
                 objective: objective.to_string(),
             });
+        }
+        if token == "--" {
+            return Err(success_criteria_required());
         }
 
         flags.push(token);
         remainder = rest;
     }
+}
+
+/// Split criteria from the objective at the required standalone `--` token.
+///
+/// The criteria segment intentionally preserves internal whitespace. A token
+/// such as `--literal` is not a delimiter and is subsequently rejected as a
+/// flag when it appears in the criteria segment.
+fn split_standalone_objective_delimiter(input: &str) -> Option<(&str, &str)> {
+    input.match_indices("--").find_map(|(index, _)| {
+        let before = &input[..index];
+        let after = &input[index + 2..];
+        let before_is_boundary = before.chars().last().is_none_or(char::is_whitespace);
+        let after_is_boundary = after.chars().next().is_none_or(char::is_whitespace);
+        (before_is_boundary && after_is_boundary).then_some((before, after))
+    })
 }
 
 fn parse_budget_command(input: &str) -> Result<GoalCommand, GoalCommandParseError> {
@@ -246,6 +285,12 @@ fn invalid_grammar() -> GoalCommandParseError {
 fn objective_required() -> GoalCommandParseError {
     GoalCommandParseError {
         key: GoalCommandErrorKey::ObjectiveRequired,
+    }
+}
+
+fn success_criteria_required() -> GoalCommandParseError {
+    GoalCommandParseError {
+        key: GoalCommandErrorKey::SuccessCriteriaRequired,
     }
 }
 
@@ -413,6 +458,8 @@ pub enum GoalMessageKey {
     BudgetUpdated,
     InvalidCommand,
     InvalidBudget,
+    SuccessCriteriaRequired,
+    ToolPhaseNonResumable,
     Terminal,
     ExecutorStartFailed,
     Stale,
@@ -448,7 +495,14 @@ pub struct GoalStatusProjection {
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
+    pub pending_reserved_tokens: Option<u64>,
+    pub pending_reserved_cost_usd: Option<f64>,
+    pub resume_safety: GoalResumeSafety,
     pub pause_reason: Option<GoalPauseReason>,
+    pub pause_description: Option<String>,
+    pub blockers: Vec<GoalBlocker>,
+    pub delivered: bool,
+    pub terminal_error: Option<String>,
 }
 
 /// One process-local transcript, intentionally absent from the control plane
@@ -562,8 +616,13 @@ impl GoalRuntime {
         }
 
         match command {
-            GoalCommand::Start { budget, objective } => {
-                self.start(ingress, budget, objective).await
+            GoalCommand::Start {
+                budget,
+                success_criteria,
+                objective,
+            } => {
+                self.start(ingress, budget, success_criteria, objective)
+                    .await
             }
             GoalCommand::Status => self.status(ingress).await,
             GoalCommand::Budget => self.budget(ingress).await,
@@ -579,10 +638,16 @@ impl GoalRuntime {
         &self,
         ingress: GoalIngressContext,
         request: GoalBudgetRequest,
+        success_criteria: String,
         objective: String,
     ) -> Result<GoalResponse, GoalRuntimeError> {
         if objective.trim().is_empty() {
             return Ok(GoalResponse::message(GoalMessageKey::InvalidCommand));
+        }
+        if success_criteria.trim().is_empty() {
+            return Ok(GoalResponse::message(
+                GoalMessageKey::SuccessCriteriaRequired,
+            ));
         }
         if let Some(current) = self
             .goals
@@ -644,6 +709,7 @@ impl GoalRuntime {
         let goal = GoalTaskRecord {
             task_id: task_id.clone(),
             objective,
+            success_criteria,
             effective_token_limit: token_limit,
             effective_cost_limit_usd: cost_limit_usd,
             pause_reason: None,
@@ -651,7 +717,10 @@ impl GoalRuntime {
             blockers: Vec::new(),
             pending_call_id: None,
             pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
             accounting_state: GoalAccountingState::Complete,
+            resume_safety: GoalResumeSafety::Clean,
         };
         match self
             .goals
@@ -680,22 +749,22 @@ impl GoalRuntime {
     }
 
     async fn status(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, goal)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
         Ok(GoalResponse::status(
             GoalMessageKey::Status,
-            status_projection(&task, &goal),
+            status_projection(&current),
         ))
     }
 
     async fn budget(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, goal)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
         Ok(GoalResponse::status(
             GoalMessageKey::Budget,
-            status_projection(&task, &goal),
+            status_projection(&current),
         ))
     }
 
@@ -721,9 +790,10 @@ impl GoalRuntime {
             }
             Err(error) => return Err(error),
         };
-        let Some((task, _)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
+        let task = &current.task;
         if !matches!(task.status, TaskStatus::Running | TaskStatus::Paused) {
             return Ok(GoalResponse::message(GoalMessageKey::Terminal));
         }
@@ -745,9 +815,10 @@ impl GoalRuntime {
     }
 
     async fn pause(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, _)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
+        let task = &current.task;
         if task.status == TaskStatus::Paused {
             return Ok(GoalResponse::message(GoalMessageKey::AlreadyPaused));
         }
@@ -775,15 +846,20 @@ impl GoalRuntime {
     }
 
     async fn resume(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, goal)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
+        let task = &current.task;
+        let goal = &current.goal;
         if task.status != TaskStatus::Paused {
             return Ok(GoalResponse::message(if task.status.is_terminal() {
                 GoalMessageKey::Terminal
             } else {
                 GoalMessageKey::Stale
             }));
+        }
+        if goal.resume_safety == GoalResumeSafety::ToolExecuted {
+            return Ok(GoalResponse::message(GoalMessageKey::ToolPhaseNonResumable));
         }
         let readiness = self
             .executor
@@ -826,9 +902,10 @@ impl GoalRuntime {
     }
 
     async fn cancel(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, _)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
+        let task = &current.task;
         if task.status == TaskStatus::Cancelled {
             return Ok(GoalResponse::message(GoalMessageKey::AlreadyCancelled));
         }
@@ -859,9 +936,10 @@ impl GoalRuntime {
         expected_epoch: i64,
         turn_kind: GoalTurnKind,
     ) -> Result<GoalResponse, GoalRuntimeError> {
-        let Some((task, _)) = self.current_goal(&ingress).await? else {
+        let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::Stale));
         };
+        let task = &current.task;
         if task.id != task_id
             || task.execution_epoch != expected_epoch
             || task.status != TaskStatus::Running
@@ -925,25 +1003,19 @@ impl GoalRuntime {
     async fn current_goal(
         &self,
         ingress: &GoalIngressContext,
-    ) -> Result<Option<(TaskRecord, GoalTaskRecord)>, GoalRuntimeError> {
-        let Some(task) = self
+    ) -> Result<Option<GoalTaskStatus>, GoalRuntimeError> {
+        let Some(current) = self
             .goals
-            .current_goal_for_session(ingress.session_id())
+            .current_goal_status_for_session(ingress.session_id())
             .await
             .map_err(GoalRuntimeError::control_plane)?
         else {
             return Ok(None);
         };
-        if !task_matches_ingress(&task, ingress) {
+        if !task_matches_ingress(&current.task, ingress) {
             return Ok(None);
         }
-        let goal = self
-            .goals
-            .get_goal_task(&task.id)
-            .await
-            .map_err(GoalRuntimeError::control_plane)?
-            .ok_or(GoalRuntimeError::MissingExtension)?;
-        Ok(Some((task, goal)))
+        Ok(Some(current))
     }
 }
 
@@ -956,8 +1028,6 @@ pub enum GoalRuntimeError {
     BudgetRequired,
     #[error("goal_invalid_budget")]
     InvalidBudget,
-    #[error("goal_missing_extension")]
-    MissingExtension,
 }
 
 impl GoalRuntimeError {
@@ -990,18 +1060,31 @@ fn transition_message(result: GoalTransitionResult, applied: GoalMessageKey) -> 
     }
 }
 
-fn status_projection(task: &TaskRecord, goal: &GoalTaskRecord) -> GoalStatusProjection {
+fn status_projection(current: &GoalTaskStatus) -> GoalStatusProjection {
+    let task = &current.task;
+    let goal = &current.goal;
     GoalStatusProjection {
         task_id: task.id.clone(),
         status: task.status,
         resumable: task.status == TaskStatus::Paused
+            && task.execution_epoch < i64::MAX
             && goal.accounting_state == GoalAccountingState::Complete
             && goal.pending_call_id.is_none()
-            && goal.pending_call_epoch.is_none(),
+            && goal.pending_call_epoch.is_none()
+            && goal.pending_reserved_tokens.is_none()
+            && goal.pending_reserved_cost_usd.is_none()
+            && goal.resume_safety == GoalResumeSafety::Clean,
         token_limit: goal.effective_token_limit,
         cost_limit_usd: goal.effective_cost_limit_usd,
         accounting_state: goal.accounting_state,
+        pending_reserved_tokens: goal.pending_reserved_tokens,
+        pending_reserved_cost_usd: goal.pending_reserved_cost_usd,
+        resume_safety: goal.resume_safety,
         pause_reason: goal.pause_reason,
+        pause_description: goal.pause_description.clone(),
+        blockers: goal.blockers.clone(),
+        delivered: task.delivered,
+        terminal_error: current.terminal_error.clone(),
     }
 }
 
