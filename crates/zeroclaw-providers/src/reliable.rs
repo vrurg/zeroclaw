@@ -2,7 +2,7 @@ use super::ModelProvider;
 use super::dispatch::{AcceptedRoute, AccountedCallReport, ProviderDispatch, RejectedAttempt};
 use super::stream_guard::AbortOnDrop;
 use super::terminal::{
-    TerminalRecoveryDisposition, TerminalUsageChargeability, terminal_completion_context,
+    TerminalRecoveryDisposition, billable_terminal_usage, terminal_completion_context,
 };
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -1209,23 +1209,12 @@ fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
 /// Extract billing metadata a Reliable terminal error preserves alongside its
 /// actual cause. The caller still returns the original error unchanged.
 fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
-    if let Some(context) = terminal_completion_context(error) {
-        return matches!(
-            context.policy().usage_chargeability(),
-            TerminalUsageChargeability::Billable
-        )
-        .then(|| context.failure().usage.clone())
-        .flatten();
-    }
-    error.chain().find_map(|cause| {
-        cause
-            .downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
-            .and_then(|failure| failure.usage.clone())
-            .or_else(|| {
-                cause
-                    .downcast_ref::<ReliableRejectedCompletionUsage>()
-                    .map(|rejected| rejected.usage.clone())
-            })
+    billable_terminal_usage(error).cloned().or_else(|| {
+        error.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<ReliableRejectedCompletionUsage>()
+                .map(|rejected| rejected.usage.clone())
+        })
     })
 }
 
@@ -3382,6 +3371,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TerminalUsageChargeability;
     use crate::router::{Route, RouterModelProvider};
     use futures_util::StreamExt;
     use std::sync::Arc;

@@ -7,7 +7,8 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{
-    StreamError, TerminalCompletionError, TerminalCompletionFailure,
+    SemanticEmptyTerminalFailure, StreamError, TerminalCompletionError, TerminalCompletionFailure,
+    terminal_completion_failure,
 };
 
 #[derive(Debug, Clone)]
@@ -179,4 +180,61 @@ pub fn terminal_completion_context(error: &anyhow::Error) -> Option<&TerminalCom
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<TerminalCompletionContext>())
+}
+
+/// Return terminal usage only when the provider policy marks it billable.
+///
+/// A contextual error is authoritative: an informational terminal outcome must
+/// not fall through to its nested failure and become chargeable. Reliable's
+/// rejected-attempt sidecar is deliberately outside this projection.
+#[must_use]
+pub fn billable_terminal_usage(
+    error: &anyhow::Error,
+) -> Option<&zeroclaw_api::model_provider::TokenUsage> {
+    if let Some(context) = terminal_completion_context(error) {
+        return (context.policy().usage_chargeability() == TerminalUsageChargeability::Billable)
+            .then(|| context.failure().usage.as_ref())
+            .flatten();
+    }
+
+    terminal_completion_failure(error)
+        .and_then(|failure| failure.usage.as_ref())
+        .or_else(|| {
+            error.chain().find_map(|cause| {
+                cause
+                    .downcast_ref::<SemanticEmptyTerminalFailure>()
+                    .and_then(|failure| failure.usage.as_ref())
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
+        billable_terminal_usage, terminal_completion_context_error,
+    };
+    use zeroclaw_api::model_provider::{
+        TerminalCompletionError, TerminalCompletionFailure, TokenUsage,
+    };
+
+    #[test]
+    fn informational_context_does_not_fall_through_to_nested_usage() {
+        let error = terminal_completion_context_error(
+            TerminalCompletionFailure::new(
+                TerminalCompletionError::Refusal,
+                Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(0),
+                    cached_input_tokens: None,
+                }),
+            ),
+            TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NextCandidate,
+                TerminalUsageChargeability::Informational,
+            ),
+        );
+
+        assert!(billable_terminal_usage(&error).is_none());
+    }
 }

@@ -2,13 +2,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, SemanticEmptyTerminalFailure,
-    terminal_completion_failure,
-};
+use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::{
-    ChatMessage, ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
+    ChatMessage, ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage,
+    billable_terminal_usage, multimodal,
 };
 
 use super::{LoopKnobs, ModelSwitchCallback};
@@ -22,24 +20,18 @@ use crate::tools::{ActivatedToolSet, Tool};
 /// accounting scope did not already own rejected attempts. Reliable's wrapper
 /// remains authoritative when present; direct providers retain usage in the
 /// existing typed terminal errors instead of gaining Reliable routing policy.
-fn rejected_terminal_usage(
+pub(super) fn rejected_terminal_usage(
     error: &anyhow::Error,
 ) -> Option<&zeroclaw_providers::traits::TokenUsage> {
-    error
-        .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<ReliableRejectedCompletionUsage>()
-                .map(|rejected| &rejected.usage)
-        })
-        .or_else(|| terminal_completion_failure(error).and_then(|failure| failure.usage.as_ref()))
-        .or_else(|| {
-            error.chain().find_map(|cause| {
-                cause
-                    .downcast_ref::<SemanticEmptyTerminalFailure>()
-                    .and_then(|failure| failure.usage.as_ref())
-            })
-        })
+    if let Some(rejected) = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ReliableRejectedCompletionUsage>()
+            .map(|rejected| &rejected.usage)
+    }) {
+        return Some(rejected);
+    }
+
+    billable_terminal_usage(error)
 }
 
 /// The resolved model binding: which provider, model, and temperature a turn

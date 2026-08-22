@@ -35,7 +35,8 @@ pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef}
 pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 pub use terminal::{
     TerminalCompletionContext, TerminalCompletionPolicy, TerminalRecoveryDisposition,
-    TerminalUsageChargeability, default_terminal_policy, terminal_completion_context,
+    TerminalUsageChargeability, billable_terminal_usage, default_terminal_policy,
+    terminal_completion_context,
 };
 
 mod request_payload;
