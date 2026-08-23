@@ -1122,7 +1122,10 @@ impl RpcDispatcher {
         // not a request to replace it. In particular, its bound Goal remains
         // owned by that session until an explicit close/delete/kill or a true
         // sibling replacement disposes it.
-        if resuming && let Some(existing) = self.ctx.sessions.live_session(&session_id).await {
+        if resuming
+            && let Some((existing, message_count)) =
+                self.ctx.sessions.reconnect_snapshot(&session_id).await
+        {
             let caller_owns_session = matches!(
                 (existing.owner_tui_id.as_deref(), self.tui_id.as_deref()),
                 (Some(owner), Some(caller)) if owner == caller
@@ -1139,12 +1142,6 @@ impl RpcDispatcher {
                     "Live session binding does not match session/new parameters",
                 ));
             }
-            let message_count = self
-                .ctx
-                .sessions
-                .history_len(&session_id)
-                .await
-                .unwrap_or_default();
             return to_result(SessionNewResult {
                 session_id,
                 agent_alias: existing.agent_alias,
@@ -1266,15 +1263,24 @@ impl RpcDispatcher {
         } else {
             None
         };
+        let mut fenced_replacements = Vec::new();
         if let Some(reservation) = replacement.as_ref() {
             for sibling_id in reservation.target_ids() {
-                if let Err(error) = self.dispose_goal_before_session_removal(sibling_id).await {
+                let Some(ingress) = self.goal_ingress_for_live_session(sibling_id).await? else {
+                    self.ctx
+                        .sessions
+                        .release_replacement_reservation(reservation)
+                        .await;
+                    return Err(rpc_err(INTERNAL_ERROR, "Replacement session disappeared"));
+                };
+                if let Err(error) = self.fence_goal_before_session_removal(&ingress).await {
                     self.ctx
                         .sessions
                         .release_replacement_reservation(reservation)
                         .await;
                     return Err(error);
                 }
+                fenced_replacements.push(ingress);
             }
         }
 
@@ -1305,6 +1311,15 @@ impl RpcDispatcher {
                 .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
             Vec::new()
         };
+
+        // The session map is now committed: the old IDs are unreachable, so
+        // their terminal Goal control rows can be hard-deleted. A failed
+        // replacement above retained those rows rather than deleting a Goal
+        // from a session that remained live.
+        for ingress in &fenced_replacements {
+            self.delete_fenced_goal_after_session_removal(ingress)
+                .await?;
+        }
 
         if let Some(ref tui_id) = self.tui_id
             && !evicted.is_empty()
@@ -2651,28 +2666,34 @@ impl RpcDispatcher {
         })
     }
 
-    /// Dispose an exact RPC-bound Goal before removing its live session.
+    async fn goal_ingress_for_live_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::goal_mode::GoalIngressContext>, JsonRpcError> {
+        let Some(agent) = self.ctx.sessions.get_agent_alias(session_id).await else {
+            return Ok(None);
+        };
+        let Some(Some(tui_id)) = self.ctx.sessions.session_owner_tui_id(session_id).await else {
+            return Ok(None);
+        };
+        crate::goal_mode::GoalIngressContext::zero_code(session_id, agent, "rpc", tui_id)
+            .map(Some)
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))
+    }
+
+    /// Fence an exact RPC-bound Goal before removing its live session.
     ///
     /// The transport binding is reconstructed only from the server-owned
     /// session record. A colliding session identifier belonging to another
     /// transport therefore cannot affect its Goal control state.
-    async fn dispose_goal_before_session_removal(
+    async fn fence_goal_before_session_removal(
         &self,
-        session_id: &str,
+        ingress: &crate::goal_mode::GoalIngressContext,
     ) -> Result<(), JsonRpcError> {
         let Some(goal_runtime) = &self.ctx.goal_runtime else {
             return Ok(());
         };
-        let Some(agent) = self.ctx.sessions.get_agent_alias(session_id).await else {
-            return Ok(());
-        };
-        let Some(Some(tui_id)) = self.ctx.sessions.session_owner_tui_id(session_id).await else {
-            return Ok(());
-        };
-        let ingress =
-            crate::goal_mode::GoalIngressContext::zero_code(session_id, agent, "rpc", tui_id)
-                .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))?;
-        match goal_runtime.dispose_session(&ingress).await {
+        match goal_runtime.fence_session_for_disposal(ingress).await {
             Ok(
                 crate::control_plane::GoalTransitionResult::Applied
                 | crate::control_plane::GoalTransitionResult::Missing,
@@ -2683,6 +2704,42 @@ impl RpcDispatcher {
             )),
             Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session disposal failed")),
         }
+    }
+
+    async fn delete_fenced_goal_after_session_removal(
+        &self,
+        ingress: &crate::goal_mode::GoalIngressContext,
+    ) -> Result<(), JsonRpcError> {
+        let Some(goal_runtime) = &self.ctx.goal_runtime else {
+            return Ok(());
+        };
+        match goal_runtime.delete_fenced_session_goal(ingress).await {
+            Ok(
+                crate::control_plane::GoalTransitionResult::Applied
+                | crate::control_plane::GoalTransitionResult::Missing,
+            ) => Ok(()),
+            Ok(crate::control_plane::GoalTransitionResult::Stale) => Err(rpc_err(
+                INTERNAL_ERROR,
+                "Goal session disposal is not safely fenced",
+            )),
+            Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session disposal failed")),
+        }
+    }
+
+    // Direct close/delete/kill has no successor session-map transaction. Keep
+    // its existing synchronous disposal ordering; replacement uses the split
+    // fence/commit/delete protocol above because its session-map commit can
+    // still fail after Goal quiescence.
+    async fn dispose_goal_before_session_removal(
+        &self,
+        session_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(ingress) = self.goal_ingress_for_live_session(session_id).await? else {
+            return Ok(());
+        };
+        self.fence_goal_before_session_removal(&ingress).await?;
+        self.delete_fenced_goal_after_session_removal(&ingress)
+            .await
     }
 
     /// Fence an exact RPC-bound Goal when an external cancellation leaves the

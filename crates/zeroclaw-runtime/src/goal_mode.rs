@@ -708,8 +708,20 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        self.fence_session_for_disposal(ingress).await?;
+        self.delete_fenced_session_goal(ingress).await
+    }
+
+    /// Fence and quiesce an exact Goal before its live session is removed.
+    /// This deliberately retains the durable control row until the session
+    /// owner has committed that removal; a failed replacement must never leave
+    /// a still-live session without its Goal control state.
+    pub async fn fence_session_for_disposal(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
         self.retry_pending_quiescence().await?;
-        let Some(mut current) = self
+        let Some(current) = self
             .goals
             .current_goal_status_for_session(ingress.session_id())
             .await
@@ -750,7 +762,27 @@ impl GoalRuntime {
             {
                 return Ok(GoalTransitionResult::Stale);
             }
-            current = reloaded;
+        }
+
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    /// Hard-delete an already fenced terminal Goal after the owning session is
+    /// no longer reachable through its transport runtime.
+    pub async fn delete_fenced_session_goal(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(current) = self
+            .goals
+            .current_goal_status_for_session(ingress.session_id())
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if !task_matches_ingress(&current.task, ingress) || !current.task.status.is_terminal() {
+            return Ok(GoalTransitionResult::Stale);
         }
 
         self.goals
@@ -1284,14 +1316,7 @@ impl GoalRuntime {
             .await
             .map_err(GoalRuntimeError::control_plane)?;
         if result == GoalTransitionResult::Applied {
-            self.executor
-                .cancel(&task.id, ingress.session_id(), task.execution_epoch)
-                .await
-                .map_err(|_| {
-                    GoalRuntimeError::control_plane(anyhow::Error::msg(
-                        "goal executor did not quiesce after pause",
-                    ))
-                })?;
+            self.quiesce_exact_goal(task, ingress.session_id()).await?;
         }
         Ok(GoalResponse::message(transition_message(
             result,
@@ -1382,14 +1407,7 @@ impl GoalRuntime {
             .await
             .map_err(GoalRuntimeError::control_plane)?;
         if result == GoalTransitionResult::Applied {
-            self.executor
-                .cancel(&task.id, ingress.session_id(), task.execution_epoch)
-                .await
-                .map_err(|_| {
-                    GoalRuntimeError::control_plane(anyhow::Error::msg(
-                        "goal executor did not quiesce after cancellation",
-                    ))
-                })?;
+            self.quiesce_exact_goal(task, ingress.session_id()).await?;
         }
         Ok(GoalResponse::message(transition_message(
             result,

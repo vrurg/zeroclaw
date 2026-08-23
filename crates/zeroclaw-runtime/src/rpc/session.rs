@@ -130,6 +130,11 @@ struct ReservedRpcSession {
 pub(crate) struct SessionReplacementReservation {
     targets: Vec<ReservedRpcSession>,
     slot: ReplacementSlot,
+    // Serializes an exact replacement with ordinary turn admission and every
+    // other session insertion.  It is intentionally held through Goal
+    // quiescence: otherwise a prompt can register after the idle snapshot but
+    // before its session is fenced.
+    _admission_gate: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl SessionReplacementReservation {
@@ -156,6 +161,7 @@ pub struct SessionStore {
     cancel_generation: std::sync::atomic::AtomicU64,
     session_generation: AtomicU64,
     replacement_slots: Arc<AtomicUsize>,
+    replacement_admission_gate: Arc<Mutex<()>>,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -171,6 +177,7 @@ impl SessionStore {
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             session_generation: AtomicU64::new(0),
             replacement_slots: Arc::new(AtomicUsize::new(0)),
+            replacement_admission_gate: Arc::new(Mutex::new(())),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
@@ -178,6 +185,9 @@ impl SessionStore {
     }
 
     pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
+        let _admission = Arc::clone(&self.replacement_admission_gate)
+            .try_lock_owned()
+            .map_err(|_| "session replacement in progress")?;
         let mut sessions = self.sessions.lock().await;
         if sessions
             .len()
@@ -201,6 +211,9 @@ impl SessionStore {
         chat_mode: &crate::rpc::types::ChatMode,
         incoming_id: &str,
     ) -> Result<SessionReplacementReservation, &'static str> {
+        let admission_gate = Arc::clone(&self.replacement_admission_gate)
+            .lock_owned()
+            .await;
         let in_flight: std::collections::HashSet<String> = self
             .cancel_tokens
             .lock()
@@ -241,6 +254,7 @@ impl SessionStore {
             slot: ReplacementSlot {
                 slots: Arc::clone(&self.replacement_slots),
             },
+            _admission_gate: admission_gate,
         })
     }
 
@@ -312,6 +326,9 @@ impl SessionStore {
         id: &str,
         token: tokio_util::sync::CancellationToken,
     ) -> Option<u64> {
+        let _admission = Arc::clone(&self.replacement_admission_gate)
+            .try_lock_owned()
+            .ok()?;
         if self.is_replacement_reserved(id).await {
             return None;
         }
@@ -322,18 +339,20 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }
 
-    /// Return immutable identity facts for a currently live session.
-    pub(crate) async fn live_session(&self, id: &str) -> Option<LiveRpcSession> {
-        self.sessions
-            .lock()
-            .await
-            .get(id)
-            .map(|session| LiveRpcSession {
-                agent_alias: session.agent_alias.clone(),
-                workspace_dir: session.workspace_dir.clone(),
-                chat_mode: session.chat_mode.clone(),
-                owner_tui_id: session.owner_tui_id.clone(),
-            })
+    /// Snapshot reconnect identity and history while the exact live session is
+    /// still present. `session/new` must not validate an unversioned identity
+    /// and then turn a concurrent removal into a successful empty reconnect.
+    pub(crate) async fn reconnect_snapshot(&self, id: &str) -> Option<(LiveRpcSession, usize)> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        let live = LiveRpcSession {
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            chat_mode: session.chat_mode.clone(),
+            owner_tui_id: session.owner_tui_id.clone(),
+        };
+        let history_len = session.agent.lock().await.history().len();
+        Some((live, history_len))
     }
 
     pub(crate) async fn lock_model_provider_update(
