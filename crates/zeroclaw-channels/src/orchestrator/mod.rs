@@ -12140,9 +12140,7 @@ pub async fn start_channels(
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
-    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
-        None;
+    let mut configured_channels_for_listeners: Option<Vec<ConfiguredChannel>> = None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
@@ -12540,29 +12538,6 @@ pub async fn start_channels(
 
             zeroclaw_runtime::health::mark_component_ok("channels");
 
-            let initial_backoff_secs = config
-                .reliability
-                .channel_initial_backoff_secs
-                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-            let max_backoff_secs = config
-                .reliability
-                .channel_max_backoff_secs
-                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-
-            for cc in &configured_channels {
-                listener_handles.push(spawn_supervised_listener(
-                    cc.channel.clone(),
-                    cc.alias.clone(),
-                    tx.clone(),
-                    initial_backoff_secs,
-                    max_backoff_secs,
-                    cancel.clone(),
-                ));
-            }
-            drop(tx);
-
             // Composite-key registry (see `composite_channel_key`).
             let cbn = Arc::new(configured_channel_map(&configured_channels));
             *CRON_CHANNEL_REGISTRY
@@ -12574,7 +12549,7 @@ pub async fn start_channels(
 
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(cbn);
-            rx_holder = Some(rx);
+            configured_channels_for_listeners = Some(configured_channels);
         }
 
         let channels_by_name = Arc::clone(
@@ -12806,7 +12781,33 @@ pub async fn start_channels(
 
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
-    let rx = rx_holder.expect("rx initialized by first agent's channel setup");
+    // All per-agent execution contexts are now complete. Start listeners only
+    // after this preparation boundary so future Goal session adapters can be
+    // registered before any inbound work is accepted.
+    let configured_channels = configured_channels_for_listeners
+        .expect("configured channels initialized on first agent's channel setup");
+    let initial_backoff_secs = config
+        .reliability
+        .channel_initial_backoff_secs
+        .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
+    let max_backoff_secs = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
+    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+    let mut listener_handles = Vec::new();
+    for channel in configured_channels {
+        listener_handles.push(spawn_supervised_listener(
+            channel.channel,
+            channel.alias,
+            tx.clone(),
+            initial_backoff_secs,
+            max_backoff_secs,
+            cancel.clone(),
+        ));
+    }
+    drop(tx);
+
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
     run_message_dispatch_loop(rx, router, max_in_flight).await;
