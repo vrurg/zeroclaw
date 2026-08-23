@@ -747,6 +747,37 @@ pub async fn run(
         }
     }
 
+    // RPC-bound Goals have no live command or delivery surface when neither
+    // IPC nor WSS is configured. Cancel them before listeners start instead
+    // of retaining records that can never be safely resumed on this daemon
+    // generation. Matrix and other route owners reconcile their opaque
+    // policies through their own registered lifecycle adapters.
+    if config.goal.enabled
+        && !need_rpc_ctx
+        && let Some(goal_runtime) = &goal_runtime
+    {
+        loop {
+            match goal_runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                    is_rpc_goal_revoked_without_rpc_surface(need_rpc_ctx, task)
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                        "Goal RPC-surface revocation failed; delaying listener startup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
 
@@ -2598,12 +2629,25 @@ fn is_goal_agent_revoked_by_config(config: &Config, agent_alias: &str) -> bool {
         .is_none_or(|agent| !agent.enabled)
 }
 
+/// Whether a retained Goal is bound to the unavailable ZeroCode command surface.
+///
+/// `originator_route` is the canonical durable surface binding. The daemon
+/// registry, rather than a duplicate Goal-specific surface flag, decides
+/// whether either supported RPC transport will be started in this generation.
+fn is_rpc_goal_revoked_without_rpc_surface(
+    has_rpc_command_surface: bool,
+    task: &crate::control_plane::TaskRecord,
+) -> bool {
+    !has_rpc_command_surface && task.originator_route.as_deref() == Some("rpc")
+}
+
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
 // The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{TaskKind, TaskRecord, TaskStatus};
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
 
@@ -2647,6 +2691,40 @@ mod tests {
         assert!(!is_goal_agent_revoked_by_config(&config, "active"));
         assert!(is_goal_agent_revoked_by_config(&config, "disabled"));
         assert!(is_goal_agent_revoked_by_config(&config, "removed"));
+    }
+
+    #[test]
+    fn rpc_goal_revocation_follows_the_configured_rpc_command_surface() {
+        let rpc_task = TaskRecord {
+            id: "rpc-goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("rpc".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-rpc".into()),
+            execution_epoch: 2,
+            started_at: "2026-08-23T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let matrix_task = TaskRecord {
+            originator_route: Some("matrix".into()),
+            ..rpc_task.clone()
+        };
+
+        assert!(is_rpc_goal_revoked_without_rpc_surface(false, &rpc_task));
+        assert!(!is_rpc_goal_revoked_without_rpc_surface(true, &rpc_task));
+        assert!(!is_rpc_goal_revoked_without_rpc_surface(
+            false,
+            &matrix_task
+        ));
     }
 
     async fn recv_log_event(
