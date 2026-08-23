@@ -8150,19 +8150,30 @@ impl ChannelGoalSessionAdapter {
         router: &AgentRouter,
         task: &zeroclaw_runtime::control_plane::TaskRecord,
     ) -> bool {
-        let Some(route) = task
-            .originator_route
-            .as_deref()
-            .and_then(|route| MatrixGoalRouteV1::decode(route).ok())
-        else {
+        let Some(route) = Self::matrix_goal_route(task) else {
             return false;
         };
+        router
+            .resolve_goal_runtime(&task.agent, &route.channel_key)
+            .is_some()
+    }
+
+    /// Identify a retained Goal that is durably bound to a Matrix session.
+    ///
+    /// This is intentionally independent of the active generation: lifecycle
+    /// policy reconciliation must first identify stale Matrix records, then
+    /// ask the generation whether it still owns their exact route and agent.
+    fn is_matrix_goal_task(task: &zeroclaw_runtime::control_plane::TaskRecord) -> bool {
+        Self::matrix_goal_route(task).is_some()
+    }
+
+    fn matrix_goal_route(
+        task: &zeroclaw_runtime::control_plane::TaskRecord,
+    ) -> Option<MatrixGoalRouteV1> {
         task.principal_id
             .as_deref()
-            .is_some_and(|principal| !principal.trim().is_empty())
-            && router
-                .resolve_goal_runtime(&task.agent, &route.channel_key)
-                .is_some()
+            .filter(|principal| !principal.trim().is_empty())?;
+        MatrixGoalRouteV1::decode(task.originator_route.as_deref()?).ok()
     }
 }
 
@@ -12580,6 +12591,41 @@ impl PreparedChannels {
         let Some(router) = self.goal_router() else {
             return self.run(cancel).await;
         };
+
+        if let Some(goal_runtime) = goal_runtime.as_ref() {
+            // A replacement generation may remove a Matrix alias or assign it
+            // to another agent. Those retained Goals are no longer authorized
+            // by the prospective generation, so durably cancel and quiesce
+            // them before this generation can accept inbound work. Matrix
+            // room-policy reconciliation remains separate: a bare legacy
+            // Matrix key does not prove one configured room policy.
+            loop {
+                match goal_runtime
+                    .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                        ChannelGoalSessionAdapter::is_matrix_goal_task(task)
+                            && !ChannelGoalSessionAdapter::owns_task_in_generation(&router, task)
+                    })
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{error:#}"),
+                            })),
+                            "Matrix Goal policy revocation failed; delaying generation start"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
         adapter.publish_generation(Arc::clone(&router));
         let result = self.run(cancel).await;
         if let Some(goal_runtime) = goal_runtime {
@@ -15670,6 +15716,24 @@ temperature = 0.3
             }
         };
 
+        assert!(ChannelGoalSessionAdapter::is_matrix_goal_task(&task(
+            "owned",
+            "main",
+            &owned_route,
+            Some("@alice:example.test"),
+        )));
+        assert!(ChannelGoalSessionAdapter::is_matrix_goal_task(&task(
+            "other-route",
+            "main",
+            &other_route,
+            Some("@alice:example.test"),
+        )));
+        assert!(!ChannelGoalSessionAdapter::is_matrix_goal_task(&task(
+            "missing-principal",
+            "main",
+            &owned_route,
+            None,
+        )));
         assert!(ChannelGoalSessionAdapter::owns_task_in_generation(
             &router,
             &task("owned", "main", &owned_route, Some("@alice:example.test")),
