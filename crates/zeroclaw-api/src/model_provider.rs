@@ -179,6 +179,14 @@ impl std::error::Error for SemanticEmptyTerminalCompletion {}
 #[derive(Debug)]
 pub struct SemanticEmptyTerminalFailure {
     pub usage: Option<TokenUsage>,
+    /// Provider-side tool activity occurred before the empty terminal result.
+    /// Replaying this request could duplicate work even though no client tool
+    /// call or final text was returned.
+    pub pre_executed_tool_activity: bool,
+    /// This completed provider response must not be sent again. For example,
+    /// a native-thinking response has already consumed a completed HTTP
+    /// request even when it contains no user-visible final answer.
+    no_replay: bool,
     cause: SemanticEmptyTerminalCompletion,
 }
 
@@ -187,8 +195,42 @@ impl SemanticEmptyTerminalFailure {
     pub const fn new(usage: Option<TokenUsage>) -> Self {
         Self {
             usage,
+            pre_executed_tool_activity: false,
+            no_replay: false,
             cause: SemanticEmptyTerminalCompletion,
         }
+    }
+
+    #[must_use]
+    pub const fn with_pre_executed_tool_activity(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            pre_executed_tool_activity: true,
+            no_replay: true,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+
+    /// Marks a completed semantic-empty response as ineligible for replay
+    /// without claiming that provider-side tool work occurred.
+    #[must_use]
+    pub const fn with_no_replay(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            pre_executed_tool_activity: false,
+            no_replay: true,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_pre_executed_tool_activity(&self) -> bool {
+        self.pre_executed_tool_activity
+    }
+
+    #[must_use]
+    pub const fn is_replayable(&self) -> bool {
+        !self.no_replay
     }
 }
 
@@ -487,6 +529,12 @@ pub enum StreamError {
     #[error(transparent)]
     TerminalCompletion(#[from] TerminalCompletionFailure),
 
+    /// The provider completed without a final answer. Consumers inspect the
+    /// structured failure to distinguish provider-side tool activity from a
+    /// completed response that is otherwise unsafe to replay.
+    #[error(transparent)]
+    SemanticEmpty(#[from] SemanticEmptyTerminalFailure),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -522,9 +570,39 @@ impl StreamError {
             | Self::Json(_)
             | Self::InvalidSse(_)
             | Self::ModelProvider(_)
+            | Self::SemanticEmpty(_)
             | Self::Io(_) => None,
         }
     }
+
+    /// Returns the structured semantic-empty failure carried by this stream
+    /// error, if any.
+    pub fn semantic_empty_terminal_failure(&self) -> Option<&SemanticEmptyTerminalFailure> {
+        match self {
+            Self::SemanticEmpty(failure) => Some(failure),
+            Self::Http(_)
+            | Self::Json(_)
+            | Self::InvalidSse(_)
+            | Self::ModelProvider(_)
+            | Self::TerminalCompletion(_)
+            | Self::Io(_) => None,
+        }
+    }
+}
+
+/// Returns the structured semantic-empty failure carried by an error.
+pub fn semantic_empty_terminal_failure(
+    error: &anyhow::Error,
+) -> Option<&SemanticEmptyTerminalFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SemanticEmptyTerminalFailure>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<StreamError>()?
+                    .semantic_empty_terminal_failure()
+            })
+    })
 }
 
 /// Structured error returned when a requested capability is not supported.

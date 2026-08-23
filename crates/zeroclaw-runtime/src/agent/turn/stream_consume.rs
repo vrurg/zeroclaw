@@ -153,6 +153,19 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 if let Some(failure) =
+                    zeroclaw_api::model_provider::semantic_empty_terminal_failure(&err)
+                {
+                    let usage = outcome.usage.clone().or_else(|| failure.usage.clone());
+                    if failure.has_pre_executed_tool_activity() {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse { usage }.into());
+                    }
+                    return Err(StreamSemanticEmptyCompletion {
+                        usage,
+                        replayable: failure.is_replayable(),
+                    }
+                    .into());
+                }
+                if let Some(failure) =
                     zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
                 {
                     if visible_event_output || !outcome.forwarded_visible_text.is_empty() {
@@ -371,6 +384,7 @@ pub(crate) async fn consume_provider_streaming_response(
         }
         return Err(StreamSemanticEmptyCompletion {
             usage: outcome.usage,
+            replayable: true,
         }
         .into());
     }

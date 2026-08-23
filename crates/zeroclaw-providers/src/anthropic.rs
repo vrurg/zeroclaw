@@ -1961,6 +1961,15 @@ impl AnthropicModelProvider {
         }
 
         if parsed.is_semantically_empty_terminal() {
+            let has_provider_tool_activity = content_block_types.iter().any(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "server_tool_use"
+                        | "web_search_tool_result"
+                        | "mcp_tool_use"
+                        | "mcp_tool_result"
+                )
+            });
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1977,9 +1986,11 @@ impl AnthropicModelProvider {
                 "Anthropic response completed without final text or tool calls"
             );
             return Err(
-                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(
-                    parsed.usage.clone(),
-                )
+                if has_provider_tool_activity {
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(parsed.usage.clone())
+                } else {
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(parsed.usage.clone())
+                }
                 .into(),
             );
         }
@@ -2133,6 +2144,7 @@ impl AnthropicModelProvider {
         let mut terminal_completion_error = None;
         let mut saw_server_tool_activity = false;
         let mut saw_client_tool_activity = false;
+        let mut saw_visible_text = false;
         // The block summary only feeds the DEBUG `message_stop` event. Avoid
         // per-block String and map allocations when that event is disabled.
         let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
@@ -2186,7 +2198,7 @@ impl AnthropicModelProvider {
                         )
                         .await;
                     } else {
-                        if let Some(usage) = usage {
+                        if let Some(usage) = usage.clone() {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
                         }
                         let _ = tx
@@ -2268,30 +2280,50 @@ impl AnthropicModelProvider {
                         .get("index")
                         .and_then(serde_json::Value::as_u64)
                         .and_then(|index| usize::try_from(index).ok());
-                    let started = match content_block_index {
-                        Some(index)
+                    // Anthropic's stream contract starts each indexed content
+                    // block with an object that declares its block kind. Do
+                    // not admit an index into lifecycle state until that
+                    // envelope is valid: otherwise a matching stop could make
+                    // malformed framing look like a clean completion.
+                    let block_type = event
+                        .get("content_block")
+                        .filter(|block| block.is_object())
+                        .and_then(|block| block.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|kind| {
+                            matches!(
+                                *kind,
+                                "text"
+                                    | "tool_use"
+                                    | "thinking"
+                                    | "redacted_thinking"
+                                    | "server_tool_use"
+                                    | "web_search_tool_result"
+                                    | "mcp_tool_use"
+                                    | "mcp_tool_result"
+                                    | "fallback"
+                            )
+                        });
+                    let started = match (content_block_index, block_type) {
+                        (Some(index), Some(block_type))
                             if seen_content_block_indices.insert(index)
                                 && open_content_block_indices.insert(index) =>
                         {
+                            content_block_kinds.insert(index, block_type.to_string());
                             true
                         }
-                        Some(_) | None => {
-                            // A duplicated or unindexed start leaves lifecycle
-                            // framing ambiguous. Keep any earlier, more
-                            // specific incomplete cause authoritative.
+                        _ => {
+                            // A malformed envelope, duplicated index, or
+                            // missing index leaves block ownership ambiguous.
+                            // Keep any earlier, more specific terminal cause.
                             terminal_completion_error
                                 .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                             false
                         }
                     };
-                    if let Some(block) = event.get("content_block") {
-                        let block_type = block
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or_default();
-                        if started && let Some(index) = content_block_index {
-                            content_block_kinds.insert(index, block_type.to_string());
-                        }
+                    if let (Some(block_type), Some(block)) =
+                        (block_type, event.get("content_block"))
+                    {
                         if let Some(content_block_type_counts) = content_block_type_counts.as_mut()
                         {
                             content_block_count = content_block_count.saturating_add(1);
@@ -2387,6 +2419,7 @@ impl AnthropicModelProvider {
                                 } else {
                                     match delta.get("text").and_then(|text| text.as_str()) {
                                         Some(text) if !text.is_empty() => {
+                                            saw_visible_text = true;
                                             if tx
                                                 .send(Ok(StreamEvent::TextDelta(
                                                     StreamChunk::delta(text.to_string()),
@@ -2621,10 +2654,21 @@ impl AnthropicModelProvider {
                         )
                         .await;
                     } else {
-                        if let Some(usage) = usage {
+                        if let Some(usage) = usage.clone() {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
                         }
-                        let _ = tx.send(Ok(StreamEvent::Final)).await;
+                        if saw_server_tool_activity
+                            && !saw_client_tool_activity
+                            && !saw_visible_text
+                        {
+                            let _ = tx
+                                .send(Err(StreamError::SemanticEmpty(
+                                    zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(usage),
+                                )))
+                                .await;
+                        } else {
+                            let _ = tx.send(Ok(StreamEvent::Final)).await;
+                        }
                     }
                     return;
                 }
@@ -3059,7 +3103,7 @@ impl ModelProvider for AnthropicModelProvider {
 
             enum NativeThinkingStreamOutcome {
                 Response(ProviderChatResponse),
-                SemanticEmpty(Option<TokenUsage>),
+                SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
             }
 
             return stream::once(async move {
@@ -3110,10 +3154,19 @@ impl ModelProvider for AnthropicModelProvider {
                             .downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
                         {
                             // Native thinking deliberately uses a non-streaming API call to
-                            // preserve signed thinking blocks. Re-express a completed empty
-                            // response with the existing stream protocol so runtime owns the
-                            // semantic-empty decision and rejected-usage accounting.
-                            Ok(NativeThinkingStreamOutcome::SemanticEmpty(failure.usage.clone()))
+                            // preserve signed thinking blocks. It has already completed an HTTP
+                            // request, so retain a typed semantic-empty outcome but never replay
+                            // that direct request as though it were a failed transport stream.
+                            let failure = if failure.has_pre_executed_tool_activity() {
+                                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(
+                                    failure.usage.clone(),
+                                )
+                            } else {
+                                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(
+                                    failure.usage.clone(),
+                                )
+                            };
+                            Ok(NativeThinkingStreamOutcome::SemanticEmpty(failure))
                         } else {
                             Err(zeroclaw_api::model_provider::terminal_completion_failure(&error)
                                 .cloned()
@@ -3146,12 +3199,12 @@ impl ModelProvider for AnthropicModelProvider {
                     events.push(Ok(StreamEvent::Final));
                     stream::iter(events)
                 }
-                Ok(NativeThinkingStreamOutcome::SemanticEmpty(usage)) => {
+                Ok(NativeThinkingStreamOutcome::SemanticEmpty(failure)) => {
                     let mut events = Vec::new();
-                    if let Some(usage) = usage {
+                    if let Some(usage) = failure.usage.clone() {
                         events.push(Ok(StreamEvent::Usage(usage)));
                     }
-                    events.push(Ok(StreamEvent::Final));
+                    events.push(Err(StreamError::SemanticEmpty(failure)));
                     stream::iter(events)
                 }
                 Err(e) => stream::iter(vec![Err(e)]),
@@ -3958,6 +4011,120 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
 
         assert_non_string_stop_reason_is_rejected(bytes).await;
+    }
+
+    async fn assert_malformed_content_block_start_is_rejected(content_block: &str) {
+        use std::io::Cursor;
+
+        let bytes = format!(
+            "event: message_start\n\\\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\\\n\
+event: content_block_start\n\\\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\\\n\
+event: content_block_stop\n\\\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\\\n\
+event: message_delta\n\\\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\\\n\
+event: message_stop\n\\\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "malformed content-block start must not emit Final"
+        );
+        let failure = failure.expect("malformed content-block start must fail");
+        assert_eq!(
+            failure.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(5));
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_malformed_content_block_start_envelopes() {
+        for content_block in ["null", "[]", "{}", "{\"type\":7}", "{\"type\":\"future\"}"] {
+            assert_malformed_content_block_start_is_rejected(content_block).await;
+        }
+    }
+
+    #[test]
+    fn native_semantic_empty_after_server_tool_activity_is_not_replayable() {
+        let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [{
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "search",
+                "input": {}
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }))
+        .expect("fixture must deserialize");
+
+        let error = AnthropicModelProvider::parse_native_response(response)
+            .expect_err("provider-side tool activity without a final answer must fail");
+        let failure = zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+            .expect("typed semantic-empty failure must survive native parsing");
+        assert!(failure.has_pre_executed_tool_activity());
+        assert!(!failure.is_replayable());
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_semantic_empty_after_server_tool_activity_is_not_final() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::SemanticEmpty(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "provider-side tool activity must not produce Final"
+        );
+        let failure = failure.expect("semantic-empty server-tool stream must fail");
+        assert!(failure.has_pre_executed_tool_activity());
+        assert!(!failure.is_replayable());
+        assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(5));
     }
 
     #[tokio::test]
@@ -4907,7 +5074,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn native_thinking_semantic_empty_stream_emits_usage_then_final() {
+    async fn native_thinking_semantic_empty_stream_emits_usage_then_no_replay_error() {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
@@ -4962,14 +5129,88 @@ data: {\"type\":\"message_stop\"}\n\n";
 
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
-            events.push(event.expect("semantic-empty native stream uses normal events"));
+            events.push(event);
         }
         server.abort();
 
         assert!(matches!(
             events.as_slice(),
-            [StreamEvent::Usage(usage), StreamEvent::Final]
-                if usage.input_tokens == Some(10) && usage.output_tokens == Some(3)
+            [Ok(StreamEvent::Usage(usage)), Err(StreamError::SemanticEmpty(failure))]
+                if usage.input_tokens == Some(10)
+                    && usage.output_tokens == Some(3)
+                    && !failure.is_replayable()
+                    && !failure.has_pre_executed_tool_activity()
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_thinking_server_tool_activity_keeps_no_replay_classification() {
+        use axum::{Json, Router, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                Json(serde_json::json!({
+                    "id": "msg_test",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "server_tool_use",
+                        "id": "srv_1",
+                        "name": "search",
+                        "input": {}
+                    }],
+                    "model": "claude-test",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 3}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server serves requests");
+        });
+        let provider = AnthropicModelProvider {
+            alias: "test".to_string(),
+            credential: Some("test-key".to_string()),
+            base_url: format!("http://{addr}"),
+            max_tokens: 4096,
+            timeout_secs: 120,
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+        };
+        let messages = [ChatMessage::user("hello")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 1_024,
+                }),
+            },
+            "claude-sonnet-4-5",
+            Some(1.0),
+            StreamOptions::new(true),
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        server.abort();
+
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(StreamEvent::Usage(usage)), Err(StreamError::SemanticEmpty(failure))]
+                if usage.input_tokens == Some(10)
+                    && usage.output_tokens == Some(3)
+                    && !failure.is_replayable()
+                    && failure.has_pre_executed_tool_activity()
         ));
     }
 

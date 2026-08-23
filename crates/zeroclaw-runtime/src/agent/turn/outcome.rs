@@ -86,6 +86,15 @@ impl StreamInterruptedAfterOutput {
             StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
         }
     }
+
+    pub(crate) fn terminal_failure(
+        &self,
+    ) -> Option<&zeroclaw_api::model_provider::TerminalCompletionFailure> {
+        match &self.cause {
+            StreamInterruptionCause::Transport { .. } => None,
+            StreamInterruptionCause::Terminal(failure) => Some(failure),
+        }
+    }
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
@@ -149,6 +158,7 @@ impl std::error::Error for StreamPreExecutedToolsWithoutFinalResponse {}
 #[derive(Debug)]
 pub(crate) struct StreamSemanticEmptyCompletion {
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) replayable: bool,
 }
 
 impl std::fmt::Display for StreamSemanticEmptyCompletion {
@@ -263,6 +273,13 @@ pub fn terminal_completion_error_message(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
+    if zeroclaw_api::model_provider::semantic_empty_terminal_failure(err)
+        .is_some_and(|failure| failure.has_pre_executed_tool_activity())
+    {
+        return Some(pre_executed_tools_without_final_response_message(
+            agent_name,
+        ));
+    }
     if is_semantic_empty_terminal_completion(err) {
         return Some(semantic_empty_terminal_completion_message(agent_name));
     }
@@ -385,7 +402,10 @@ mod tests {
     #[test]
     fn terminal_completion_diagnostics_are_stable_english() {
         let direct = SemanticEmptyTerminalCompletion;
-        let stream = StreamSemanticEmptyCompletion { usage: None };
+        let stream = StreamSemanticEmptyCompletion {
+            usage: None,
+            replayable: true,
+        };
         let provider_tools = StreamPreExecutedToolsWithoutFinalResponse { usage: None };
 
         assert_eq!(

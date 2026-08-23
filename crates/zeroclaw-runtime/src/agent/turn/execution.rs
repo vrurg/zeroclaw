@@ -31,6 +31,16 @@ pub(super) fn rejected_terminal_usage(
         return Some(rejected);
     }
 
+    // `StreamTerminalCompletion` carries the provider-owned policy across
+    // the streaming boundary. Consult it before its nested failure so a
+    // direct informational refusal cannot fall through as billable usage.
+    if let Some(terminal) = error.downcast_ref::<super::outcome::StreamTerminalCompletion>() {
+        return (terminal.policy.usage_chargeability()
+            == zeroclaw_providers::TerminalUsageChargeability::Billable)
+            .then_some(terminal.failure.usage.as_ref())
+            .flatten();
+    }
+
     billable_terminal_usage(error)
 }
 
@@ -279,8 +289,9 @@ impl<'a> ResolvedAgentExecution<'a> {
 
 #[cfg(test)]
 mod run_model_query_tests {
-    use super::ResolvedModelAccess;
+    use super::{ResolvedModelAccess, rejected_terminal_usage};
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+    use crate::agent::turn::outcome::StreamTerminalCompletion;
     use async_trait::async_trait;
     use std::sync::{
         Arc,
@@ -294,7 +305,10 @@ mod run_model_query_tests {
     use zeroclaw_api::tool::ToolSpec;
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::TokenUsage;
-    use zeroclaw_providers::{ChatMessage, ModelProvider, ReliableRejectedCompletionUsage};
+    use zeroclaw_providers::{
+        ChatMessage, ModelProvider, ReliableRejectedCompletionUsage, TerminalCompletionPolicy,
+        TerminalRecoveryDisposition, TerminalUsageChargeability,
+    };
 
     /// Provider stub returning a fixed reply WITH token usage, so the seam's
     /// cost-recording path has something to record.
@@ -839,5 +853,44 @@ mod run_model_query_tests {
             assert_eq!(recorded.output_tokens, 5);
             assert_eq!(recorded.last_input_tokens, 0);
         }
+    }
+
+    #[test]
+    fn rejected_terminal_usage_honors_direct_stream_chargeability_policy() {
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            cached_input_tokens: None,
+        };
+        let refusal = anyhow::Error::new(StreamTerminalCompletion {
+            failure: TerminalCompletionFailure::new(
+                TerminalCompletionError::Refusal,
+                Some(usage.clone()),
+            ),
+            policy: TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NextCandidate,
+                TerminalUsageChargeability::Informational,
+            ),
+        });
+        assert!(
+            rejected_terminal_usage(&refusal).is_none(),
+            "an informational direct stream refusal must not fall through as billable"
+        );
+
+        let limit = anyhow::Error::new(StreamTerminalCompletion {
+            failure: TerminalCompletionFailure::new(
+                TerminalCompletionError::OutputTokenLimit,
+                Some(usage),
+            ),
+            policy: TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NoReplay,
+                TerminalUsageChargeability::Billable,
+            ),
+        });
+        assert_eq!(
+            rejected_terminal_usage(&limit).and_then(|usage| usage.input_tokens),
+            Some(10),
+            "a billable direct terminal stream retains usage for the outer owner"
+        );
     }
 }

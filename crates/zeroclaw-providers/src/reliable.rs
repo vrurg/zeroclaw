@@ -1222,7 +1222,13 @@ fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
 /// transport errors. In particular, retrying a candidate after it produced a
 /// paused partial turn could duplicate provider-executed work.
 fn terminal_recovery_disposition(error: &anyhow::Error) -> Option<TerminalRecoveryDisposition> {
-    terminal_completion_context(error).map(|context| context.policy().recovery())
+    terminal_completion_context(error)
+        .map(|context| context.policy().recovery())
+        .or_else(|| {
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(error)
+                .filter(|failure| !failure.is_replayable())
+                .map(|_| TerminalRecoveryDisposition::NoReplay)
+        })
 }
 
 /// A Reliable chat request exhausted its candidates after receiving rejected
