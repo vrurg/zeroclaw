@@ -380,6 +380,76 @@ async fn cancellation_fence_allows_only_matching_pending_settlement() {
 }
 
 #[tokio::test]
+async fn hard_disposal_requires_pending_accounting_to_be_classified_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("dispose-outcome-unknown", "session-dispose-unknown");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .admit_pending_call_with_reservation(
+            "dispose-outcome-unknown",
+            "session-dispose-unknown",
+            1,
+            "dispose-pending-call",
+            Some(10),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .finish_session_goal(
+            "dispose-outcome-unknown",
+            "session-dispose-unknown",
+            1,
+            TaskStatus::Cancelled,
+            Some("session_disposed".into()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .dispose_session_goal("dispose-outcome-unknown", "session-dispose-unknown", 2)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale,
+        "a pending operation cannot disappear before it is classified"
+    );
+
+    assert_eq!(
+        store
+            .settle_pending_call(
+                "dispose-outcome-unknown",
+                "session-dispose-unknown",
+                1,
+                "dispose-pending-call",
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .dispose_session_goal("dispose-outcome-unknown", "session-dispose-unknown", 2)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied,
+        "the classified terminal control record may be removed with its session"
+    );
+    assert!(
+        store
+            .current_goal_for_session("session-dispose-unknown")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn completed_goal_delivery_mark_is_exact_and_idempotent() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();

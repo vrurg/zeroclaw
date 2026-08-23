@@ -682,6 +682,186 @@ impl GoalRuntime {
         }
     }
 
+    /// Fence, quiesce, and hard-delete the current Goal before its owning
+    /// session is destroyed or genuinely replaced.
+    ///
+    /// This bypasses command admission deliberately: session disposal must
+    /// remain effective when Goal Mode has just been disabled or the session's
+    /// former ingress policy is no longer valid.
+    pub async fn dispose_session(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(mut current) = self
+            .goals
+            .current_goal_status_for_session(ingress.session_id())
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if !task_matches_ingress(&current.task, ingress) {
+            return Ok(GoalTransitionResult::Missing);
+        }
+
+        if !current.task.status.is_terminal() {
+            let result = self
+                .goals
+                .finish_session_goal(
+                    &current.task.id,
+                    ingress.session_id(),
+                    current.task.execution_epoch,
+                    TaskStatus::Cancelled,
+                    Some("session_disposed".into()),
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane)?;
+            if result != GoalTransitionResult::Applied {
+                return Ok(result);
+            }
+            self.quiesce_exact_goal(&current.task, ingress.session_id())
+                .await?;
+            let Some(reloaded) = self
+                .goals
+                .current_goal_status_for_session(ingress.session_id())
+                .await
+                .map_err(GoalRuntimeError::control_plane)?
+            else {
+                return Ok(GoalTransitionResult::Missing);
+            };
+            if reloaded.task.id != current.task.id || !task_matches_ingress(&reloaded.task, ingress)
+            {
+                return Ok(GoalTransitionResult::Stale);
+            }
+            current = reloaded;
+        }
+
+        self.goals
+            .dispose_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)
+    }
+
+    /// Interrupt a live session without disposing it. A clean Goal pauses so
+    /// an explicit later resume can start a new epoch; an unsettled operation
+    /// is classified by the executor as outcome-unknown and fails closed.
+    pub async fn interrupt_session(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        self.pause_session_for_reason(ingress, GoalPauseReason::OperatorPaused)
+            .await
+    }
+
+    /// Fence active Goals during daemon shutdown or generation cutover.
+    pub async fn pause_for_runtime_cutover(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        self.pause_session_for_reason(ingress, GoalPauseReason::DaemonRestart)
+            .await
+    }
+
+    /// Cancel a Goal whose currently active policy no longer authorizes it.
+    /// The terminal audit is retained while its session exists.
+    pub async fn cancel_revoked(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(current) = self
+            .goals
+            .current_goal_status_for_session(ingress.session_id())
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if !task_matches_ingress(&current.task, ingress) {
+            return Ok(GoalTransitionResult::Missing);
+        }
+        if current.task.status.is_terminal() {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let result = self
+            .goals
+            .finish_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                TaskStatus::Cancelled,
+                Some("goal_policy_revoked".into()),
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            self.quiesce_exact_goal(&current.task, ingress.session_id())
+                .await?;
+        }
+        Ok(result)
+    }
+
+    async fn pause_session_for_reason(
+        &self,
+        ingress: &GoalIngressContext,
+        reason: GoalPauseReason,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(current) = self
+            .goals
+            .current_goal_status_for_session(ingress.session_id())
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if !task_matches_ingress(&current.task, ingress) {
+            return Ok(GoalTransitionResult::Missing);
+        }
+        match current.task.status {
+            TaskStatus::Running => {
+                let result = self
+                    .goals
+                    .pause_session_goal(
+                        &current.task.id,
+                        ingress.session_id(),
+                        current.task.execution_epoch,
+                        GoalPauseState {
+                            reason,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await
+                    .map_err(GoalRuntimeError::control_plane)?;
+                if result == GoalTransitionResult::Applied {
+                    self.quiesce_exact_goal(&current.task, ingress.session_id())
+                        .await?;
+                }
+                Ok(result)
+            }
+            TaskStatus::Paused => Ok(GoalTransitionResult::Applied),
+            _ => Ok(GoalTransitionResult::Stale),
+        }
+    }
+
+    async fn quiesce_exact_goal(
+        &self,
+        task: &TaskRecord,
+        session_id: &str,
+    ) -> Result<(), GoalRuntimeError> {
+        self.executor
+            .cancel(&task.id, session_id, task.execution_epoch)
+            .await
+            .map_err(|_| {
+                GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "goal executor did not quiesce after lifecycle fence",
+                ))
+            })
+    }
+
     async fn start(
         &self,
         ingress: GoalIngressContext,

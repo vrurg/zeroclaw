@@ -1582,6 +1582,38 @@ impl GoalTaskRegistry for SqliteTaskStore {
         }
     }
 
+    async fn dispose_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let changed = conn.execute(
+            "DELETE FROM tasks
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND execution_epoch = ?3
+                AND status IN ('completed','failed','cancelled','lost','timed_out')
+                AND EXISTS (
+                    SELECT 1 FROM goal_tasks
+                     WHERE task_id = ?1
+                       AND (
+                            (pending_call_id IS NULL
+                             AND pending_call_epoch IS NULL
+                             AND pending_reserved_tokens IS NULL
+                             AND pending_reserved_cost_usd IS NULL)
+                         OR accounting_state = 'outcome_unknown'
+                       )
+                )",
+            params![task_id, session_id, expected_epoch],
+        )?;
+        if changed == 1 {
+            Ok(GoalTransitionResult::Applied)
+        } else {
+            goal_transition_absence(&conn, task_id)
+        }
+    }
+
     async fn cancel_running_goal_children(&self, task_id: &str, session_id: &str) -> Result<usize> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();

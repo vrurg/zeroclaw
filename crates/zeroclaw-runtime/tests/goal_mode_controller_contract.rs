@@ -11,7 +11,7 @@ use zeroclaw_config::{
 use zeroclaw_runtime::{
     control_plane::{
         GoalPauseReason, GoalPauseState, GoalResumeSafety, GoalTaskRegistry, GoalTransitionResult,
-        SqliteTaskStore, TaskStatus,
+        SqliteTaskStore, TaskRegistry, TaskStatus,
     },
     goal_mode::{
         GoalBudgetRequest, GoalCommand, GoalCommandErrorKey, GoalExecutionPreflight,
@@ -32,6 +32,7 @@ struct FakeExecutor {
     action: LaunchAction,
     launches: Mutex<Vec<GoalExecutionScope>>,
     preflights: Mutex<Vec<GoalExecutionPreflight>>,
+    cancellations: Mutex<Vec<(String, String, i64)>>,
 }
 
 impl FakeExecutor {
@@ -41,6 +42,7 @@ impl FakeExecutor {
             action,
             launches: Mutex::new(Vec::new()),
             preflights: Mutex::new(Vec::new()),
+            cancellations: Mutex::new(Vec::new()),
         }
     }
 }
@@ -77,6 +79,13 @@ impl GoalExecutor for FakeExecutor {
                 Err(())
             }
         }
+    }
+
+    async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+        self.cancellations
+            .lock()
+            .push((task_id.to_owned(), session_id.to_owned(), epoch));
+        Ok(())
     }
 }
 
@@ -761,6 +770,160 @@ async fn stale_executor_failure_cannot_overwrite_a_newer_fence() {
             .expect("current goal")
             .status,
         TaskStatus::Paused
+    );
+}
+
+#[tokio::test]
+async fn session_disposal_fences_quiesces_then_deletes_goal_control_state() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+
+    runtime
+        .submit(
+            matrix("session-dispose"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise session disposal".into(),
+            },
+        )
+        .await
+        .expect("start should create a Goal");
+    let task_id = store
+        .current_goal_for_session("session-dispose")
+        .await
+        .expect("read current Goal")
+        .expect("Goal exists")
+        .id;
+
+    runtime
+        .dispose_session(&matrix("session-dispose"))
+        .await
+        .expect("disposal should quiesce and delete a settled Goal");
+
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [(task_id.clone(), "session-dispose".to_owned(), 1)],
+        "the old execution epoch must be cancelled after its durable fence"
+    );
+    assert!(
+        store
+            .current_goal_for_session("session-dispose")
+            .await
+            .expect("read current Goal after disposal")
+            .is_none(),
+        "session disposal must hard-delete Goal control state"
+    );
+    assert!(
+        store
+            .get(&task_id)
+            .await
+            .expect("read disposed task")
+            .is_none(),
+        "the terminal task row must not remain as a historical current Goal"
+    );
+}
+
+#[tokio::test]
+async fn session_disposal_retains_a_goal_when_quiescence_cannot_classify_pending_accounting() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+
+    runtime
+        .submit(
+            matrix("session-pending-dispose"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise unsettled session disposal".into(),
+            },
+        )
+        .await
+        .expect("start should create a Goal");
+    let current = store
+        .current_goal_for_session("session-pending-dispose")
+        .await
+        .expect("read current Goal")
+        .expect("Goal exists");
+    assert_eq!(
+        store
+            .admit_pending_call_with_reservation(
+                &current.id,
+                "session-pending-dispose",
+                current.execution_epoch,
+                "pending-disposal-operation",
+                Some(64),
+                None,
+            )
+            .await
+            .expect("admit pending operation"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        runtime
+            .dispose_session(&matrix("session-pending-dispose"))
+            .await
+            .expect("unclassified accounting must not turn into an error"),
+        GoalTransitionResult::Stale,
+        "deletion is forbidden until the executor classifies the admitted operation"
+    );
+    let retained = store
+        .current_goal_for_session("session-pending-dispose")
+        .await
+        .expect("read retained Goal")
+        .expect("unclassified Goal remains durable");
+    assert_eq!(retained.id, current.id);
+    assert_eq!(retained.status, TaskStatus::Cancelled);
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [(current.id, "session-pending-dispose".to_owned(), 1)]
+    );
+}
+
+#[tokio::test]
+async fn session_disposal_cannot_target_a_goal_owned_by_another_transport_binding() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(executor);
+    runtime
+        .submit(
+            matrix("shared-session-id"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "retain transport ownership".into(),
+            },
+        )
+        .await
+        .expect("start should create a Matrix Goal");
+    let rpc_binding =
+        GoalIngressContext::zero_code("shared-session-id", "main", "rpc", "tui-connection")
+            .expect("trusted RPC binding");
+
+    assert_eq!(
+        runtime
+            .dispose_session(&rpc_binding)
+            .await
+            .expect("foreign binding is not an error"),
+        GoalTransitionResult::Missing
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("shared-session-id")
+            .await
+            .unwrap()
+            .expect("the Matrix Goal remains")
+            .status,
+        TaskStatus::Running
     );
 }
 

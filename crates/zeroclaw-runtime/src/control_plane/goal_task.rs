@@ -476,6 +476,20 @@ pub trait GoalTaskRegistry: Send + Sync {
         expected_epoch: i64,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Hard-delete one terminal Goal while disposing its owning session.
+    ///
+    /// A lifecycle owner calls this only after it has quiesced the exact
+    /// executor. An unresolved pending operation must already be classified
+    /// as `outcome_unknown`; retaining the pending control row would otherwise
+    /// make session disposal impossible despite the deliberately discarded
+    /// session state. The canonical usage ledger remains untouched.
+    async fn dispose_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     /// Terminally classify direct foreground children that remain Running
     /// after their exact Goal executor has been forced to quiesce. This is a
     /// lifecycle repair, not child supervision or a second task store.
