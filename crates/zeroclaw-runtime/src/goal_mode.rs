@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -624,6 +624,11 @@ pub struct GoalRuntime {
     cost_tracker: Arc<CostTracker>,
     executor: Arc<dyn GoalExecutor>,
     boot_id: String,
+    /// A daemon-generation cutover must prevent a command already accepted by
+    /// a listener from admitting a successor after lifecycle fencing begins.
+    /// This is process-local coordination only; canonical lifecycle state
+    /// remains in the task control plane.
+    admission_cutover: RwLock<bool>,
 }
 
 impl GoalRuntime {
@@ -644,6 +649,7 @@ impl GoalRuntime {
             cost_tracker,
             executor,
             boot_id: required_ingress_value(boot_id.into())?,
+            admission_cutover: RwLock::new(false),
         })
     }
 
@@ -655,6 +661,10 @@ impl GoalRuntime {
     ) -> Result<GoalResponse, GoalRuntimeError> {
         if command == GoalCommand::Help {
             return Ok(GoalResponse::message(GoalMessageKey::Help));
+        }
+        let admission = self.admission_cutover.read().await;
+        if *admission {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
         }
         if !self.config.goal.enabled {
             return Ok(GoalResponse::message(GoalMessageKey::Disabled));
@@ -764,6 +774,76 @@ impl GoalRuntime {
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
         self.pause_session_for_reason(ingress, GoalPauseReason::DaemonRestart)
             .await
+    }
+
+    /// Stop this daemon generation from admitting another Goal command, then
+    /// fence and quiesce every durable running Goal before generic runtime
+    /// components are cancelled.
+    ///
+    /// The task plane is the source of truth for the enumeration. In
+    /// particular, no transport-owned session list may be used here: a Goal
+    /// can outlive a reconnect and the runtime must still classify its exact
+    /// pending operation before shutdown.
+    pub async fn pause_running_goals_for_runtime_cutover(&self) -> Result<usize, GoalRuntimeError> {
+        let mut admission = self.admission_cutover.write().await;
+        *admission = true;
+
+        let running = self
+            .goals
+            .list_running_goal_statuses()
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        let mut paused = 0;
+        for current in running {
+            let Some(session_id) = current.task.session_id.as_deref() else {
+                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                    "running Goal has no durable session binding during runtime cutover"
+                )));
+            };
+            if session_id.trim().is_empty() {
+                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                    "running Goal has an empty durable session binding during runtime cutover"
+                )));
+            }
+            let result = self
+                .goals
+                .pause_session_goal(
+                    &current.task.id,
+                    session_id,
+                    current.task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::DaemonRestart,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane)?;
+            match result {
+                GoalTransitionResult::Applied => {
+                    self.quiesce_exact_goal(&current.task, session_id).await?;
+                    paused += 1;
+                }
+                GoalTransitionResult::Missing => {}
+                GoalTransitionResult::Stale => {
+                    let still_running = self
+                        .goals
+                        .current_goal_status_for_session(session_id)
+                        .await
+                        .map_err(GoalRuntimeError::control_plane)?
+                        .is_some_and(|latest| {
+                            latest.task.id == current.task.id
+                                && latest.task.status == TaskStatus::Running
+                        });
+                    if still_running {
+                        return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                            "running Goal changed while runtime cutover was fencing it"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(paused)
     }
 
     /// Cancel a Goal whose currently active policy no longer authorizes it.

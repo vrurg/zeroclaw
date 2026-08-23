@@ -118,6 +118,60 @@ async fn session_goal_admission_is_unique_and_epoch_fenced() {
 }
 
 #[tokio::test]
+async fn running_goal_enumeration_excludes_paused_terminal_and_unrelated_tasks() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (running, running_goal) = session_goal("running-goal", "session-running");
+    store
+        .create_or_replace_session_goal(running, running_goal)
+        .await
+        .unwrap();
+    let (paused, paused_goal) = session_goal("paused-goal", "session-paused");
+    store
+        .create_or_replace_session_goal(paused, paused_goal)
+        .await
+        .unwrap();
+    store
+        .pause_session_goal(
+            "paused-goal",
+            "session-paused",
+            1,
+            zeroclaw_runtime::control_plane::GoalPauseState {
+                reason: zeroclaw_runtime::control_plane::GoalPauseReason::OperatorPaused,
+                description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let unrelated = TaskRecord {
+        id: "ordinary-running-task".into(),
+        kind: TaskKind::Delegate,
+        agent: "main".into(),
+        status: TaskStatus::Running,
+        owner_pid: 1,
+        owner_boot_id: "boot-a".into(),
+        heartbeat_at: None,
+        depth: 0,
+        parent_id: None,
+        originator_route: None,
+        delivered: false,
+        idem_key: None,
+        principal_id: None,
+        session_id: None,
+        execution_epoch: 0,
+        started_at: "2026-08-20T00:00:00Z".into(),
+        finished_at: None,
+    };
+    store.create(unrelated).await.unwrap();
+
+    let running = store.list_running_goal_statuses().await.unwrap();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].task.id, "running-goal");
+    assert_eq!(running[0].task.execution_epoch, 1);
+}
+
+#[tokio::test]
 async fn resume_refuses_execution_epoch_overflow() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();

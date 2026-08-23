@@ -828,6 +828,70 @@ async fn session_disposal_fences_quiesces_then_deletes_goal_control_state() {
 }
 
 #[tokio::test]
+async fn runtime_cutover_fences_and_quiesces_every_running_goal() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+
+    for session_id in ["session-cutover-a", "session-cutover-b"] {
+        runtime
+            .submit(
+                matrix(session_id),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "complete the work".into(),
+                    objective: format!("exercise daemon cutover for {session_id}"),
+                },
+            )
+            .await
+            .expect("start should create a running Goal");
+    }
+
+    assert_eq!(
+        runtime
+            .pause_running_goals_for_runtime_cutover()
+            .await
+            .expect("cutover should fence every running Goal"),
+        2
+    );
+    assert_eq!(
+        runtime
+            .submit(
+                matrix("session-cutover-successor"),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "complete the work".into(),
+                    objective: "must not be admitted after cutover".into(),
+                },
+            )
+            .await
+            .expect("cutover rejection is a typed response")
+            .key,
+        GoalMessageKey::Stale,
+        "the outgoing runtime generation must not admit a successor Goal"
+    );
+
+    for session_id in ["session-cutover-a", "session-cutover-b"] {
+        let status = store
+            .current_goal_status_for_session(session_id)
+            .await
+            .expect("read cutover Goal")
+            .expect("Goal remains retained for explicit resume");
+        assert_eq!(status.task.status, TaskStatus::Paused);
+        assert_eq!(status.task.execution_epoch, 2);
+        assert_eq!(
+            status.goal.pause_reason,
+            Some(GoalPauseReason::DaemonRestart)
+        );
+    }
+    let cancellations = executor.cancellations.lock();
+    assert_eq!(cancellations.len(), 2);
+    assert!(cancellations.iter().all(|(_, _, epoch)| *epoch == 1));
+}
+
+#[tokio::test]
 async fn session_disposal_retains_a_goal_when_quiescence_cannot_classify_pending_accounting() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,

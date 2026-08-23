@@ -287,6 +287,13 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// Read every currently running Goal from the canonical control plane.
+    ///
+    /// This is intentionally narrower than `TaskRegistry::list_running`: the
+    /// daemon lifecycle owner must fence Goal executors without taking
+    /// responsibility for unrelated durable task kinds.
+    async fn list_running_goal_statuses(&self) -> anyhow::Result<Vec<GoalTaskStatus>>;
+
     async fn create_goal(
         &self,
         task: TaskRecord,

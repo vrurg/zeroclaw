@@ -995,6 +995,30 @@ pub async fn run(
             exit.await
         }
     };
+    // Goal executors can have an admitted logical provider operation even
+    // while the daemon is about to stop. Fence and quiesce them before the
+    // shared component token begins cancelling transports; otherwise a
+    // transport teardown could orphan a Running Goal or hide uncertain spend.
+    // A durable-fence error is retried in place: returning or cancelling the
+    // generic workers first would violate the fail-closed lifecycle contract.
+    if let Some(goal_runtime) = &goal_runtime {
+        loop {
+            match goal_runtime.pause_running_goals_for_runtime_cutover().await {
+                Ok(_) => break,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                        "Goal runtime cutover fence failed; retaining daemon components"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     match &exit_result {
         Ok(exit) => crate::health::mark_component_error(
             "daemon",
@@ -1032,8 +1056,8 @@ pub async fn run(
     }
 
     // Keep the daemon-generation Goal controller alive until every component
-    // has stopped. Later lifecycle cutover work will fence and quiesce owned
-    // Goal executors before this generation is released.
+    // has stopped. Its executors were fenced and quiesced before component
+    // cancellation began.
     drop(goal_runtime);
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
