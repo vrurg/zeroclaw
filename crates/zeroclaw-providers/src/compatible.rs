@@ -2147,9 +2147,10 @@ fn sse_bytes_to_events_for_contract(
 
                         if let Some(usage) = chunk.usage {
                             let token_usage = usage.into_provider_usage();
-                            if output_limit_observed {
-                                output_limit_usage = Some(token_usage.clone());
-                            }
+                            // Usage frames are independent from choice frames. Keep the latest
+                            // value even before `finish_reason: "length"` so the typed terminal
+                            // failure retains a provider report that arrived first.
+                            output_limit_usage = Some(token_usage.clone());
                             if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
                                 return;
                             }
@@ -5372,6 +5373,45 @@ mod tests {
                 assert_eq!(
                     failure.reason,
                     zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+                );
+                assert_eq!(
+                    failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+                    Some(20)
+                );
+            }
+            other => panic!("expected output-limit failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_length_stream_retains_usage_reported_before_length() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+
+        assert!(matches!(
+            events.first(),
+            Some(Ok(StreamEvent::Usage(usage)))
+                if usage.input_tokens == Some(10) && usage.output_tokens == Some(20)
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "length must not emit Final: {events:?}"
+        );
+        match events.last() {
+            Some(Err(StreamError::TerminalCompletion(failure))) => {
+                assert_eq!(
+                    failure.reason,
+                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+                );
+                assert_eq!(
+                    failure.usage.as_ref().and_then(|usage| usage.input_tokens),
+                    Some(10)
                 );
                 assert_eq!(
                     failure.usage.as_ref().and_then(|usage| usage.output_tokens),
