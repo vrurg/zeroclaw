@@ -8158,6 +8158,30 @@ impl ChannelGoalSessionAdapter {
             .is_some()
     }
 
+    /// Check whether the prospective Matrix generation still authorizes an
+    /// exact retained Goal route, including its configured room policy.
+    fn owns_task_policy_in_generation(
+        router: &AgentRouter,
+        task: &zeroclaw_runtime::control_plane::TaskRecord,
+    ) -> bool {
+        let Some(route) = Self::matrix_goal_route(task) else {
+            return false;
+        };
+        let Some(runtime) = router.resolve_goal_runtime(&task.agent, &route.channel_key) else {
+            return false;
+        };
+        let Some(matrix) =
+            matrix_config_for_goal_route(runtime.ctx.prompt_config.as_ref(), &route.channel_key)
+        else {
+            return false;
+        };
+        matrix.allowed_rooms.is_empty()
+            || matrix
+                .allowed_rooms
+                .iter()
+                .any(|room| room == &route.reply_target)
+    }
+
     /// Identify a retained Goal that is durably bound to a Matrix session.
     ///
     /// This is intentionally independent of the active generation: lifecycle
@@ -8174,6 +8198,28 @@ impl ChannelGoalSessionAdapter {
             .as_deref()
             .filter(|principal| !principal.trim().is_empty())?;
         MatrixGoalRouteV1::decode(task.originator_route.as_deref()?).ok()
+    }
+}
+
+/// Resolve the live Matrix config for one canonical Goal route key.
+///
+/// A bare `matrix` key is legacy-compatible only when the prospective
+/// generation has exactly one Matrix alias. Multiple aliases would make room
+/// authorization ambiguous, so lifecycle policy fails closed instead.
+fn matrix_config_for_goal_route<'a>(
+    config: &'a Config,
+    channel_key: &str,
+) -> Option<&'a zeroclaw_config::schema::MatrixConfig> {
+    match channel_key {
+        "matrix" => {
+            let mut configured = config.channels.matrix.values();
+            let matrix = configured.next()?;
+            configured.next().is_none().then_some(matrix)
+        }
+        _ => config
+            .channels
+            .matrix
+            .get(channel_key.strip_prefix("matrix.")?),
     }
 }
 
@@ -12594,16 +12640,18 @@ impl PreparedChannels {
 
         if let Some(goal_runtime) = goal_runtime.as_ref() {
             // A replacement generation may remove a Matrix alias or assign it
-            // to another agent. Those retained Goals are no longer authorized
-            // by the prospective generation, so durably cancel and quiesce
-            // them before this generation can accept inbound work. Matrix
-            // room-policy reconciliation remains separate: a bare legacy
-            // Matrix key does not prove one configured room policy.
+            // to another agent, or remove the Goal's room from its allowlist.
+            // Those retained Goals are no longer authorized by the prospective
+            // generation, so durably cancel and quiesce them before this
+            // generation can accept inbound work. An ambiguous bare legacy
+            // Matrix key fails closed rather than guessing an alias policy.
             loop {
                 match goal_runtime
                     .cancel_nonterminal_goals_for_policy_revocation(|task| {
                         ChannelGoalSessionAdapter::is_matrix_goal_task(task)
-                            && !ChannelGoalSessionAdapter::owns_task_in_generation(&router, task)
+                            && !ChannelGoalSessionAdapter::owns_task_policy_in_generation(
+                                &router, task,
+                            )
                     })
                     .await
                 {
@@ -15674,7 +15722,18 @@ temperature = 0.3
 
     #[test]
     fn channel_generation_cutover_selects_only_its_owned_matrix_goals() {
-        let ctx = router_test_ctx();
+        let mut config = Config::default();
+        config.channels.matrix.insert(
+            "primary".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                allowed_rooms: vec!["!owned:example.test".to_string()],
+                ..Default::default()
+            },
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(config),
+            ..(*router_test_ctx()).clone()
+        });
         let mut agents = HashMap::new();
         agents.insert("main".to_string(), ctx);
         let mut owners = HashMap::new();
@@ -15690,6 +15749,13 @@ temperature = 0.3
         let other_route = MatrixGoalRouteV1::new(
             "matrix.secondary".to_string(),
             "!other:example.test".to_string(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let revoked_room_route = MatrixGoalRouteV1::new(
+            "matrix.primary".to_string(),
+            "!revoked:example.test".to_string(),
         )
         .unwrap()
         .encode()
@@ -15738,6 +15804,22 @@ temperature = 0.3
             &router,
             &task("owned", "main", &owned_route, Some("@alice:example.test")),
         ));
+        assert!(ChannelGoalSessionAdapter::owns_task_policy_in_generation(
+            &router,
+            &task("owned", "main", &owned_route, Some("@alice:example.test")),
+        ));
+        assert!(
+            !ChannelGoalSessionAdapter::owns_task_policy_in_generation(
+                &router,
+                &task(
+                    "revoked-room",
+                    "main",
+                    &revoked_room_route,
+                    Some("@alice:example.test"),
+                ),
+            ),
+            "a retained Matrix Goal loses authorization when its exact room leaves the allowlist"
+        );
         assert!(!ChannelGoalSessionAdapter::owns_task_in_generation(
             &router,
             &task(
