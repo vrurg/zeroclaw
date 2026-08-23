@@ -4830,12 +4830,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let goal_session_adapter = goal_session_adapter.clone();
                         Box::pin(async move {
-                            zeroclaw_channels::orchestrator::prepare_channels(
+                            Box::pin(zeroclaw_channels::orchestrator::prepare_channels(
                                 config,
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                            )
+                            ))
                             .await?
                             .run_with_goal_adapter(&goal_session_adapter, goal_runtime, cancel)
                             .await

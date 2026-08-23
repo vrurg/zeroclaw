@@ -125,7 +125,9 @@ async fn finish_goal_or_retain_ownership(
                 })
                 .is_ok()
         {
-            Err(anyhow::anyhow!("injected goal terminal transition failure"))
+            Err(anyhow::Error::msg(
+                "injected goal terminal transition failure",
+            ))
         } else {
             goals
                 .finish_session_goal(
@@ -1601,17 +1603,15 @@ mod tests {
         let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
 
         let goals: Arc<dyn GoalTaskRegistry> = store;
-        let retained = tokio::spawn({
-            let goals = Arc::clone(&goals);
-            let scope = scope.clone();
-            async move {
-                super::finish_goal_or_retain_ownership(
-                    &goals,
-                    &scope,
-                    "goal_execution_host_unavailable",
-                )
-                .await;
-            }
+        let retained_goals = Arc::clone(&goals);
+        let retained_scope = scope.clone();
+        let retained = zeroclaw_spawn::spawn!(async move {
+            super::finish_goal_or_retain_ownership(
+                &retained_goals,
+                &retained_scope,
+                "goal_execution_host_unavailable",
+            )
+            .await;
         });
         sleep(Duration::from_millis(20)).await;
         assert!(
@@ -1695,17 +1695,15 @@ mod tests {
 
         INJECTED_GOAL_TRANSITION_ERRORS.store(1, Ordering::SeqCst);
         let goals: Arc<dyn GoalTaskRegistry> = store;
-        let retained = tokio::spawn({
-            let goals = Arc::clone(&goals);
-            let scope = scope.clone();
-            async move {
-                super::finish_goal_or_retain_ownership(
-                    &goals,
-                    &scope,
-                    "goal_execution_host_unavailable",
-                )
-                .await;
-            }
+        let retained_goals = Arc::clone(&goals);
+        let retained_scope = scope.clone();
+        let retained = zeroclaw_spawn::spawn!(async move {
+            super::finish_goal_or_retain_ownership(
+                &retained_goals,
+                &retained_scope,
+                "goal_execution_host_unavailable",
+            )
+            .await;
         });
 
         sleep(Duration::from_millis(20)).await;
