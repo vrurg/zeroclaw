@@ -119,10 +119,10 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, MaxIterationBehavior, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
+    ResolvedRuntimeKnobs, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, is_model_switch_requested, run_goal_parent_tool_loop,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::goal_mode::{
@@ -647,8 +647,21 @@ fn scope_override_key(
     msg: &zeroclaw_api::channel::ChannelMessage,
     agent_alias: &str,
 ) -> String {
+    scope_override_key_for_parts(scope, &channel_scope(msg), &msg.sender, agent_alias)
+}
+
+/// Build the durable in-memory model-override key without requiring a
+/// transport message. Goal execution owns a validated Matrix session binding,
+/// not an inbound [`ChannelMessage`], but it must share normal channel model
+/// precedence exactly.
+fn scope_override_key_for_parts(
+    scope: OverrideScope,
+    channel_key: &str,
+    sender: &str,
+    agent_alias: &str,
+) -> String {
     let raw = match scope {
-        OverrideScope::User => format!("user::{}::{}", channel_scope(msg), msg.sender),
+        OverrideScope::User => format!("user::{channel_key}::{sender}"),
         OverrideScope::Agent => format!("agent::{agent_alias}"),
     };
     sanitize_session_key(&raw)
@@ -1846,11 +1859,15 @@ fn default_route_selection_from_snapshot(
     }
 }
 
-/// First scope override that matches `msg`, in precedence order
-/// `User > Agent`. Session-only — never consults disk.
-fn scope_override_lookup(
+/// First matching scope override for a canonical channel/sender pair.
+///
+/// This is the message-free counterpart used by the Goal host lease. Keep it
+/// private to the channel owner: the key inputs are derived from a trusted
+/// binding, never from Goal command text.
+fn scope_override_lookup_for_parts(
     ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_key: &str,
+    sender: &str,
 ) -> Option<ChannelRouteSelection> {
     let overrides = ctx
         .scope_overrides
@@ -1865,7 +1882,12 @@ fn scope_override_lookup(
         .into_iter()
         .find_map(|scope| {
             overrides
-                .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
+                .get(&scope_override_key_for_parts(
+                    scope,
+                    channel_key,
+                    sender,
+                    ctx.agent_alias.as_str(),
+                ))
                 .cloned()
         })
 }
@@ -1876,9 +1898,28 @@ fn get_route_selection(
     sender_key: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> ChannelRouteSelection {
+    get_route_selection_for_parts(
+        ctx,
+        &channel_scope(msg),
+        &msg.sender,
+        sender_key,
+        defaults_snapshot,
+    )
+}
+
+/// Resolve a channel model route from canonical key material. This is shared
+/// by ordinary incoming messages and Matrix Goal execution; it deliberately
+/// centralizes precedence rather than having Goal synthesize a message.
+fn get_route_selection_for_parts(
+    ctx: &ChannelRuntimeContext,
+    channel_key: &str,
+    sender: &str,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> ChannelRouteSelection {
     // Precedence (most specific wins): user > agent scope override,
     // then the per-sender route override, then the config default.
-    scope_override_lookup(ctx, msg).unwrap_or_else(|| {
+    scope_override_lookup_for_parts(ctx, channel_key, sender).unwrap_or_else(|| {
         ctx.route_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8075,6 +8116,7 @@ struct ChannelGoalExecutionSession {
     runtime: Arc<ChannelAgentRuntime>,
     route: MatrixGoalRouteV1,
     session_id: String,
+    principal_id: String,
 }
 
 #[async_trait::async_trait]
@@ -8091,9 +8133,22 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
         binding: &GoalSessionBinding,
     ) -> anyhow::Result<GoalHostModelBinding> {
         let runtime = self.runtime_for_binding(binding)?;
+        let route = MatrixGoalRouteV1::decode(binding.route())?;
+        let principal_id = binding
+            .principal_id()
+            .filter(|principal| !principal.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding has no raw MXID"))?;
+        let defaults = runtime_defaults_snapshot(runtime.ctx.as_ref());
+        let selection = get_route_selection_for_parts(
+            runtime.ctx.as_ref(),
+            &route.channel_key,
+            principal_id,
+            binding.session_id(),
+            &defaults,
+        );
         Ok(GoalHostModelBinding {
-            provider_ref: runtime.ctx.model_provider_ref.as_str().to_string(),
-            model: runtime.ctx.model.as_str().to_string(),
+            provider_ref: selection.model_provider,
+            model: selection.model,
         })
     }
 
@@ -8105,6 +8160,11 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
         if scope.session_id != binding.session_id() {
             anyhow::bail!("Matrix Goal scope does not match its session binding");
         }
+        let principal_id = binding
+            .principal_id()
+            .filter(|principal| !principal.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding has no raw MXID"))?
+            .to_string();
         let route = MatrixGoalRouteV1::decode(binding.route())?;
         let runtime = self.runtime_for_binding(binding)?;
         let queue_guard = runtime
@@ -8126,6 +8186,7 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
             runtime,
             route,
             session_id: scope.session_id.clone(),
+            principal_id,
         }))
     }
 }
@@ -8156,13 +8217,90 @@ impl GoalSessionLease for ChannelGoalExecutionSession {
 
     async fn run_parent_turn(
         &mut self,
-        _working_history: Vec<ChatMessage>,
-        _cancellation: CancellationToken,
+        mut working_history: Vec<ChatMessage>,
+        cancellation: CancellationToken,
     ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
-        // The next PR7 slice refactors the normal channel route resolver into
-        // a key-based seam before wiring this call. Until then, failing closed
-        // is safer than silently ignoring an active session's model override.
-        anyhow::bail!("Matrix Goal parent turn awaits canonical route resolution")
+        let ctx = self.runtime.ctx.as_ref();
+        let defaults = runtime_defaults_snapshot(ctx);
+        let route = get_route_selection_for_parts(
+            ctx,
+            &self.route.channel_key,
+            &self.principal_id,
+            &self.session_id,
+            &defaults,
+        );
+        let provider = get_or_create_provider(
+            ctx,
+            &route.model_provider,
+            route.api_key.as_deref(),
+            &defaults,
+        )
+        .await
+        .context("resolve Matrix Goal model provider")?;
+
+        // Goal Mode keeps ordinary channel safety exclusions and adds the
+        // controller-owned exclusions shared by all session adapters. It must
+        // not inherit hook, receipt, draft, or steering side effects.
+        let mut excluded_tools = if ctx.autonomy_level == AutonomyLevel::Full {
+            Vec::new()
+        } else {
+            ctx.non_cli_excluded_tools.as_ref().clone()
+        };
+        for excluded in zeroclaw_runtime::goal_mode::goal_parent_excluded_tools() {
+            if !excluded_tools.iter().any(|current| current == excluded) {
+                excluded_tools.push((*excluded).to_string());
+            }
+        }
+        let mut pacing = ctx.pacing.clone();
+        pacing.loop_detection_enabled = false;
+        let loop_knobs = LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+            ..LoopKnobs::default()
+        };
+        let exec = ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
+                model_provider: provider.as_ref(),
+                provider_name: route.model_provider.as_str(),
+                model: route.model.as_str(),
+                temperature: ctx.temperature,
+            },
+            ResolvedIo {
+                tools_registry: ctx.tools_registry.as_ref(),
+                observer: ctx.observer.as_ref(),
+                silent: true,
+                approval: Some(ctx.approval_manager.as_ref()),
+                multimodal_config: &ctx.multimodal,
+                config: Some(ctx.prompt_config.as_ref()),
+                hooks: None,
+                activated_tools: ctx.activated_tools.as_ref(),
+                model_switch_callback: None,
+                receipt_generator: None,
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations: ctx.max_tool_iterations,
+                excluded_tools: &excluded_tools,
+                dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                pacing: &pacing,
+                strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                parallel_tools: false,
+                max_tool_result_chars: ctx.max_tool_result_chars,
+                context_token_budget: ctx.context_token_budget,
+                knobs: &loop_knobs,
+            },
+        );
+        let candidate = run_goal_parent_tool_loop(
+            exec,
+            &mut working_history,
+            &self.route.channel_key,
+            cancellation,
+            None,
+            Some(ctx.agent_alias.as_str()),
+        )
+        .await
+        .context("run Matrix Goal parent turn")?;
+        Ok((candidate, working_history))
     }
 
     fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
@@ -25936,6 +26074,20 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert_eq!(
             get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
+            "user-model"
+        );
+        // Goal execution has a trusted route binding and raw Matrix sender,
+        // rather than a synthetic inbound ChannelMessage. It must observe the
+        // exact same precedence as an ordinary channel turn.
+        assert_eq!(
+            get_route_selection_for_parts(
+                &ctx,
+                &channel_scope(&msg),
+                &msg.sender,
+                &sender_key,
+                &snapshot,
+            )
+            .model,
             "user-model"
         );
     }
