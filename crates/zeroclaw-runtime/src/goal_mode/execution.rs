@@ -3,7 +3,7 @@
 //! The driver owns durable Goal control and accounting. The RPC adapter owns
 //! only its existing session queue, agent lock, and canonical history access.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use crate::agent::cost::{
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalTaskRegistry, GoalTransitionResult, TaskStatus,
+    GoalTaskRegistry, GoalTransitionResult, TaskRecord, TaskStatus,
 };
 use crate::rpc::session::SessionStore;
 
@@ -107,30 +107,26 @@ async fn finish_goal_or_retain_ownership(
     scope: &GoalExecutionScope,
     reason: &str,
 ) {
-    retry_goal_transition(|| {
-        goals.finish_session_goal(
-            &scope.task_id,
-            &scope.session_id,
-            scope.execution_epoch,
-            TaskStatus::Failed,
-            Some(reason.into()),
-        )
-    })
-    .await;
-}
-
-async fn retry_goal_transition<F, Fut>(mut transition: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<GoalTransitionResult>>,
-{
     loop {
-        match transition().await {
-            Ok(
-                GoalTransitionResult::Applied
-                | GoalTransitionResult::Stale
-                | GoalTransitionResult::Missing,
-            ) => return,
+        match goals
+            .finish_session_goal(
+                &scope.task_id,
+                &scope.session_id,
+                scope.execution_epoch,
+                TaskStatus::Failed,
+                Some(reason.into()),
+            )
+            .await
+        {
+            Ok(GoalTransitionResult::Applied | GoalTransitionResult::Missing) => return,
+            Ok(GoalTransitionResult::Stale)
+                if !exact_running_goal_requires_owner(goals, scope).await =>
+            {
+                return;
+            }
+            Ok(GoalTransitionResult::Stale) => {
+                tokio::time::sleep(GOAL_TRANSITION_RETRY_DELAY).await;
+            }
             Err(error) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -143,6 +139,30 @@ where
             }
         }
     }
+}
+
+async fn exact_running_goal_requires_owner(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+) -> bool {
+    match goals
+        .current_goal_status_for_session(&scope.session_id)
+        .await
+    {
+        Ok(Some(current)) => is_exact_running_goal_task(&current.task, scope),
+        Ok(None) => match goals.current_goal_for_session(&scope.session_id).await {
+            Ok(Some(task)) => is_exact_running_goal_task(&task, scope),
+            Ok(None) => false,
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
+}
+
+fn is_exact_running_goal_task(task: &TaskRecord, scope: &GoalExecutionScope) -> bool {
+    task.id == scope.task_id
+        && task.execution_epoch == scope.execution_epoch
+        && task.status == TaskStatus::Running
 }
 
 /// Construct the shared Goal executor over one host-owned live session model.
@@ -1122,31 +1142,102 @@ impl GoalExecutor for GoalExecutionDriver {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::sync::Arc;
+
+    use super::{
+        GoalVerifierOutcome, exact_running_goal_requires_owner, is_exact_running_goal_task,
+        parse_goal_verifier_response,
+    };
+    use crate::{
+        control_plane::{
+            GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
+            GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskStatus,
+        },
+        goal_mode::{GoalExecutionScope, GoalTurnKind},
     };
 
-    use super::{GoalVerifierOutcome, parse_goal_verifier_response, retry_goal_transition};
-    use crate::control_plane::GoalTransitionResult;
-
     #[tokio::test]
-    async fn transition_storage_error_retries_before_releasing_execution_ownership() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        retry_goal_transition({
-            let attempts = Arc::clone(&attempts);
-            move || {
-                let attempts = Arc::clone(&attempts);
-                async move {
-                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        anyhow::bail!("injected transition write failure");
-                    }
-                    Ok(GoalTransitionResult::Applied)
-                }
-            }
-        })
-        .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    async fn stale_transition_keeps_ownership_when_exact_task_still_runs() {
+        let directory = tempfile::tempdir().expect("temporary control plane");
+        let store = SqliteTaskStore::new(directory.path()).expect("control plane");
+        let scope = GoalExecutionScope {
+            task_id: "goal-a".into(),
+            session_id: "session-a".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = TaskRecord {
+            id: "goal-a".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-a".into()),
+            execution_epoch: 1,
+            started_at: "2026-08-23T00:00:00Z".into(),
+            finished_at: None,
+        };
+
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    task.clone(),
+                    GoalTaskRecord {
+                        task_id: task.id.clone(),
+                        objective: "complete the objective".into(),
+                        success_criteria: "complete".into(),
+                        effective_token_limit: None,
+                        effective_cost_limit_usd: None,
+                        pause_reason: None,
+                        pause_description: None,
+                        blockers: Vec::new(),
+                        pending_call_id: None,
+                        pending_call_epoch: None,
+                        pending_reserved_tokens: None,
+                        pending_reserved_cost_usd: None,
+                        accounting_state: GoalAccountingState::Complete,
+                        resume_safety: GoalResumeSafety::Clean,
+                    },
+                )
+                .await
+                .expect("create goal"),
+            GoalTransitionResult::Applied
+        );
+        drop(store);
+        let connection = rusqlite::Connection::open(directory.path().join("control_plane.db"))
+            .expect("open test control plane");
+        connection
+            .execute("DELETE FROM goal_tasks WHERE task_id = ?1", ["goal-a"])
+            .expect("remove only the goal extension");
+        drop(connection);
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
+
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    "goal-a",
+                    "session-a",
+                    1,
+                    TaskStatus::Failed,
+                    Some("goal_execution_host_unavailable".into()),
+                )
+                .await
+                .expect("guarded transition"),
+            GoalTransitionResult::Stale
+        );
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        assert!(exact_running_goal_requires_owner(&goals, &scope).await);
+        assert!(is_exact_running_goal_task(&task, &scope));
     }
 
     #[test]
