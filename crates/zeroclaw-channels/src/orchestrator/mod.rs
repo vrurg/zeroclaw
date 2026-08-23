@@ -2270,22 +2270,36 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+    if let Err(error) = append_sender_turn_strict(ctx, sender_key, turn) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+            "Failed to persist session turn"
+        );
+    }
+}
+
+/// Persist one canonical channel turn before exposing it in the in-memory
+/// session history. Goal completion uses this strict path: a failed durable
+/// append must prevent delivery rather than creating an unverifiable history
+/// claim. Ordinary channel turns retain their best-effort wrapper above.
+fn append_sender_turn_strict(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Result<()> {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Persist to JSONL before adding to in-memory history.
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.append(sender_key, &turn)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to persist session turn"
-        );
+    if let Some(store) = &ctx.session_store {
+        store
+            .append(sender_key, &turn)
+            .context("persist channel session turn")?;
     }
 
     // Use the user-configured max_history_messages (fall back to
@@ -2308,6 +2322,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > max_history {
         turns.remove(0);
     }
+    Ok(())
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
