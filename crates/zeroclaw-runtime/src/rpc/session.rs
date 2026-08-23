@@ -461,6 +461,34 @@ impl SessionStore {
             .collect()
     }
 
+    /// Remove only the exact idle sibling IDs that the dispatcher previously
+    /// fenced and disposed. Re-evaluating the broad sibling selector here
+    /// would create a race: a different session could finish a turn between
+    /// the snapshot and removal, then disappear without Goal disposal.
+    pub async fn evict_exact_idle_session_ids(
+        &self,
+        session_ids: &[String],
+    ) -> Vec<(String, String)> {
+        let in_flight: std::collections::HashSet<String> = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut sessions = self.sessions.lock().await;
+        let mut evicted = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if in_flight.contains(session_id) {
+                continue;
+            }
+            if let Some(session) = sessions.remove(session_id) {
+                evicted.push((session_id.clone(), session.agent_alias));
+            }
+        }
+        evicted
+    }
+
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
     /// session doesn't exist, `Some(None)` if it exists but is unowned (e.g.
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
@@ -920,6 +948,34 @@ mod tests {
         assert!(
             store.get_agent("old_chat").await.is_none(),
             "abandoned same-mode session evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_exact_idle_session_ids_never_removes_an_unsnapshotted_sibling() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some(owner.to_string()))
+        };
+        store.insert("disposed".into(), mk("tui1")).await.unwrap();
+        store.insert("late_idle".into(), mk("tui1")).await.unwrap();
+
+        let evicted = store
+            .evict_exact_idle_session_ids(&["disposed".to_string()])
+            .await;
+
+        assert_eq!(
+            evicted
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["disposed"]
+        );
+        assert!(
+            store.get_agent("late_idle").await.is_some(),
+            "only the dispatcher-disposed snapshot may be removed"
         );
     }
 

@@ -1253,7 +1253,7 @@ impl RpcDispatcher {
             let evicted = self
                 .ctx
                 .sessions
-                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .evict_exact_idle_session_ids(&idle_siblings)
                 .await;
             if !evicted.is_empty() {
                 if let Some(ref hooks) = self.ctx.hooks {

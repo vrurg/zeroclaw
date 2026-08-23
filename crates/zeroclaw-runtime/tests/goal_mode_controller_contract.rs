@@ -1145,6 +1145,69 @@ async fn policy_revocation_cancels_matching_running_and_paused_goals() {
 }
 
 #[tokio::test]
+async fn policy_revocation_retries_every_durably_cancelled_executor_before_success() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(1),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    runtime
+        .submit(
+            matrix("session-revoke-retry"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise retry-safe policy revocation".into(),
+            },
+        )
+        .await
+        .expect("start Goal");
+    let task_id = store
+        .current_goal_for_session("session-revoke-retry")
+        .await
+        .expect("read Goal")
+        .expect("Goal exists")
+        .id;
+
+    assert!(
+        runtime
+            .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                task.originator_route.as_deref() == Some("matrix.room")
+            })
+            .await
+            .is_err(),
+        "policy installation must stop while a durably cancelled executor remains unquiesced"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-revoke-retry")
+            .await
+            .expect("read retained audit")
+            .expect("Goal remains")
+            .status,
+        TaskStatus::Cancelled
+    );
+
+    assert_eq!(
+        runtime
+            .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                task.originator_route.as_deref() == Some("matrix.room")
+            })
+            .await
+            .expect("retry must quiesce before policy installation"),
+        0,
+        "the retry must not count a second lifecycle transition"
+    );
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [
+            (task_id.clone(), "session-revoke-retry".to_owned(), 1),
+            (task_id, "session-revoke-retry".to_owned(), 1)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn session_disposal_retains_a_goal_when_quiescence_cannot_classify_pending_accounting() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,
