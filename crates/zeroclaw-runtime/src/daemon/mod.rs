@@ -653,11 +653,14 @@ pub async fn run(
             crate::goal_mode::RpcGoalSessionAdapter::new(std::sync::Arc::clone(sessions)),
         ));
     }
-    let goal_cost_tracker = if config.goal.enabled {
-        crate::cost::CostTracker::get_or_init_global_for_goal(config.cost.clone(), &config.data_dir)
-    } else {
-        None
-    };
+    // A disabled Goal command surface still needs the one canonical lifecycle
+    // controller long enough to revoke retained Goals from an earlier enabled
+    // generation. The scoped tracker preserves ordinary `[cost].enabled`
+    // policy and writes nothing unless Goal work is actually settled.
+    let goal_cost_tracker = crate::cost::CostTracker::get_or_init_global_for_goal(
+        config.cost.clone(),
+        &config.data_dir,
+    );
     let goal_runtime = crate::control_plane::control_plane()
         .zip(goal_cost_tracker.as_ref())
         .and_then(|(control_plane, cost_tracker)| {
@@ -688,6 +691,32 @@ pub async fn run(
                 }
             }
         });
+
+    // Global Goal disablement is a policy revocation, not a restart pause.
+    // Perform it before any transport listener starts so a later re-enable
+    // cannot revive retained work that this generation no longer authorizes.
+    if !config.goal.enabled
+        && let Some(goal_runtime) = &goal_runtime
+    {
+        loop {
+            match goal_runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|_| true)
+                .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                        "Goal policy revocation failed; delaying listener startup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();

@@ -955,6 +955,62 @@ async fn generation_cutover_fences_only_the_matching_live_session_owner() {
 }
 
 #[tokio::test]
+async fn policy_revocation_cancels_matching_running_and_paused_goals() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    for session_id in ["session-revoke-running", "session-revoke-paused"] {
+        runtime
+            .submit(
+                matrix(session_id),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "complete the work".into(),
+                    objective: format!("exercise policy revocation for {session_id}"),
+                },
+            )
+            .await
+            .expect("start Goal");
+    }
+    runtime
+        .submit(matrix("session-revoke-paused"), GoalCommand::Pause)
+        .await
+        .expect("pause retained Goal");
+
+    assert_eq!(
+        runtime
+            .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                task.originator_route.as_deref() == Some("matrix.room")
+            })
+            .await
+            .expect("policy revocation should cancel matching Goals"),
+        2
+    );
+    for session_id in ["session-revoke-running", "session-revoke-paused"] {
+        assert_eq!(
+            store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .expect("retained cancellation audit")
+                .status,
+            TaskStatus::Cancelled
+        );
+    }
+    assert_eq!(
+        store
+            .current_goal_for_session("session-revoke-running")
+            .await
+            .unwrap()
+            .expect("running Goal")
+            .execution_epoch,
+        2
+    );
+}
+
+#[tokio::test]
 async fn session_disposal_retains_a_goal_when_quiescence_cannot_classify_pending_accounting() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,

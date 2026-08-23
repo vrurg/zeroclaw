@@ -906,6 +906,77 @@ impl GoalRuntime {
         Ok(result)
     }
 
+    /// Terminally cancel every matching running or paused Goal whose current
+    /// policy no longer authorizes it. The canonical task and Goal records are
+    /// retained so re-enabling policy cannot silently revive prior work.
+    ///
+    /// As with lifecycle cutover matching, the predicate reads canonical task
+    /// facts only. Transport and policy owners supply their own opaque route
+    /// interpretation without gaining lifecycle mutation authority.
+    pub async fn cancel_nonterminal_goals_for_policy_revocation<F>(
+        &self,
+        matches_revoked_policy: F,
+    ) -> Result<usize, GoalRuntimeError>
+    where
+        F: Fn(&TaskRecord) -> bool,
+    {
+        let nonterminal = self
+            .goals
+            .list_nonterminal_goal_statuses()
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        let mut cancelled = 0;
+        for current in nonterminal
+            .into_iter()
+            .filter(|current| matches_revoked_policy(&current.task))
+        {
+            let Some(session_id) = current.task.session_id.as_deref() else {
+                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                    "nonterminal Goal has no durable session binding during policy revocation"
+                )));
+            };
+            if session_id.trim().is_empty() {
+                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                    "nonterminal Goal has an empty durable session binding during policy revocation"
+                )));
+            }
+            match self
+                .goals
+                .finish_session_goal(
+                    &current.task.id,
+                    session_id,
+                    current.task.execution_epoch,
+                    TaskStatus::Cancelled,
+                    Some("goal_policy_revoked".into()),
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane)?
+            {
+                GoalTransitionResult::Applied => {
+                    self.quiesce_exact_goal(&current.task, session_id).await?;
+                    cancelled += 1;
+                }
+                GoalTransitionResult::Missing => {}
+                GoalTransitionResult::Stale => {
+                    let still_nonterminal = self
+                        .goals
+                        .current_goal_status_for_session(session_id)
+                        .await
+                        .map_err(GoalRuntimeError::control_plane)?
+                        .is_some_and(|latest| {
+                            latest.task.id == current.task.id && !latest.task.status.is_terminal()
+                        });
+                    if still_nonterminal {
+                        return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
+                            "nonterminal Goal changed while policy revocation was fencing it"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
     async fn pause_session_for_reason(
         &self,
         ingress: &GoalIngressContext,

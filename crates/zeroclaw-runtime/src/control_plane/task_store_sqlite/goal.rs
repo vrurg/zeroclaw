@@ -857,6 +857,30 @@ impl GoalTaskRegistry for SqliteTaskStore {
             .context("collect running Goal statuses")
     }
 
+    async fn list_nonterminal_goal_statuses(&self) -> Result<Vec<GoalTaskStatus>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare(
+                "SELECT tasks.*, tasks.error AS terminal_error, goal_tasks.*
+                   FROM tasks JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+                  WHERE tasks.kind = 'goal' AND tasks.status IN ('running', 'paused')",
+            )
+            .context("prepare nonterminal Goal status query")?;
+        let rows = statement
+            .query_map([], |row| {
+                let terminal_error: Option<String> = row.get("terminal_error")?;
+                Ok(GoalTaskStatus {
+                    task: row_to_record(row)?,
+                    goal: row_to_goal_task(row)?,
+                    terminal_error: terminal_error
+                        .map(|error| zeroclaw_providers::sanitize_api_error(&error)),
+                })
+            })
+            .context("query nonterminal Goal statuses")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("collect nonterminal Goal statuses")
+    }
+
     async fn create_goal(
         &self,
         mut task: TaskRecord,

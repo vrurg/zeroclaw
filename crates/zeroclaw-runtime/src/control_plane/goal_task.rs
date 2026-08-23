@@ -294,6 +294,12 @@ pub trait GoalTaskRegistry: Send + Sync {
     /// responsibility for unrelated durable task kinds.
     async fn list_running_goal_statuses(&self) -> anyhow::Result<Vec<GoalTaskStatus>>;
 
+    /// Read every nonterminal Goal from the canonical control plane.
+    ///
+    /// Policy revocation must include retained paused Goals as well as active
+    /// executors; neither category may regain eligibility after re-enablement.
+    async fn list_nonterminal_goal_statuses(&self) -> anyhow::Result<Vec<GoalTaskStatus>>;
+
     async fn create_goal(
         &self,
         task: TaskRecord,
