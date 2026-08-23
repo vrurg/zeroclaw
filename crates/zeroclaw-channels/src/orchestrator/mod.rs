@@ -8175,11 +8175,24 @@ impl ChannelGoalSessionAdapter {
         else {
             return false;
         };
-        matrix.allowed_rooms.is_empty()
+        let Some(alias) = route.channel_key.strip_prefix("matrix.") else {
+            return false;
+        };
+        let Some(principal) = task.principal_id.as_deref() else {
+            return false;
+        };
+        crate::allowlist::is_user_allowed(
+            &runtime
+                .ctx
+                .prompt_config
+                .channel_external_peers("matrix", alias),
+            principal,
+            crate::allowlist::Match::CaseInsensitive,
+        ) && (matrix.allowed_rooms.is_empty()
             || matrix
                 .allowed_rooms
                 .iter()
-                .any(|room| room == &route.reply_target)
+                .any(|room| room == &route.reply_target))
     }
 
     /// Identify a retained Goal that is durably bound to a Matrix session.
@@ -15723,6 +15736,10 @@ temperature = 0.3
     #[test]
     fn channel_generation_cutover_selects_only_its_owned_matrix_goals() {
         let mut config = Config::default();
+        config.peer_groups.insert(
+            "matrix_primary".to_string(),
+            peer_group("matrix.primary", &["@alice:example.test"], false),
+        );
         config.channels.matrix.insert(
             "primary".to_string(),
             zeroclaw_config::schema::MatrixConfig {
@@ -15808,6 +15825,30 @@ temperature = 0.3
             &router,
             &task("owned", "main", &owned_route, Some("@alice:example.test")),
         ));
+        assert!(
+            ChannelGoalSessionAdapter::owns_task_policy_in_generation(
+                &router,
+                &task(
+                    "case-normalized",
+                    "main",
+                    &owned_route,
+                    Some("@ALICE:EXAMPLE.TEST")
+                ),
+            ),
+            "Matrix policy must retain an MXID authorized by the canonical case-insensitive matcher"
+        );
+        assert!(
+            !ChannelGoalSessionAdapter::owns_task_policy_in_generation(
+                &router,
+                &task(
+                    "revoked-principal",
+                    "main",
+                    &owned_route,
+                    Some("@bob:example.test")
+                ),
+            ),
+            "a retained Matrix Goal loses authorization when its principal leaves the peer group"
+        );
         assert!(
             !ChannelGoalSessionAdapter::owns_task_policy_in_generation(
                 &router,

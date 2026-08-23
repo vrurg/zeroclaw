@@ -661,7 +661,9 @@ pub async fn run(
         config.cost.clone(),
         &config.data_dir,
     );
-    let goal_runtime = crate::control_plane::control_plane()
+    let goal_control_plane = crate::control_plane::control_plane();
+    let goal_runtime = goal_control_plane
+        .as_ref()
         .zip(goal_cost_tracker.as_ref())
         .and_then(|(control_plane, cost_tracker)| {
             let executor: std::sync::Arc<dyn crate::goal_mode::GoalExecutor> =
@@ -691,6 +693,19 @@ pub async fn run(
                 }
             }
         });
+
+    // An initialized control plane can retain durable Goals from a preceding
+    // generation even when this generation disables their command surface.
+    // Do not install listeners or a narrower policy unless the lifecycle
+    // owner is available to fence and reconcile those records first.
+    if goal_control_plane.is_some() && goal_runtime.is_none() {
+        anyhow::bail!(
+            "Goal lifecycle runtime is unavailable while durable Goal control state is initialized"
+        );
+    }
+    if config.goal.enabled && goal_runtime.is_none() {
+        anyhow::bail!("Goal Mode is enabled but its lifecycle runtime is unavailable");
+    }
 
     // Global Goal disablement is a policy revocation, not a restart pause.
     // Perform it before any transport listener starts so a later re-enable

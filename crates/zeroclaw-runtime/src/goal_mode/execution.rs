@@ -1195,29 +1195,36 @@ impl GoalExecutor for GoalExecutionHost {
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
         let (cancellation, handle) = {
             let mut executors = self.executors.lock().await;
-            let Some(executor) = executors.get_mut(task_id) else {
-                return Ok(());
-            };
-            if executor.session_id != session_id || executor.epoch != epoch {
-                return Err(());
+            match executors.get_mut(task_id) {
+                Some(executor) if executor.session_id == session_id && executor.epoch == epoch => {
+                    (Some(executor.cancellation.clone()), executor.handle.take())
+                }
+                Some(_) => return Err(()),
+                // A prior cancellation may already have joined the executor
+                // but failed while classifying children or a pending call.
+                // Continue that durable cleanup below instead of falsely
+                // treating the absent handle as settled state.
+                None => (None, None),
             }
-            (executor.cancellation.clone(), executor.handle.take())
         };
-        cancellation.cancel();
-        let Some(mut handle) = handle else {
-            return Err(());
-        };
-        let join_failed = match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await
-        {
-            Ok(Ok(())) => false,
-            Ok(Err(_)) => true,
-            Err(_) => {
-                handle.abort();
-                // Abort-induced cancellation is the expected forced-quiesce
-                // result; it is not a second controller failure.
-                let _ = handle.await;
-                false
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+        }
+        let join_failed = match handle {
+            Some(mut handle) => {
+                match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await {
+                    Ok(Ok(())) => false,
+                    Ok(Err(_)) => true,
+                    Err(_) => {
+                        handle.abort();
+                        // Abort-induced cancellation is the expected forced-quiesce
+                        // result; it is not a second controller failure.
+                        let _ = handle.await;
+                        false
+                    }
+                }
             }
+            None => false,
         };
         // If forced quiescence dropped a non-cooperative foreground child
         // wrapper, its direct durable row must not remain falsely Running.
@@ -1229,7 +1236,6 @@ impl GoalExecutor for GoalExecutionHost {
             .await
             .is_err()
         {
-            self.executors.lock().await.remove(task_id);
             return Err(());
         }
         // A durable fence may have interrupted a dispatched operation after
@@ -1253,7 +1259,6 @@ impl GoalExecutor for GoalExecutionHost {
                         Ok(GoalTransitionResult::Applied) => {}
                         Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
                         | Err(_) => {
-                            self.executors.lock().await.remove(task_id);
                             return Err(());
                         }
                     }
@@ -1261,7 +1266,6 @@ impl GoalExecutor for GoalExecutionHost {
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(_) => {
-                self.executors.lock().await.remove(task_id);
                 return Err(());
             }
         }

@@ -1215,6 +1215,28 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
+        // A caller-controlled session ID can collide with an existing live
+        // session. Dispose its exact Goal before `insert` replaces the map
+        // entry, otherwise a fenced executor could outlive its session.
+        self.dispose_goal_before_session_removal(&session_id)
+            .await?;
+
+        let idle_siblings = if let Some(tui_id) = self.tui_id.as_deref()
+            && req.keep_siblings != Some(true)
+        {
+            self.ctx
+                .sessions
+                .idle_same_mode_sibling_ids(tui_id, &chat_mode, &session_id)
+                .await
+        } else {
+            Vec::new()
+        };
+        // Capture and fence every genuine replacement while its trusted RPC
+        // binding is still present. Same-ID reattachment is excluded above.
+        for sibling_id in &idle_siblings {
+            self.dispose_goal_before_session_removal(sibling_id).await?;
+        }
+
         self.ctx
             .sessions
             .insert(
@@ -2283,7 +2305,10 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        if self.ctx.sessions.cancel_session(&req.session_id) {
+        let goal_cancelled = self
+            .interrupt_goal_for_live_session(&req.session_id)
+            .await?;
+        if self.ctx.sessions.cancel_session(&req.session_id) || goal_cancelled {
             to_result(SessionCancelResult {
                 session_id: req.session_id,
                 cancelled: true,
@@ -2580,6 +2605,35 @@ impl RpcDispatcher {
                 "Goal session disposal is not safely quiesced",
             )),
             Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session disposal failed")),
+        }
+    }
+
+    /// Fence an exact RPC-bound Goal when an external cancellation leaves the
+    /// session alive. This is deliberately distinct from disposal: a later
+    /// explicit `/goal resume` may start a new epoch in the same session.
+    async fn interrupt_goal_for_live_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, JsonRpcError> {
+        let Some(goal_runtime) = &self.ctx.goal_runtime else {
+            return Ok(false);
+        };
+        let Some(agent) = self.ctx.sessions.get_agent_alias(session_id).await else {
+            return Ok(false);
+        };
+        let Some(Some(tui_id)) = self.ctx.sessions.session_owner_tui_id(session_id).await else {
+            return Ok(false);
+        };
+        let ingress =
+            crate::goal_mode::GoalIngressContext::zero_code(session_id, agent, "rpc", tui_id)
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))?;
+        match goal_runtime.interrupt_session(&ingress).await {
+            Ok(crate::control_plane::GoalTransitionResult::Applied) => Ok(true),
+            Ok(
+                crate::control_plane::GoalTransitionResult::Missing
+                | crate::control_plane::GoalTransitionResult::Stale,
+            ) => Ok(false),
+            Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session interruption failed")),
         }
     }
 

@@ -4,11 +4,11 @@
 //! Later stages supply those concrete boundaries; this stage owns only the
 //! exact command grammar and session-bound controller facade.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -629,6 +629,11 @@ pub struct GoalRuntime {
     /// This is process-local coordination only; canonical lifecycle state
     /// remains in the task control plane.
     admission_cutover: RwLock<bool>,
+    /// Exact executor fences that committed durably but have not yet proved
+    /// quiescence. This is process-local retry coordination, not lifecycle
+    /// authority: SQLite remains canonical and a fresh process owns no old
+    /// executor to cancel.
+    pending_quiescence: Mutex<HashMap<(String, String), GoalSessionFence>>,
 }
 
 impl GoalRuntime {
@@ -650,6 +655,7 @@ impl GoalRuntime {
             executor,
             boot_id: required_ingress_value(boot_id.into())?,
             admission_cutover: RwLock::new(false),
+            pending_quiescence: Mutex::new(HashMap::new()),
         })
     }
 
@@ -702,6 +708,7 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        self.retry_pending_quiescence().await?;
         let Some(mut current) = self
             .goals
             .current_goal_status_for_session(ingress.session_id())
@@ -807,6 +814,7 @@ impl GoalRuntime {
     where
         F: Fn(&TaskRecord) -> bool,
     {
+        self.retry_pending_quiescence().await?;
         let running = self
             .goals
             .list_running_goal_statuses()
@@ -920,6 +928,7 @@ impl GoalRuntime {
     where
         F: Fn(&TaskRecord) -> bool,
     {
+        self.retry_pending_quiescence().await?;
         let nonterminal = self
             .goals
             .list_nonterminal_goal_statuses()
@@ -987,6 +996,7 @@ impl GoalRuntime {
         ingress: &GoalIngressContext,
         reason: GoalPauseReason,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        self.retry_pending_quiescence().await?;
         let Some(current) = self
             .goals
             .current_goal_status_for_session(ingress.session_id())
@@ -1030,14 +1040,43 @@ impl GoalRuntime {
         task: &TaskRecord,
         session_id: &str,
     ) -> Result<(), GoalRuntimeError> {
-        self.executor
-            .cancel(&task.id, session_id, task.execution_epoch)
+        let fence = GoalSessionFence::new(&task.id, session_id, task.execution_epoch);
+        self.pending_quiescence
+            .lock()
             .await
-            .map_err(|_| {
-                GoalRuntimeError::control_plane(anyhow::Error::msg(
-                    "goal executor did not quiesce after lifecycle fence",
-                ))
-            })
+            .insert((task.id.clone(), session_id.to_string()), fence.clone());
+        self.retry_pending_quiescence().await
+    }
+
+    /// Retry all exact executor joins that were durably fenced before a prior
+    /// lifecycle operation failed. A caller must complete this before it can
+    /// install a replacement policy, clear a generation, or delete a session.
+    async fn retry_pending_quiescence(&self) -> Result<(), GoalRuntimeError> {
+        let fences = self
+            .pending_quiescence
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for fence in fences {
+            self.executor
+                .cancel(&fence.task_id, &fence.session_id, fence.execution_epoch)
+                .await
+                .map_err(|_| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "goal executor did not quiesce after lifecycle fence",
+                    ))
+                })?;
+            let mut pending = self.pending_quiescence.lock().await;
+            if pending
+                .get(&(fence.task_id.clone(), fence.session_id.clone()))
+                .is_some_and(|recorded| recorded == &fence)
+            {
+                pending.remove(&(fence.task_id, fence.session_id));
+            }
+        }
+        Ok(())
     }
 
     async fn start(

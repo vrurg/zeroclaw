@@ -33,6 +33,7 @@ struct FakeExecutor {
     launches: Mutex<Vec<GoalExecutionScope>>,
     preflights: Mutex<Vec<GoalExecutionPreflight>>,
     cancellations: Mutex<Vec<(String, String, i64)>>,
+    cancel_failures_remaining: Mutex<usize>,
 }
 
 impl FakeExecutor {
@@ -43,7 +44,13 @@ impl FakeExecutor {
             launches: Mutex::new(Vec::new()),
             preflights: Mutex::new(Vec::new()),
             cancellations: Mutex::new(Vec::new()),
+            cancel_failures_remaining: Mutex::new(0),
         }
+    }
+
+    fn with_cancel_failures(mut self, failures: usize) -> Self {
+        *self.cancel_failures_remaining.get_mut() = failures;
+        self
     }
 }
 
@@ -85,6 +92,11 @@ impl GoalExecutor for FakeExecutor {
         self.cancellations
             .lock()
             .push((task_id.to_owned(), session_id.to_owned(), epoch));
+        let mut failures = self.cancel_failures_remaining.lock();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(());
+        }
         Ok(())
     }
 }
@@ -828,6 +840,70 @@ async fn session_disposal_fences_quiesces_then_deletes_goal_control_state() {
 }
 
 #[tokio::test]
+async fn session_disposal_retries_a_durably_fenced_executor_before_deleting_control_state() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(1),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+
+    runtime
+        .submit(
+            matrix("session-dispose-retry"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise retry-safe disposal".into(),
+            },
+        )
+        .await
+        .expect("start should create a Goal");
+    let task_id = store
+        .current_goal_for_session("session-dispose-retry")
+        .await
+        .expect("read current Goal")
+        .expect("Goal exists")
+        .id;
+
+    assert!(
+        runtime
+            .dispose_session(&matrix("session-dispose-retry"))
+            .await
+            .is_err(),
+        "a failed executor join must retain the fenced Goal for retry"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-dispose-retry")
+            .await
+            .expect("read retained Goal")
+            .expect("Goal remains while quiescence is unproved")
+            .status,
+        TaskStatus::Cancelled
+    );
+
+    runtime
+        .dispose_session(&matrix("session-dispose-retry"))
+        .await
+        .expect("retry must quiesce the original fenced executor before deletion");
+    assert!(
+        store
+            .current_goal_for_session("session-dispose-retry")
+            .await
+            .expect("read disposed Goal")
+            .is_none()
+    );
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [
+            (task_id.clone(), "session-dispose-retry".to_owned(), 1),
+            (task_id, "session-dispose-retry".to_owned(), 1)
+        ],
+        "retry must target only the original fenced executor epoch"
+    );
+}
+
+#[tokio::test]
 async fn runtime_cutover_fences_and_quiesces_every_running_goal() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,
@@ -889,6 +965,64 @@ async fn runtime_cutover_fences_and_quiesces_every_running_goal() {
     let cancellations = executor.cancellations.lock();
     assert_eq!(cancellations.len(), 2);
     assert!(cancellations.iter().all(|(_, _, epoch)| *epoch == 1));
+}
+
+#[tokio::test]
+async fn runtime_cutover_retries_a_previous_fence_before_reporting_success() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(1),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    runtime
+        .submit(
+            matrix("session-cutover-retry"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise retry-safe runtime cutover".into(),
+            },
+        )
+        .await
+        .expect("start should create a running Goal");
+    let task_id = store
+        .current_goal_for_session("session-cutover-retry")
+        .await
+        .expect("read current Goal")
+        .expect("Goal exists")
+        .id;
+
+    assert!(
+        runtime
+            .pause_running_goals_for_runtime_cutover()
+            .await
+            .is_err(),
+        "cutover must not report success before its fenced executor quiesces"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-cutover-retry")
+            .await
+            .expect("read fenced Goal")
+            .expect("Goal remains")
+            .status,
+        TaskStatus::Paused
+    );
+    assert_eq!(
+        runtime
+            .pause_running_goals_for_runtime_cutover()
+            .await
+            .expect("retry quiesces the retained fence"),
+        0,
+        "the retry must not pretend it freshly paused an already fenced Goal"
+    );
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [
+            (task_id.clone(), "session-cutover-retry".to_owned(), 1),
+            (task_id, "session-cutover-retry".to_owned(), 1)
+        ]
+    );
 }
 
 #[tokio::test]

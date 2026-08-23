@@ -430,6 +430,37 @@ impl SessionStore {
         evicted
     }
 
+    /// Snapshot idle sibling IDs that a `session/new` request may genuinely
+    /// replace. The dispatcher must fence and dispose any Goal before calling
+    /// [`Self::evict_same_mode_sibling`], while the trusted session binding is
+    /// still available in this store.
+    pub async fn idle_same_mode_sibling_ids(
+        &self,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        except_id: &str,
+    ) -> Vec<String> {
+        let in_flight: std::collections::HashSet<String> = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        self.sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, session)| {
+                key.as_str() != except_id
+                    && session.owner_tui_id.as_deref() == Some(tui_id)
+                    && &session.chat_mode == chat_mode
+                    && !in_flight.contains(key.as_str())
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
     /// session doesn't exist, `Some(None)` if it exists but is unowned (e.g.
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
