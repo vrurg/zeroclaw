@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
-use crate::goal_mode::GoalSessionAdapter;
+use crate::goal_mode::{GoalRuntime, GoalSessionAdapter};
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
@@ -36,7 +36,8 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+pub type ChannelsStarter =
+    Box<dyn Fn(Config, CancellationToken, Option<Arc<GoalRuntime>>) -> StarterFuture + Send + Sync>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -229,7 +230,7 @@ mod tests {
     }
 
     fn channels_starter() -> ChannelsStarter {
-        Box::new(|_, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn socket_starter() -> SocketStarter {

@@ -126,7 +126,7 @@ use zeroclaw_runtime::agent::loop_::{
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::goal_mode::{
-    GoalExecutionScope, GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding,
+    GoalExecutionScope, GoalHostModelBinding, GoalRuntime, GoalSessionAdapter, GoalSessionBinding,
     GoalSessionLease,
 };
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -8145,6 +8145,25 @@ impl ChannelGoalSessionAdapter {
         is_owned_matrix_goal_binding(route, principal_id)
             && self.runtime_for_goal_route(agent, route).is_ok()
     }
+
+    fn owns_task_in_generation(
+        router: &AgentRouter,
+        task: &zeroclaw_runtime::control_plane::TaskRecord,
+    ) -> bool {
+        let Some(route) = task
+            .originator_route
+            .as_deref()
+            .and_then(|route| MatrixGoalRouteV1::decode(route).ok())
+        else {
+            return false;
+        };
+        task.principal_id
+            .as_deref()
+            .is_some_and(|principal| !principal.trim().is_empty())
+            && router
+                .resolve_goal_runtime(&task.agent, &route.channel_key)
+                .is_some()
+    }
 }
 
 fn is_owned_matrix_goal_binding(route: &str, principal_id: Option<&str>) -> bool {
@@ -12555,6 +12574,7 @@ impl PreparedChannels {
     pub async fn run_with_goal_adapter(
         &self,
         adapter: &ChannelGoalSessionAdapter,
+        goal_runtime: Option<Arc<GoalRuntime>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let Some(router) = self.goal_router() else {
@@ -12562,6 +12582,39 @@ impl PreparedChannels {
         };
         adapter.publish_generation(Arc::clone(&router));
         let result = self.run(cancel).await;
+        if let Some(goal_runtime) = goal_runtime {
+            // A channel generation owns Matrix live-session resources. It
+            // cannot be cleared while one of those sessions still has a Goal
+            // executor: that would let the executor outlive its provider,
+            // history, foreground lease, or reply target. Retrying here is
+            // deliberate fail-closed behavior; the daemon supervisor may not
+            // publish a replacement generation until the old one is fenced.
+            loop {
+                match goal_runtime
+                    .pause_running_goals_for_lifecycle_cutover(|task| {
+                        ChannelGoalSessionAdapter::owns_task_in_generation(&router, task)
+                    })
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{error:#}"),
+                            })),
+                            "Channel Goal lifecycle cutover failed; retaining generation"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
         adapter.clear_generation(&router);
         result
     }
@@ -15571,6 +15624,78 @@ temperature = 0.3
 
         adapter.clear_generation(&replacement);
         assert!(adapter.generation.read().is_none());
+    }
+
+    #[test]
+    fn channel_generation_cutover_selects_only_its_owned_matrix_goals() {
+        let ctx = router_test_ctx();
+        let mut agents = HashMap::new();
+        agents.insert("main".to_string(), ctx);
+        let mut owners = HashMap::new();
+        owners.insert("matrix.primary".to_string(), "main".to_string());
+        let router = AgentRouter::multi(agents, owners, None, None);
+        let owned_route = MatrixGoalRouteV1::new(
+            "matrix.primary".to_string(),
+            "!owned:example.test".to_string(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let other_route = MatrixGoalRouteV1::new(
+            "matrix.secondary".to_string(),
+            "!other:example.test".to_string(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let task = |id: &str, agent: &str, route: &str, principal: Option<&str>| {
+            zeroclaw_runtime::control_plane::TaskRecord {
+                id: id.to_string(),
+                kind: zeroclaw_runtime::control_plane::TaskKind::Goal,
+                agent: agent.to_string(),
+                status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+                owner_pid: 1,
+                owner_boot_id: "boot".to_string(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: Some(route.to_string()),
+                delivered: false,
+                idem_key: None,
+                principal_id: principal.map(str::to_string),
+                session_id: Some(format!("session-{id}")),
+                execution_epoch: 1,
+                started_at: "2026-08-20T00:00:00Z".to_string(),
+                finished_at: None,
+            }
+        };
+
+        assert!(ChannelGoalSessionAdapter::owns_task_in_generation(
+            &router,
+            &task("owned", "main", &owned_route, Some("@alice:example.test")),
+        ));
+        assert!(!ChannelGoalSessionAdapter::owns_task_in_generation(
+            &router,
+            &task(
+                "other-route",
+                "main",
+                &other_route,
+                Some("@alice:example.test")
+            ),
+        ));
+        assert!(!ChannelGoalSessionAdapter::owns_task_in_generation(
+            &router,
+            &task(
+                "wrong-agent",
+                "other",
+                &owned_route,
+                Some("@alice:example.test")
+            ),
+        ));
+        assert!(!ChannelGoalSessionAdapter::owns_task_in_generation(
+            &router,
+            &task("missing-principal", "main", &owned_route, None),
+        ));
     }
 
     #[tokio::test]

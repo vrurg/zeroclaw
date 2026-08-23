@@ -4824,7 +4824,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
                     let goal_session_adapter = goal_session_adapter.clone();
-                    move |config, cancel| {
+                    move |config, cancel, goal_runtime| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4837,7 +4837,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 sop_audit,
                             )
                             .await?
-                            .run_with_goal_adapter(&goal_session_adapter, cancel)
+                            .run_with_goal_adapter(&goal_session_adapter, goal_runtime, cancel)
                             .await
                         })
                     }

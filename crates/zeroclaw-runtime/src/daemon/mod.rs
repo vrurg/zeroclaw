@@ -786,6 +786,7 @@ pub async fn run(
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
+            let goal_runtime_for_supervisor = goal_runtime.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -795,7 +796,8 @@ pub async fn run(
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
+                    let goal_runtime = goal_runtime_for_supervisor.clone();
+                    async move { start(cfg, cancel, goal_runtime).await }
                 },
             ));
         } else {

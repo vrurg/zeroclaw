@@ -788,13 +788,35 @@ impl GoalRuntime {
         let mut admission = self.admission_cutover.write().await;
         *admission = true;
 
+        self.pause_running_goals_for_lifecycle_cutover(|_| true)
+            .await
+    }
+
+    /// Fence and quiesce the running Goals selected by a live-session owner
+    /// before that owner replaces or drops its generation.
+    ///
+    /// The predicate receives canonical task facts only. It does not create a
+    /// second Goal route registry: a transport may recognize its own opaque
+    /// route and agent binding, while this runtime remains the sole lifecycle
+    /// and accounting owner. Unlike daemon shutdown, this does not close
+    /// admission for unrelated live-session owners.
+    pub async fn pause_running_goals_for_lifecycle_cutover<F>(
+        &self,
+        matches_session_owner: F,
+    ) -> Result<usize, GoalRuntimeError>
+    where
+        F: Fn(&TaskRecord) -> bool,
+    {
         let running = self
             .goals
             .list_running_goal_statuses()
             .await
             .map_err(GoalRuntimeError::control_plane)?;
         let mut paused = 0;
-        for current in running {
+        for current in running
+            .into_iter()
+            .filter(|current| matches_session_owner(&current.task))
+        {
             let Some(session_id) = current.task.session_id.as_deref() else {
                 return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
                     "running Goal has no durable session binding during runtime cutover"

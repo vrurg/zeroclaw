@@ -892,6 +892,69 @@ async fn runtime_cutover_fences_and_quiesces_every_running_goal() {
 }
 
 #[tokio::test]
+async fn generation_cutover_fences_only_the_matching_live_session_owner() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    runtime
+        .submit(
+            matrix("session-matrix-generation"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise Matrix generation cutover".into(),
+            },
+        )
+        .await
+        .expect("start Matrix Goal");
+    let rpc = GoalIngressContext::zero_code("session-rpc-generation", "main", "rpc", "tui-a")
+        .expect("trusted RPC ingress");
+    runtime
+        .submit(
+            rpc,
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "must remain live across Matrix generation cutover".into(),
+            },
+        )
+        .await
+        .expect("start RPC Goal");
+
+    assert_eq!(
+        runtime
+            .pause_running_goals_for_lifecycle_cutover(|task| {
+                task.originator_route.as_deref() == Some("matrix.room")
+            })
+            .await
+            .expect("generation cutover should fence the matching Goal"),
+        1
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-matrix-generation")
+            .await
+            .unwrap()
+            .expect("Matrix Goal")
+            .status,
+        TaskStatus::Paused
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-rpc-generation")
+            .await
+            .unwrap()
+            .expect("RPC Goal")
+            .status,
+        TaskStatus::Running,
+        "a Matrix generation replacement must not pause an unrelated RPC Goal"
+    );
+    assert_eq!(executor.cancellations.lock().len(), 1);
+}
+
+#[tokio::test]
 async fn session_disposal_retains_a_goal_when_quiescence_cannot_classify_pending_accounting() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,
