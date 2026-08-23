@@ -20,6 +20,7 @@ use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
 use zeroclaw_config::{cost::CostTracker, schema::Config};
 use zeroclaw_providers::dispatch::{AccountedAttempt, AttemptUsageOutcome};
 
+use super::host::GoalSessionAdapterRouter;
 use super::{
     GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor,
     GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease,
@@ -235,15 +236,16 @@ struct RegisteredGoalExecutor {
 }
 
 impl GoalExecutionHost {
-    /// Construct the shared Goal lifecycle owner over one live-session adapter.
+    /// Construct the shared Goal lifecycle owner over the daemon generation's
+    /// live-session adapters.
     pub fn new(
-        adapter: Arc<dyn GoalSessionAdapter>,
+        adapters: Vec<Arc<dyn GoalSessionAdapter>>,
         goals: Arc<dyn GoalTaskRegistry>,
         config: Arc<Config>,
         cost_tracker: Arc<CostTracker>,
     ) -> Self {
         Self {
-            adapter,
+            adapter: Arc::new(GoalSessionAdapterRouter::new(adapters)),
             goals,
             config,
             cost_tracker,
@@ -284,7 +286,14 @@ struct RpcGoalExecutionSession {
 
 #[async_trait]
 impl GoalSessionAdapter for RpcGoalSessionAdapter {
-    async fn model_binding(&self, binding: &GoalSessionBinding) -> Option<GoalHostModelBinding> {
+    fn owns(&self, binding: &GoalSessionBinding) -> bool {
+        binding.route() == "rpc"
+    }
+
+    async fn model_binding(
+        &self,
+        binding: &GoalSessionBinding,
+    ) -> anyhow::Result<GoalHostModelBinding> {
         if self
             .sessions
             .get_agent_alias(binding.session_id())
@@ -292,11 +301,15 @@ impl GoalSessionAdapter for RpcGoalSessionAdapter {
             .as_deref()
             != Some(binding.agent())
         {
-            return None;
+            anyhow::bail!("goal RPC session agent binding is unavailable");
         }
-        let agent = self.sessions.get_agent(binding.session_id()).await?;
+        let agent = self
+            .sessions
+            .get_agent(binding.session_id())
+            .await
+            .context("goal RPC session is unavailable")?;
         let (provider_ref, model, _) = agent.lock().await.goal_model_binding();
-        Some(GoalHostModelBinding {
+        Ok(GoalHostModelBinding {
             provider_ref,
             model,
         })
@@ -351,9 +364,16 @@ impl GoalSessionLease for RpcGoalExecutionSession {
             .await
     }
 
-    fn append_verified_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
-        self.agent.append_verified_goal_candidate(candidate);
+    fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
+        self.agent
+            .append_verified_goal_candidate(candidate.to_owned());
         Ok(())
+    }
+
+    async fn deliver_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
+        // RPC presentation is wired with the ZeroCode command surface. Keep
+        // the dormant adapter fail-closed until it owns a real outbound sink.
+        anyhow::bail!("goal RPC delivery is unavailable")
     }
 }
 
@@ -805,7 +825,7 @@ impl GoalExecutor for GoalExecutionHost {
         {
             return GoalExecutionReadiness::ExecutorBusy;
         }
-        let Some(binding) = self.adapter.model_binding(&request.binding).await else {
+        let Ok(binding) = self.adapter.model_binding(&request.binding).await else {
             return GoalExecutionReadiness::BindingUnavailable;
         };
         if build_session_model_provider(
@@ -1031,7 +1051,7 @@ impl GoalExecutor for GoalExecutionHost {
                             .await
                         {
                             Ok(GoalTransitionResult::Applied) => {
-                                if let Err(error) = session.append_verified_candidate(candidate) {
+                                if let Err(error) = session.append_verified_candidate(&candidate) {
                                     ::zeroclaw_log::record!(
                                         WARN,
                                         ::zeroclaw_log::Event::new(

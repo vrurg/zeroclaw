@@ -754,9 +754,11 @@ pub async fn run(
             .map(|(control_plane, cost_tracker)| {
                 let executor: std::sync::Arc<dyn crate::goal_mode::GoalExecutor> =
                     std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
-                        std::sync::Arc::new(crate::goal_mode::RpcGoalSessionAdapter::new(
-                            std::sync::Arc::clone(&sessions),
-                        )),
+                        vec![std::sync::Arc::new(
+                            crate::goal_mode::RpcGoalSessionAdapter::new(std::sync::Arc::clone(
+                                &sessions,
+                            )),
+                        )],
                         std::sync::Arc::clone(&control_plane.goals),
                         std::sync::Arc::new(config.clone()),
                         std::sync::Arc::clone(cost_tracker),

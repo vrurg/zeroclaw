@@ -17,8 +17,15 @@ struct FakeGoalSessionLease;
 
 #[async_trait]
 impl GoalSessionAdapter for FakeGoalSessionAdapter {
-    async fn model_binding(&self, _binding: &GoalSessionBinding) -> Option<GoalHostModelBinding> {
-        Some(GoalHostModelBinding {
+    fn owns(&self, _binding: &GoalSessionBinding) -> bool {
+        true
+    }
+
+    async fn model_binding(
+        &self,
+        _binding: &GoalSessionBinding,
+    ) -> anyhow::Result<GoalHostModelBinding> {
+        Ok(GoalHostModelBinding {
             provider_ref: "test.provider".into(),
             model: "test-model".into(),
         })
@@ -47,7 +54,11 @@ impl GoalSessionLease for FakeGoalSessionLease {
         Ok(("candidate".into(), working_history))
     }
 
-    fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+    fn append_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn deliver_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
