@@ -1437,12 +1437,17 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
-        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
-            agent
-                .lock()
-                .await
-                .channel_handles()
-                .unregister_channel("rpc");
+        let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        };
+        self.dispose_goal_before_session_removal(&req.session_id)
+            .await?;
+        agent
+            .lock()
+            .await
+            .channel_handles()
+            .unregister_channel("rpc");
+        {
             let strong = std::sync::Arc::strong_count(&agent);
             let agent_alias = self
                 .ctx
@@ -1505,6 +1510,8 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        self.dispose_goal_before_session_removal(sid).await?;
 
         let chat_mode = self
             .ctx
@@ -2513,6 +2520,8 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        self.dispose_goal_before_session_removal(&req.session_id)
+            .await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2538,6 +2547,40 @@ impl RpcDispatcher {
             session_id: req.session_id,
             deleted: true,
         })
+    }
+
+    /// Dispose an exact RPC-bound Goal before removing its live session.
+    ///
+    /// The transport binding is reconstructed only from the server-owned
+    /// session record. A colliding session identifier belonging to another
+    /// transport therefore cannot affect its Goal control state.
+    async fn dispose_goal_before_session_removal(
+        &self,
+        session_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        let Some(goal_runtime) = &self.ctx.goal_runtime else {
+            return Ok(());
+        };
+        let Some(agent) = self.ctx.sessions.get_agent_alias(session_id).await else {
+            return Ok(());
+        };
+        let Some(Some(tui_id)) = self.ctx.sessions.session_owner_tui_id(session_id).await else {
+            return Ok(());
+        };
+        let ingress =
+            crate::goal_mode::GoalIngressContext::zero_code(session_id, agent, "rpc", tui_id)
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))?;
+        match goal_runtime.dispose_session(&ingress).await {
+            Ok(
+                crate::control_plane::GoalTransitionResult::Applied
+                | crate::control_plane::GoalTransitionResult::Missing,
+            ) => Ok(()),
+            Ok(crate::control_plane::GoalTransitionResult::Stale) => Err(rpc_err(
+                INTERNAL_ERROR,
+                "Goal session disposal is not safely quiesced",
+            )),
+            Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session disposal failed")),
+        }
     }
 
     fn handle_session_approve(&self, params: &Value) -> RpcResult {
@@ -10417,6 +10460,33 @@ mod tests {
         }
     }
 
+    struct GoalLifecycleExecutor {
+        cancellations: std::sync::Mutex<Vec<(String, String, i64)>>,
+    }
+
+    #[async_trait]
+    impl crate::goal_mode::GoalExecutor for GoalLifecycleExecutor {
+        async fn preflight(
+            &self,
+            _request: &crate::goal_mode::GoalExecutionPreflight,
+        ) -> crate::goal_mode::GoalExecutionReadiness {
+            crate::goal_mode::GoalExecutionReadiness::Ready
+        }
+
+        async fn launch(&self, _scope: crate::goal_mode::GoalExecutionScope) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+            self.cancellations.lock().unwrap().push((
+                task_id.to_owned(),
+                session_id.to_owned(),
+                epoch,
+            ));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn session_close_real_session_fires_session_end_hook() {
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
@@ -10482,6 +10552,147 @@ mod tests {
             end_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "session_end must fire when a real session is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_close_disposes_exact_rpc_goal_before_session_removal() {
+        use crate::control_plane::{
+            GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
+            SqliteTaskStore, TaskKind, TaskRecord, TaskStatus,
+        };
+        use zeroclaw_config::{cost::CostTracker, schema::CostConfig};
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let sid = "rpc-goal-disposal".to_string();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        sessions
+            .insert(
+                sid.clone(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    std::env::temp_dir().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                )
+                .with_owner(Some("tui-goal-disposal".into())),
+            )
+            .await
+            .unwrap();
+
+        let goal_store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = goal_store.clone();
+        let task_id = "rpc-goal-task".to_string();
+        assert_eq!(
+            goal_store
+                .create_or_replace_session_goal(
+                    TaskRecord {
+                        id: task_id.clone(),
+                        kind: TaskKind::Goal,
+                        agent: "test-agent".into(),
+                        status: TaskStatus::Running,
+                        owner_pid: 1,
+                        owner_boot_id: "test-boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some("rpc".into()),
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        session_id: Some(sid.clone()),
+                        execution_epoch: 0,
+                        started_at: "2026-08-23T00:00:00Z".into(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id: task_id.clone(),
+                        objective: "dispose with the session".into(),
+                        success_criteria: "the session is gone".into(),
+                        effective_token_limit: None,
+                        effective_cost_limit_usd: None,
+                        pause_reason: None,
+                        pause_description: None,
+                        blockers: Vec::new(),
+                        pending_call_id: None,
+                        pending_call_epoch: None,
+                        pending_reserved_tokens: None,
+                        pending_reserved_cost_usd: None,
+                        accounting_state: GoalAccountingState::Complete,
+                        resume_safety: GoalResumeSafety::Clean,
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let cost_dir = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), cost_dir.path()).unwrap());
+        let executor = Arc::new(GoalLifecycleExecutor {
+            cancellations: std::sync::Mutex::new(Vec::new()),
+        });
+        let goal_runtime = Arc::new(
+            crate::goal_mode::GoalRuntime::new(
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                goals,
+                tracker,
+                executor.clone(),
+                "test-boot",
+            )
+            .unwrap(),
+        );
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(
+                zeroclaw_config::schema::Config::default(),
+            )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions: Arc::clone(&sessions),
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            goal_runtime: Some(goal_runtime),
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-goal-close:pid=1".into());
+
+        assert!(
+            dispatcher
+                .handle_session_close(&serde_json::json!({"session_id": sid}))
+                .await
+                .is_ok()
+        );
+        assert!(sessions.get_agent("rpc-goal-disposal").await.is_none());
+        assert!(
+            goal_store
+                .current_goal_for_session("rpc-goal-disposal")
+                .await
+                .unwrap()
+                .is_none(),
+            "Goal control state must be disposed before the RPC session disappears"
+        );
+        assert_eq!(
+            executor.cancellations.lock().unwrap().as_slice(),
+            [(task_id, "rpc-goal-disposal".into(), 1)]
         );
     }
 
