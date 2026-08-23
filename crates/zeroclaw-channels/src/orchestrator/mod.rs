@@ -12042,15 +12042,77 @@ fn compose_channel_mcp_prompt_sections(
     expose_text_tool_protocol
 }
 
-/// Start all configured channels and route messages to the agent
+/// Prepared, generation-local channel runtime state.
+///
+/// Channel contexts must exist before listeners begin accepting work. Keeping
+/// that preparation separate from [`PreparedChannels::run`] gives daemon
+/// composition a safe point to bind session-owned integrations without a
+/// mutable registry appearing after ingress is live.
+pub struct PreparedChannels {
+    state: PreparedChannelsState,
+}
+
+enum PreparedChannelsState {
+    WaitingForReload,
+    Ready {
+        router: AgentRouter,
+        configured_channels: Vec<ConfiguredChannel>,
+        initial_backoff_secs: u64,
+        max_backoff_secs: u64,
+        max_in_flight: usize,
+    },
+}
+
+impl PreparedChannels {
+    /// Start listeners from this immutable prepared generation.
+    pub async fn run(&self, cancel: tokio_util::sync::CancellationToken) -> Result<()> {
+        match &self.state {
+            PreparedChannelsState::WaitingForReload => {
+                cancel.cancelled().await;
+                Ok(())
+            }
+            PreparedChannelsState::Ready {
+                router,
+                configured_channels,
+                initial_backoff_secs,
+                max_backoff_secs,
+                max_in_flight,
+            } => {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+                let mut listener_handles = Vec::new();
+                for channel in configured_channels {
+                    listener_handles.push(spawn_supervised_listener(
+                        Arc::clone(&channel.channel),
+                        channel.alias.clone(),
+                        tx.clone(),
+                        *initial_backoff_secs,
+                        *max_backoff_secs,
+                        cancel.clone(),
+                    ));
+                }
+                drop(tx);
+
+                run_message_dispatch_loop(rx, router.clone(), *max_in_flight).await;
+
+                for handle in listener_handles {
+                    let _ = handle.await;
+                }
+
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Prepare all configured channel contexts before any listener accepts work.
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(
+pub async fn prepare_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
-    cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
-) -> Result<()> {
+) -> Result<PreparedChannels> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12067,8 +12129,9 @@ pub async fn start_channels(
              (complete onboarding at /onboard or set \
              [providers.models.<type>.<alias>] model = \"...\" and reload)."
         );
-        cancel.cancelled().await;
-        return Ok(());
+        return Ok(PreparedChannels {
+            state: PreparedChannelsState::WaitingForReload,
+        });
     }
 
     zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
@@ -12513,8 +12576,9 @@ pub async fn start_channels(
                     "No active channels to supervise (none configured or all disabled). \
                      Waiting for reload signal."
                 );
-                cancel.cancelled().await;
-                return Ok(());
+                return Ok(PreparedChannels {
+                    state: PreparedChannelsState::WaitingForReload,
+                });
             }
 
             println!("🦀 ZeroClaw Channel Server");
@@ -12784,39 +12848,40 @@ pub async fn start_channels(
     // All per-agent execution contexts are now complete. Start listeners only
     // after this preparation boundary so future Goal session adapters can be
     // registered before any inbound work is accepted.
-    let configured_channels = configured_channels_for_listeners
-        .expect("configured channels initialized on first agent's channel setup");
-    let initial_backoff_secs = config
-        .reliability
-        .channel_initial_backoff_secs
-        .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS);
-    let max_backoff_secs = config
-        .reliability
-        .channel_max_backoff_secs
-        .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
-    let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-    let mut listener_handles = Vec::new();
-    for channel in configured_channels {
-        listener_handles.push(spawn_supervised_listener(
-            channel.channel,
-            channel.alias,
-            tx.clone(),
-            initial_backoff_secs,
-            max_backoff_secs,
-            cancel.clone(),
-        ));
-    }
-    drop(tx);
+    Ok(PreparedChannels {
+        state: PreparedChannelsState::Ready {
+            router,
+            configured_channels: configured_channels_for_listeners
+                .expect("configured channels initialized on first agent's channel setup"),
+            initial_backoff_secs: config
+                .reliability
+                .channel_initial_backoff_secs
+                .max(DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS),
+            max_backoff_secs: config
+                .reliability
+                .channel_max_backoff_secs
+                .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS),
+            max_in_flight: max_in_flight_messages
+                .expect("max_in_flight initialized by first agent's channel setup"),
+        },
+    })
+}
 
-    let max_in_flight =
-        max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
-    run_message_dispatch_loop(rx, router, max_in_flight).await;
-
-    for h in listener_handles {
-        let _ = h.await;
-    }
-
-    Ok(())
+/// Start all configured channels and route messages to the agent.
+///
+/// This compatibility entry point preserves the existing callers while daemon
+/// startup progressively adopts the explicit preparation boundary above.
+pub async fn start_channels(
+    config: Config,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+) -> Result<()> {
+    prepare_channels(config, canvas_store, sop_engine, sop_audit)
+        .await?
+        .run(cancel)
+        .await
 }
 
 pub async fn deliver_announcement(
@@ -13325,6 +13390,23 @@ pub(crate) mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    #[tokio::test]
+    async fn prepared_channels_waits_for_cancellation_when_no_runtime_is_available() {
+        // Preparation must preserve the old supervisor behavior for an
+        // unavailable channel runtime: it waits for reload/shutdown instead
+        // of returning and making the component supervisor hot-loop.
+        let prepared = PreparedChannels {
+            state: PreparedChannelsState::WaitingForReload,
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        prepared
+            .run(cancellation)
+            .await
+            .expect("waiting prepared channels stop cleanly on cancellation");
+    }
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.
     ///
