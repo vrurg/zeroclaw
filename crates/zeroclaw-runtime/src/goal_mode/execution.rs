@@ -3,7 +3,7 @@
 //! The driver owns durable Goal control and accounting. The RPC adapter owns
 //! only its existing session queue, agent lock, and canonical history access.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ const VERIFIER_JSON_MAX_BYTES: usize = 65_536;
 const VERIFIER_BLOCKER_MAX_COUNT: usize = 16;
 const VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS: usize = 1_024;
 const GOAL_EXECUTOR_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+const GOAL_TRANSITION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct GoalBudgetExhausted;
@@ -96,6 +97,52 @@ enum GoalVerifierOutcome {
     Complete,
     Continue(String),
     Blocked(String, Vec<crate::control_plane::GoalBlocker>),
+}
+
+/// Keep the registered executor alive until a terminal fence commits or a
+/// newer owner makes this exact epoch stale. Returning on a storage error
+/// would strand a durable `Running` Goal without any process-local owner.
+async fn finish_goal_or_retain_ownership(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+    reason: &str,
+) {
+    retry_goal_transition(|| {
+        goals.finish_session_goal(
+            &scope.task_id,
+            &scope.session_id,
+            scope.execution_epoch,
+            TaskStatus::Failed,
+            Some(reason.into()),
+        )
+    })
+    .await;
+}
+
+async fn retry_goal_transition<F, Fut>(mut transition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<GoalTransitionResult>>,
+{
+    loop {
+        match transition().await {
+            Ok(
+                GoalTransitionResult::Applied
+                | GoalTransitionResult::Stale
+                | GoalTransitionResult::Missing,
+            ) => return,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                    "goal terminal transition failed; retaining executor ownership"
+                );
+                tokio::time::sleep(GOAL_TRANSITION_RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 /// Construct the shared Goal executor over one host-owned live session model.
@@ -767,15 +814,12 @@ impl GoalExecutor for GoalExecutionDriver {
             let mut session = match host.acquire(&scope, &expected_agent).await {
                 Ok(session) => session,
                 Err(_) => {
-                    let _ = goals
-                        .finish_session_goal(
-                            &scope.task_id,
-                            &scope.session_id,
-                            scope.execution_epoch,
-                            TaskStatus::Failed,
-                            Some("goal_execution_host_unavailable".into()),
-                        )
-                        .await;
+                    finish_goal_or_retain_ownership(
+                        &goals,
+                        &scope,
+                        "goal_execution_host_unavailable",
+                    )
+                    .await;
                     return;
                 }
             };
@@ -807,15 +851,12 @@ impl GoalExecutor for GoalExecutionDriver {
             let mut transcript = match session.working_history() {
                 Ok(history) => history,
                 Err(_) => {
-                    let _ = goals
-                        .finish_session_goal(
-                            &scope.task_id,
-                            &scope.session_id,
-                            scope.execution_epoch,
-                            TaskStatus::Failed,
-                            Some("goal_transcript_initialization_failed".into()),
-                        )
-                        .await;
+                    finish_goal_or_retain_ownership(
+                        &goals,
+                        &scope,
+                        "goal_transcript_initialization_failed",
+                    )
+                    .await;
                     return;
                 }
             };
@@ -1081,7 +1122,32 @@ impl GoalExecutor for GoalExecutionDriver {
 
 #[cfg(test)]
 mod tests {
-    use super::{GoalVerifierOutcome, parse_goal_verifier_response};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{GoalVerifierOutcome, parse_goal_verifier_response, retry_goal_transition};
+    use crate::control_plane::GoalTransitionResult;
+
+    #[tokio::test]
+    async fn transition_storage_error_retries_before_releasing_execution_ownership() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        retry_goal_transition({
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("injected transition write failure");
+                    }
+                    Ok(GoalTransitionResult::Applied)
+                }
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn verifier_complete_requires_exact_schema_and_no_blockers() {
