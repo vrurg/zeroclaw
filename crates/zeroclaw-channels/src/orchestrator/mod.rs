@@ -2320,16 +2320,16 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .lock()
         .unwrap_or_else(|error| error.into_inner());
 
-    if let Some(store) = &ctx.session_store {
-        if let Err(error) = store.append(sender_key, &turn) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
-                "Failed to persist session turn"
-            );
-        }
+    if let Some(store) = &ctx.session_store
+        && let Err(error) = store.append(sender_key, &turn)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+            "Failed to persist session turn"
+        );
     }
 
     append_sender_turn_in_memory(ctx, sender_key, turn);
@@ -8083,28 +8083,6 @@ fn matrix_goal_route_round_trips_alias_and_room_without_thread_state() {
     assert!(MatrixGoalRouteV1::new("discord.primary".to_string(), "room".to_string()).is_err());
 }
 
-#[cfg(test)]
-#[test]
-fn matrix_goal_adapter_owns_a_valid_binding_shape_without_an_active_generation() {
-    let route = MatrixGoalRouteV1::new(
-        "matrix.primary".to_string(),
-        "!room:example.test".to_string(),
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-
-    assert!(is_owned_matrix_goal_binding(
-        &route,
-        Some("@alice:example.test")
-    ));
-    assert!(!is_owned_matrix_goal_binding(&route, None));
-    assert!(!is_owned_matrix_goal_binding(
-        "not-a-route",
-        Some("@alice:example.test")
-    ));
-}
-
 /// Stable channel-session adapter registered with the daemon-owned Goal host.
 ///
 /// It holds only the currently active channel generation. Route ownership,
@@ -8140,13 +8118,32 @@ impl ChannelGoalSessionAdapter {
         &self,
         binding: &GoalSessionBinding,
     ) -> anyhow::Result<Arc<ChannelAgentRuntime>> {
-        let route = MatrixGoalRouteV1::decode(binding.route())?;
+        self.runtime_for_goal_route(binding.agent(), binding.route())
+    }
+
+    fn runtime_for_goal_route(
+        &self,
+        agent: &str,
+        route: &str,
+    ) -> anyhow::Result<Arc<ChannelAgentRuntime>> {
+        let route = MatrixGoalRouteV1::decode(route)?;
         let Some(router) = self.generation.read().as_ref().cloned() else {
             anyhow::bail!("channel Goal adapter has no active generation");
         };
         router
-            .resolve_goal_runtime(binding.agent(), &route.channel_key)
-            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding is not owned by this generation"))
+            .resolve_goal_runtime(agent, &route.channel_key)
+            .ok_or_else(|| {
+                anyhow::Error::msg("Matrix Goal binding is not owned by this generation")
+            })
+    }
+
+    /// Check the complete transport-owned part of Matrix Goal ownership
+    /// without resolving a provider/model. Adapter routing must never turn a
+    /// readiness failure into a different session owner, but it must also not
+    /// claim a route whose active generation belongs to another agent.
+    fn owns_matrix_binding(&self, route: &str, agent: &str, principal_id: Option<&str>) -> bool {
+        is_owned_matrix_goal_binding(route, principal_id)
+            && self.runtime_for_goal_route(agent, route).is_ok()
     }
 }
 
@@ -8166,7 +8163,7 @@ struct ChannelGoalExecutionSession {
 #[async_trait::async_trait]
 impl GoalSessionAdapter for ChannelGoalSessionAdapter {
     fn owns(&self, binding: &GoalSessionBinding) -> bool {
-        is_owned_matrix_goal_binding(binding.route(), binding.principal_id())
+        self.owns_matrix_binding(binding.route(), binding.agent(), binding.principal_id())
     }
 
     async fn model_binding(
@@ -8178,7 +8175,7 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
         let principal_id = binding
             .principal_id()
             .filter(|principal| !principal.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding has no raw MXID"))?;
+            .ok_or_else(|| anyhow::Error::msg("Matrix Goal binding has no raw MXID"))?;
         let defaults = runtime_defaults_snapshot(runtime.ctx.as_ref());
         let selection = get_route_selection_for_parts(
             runtime.ctx.as_ref(),
@@ -8204,7 +8201,7 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
         let principal_id = binding
             .principal_id()
             .filter(|principal| !principal.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding has no raw MXID"))?
+            .ok_or_else(|| anyhow::Error::msg("Matrix Goal binding has no raw MXID"))?
             .to_string();
         let route = MatrixGoalRouteV1::decode(binding.route())?;
         let runtime = self.runtime_for_binding(binding)?;
@@ -8358,7 +8355,7 @@ impl GoalSessionLease for ChannelGoalExecutionSession {
             .ctx
             .channels_by_name
             .get(&self.route.channel_key)
-            .ok_or_else(|| anyhow::anyhow!("Matrix Goal delivery channel is unavailable"))?;
+            .ok_or_else(|| anyhow::Error::msg("Matrix Goal delivery channel is unavailable"))?;
         let safe_candidate = redact_channel_outbound_leaks(
             candidate,
             &self.runtime.ctx.prompt_config.security.leak_detection,
@@ -15326,6 +15323,38 @@ temperature = 0.3
             sop_engine: None,
             sop_audit: None,
         })
+    }
+
+    #[test]
+    fn matrix_goal_adapter_requires_an_active_exact_generation_owner() {
+        let route = MatrixGoalRouteV1::new(
+            "matrix.primary".to_string(),
+            "!room:example.test".to_string(),
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let adapter = ChannelGoalSessionAdapter::new();
+        assert!(!adapter.owns_matrix_binding(&route, "ops", Some("@alice:example.test")));
+        assert!(!adapter.owns_matrix_binding(&route, "ops", None));
+        assert!(!adapter.owns_matrix_binding("not-a-route", "ops", Some("@alice:example.test")));
+
+        let mut agents = HashMap::new();
+        agents.insert("ops".to_string(), router_test_ctx());
+        let mut owners = HashMap::new();
+        owners.insert("matrix.primary".to_string(), "ops".to_string());
+        let generation = Arc::new(AgentRouter::multi(agents, owners, None, None));
+        adapter.publish_generation(Arc::clone(&generation));
+
+        assert!(adapter.owns_matrix_binding(&route, "ops", Some("@alice:example.test")));
+        assert!(
+            !adapter.owns_matrix_binding(&route, "other", Some("@alice:example.test")),
+            "the configured channel owner is part of trusted Matrix Goal ownership"
+        );
+
+        adapter.clear_generation(&generation);
+        assert!(!adapter.owns_matrix_binding(&route, "ops", Some("@alice:example.test")));
     }
 
     #[test]
