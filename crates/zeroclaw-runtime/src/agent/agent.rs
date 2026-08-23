@@ -40,6 +40,11 @@ const GOAL_PARENT_UNSUPPORTED_TOOLS: &[&str] = &[
     "cron_run",
 ];
 
+/// Return the Goal-parent exclusions shared by every live-session adapter.
+pub(crate) fn goal_parent_excluded_tools() -> &'static [&'static str] {
+    GOAL_PARENT_UNSUPPORTED_TOOLS
+}
+
 /// A Goal foreground child must not recursively create or supervise another
 /// child. Keep this predicate shared by both delegate registry construction
 /// modes so a target cannot recover a parent-only tool through a different
@@ -1137,7 +1142,7 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
         let agent_alias_for_loop = self.observer_agent_alias();
-        let goal_excluded_tools = GOAL_PARENT_UNSUPPORTED_TOOLS
+        let goal_excluded_tools = goal_parent_excluded_tools()
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();

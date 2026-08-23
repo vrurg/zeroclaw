@@ -169,6 +169,36 @@ async fn launched_goal_scope_owns_one_logical_operation_permit() {
     drop(permit);
 }
 
+#[tokio::test]
+async fn start_preflight_receives_the_exact_immutable_ingress_binding() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, _, _, _) = controller(Arc::clone(&executor));
+
+    runtime
+        .submit(
+            matrix("session-binding"),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: Some(64),
+                    cost_limit_usd: None,
+                },
+                success_criteria: "return a verified result".into(),
+                objective: "exercise trusted ingress binding".into(),
+            },
+        )
+        .await
+        .expect("start should preflight trusted ingress");
+
+    let binding = executor.preflights.lock()[0].binding.clone();
+    assert_eq!(binding.session_id(), "session-binding");
+    assert_eq!(binding.agent(), "main");
+    assert_eq!(binding.route(), "matrix.room");
+    assert_eq!(binding.principal_id(), Some("@alice:example.test"));
+}
+
 #[test]
 fn start_requires_delimiters_and_preserves_criteria_and_objective_verbatim() {
     let command = parse_goal_command(

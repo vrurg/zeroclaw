@@ -7,20 +7,17 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_runtime::goal_mode::{
-    GoalExecutionHost, GoalExecutionScope, GoalExecutionSession, GoalHostModelBinding,
+    GoalExecutionScope, GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding,
+    GoalSessionLease,
 };
 
-struct FakeGoalHost;
+struct FakeGoalSessionAdapter;
 
-struct FakeGoalSession;
+struct FakeGoalSessionLease;
 
 #[async_trait]
-impl GoalExecutionHost for FakeGoalHost {
-    async fn model_binding(
-        &self,
-        _session_id: &str,
-        _expected_agent: &str,
-    ) -> Option<GoalHostModelBinding> {
+impl GoalSessionAdapter for FakeGoalSessionAdapter {
+    async fn model_binding(&self, _binding: &GoalSessionBinding) -> Option<GoalHostModelBinding> {
         Some(GoalHostModelBinding {
             provider_ref: "test.provider".into(),
             model: "test-model".into(),
@@ -30,14 +27,14 @@ impl GoalExecutionHost for FakeGoalHost {
     async fn acquire(
         &self,
         _scope: &GoalExecutionScope,
-        _expected_agent: &str,
-    ) -> anyhow::Result<Box<dyn GoalExecutionSession>> {
-        Ok(Box::new(FakeGoalSession))
+        _binding: &GoalSessionBinding,
+    ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+        Ok(Box::new(FakeGoalSessionLease))
     }
 }
 
 #[async_trait]
-impl GoalExecutionSession for FakeGoalSession {
+impl GoalSessionLease for FakeGoalSessionLease {
     fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
         Ok(vec![ChatMessage::system("test")])
     }
@@ -56,6 +53,6 @@ impl GoalExecutionSession for FakeGoalSession {
 }
 
 #[test]
-fn external_hosts_can_implement_the_narrow_goal_execution_contract() {
-    let _host: Box<dyn GoalExecutionHost> = Box::new(FakeGoalHost);
+fn external_adapters_can_implement_the_narrow_goal_execution_contract() {
+    let _adapter: Box<dyn GoalSessionAdapter> = Box::new(FakeGoalSessionAdapter);
 }

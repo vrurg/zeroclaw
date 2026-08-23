@@ -752,14 +752,16 @@ pub async fn run(
         let goal_executor = crate::control_plane::control_plane()
             .zip(cost_tracker.as_ref())
             .map(|(control_plane, cost_tracker)| {
-                crate::goal_mode::goal_executor_for_host(
-                    std::sync::Arc::new(crate::goal_mode::RpcGoalExecutionHost::new(
-                        std::sync::Arc::clone(&sessions),
-                    )),
-                    std::sync::Arc::clone(&control_plane.goals),
-                    std::sync::Arc::new(config.clone()),
-                    std::sync::Arc::clone(cost_tracker),
-                )
+                let executor: std::sync::Arc<dyn crate::goal_mode::GoalExecutor> =
+                    std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                        std::sync::Arc::new(crate::goal_mode::RpcGoalSessionAdapter::new(
+                            std::sync::Arc::clone(&sessions),
+                        )),
+                        std::sync::Arc::clone(&control_plane.goals),
+                        std::sync::Arc::new(config.clone()),
+                        std::sync::Arc::clone(cost_tracker),
+                    ));
+                executor
             });
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),

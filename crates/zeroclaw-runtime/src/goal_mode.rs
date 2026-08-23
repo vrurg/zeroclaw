@@ -22,8 +22,15 @@ use crate::control_plane::{
 mod execution;
 mod host;
 
-pub use execution::{RpcGoalExecutionHost, goal_executor_for_host};
-pub use host::{GoalExecutionHost, GoalExecutionSession, GoalHostModelBinding};
+pub use execution::GoalExecutionHost;
+pub(crate) use execution::RpcGoalSessionAdapter;
+pub use host::{GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease};
+
+/// Return the Goal-parent tool names that channel and RPC execution must both
+/// exclude from the parent tool loop.
+pub fn goal_parent_excluded_tools() -> &'static [&'static str] {
+    crate::agent::agent::goal_parent_excluded_tools()
+}
 
 const INITIAL_GOAL_EXECUTION_EPOCH: i64 = 1;
 
@@ -571,10 +578,20 @@ pub struct GoalExecutionScope {
 /// Preflight input used before a durable Goal is admitted to execution.
 #[derive(Debug, Clone)]
 pub struct GoalExecutionPreflight {
-    pub session_id: String,
-    pub agent: String,
+    pub binding: GoalSessionBinding,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
+}
+
+impl GoalSessionBinding {
+    fn from_ingress(ingress: &GoalIngressContext) -> Self {
+        Self::new(
+            ingress.session_id.clone(),
+            ingress.agent.clone(),
+            ingress.route.clone(),
+            ingress.durable_principal_id().map(str::to_string),
+        )
+    }
 }
 
 /// Readiness facts supplied by the dormant executor seam.
@@ -707,8 +724,7 @@ impl GoalRuntime {
         let readiness = self
             .executor
             .preflight(&GoalExecutionPreflight {
-                session_id: ingress.session_id.clone(),
-                agent: ingress.agent.clone(),
+                binding: GoalSessionBinding::from_ingress(&ingress),
                 token_limit,
                 cost_limit_usd,
             })
@@ -905,8 +921,7 @@ impl GoalRuntime {
         let readiness = self
             .executor
             .preflight(&GoalExecutionPreflight {
-                session_id: ingress.session_id.clone(),
-                agent: ingress.agent.clone(),
+                binding: GoalSessionBinding::from_ingress(&ingress),
                 token_limit: goal.effective_token_limit,
                 cost_limit_usd: goal.effective_cost_limit_usd,
             })

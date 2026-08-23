@@ -21,8 +21,8 @@ use zeroclaw_config::{cost::CostTracker, schema::Config};
 use zeroclaw_providers::dispatch::{AccountedAttempt, AttemptUsageOutcome};
 
 use super::{
-    GoalExecutionHost, GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope,
-    GoalExecutionSession, GoalExecutor, GoalHostModelBinding,
+    GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor,
+    GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease,
 };
 use crate::agent::agent::Agent;
 use crate::agent::agent::build_session_model_provider;
@@ -195,25 +195,32 @@ fn is_exact_running_goal_task(task: &TaskRecord, scope: &GoalExecutionScope) -> 
         && task.status == TaskStatus::Running
 }
 
-/// Construct the shared Goal executor over one host-owned live session model.
-pub fn goal_executor_for_host(
-    host: Arc<dyn GoalExecutionHost>,
-    goals: Arc<dyn GoalTaskRegistry>,
-    config: Arc<Config>,
-    cost_tracker: Arc<CostTracker>,
-) -> Arc<dyn GoalExecutor> {
-    Arc::new(GoalExecutionDriver {
-        host,
-        goals,
-        config,
-        cost_tracker,
-        executors: Arc::new(Mutex::new(HashMap::new())),
-    })
+fn session_binding_for_task(
+    task: &TaskRecord,
+    scope: &GoalExecutionScope,
+) -> Option<GoalSessionBinding> {
+    let route = task.originator_route.as_deref()?;
+    if route.trim().is_empty()
+        || task.agent.trim().is_empty()
+        || task.session_id.as_deref() != Some(scope.session_id.as_str())
+    {
+        return None;
+    }
+    Some(GoalSessionBinding::new(
+        scope.session_id.clone(),
+        task.agent.clone(),
+        route.to_string(),
+        task.principal_id.clone(),
+    ))
 }
 
-/// Private shared lifecycle driver; hosts retain live-session ownership.
-struct GoalExecutionDriver {
-    host: Arc<dyn GoalExecutionHost>,
+/// Transport-neutral Goal lifecycle owner.
+///
+/// The host owns durable Goal lifecycle, accounting, verification, and
+/// cancellation. A [`GoalSessionAdapter`] supplies only the transport's live
+/// session capabilities.
+pub struct GoalExecutionHost {
+    adapter: Arc<dyn GoalSessionAdapter>,
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
@@ -227,7 +234,23 @@ struct RegisteredGoalExecutor {
     handle: Option<JoinHandle<()>>,
 }
 
-impl GoalExecutionDriver {
+impl GoalExecutionHost {
+    /// Construct the shared Goal lifecycle owner over one live-session adapter.
+    pub fn new(
+        adapter: Arc<dyn GoalSessionAdapter>,
+        goals: Arc<dyn GoalTaskRegistry>,
+        config: Arc<Config>,
+        cost_tracker: Arc<CostTracker>,
+    ) -> Self {
+        Self {
+            adapter,
+            goals,
+            config,
+            cost_tracker,
+            executors: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     async fn session_executor_is_active(&self, session_id: &str) -> bool {
         let mut executors = self.executors.lock().await;
         executors.retain(|_, executor| {
@@ -242,12 +265,12 @@ impl GoalExecutionDriver {
     }
 }
 
-/// RPC adapter that retains ownership of its in-memory session store.
-pub struct RpcGoalExecutionHost {
+/// RPC implementation of the live Goal session adapter.
+pub(crate) struct RpcGoalSessionAdapter {
     sessions: Arc<SessionStore>,
 }
 
-impl RpcGoalExecutionHost {
+impl RpcGoalSessionAdapter {
     /// Bind Goal execution to the daemon's existing RPC session owner.
     pub fn new(sessions: Arc<SessionStore>) -> Self {
         Self { sessions }
@@ -260,16 +283,18 @@ struct RpcGoalExecutionSession {
 }
 
 #[async_trait]
-impl GoalExecutionHost for RpcGoalExecutionHost {
-    async fn model_binding(
-        &self,
-        session_id: &str,
-        expected_agent: &str,
-    ) -> Option<GoalHostModelBinding> {
-        if self.sessions.get_agent_alias(session_id).await.as_deref() != Some(expected_agent) {
+impl GoalSessionAdapter for RpcGoalSessionAdapter {
+    async fn model_binding(&self, binding: &GoalSessionBinding) -> Option<GoalHostModelBinding> {
+        if self
+            .sessions
+            .get_agent_alias(binding.session_id())
+            .await
+            .as_deref()
+            != Some(binding.agent())
+        {
             return None;
         }
-        let agent = self.sessions.get_agent(session_id).await?;
+        let agent = self.sessions.get_agent(binding.session_id()).await?;
         let (provider_ref, model, _) = agent.lock().await.goal_model_binding();
         Some(GoalHostModelBinding {
             provider_ref,
@@ -280,8 +305,8 @@ impl GoalExecutionHost for RpcGoalExecutionHost {
     async fn acquire(
         &self,
         scope: &GoalExecutionScope,
-        expected_agent: &str,
-    ) -> anyhow::Result<Box<dyn GoalExecutionSession>> {
+        binding: &GoalSessionBinding,
+    ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
         let queue_guard = self
             .sessions
             .session_queue
@@ -293,7 +318,7 @@ impl GoalExecutionHost for RpcGoalExecutionHost {
             .get_agent_alias(&scope.session_id)
             .await
             .as_deref()
-            != Some(expected_agent)
+            != Some(binding.agent())
         {
             anyhow::bail!("goal RPC session agent binding changed while waiting for lease");
         }
@@ -311,7 +336,7 @@ impl GoalExecutionHost for RpcGoalExecutionHost {
 }
 
 #[async_trait]
-impl GoalExecutionSession for RpcGoalExecutionSession {
+impl GoalSessionLease for RpcGoalExecutionSession {
     fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
         self.agent.goal_working_history()
     }
@@ -772,16 +797,15 @@ fn validate_verifier_blockers(
 }
 
 #[async_trait]
-impl GoalExecutor for GoalExecutionDriver {
+impl GoalExecutor for GoalExecutionHost {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
-        if self.session_executor_is_active(&request.session_id).await {
+        if self
+            .session_executor_is_active(request.binding.session_id())
+            .await
+        {
             return GoalExecutionReadiness::ExecutorBusy;
         }
-        let Some(binding) = self
-            .host
-            .model_binding(&request.session_id, &request.agent)
-            .await
-        else {
+        let Some(binding) = self.adapter.model_binding(&request.binding).await else {
             return GoalExecutionReadiness::BindingUnavailable;
         };
         if build_session_model_provider(
@@ -796,7 +820,7 @@ impl GoalExecutor for GoalExecutionDriver {
         if request.cost_limit_usd.is_some() {
             let fallback_options = zeroclaw_providers::provider_runtime_options_for_agent(
                 &self.config,
-                &request.agent,
+                request.binding.agent(),
             );
             let options = zeroclaw_providers::options_for_provider_ref(
                 &self.config,
@@ -827,7 +851,7 @@ impl GoalExecutor for GoalExecutionDriver {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let executor_key = scope.task_id.clone();
-        let host = Arc::clone(&self.host);
+        let adapter = Arc::clone(&self.adapter);
         let goals = Arc::clone(&self.goals);
         let config = Arc::clone(&self.config);
         let cost_tracker = Arc::clone(&self.cost_tracker);
@@ -861,7 +885,12 @@ impl GoalExecutor for GoalExecutionDriver {
                 return;
             };
             let expected_agent = current.task.agent.clone();
-            let mut session = match host.acquire(&scope, &expected_agent).await {
+            let Some(binding) = session_binding_for_task(&current.task, &scope) else {
+                finish_goal_or_retain_ownership(&goals, &scope, "goal_session_binding_unavailable")
+                    .await;
+                return;
+            };
+            let mut session = match adapter.acquire(&scope, &binding).await {
                 Ok(session) => session,
                 Err(_) => {
                     finish_goal_or_retain_ownership(
@@ -1179,7 +1208,7 @@ mod tests {
 
     use super::{
         GoalVerifierOutcome, INJECTED_GOAL_TRANSITION_ERRORS, exact_running_goal_requires_owner,
-        is_exact_running_goal_task, parse_goal_verifier_response,
+        is_exact_running_goal_task, parse_goal_verifier_response, session_binding_for_task,
     };
     use crate::{
         control_plane::{
@@ -1189,6 +1218,47 @@ mod tests {
         goal_mode::{GoalExecutionScope, GoalTurnKind},
     };
     use tokio::time::{sleep, timeout};
+
+    #[test]
+    fn task_binding_uses_the_exact_durable_route_and_principal() {
+        let scope = GoalExecutionScope {
+            task_id: "goal-binding".into(),
+            session_id: "session-binding".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = TaskRecord {
+            id: scope.task_id.clone(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("  matrix.room  ".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@alice:example.test".into()),
+            session_id: Some(scope.session_id.clone()),
+            execution_epoch: scope.execution_epoch,
+            started_at: "2026-08-23T00:00:00Z".into(),
+            finished_at: None,
+        };
+
+        let binding = session_binding_for_task(&task, &scope).expect("canonical binding");
+        assert_eq!(binding.session_id(), "session-binding");
+        assert_eq!(binding.agent(), "main");
+        assert_eq!(binding.route(), "  matrix.room  ");
+        assert_eq!(binding.principal_id(), Some("@alice:example.test"));
+
+        let mut mismatched = task;
+        mismatched.session_id = Some("other-session".into());
+        assert!(session_binding_for_task(&mismatched, &scope).is_none());
+    }
 
     #[tokio::test]
     async fn stale_transition_keeps_ownership_when_exact_task_still_runs() {
