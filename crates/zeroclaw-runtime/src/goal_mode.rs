@@ -708,8 +708,10 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
-        self.fence_session_for_disposal(ingress).await?;
-        self.delete_fenced_session_goal(ingress).await
+        match self.fence_session_for_disposal(ingress).await? {
+            GoalTransitionResult::Applied => self.delete_fenced_session_goal(ingress).await,
+            result => Ok(result),
+        }
     }
 
     /// Fence and quiesce an exact Goal before its live session is removed.
@@ -1291,6 +1293,7 @@ impl GoalRuntime {
     }
 
     async fn pause(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        self.retry_pending_quiescence().await?;
         let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
@@ -1385,6 +1388,7 @@ impl GoalRuntime {
     }
 
     async fn cancel(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        self.retry_pending_quiescence().await?;
         let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };

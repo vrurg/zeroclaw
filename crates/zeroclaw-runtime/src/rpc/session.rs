@@ -71,7 +71,6 @@ pub struct RpcSession {
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
     generation: u64,
-    replacement_reserved: bool,
 }
 
 /// Immutable metadata for an already-live RPC session.
@@ -106,7 +105,6 @@ impl RpcSession {
             chat_mode,
             owner_tui_id: None,
             generation: 0,
-            replacement_reserved: false,
         }
     }
 
@@ -130,11 +128,28 @@ struct ReservedRpcSession {
 pub(crate) struct SessionReplacementReservation {
     targets: Vec<ReservedRpcSession>,
     slot: ReplacementSlot,
-    // Serializes an exact replacement with ordinary turn admission and every
-    // other session insertion.  It is intentionally held through Goal
-    // quiescence: otherwise a prompt can register after the idle snapshot but
-    // before its session is fenced.
-    _admission_gate: tokio::sync::OwnedMutexGuard<()>,
+    incoming_id: String,
+    reserved_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    reserved_incoming_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Drop for SessionReplacementReservation {
+    fn drop(&mut self) {
+        let mut generations = self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for target in &self.targets {
+            if generations.get(&target.id) == Some(&target.generation) {
+                generations.remove(&target.id);
+            }
+        }
+        drop(generations);
+        self.reserved_incoming_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.incoming_id);
+    }
 }
 
 impl SessionReplacementReservation {
@@ -161,7 +176,8 @@ pub struct SessionStore {
     cancel_generation: std::sync::atomic::AtomicU64,
     session_generation: AtomicU64,
     replacement_slots: Arc<AtomicUsize>,
-    replacement_admission_gate: Arc<Mutex<()>>,
+    reserved_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    reserved_incoming_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -177,7 +193,10 @@ impl SessionStore {
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             session_generation: AtomicU64::new(0),
             replacement_slots: Arc::new(AtomicUsize::new(0)),
-            replacement_admission_gate: Arc::new(Mutex::new(())),
+            reserved_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reserved_incoming_ids: Arc::new(
+                std::sync::Mutex::new(std::collections::HashSet::new()),
+            ),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
@@ -185,10 +204,15 @@ impl SessionStore {
     }
 
     pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
-        let _admission = Arc::clone(&self.replacement_admission_gate)
-            .try_lock_owned()
-            .map_err(|_| "session replacement in progress")?;
         let mut sessions = self.sessions.lock().await;
+        if self
+            .reserved_incoming_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id)
+        {
+            return Err("session replacement in progress");
+        }
         if sessions
             .len()
             .saturating_add(self.replacement_slots.load(Ordering::SeqCst))
@@ -211,25 +235,28 @@ impl SessionStore {
         chat_mode: &crate::rpc::types::ChatMode,
         incoming_id: &str,
     ) -> Result<SessionReplacementReservation, &'static str> {
-        let admission_gate = Arc::clone(&self.replacement_admission_gate)
-            .lock_owned()
-            .await;
-        let in_flight: std::collections::HashSet<String> = self
-            .cancel_tokens
+        let sessions = self.sessions.lock().await;
+        let in_flight = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let reserved = self
+            .reserved_generations
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        let mut sessions = self.sessions.lock().await;
+            .unwrap_or_else(|e| e.into_inner());
+        if self
+            .reserved_incoming_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(incoming_id)
+        {
+            return Err("replacement incoming identifier is reserved");
+        }
         let targets: Vec<ReservedRpcSession> = sessions
             .iter()
             .filter(|(id, session)| {
                 id.as_str() != incoming_id
                     && session.owner_tui_id.as_deref() == Some(tui_id)
                     && &session.chat_mode == chat_mode
-                    && !session.replacement_reserved
-                    && !in_flight.contains(id.as_str())
+                    && !reserved.contains_key(id.as_str())
+                    && !in_flight.contains_key(id.as_str())
             })
             .map(|(id, session)| ReservedRpcSession {
                 id: id.clone(),
@@ -240,13 +267,28 @@ impl SessionStore {
             return Err("session limit reached");
         }
         for target in &targets {
-            let Some(session) = sessions.get_mut(&target.id) else {
+            let Some(session) = sessions.get(&target.id) else {
                 return Err("replacement session disappeared");
             };
-            if session.generation != target.generation || session.replacement_reserved {
+            if session.generation != target.generation || reserved.contains_key(&target.id) {
                 return Err("replacement session changed");
             }
-            session.replacement_reserved = true;
+        }
+        drop(in_flight);
+        drop(reserved);
+        let mut reserved = self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut incoming = self
+            .reserved_incoming_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !incoming.insert(incoming_id.to_string()) {
+            return Err("replacement incoming identifier is reserved");
+        }
+        for target in &targets {
+            reserved.insert(target.id.clone(), target.generation);
         }
         self.replacement_slots.fetch_add(1, Ordering::SeqCst);
         Ok(SessionReplacementReservation {
@@ -254,7 +296,9 @@ impl SessionStore {
             slot: ReplacementSlot {
                 slots: Arc::clone(&self.replacement_slots),
             },
-            _admission_gate: admission_gate,
+            incoming_id: incoming_id.to_string(),
+            reserved_generations: Arc::clone(&self.reserved_generations),
+            reserved_incoming_ids: Arc::clone(&self.reserved_incoming_ids),
         })
     }
 
@@ -263,15 +307,7 @@ impl SessionStore {
         &self,
         reservation: &SessionReplacementReservation,
     ) {
-        let _ = &reservation.slot;
-        let mut sessions = self.sessions.lock().await;
-        for target in &reservation.targets {
-            if let Some(session) = sessions.get_mut(&target.id)
-                && session.generation == target.generation
-            {
-                session.replacement_reserved = false;
-            }
-        }
+        let _ = reservation;
     }
 
     /// Atomically remove the exact reserved sessions and insert their
@@ -291,7 +327,14 @@ impl SessionStore {
             let Some(current) = sessions.get(&target.id) else {
                 return Err("reserved replacement session disappeared");
             };
-            if current.generation != target.generation || !current.replacement_reserved {
+            if current.generation != target.generation
+                || self
+                    .reserved_generations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&target.id)
+                    != Some(&target.generation)
+            {
                 return Err("reserved replacement session changed");
             }
         }
@@ -311,11 +354,13 @@ impl SessionStore {
 
     /// A reserved replacement target may not begin a new ordinary turn.
     pub(crate) async fn is_replacement_reserved(&self, id: &str) -> bool {
-        self.sessions
-            .lock()
-            .await
-            .get(id)
-            .is_some_and(|session| session.replacement_reserved)
+        self.sessions.lock().await.get(id).is_some_and(|session| {
+            self.reserved_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                == Some(&session.generation)
+        })
     }
 
     /// Register an in-flight turn only if no replacement has fenced this
@@ -326,13 +371,30 @@ impl SessionStore {
         id: &str,
         token: tokio_util::sync::CancellationToken,
     ) -> Option<u64> {
-        let _admission = Arc::clone(&self.replacement_admission_gate)
-            .try_lock_owned()
-            .ok()?;
-        if self.is_replacement_reserved(id).await {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        if self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            == Some(&session.generation)
+        {
             return None;
         }
-        Some(self.register_cancel_token(id, token))
+        let generation = self
+            .cancel_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        if let Some((_, stale)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), (generation, token))
+        {
+            stale.cancel();
+        }
+        Some(generation)
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
