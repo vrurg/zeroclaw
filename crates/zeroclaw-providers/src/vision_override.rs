@@ -161,6 +161,7 @@ impl ModelProvider for VisionOverrideProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_history(messages, model, temperature)
             .await
@@ -255,6 +256,7 @@ impl zeroclaw_api::attribution::Attributable for VisionOverrideProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::AccountedChatScope;
     use crate::traits::ProviderCapabilities;
     use std::sync::Arc;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -457,6 +459,30 @@ mod tests {
         assert!(outcome.result.is_ok());
         assert_eq!(outcome.accounting.attempts().len(), 1);
         let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_accounting_through_vision_override_keeps_only_inner_leaf() {
+        let wrapped = VisionOverrideProvider::new(Box::new(AccountedVisionLeaf), false);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        let result = scope
+            .scope(ProviderDispatch::from_ref(&wrapped).chat_with_history(
+                &messages,
+                "served-model",
+                None,
+            ))
+            .await;
+
+        assert!(result.is_ok());
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        let leaf = &report.attempts()[0];
         assert_eq!(
             (leaf.provider_ref(), leaf.model()),
             ("configured.inner", "served-model")
