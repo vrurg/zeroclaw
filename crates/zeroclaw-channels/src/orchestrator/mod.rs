@@ -89,6 +89,7 @@ pub use crate::telegram::TelegramChannel;
 pub use crate::whatsapp_web::WhatsAppWebChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_queue::SessionActorQueue;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
@@ -7838,12 +7839,34 @@ async fn process_channel_message_body(
 /// can reuse the same in-flight tracking / cancellation / process logic.
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
+    foreground_sessions: Option<Arc<SessionActorQueue>>,
     msg: zeroclaw_api::channel::ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
+    let _foreground_lease = match foreground_sessions {
+        Some(foreground_sessions) if is_matrix_channel_name(&msg.channel) => {
+            match foreground_sessions
+                .acquire(&conversation_history_key(&msg))
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "matrix foreground session lease is unavailable"
+                    );
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
@@ -7894,11 +7917,31 @@ async fn dispatch_worker(
     completion.mark_done();
 }
 
+/// One live channel runtime for a configured agent.
+///
+/// The context remains the canonical owner of channel execution facilities.
+/// Matrix foreground work uses one per-agent queue so ordinary turns and Goal
+/// work can contend on the exact same canonical session key.
+#[derive(Clone)]
+struct ChannelAgentRuntime {
+    ctx: Arc<ChannelRuntimeContext>,
+    foreground_sessions: Arc<SessionActorQueue>,
+}
+
+impl ChannelAgentRuntime {
+    fn new(ctx: Arc<ChannelRuntimeContext>) -> Self {
+        Self {
+            ctx,
+            foreground_sessions: Arc::new(SessionActorQueue::new(32, 30, 600)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AgentRouter {
-    by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
+    by_agent: Arc<HashMap<String, Arc<ChannelAgentRuntime>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
-    single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    single_ctx: Option<Arc<ChannelAgentRuntime>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -7909,7 +7952,7 @@ impl AgentRouter {
         Self {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
-            single_ctx: Some(ctx),
+            single_ctx: Some(Arc::new(ChannelAgentRuntime::new(ctx))),
             sop_engine: None,
             sop_audit: None,
         }
@@ -7922,7 +7965,12 @@ impl AgentRouter {
         sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     ) -> Self {
         Self {
-            by_agent: Arc::new(by_agent),
+            by_agent: Arc::new(
+                by_agent
+                    .into_iter()
+                    .map(|(agent, ctx)| (agent, Arc::new(ChannelAgentRuntime::new(ctx))))
+                    .collect(),
+            ),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
             sop_engine,
@@ -7930,10 +7978,10 @@ impl AgentRouter {
         }
     }
 
-    fn resolve(
+    fn resolve_runtime(
         &self,
         msg: &zeroclaw_api::channel::ChannelMessage,
-    ) -> Option<Arc<ChannelRuntimeContext>> {
+    ) -> Option<Arc<ChannelAgentRuntime>> {
         if let Some(ctx) = &self.single_ctx {
             return Some(Arc::clone(ctx));
         }
@@ -8432,11 +8480,13 @@ async fn run_message_dispatch_loop(
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
         if let Some(gate_ctx) = gate_ctx {
-            let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
+            let gate_channel =
+                find_channel_for_message(&gate_ctx.ctx.channels_by_name, &msg).cloned();
             let gate_channel_route_keys = gate_channel
                 .as_ref()
                 .map(|target| {
                     let mut keys: Vec<String> = gate_ctx
+                        .ctx
                         .channels_by_name
                         .iter()
                         .filter(|&(_key, channel)| Arc::ptr_eq(channel, target))
@@ -8451,11 +8501,11 @@ async fn run_message_dispatch_loop(
                     keys
                 })
                 .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
-            let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+            let gate_prompt_channels = unique_channel_handles(&gate_ctx.ctx.channels_by_name);
             if dispatch_channel_sop_gate(
                 &router,
                 &msg,
-                gate_ctx.prompt_config.as_ref(),
+                gate_ctx.ctx.prompt_config.as_ref(),
                 &gate_prompt_channels,
                 &gate_channel_route_keys,
             )
@@ -8465,10 +8515,11 @@ async fn run_message_dispatch_loop(
             }
         }
 
-        let Some(ctx) = router.resolve(&msg) else {
+        let Some(agent_runtime) = router.resolve_runtime(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
             continue;
         };
+        let ctx = Arc::clone(&agent_runtime.ctx);
 
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
@@ -8533,6 +8584,8 @@ async fn run_message_dispatch_loop(
                     // to expire, then feeds the combined message through the normal
                     // worker path below.
                     let debounce_ctx = Arc::clone(&ctx);
+                    let debounce_foreground_sessions = is_matrix_channel_name(&msg.channel)
+                        .then(|| Arc::clone(&agent_runtime.foreground_sessions));
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
@@ -8555,6 +8608,7 @@ async fn run_message_dispatch_loop(
 
                         dispatch_worker(
                             debounce_ctx,
+                            debounce_foreground_sessions,
                             debounce_msg,
                             debounce_in_flight,
                             debounce_task_seq,
@@ -8580,10 +8634,20 @@ async fn run_message_dispatch_loop(
         };
 
         let worker_ctx = Arc::clone(&ctx);
+        let worker_foreground_sessions = is_matrix_channel_name(&msg.channel)
+            .then(|| Arc::clone(&agent_runtime.foreground_sessions));
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                worker_foreground_sessions,
+                msg,
+                in_flight,
+                task_sequence,
+                permit,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -14865,15 +14929,60 @@ temperature = 0.3
         let msg_clamps = channel_message("discord", Some("clamps"));
         let msg_glados = channel_message("discord", Some("glados"));
 
-        let resolved_clamps = router.resolve(&msg_clamps).expect("clamps resolves");
-        let resolved_glados = router.resolve(&msg_glados).expect("glados resolves");
+        let resolved_clamps = router
+            .resolve_runtime(&msg_clamps)
+            .expect("clamps resolves");
+        let resolved_glados = router
+            .resolve_runtime(&msg_glados)
+            .expect("glados resolves");
 
-        assert!(Arc::ptr_eq(&resolved_clamps, &clamps_ctx), "clamps routing");
-        assert!(Arc::ptr_eq(&resolved_glados, &glados_ctx), "glados routing");
         assert!(
-            !Arc::ptr_eq(&resolved_clamps, &resolved_glados),
+            Arc::ptr_eq(&resolved_clamps.ctx, &clamps_ctx),
+            "clamps routing"
+        );
+        assert!(
+            Arc::ptr_eq(&resolved_glados.ctx, &glados_ctx),
+            "glados routing"
+        );
+        assert!(
+            !Arc::ptr_eq(&resolved_clamps.ctx, &resolved_glados.ctx),
             "ctxs distinct"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_router_multi_shares_one_foreground_lease_across_an_agents_matrix_aliases() {
+        let ops_ctx = router_test_ctx();
+        let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+        by_agent.insert("ops".to_string(), ops_ctx);
+        let mut owners: HashMap<String, String> = HashMap::new();
+        owners.insert("matrix.primary".to_string(), "ops".to_string());
+        owners.insert("matrix.secondary".to_string(), "ops".to_string());
+        let router = AgentRouter::multi(by_agent, owners, None, None);
+
+        let primary = router
+            .resolve_runtime(&channel_message("matrix", Some("primary")))
+            .expect("primary resolves");
+        let secondary = router
+            .resolve_runtime(&channel_message("matrix", Some("secondary")))
+            .expect("secondary resolves");
+        let session = "matrix_ops_room_sender";
+        let primary_lease = primary
+            .foreground_sessions
+            .acquire(session)
+            .await
+            .expect("primary lease");
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                secondary.foreground_sessions.acquire(session),
+            )
+            .await
+            .is_err(),
+            "matrix aliases owned by one agent must contend on one foreground lease"
+        );
+        drop(primary_lease);
     }
 
     #[test]
@@ -14886,7 +14995,10 @@ temperature = 0.3
         let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let cli_msg = channel_message("cli", None);
-        assert!(router.resolve(&cli_msg).is_none(), "cli has no owner");
+        assert!(
+            router.resolve_runtime(&cli_msg).is_none(),
+            "cli has no owner"
+        );
     }
 
     #[test]
@@ -14899,8 +15011,8 @@ temperature = 0.3
         let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("notion", None);
-        let resolved = router.resolve(&msg).expect("notion resolves");
-        assert!(Arc::ptr_eq(&resolved, &notion_agent_ctx));
+        let resolved = router.resolve_runtime(&msg).expect("notion resolves");
+        assert!(Arc::ptr_eq(&resolved.ctx, &notion_agent_ctx));
     }
 
     #[test]
@@ -14925,8 +15037,10 @@ temperature = 0.3
         let router = AgentRouter::multi(by_agent, owners, None, None);
 
         let msg = channel_message("mattermost", Some("default"));
-        let resolved = router.resolve(&msg).expect("fallback owner resolves");
-        assert!(Arc::ptr_eq(&resolved, &legacy_ctx));
+        let resolved = router
+            .resolve_runtime(&msg)
+            .expect("fallback owner resolves");
+        assert!(Arc::ptr_eq(&resolved.ctx, &legacy_ctx));
     }
 
     #[test]
@@ -28723,7 +28837,7 @@ This is an example JSON object for profile settings."#;
         );
         assert!(
             router
-                .resolve(&channel_message("discord", Some("ops")))
+                .resolve_runtime(&channel_message("discord", Some("ops")))
                 .is_none(),
             "ordinary traffic on the approval-only alias must not reach the worker"
         );
@@ -33758,7 +33872,10 @@ Done."#;
             "test-provider",
             None,
         );
-        router.by_agent = Arc::new(HashMap::from([("worker".to_string(), gate_ctx)]));
+        router.by_agent = Arc::new(HashMap::from([(
+            "worker".to_string(),
+            Arc::new(ChannelAgentRuntime::new(gate_ctx)),
+        )]));
 
         let msg = ChannelMessage {
             channel: "test-channel".to_string(),
@@ -33769,7 +33886,7 @@ Done."#;
             ..ChannelMessage::new("1", "111222333", "room-1", "", "test-channel", 0)
         };
         assert!(
-            router.resolve(&msg).is_none(),
+            router.resolve_runtime(&msg).is_none(),
             "the configured approval route must not need an agent owner"
         );
 
