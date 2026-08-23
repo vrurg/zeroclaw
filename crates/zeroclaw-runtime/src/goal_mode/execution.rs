@@ -172,6 +172,69 @@ async fn finish_goal_or_retain_ownership(
     }
 }
 
+/// Persist and present a verified completion after its exact `Completed`
+/// transition has committed. History must be durable before external delivery;
+/// a failed append or send leaves the existing task delivery fact unset and
+/// never rewrites the completed lifecycle decision.
+async fn append_deliver_completed_goal(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+    session: &mut dyn GoalSessionLease,
+    candidate: &str,
+) {
+    // Terminal transitions fence the running executor by incrementing its
+    // epoch. Reload the exact completed record so delivery uses the durable
+    // post-transition epoch rather than the now-stale running epoch.
+    let Ok(Some(completed)) = goals
+        .current_goal_status_for_session(&scope.session_id)
+        .await
+    else {
+        return;
+    };
+    if completed.task.id != scope.task_id
+        || completed.task.status != TaskStatus::Completed
+        || completed.task.delivered
+    {
+        return;
+    }
+    let completion_epoch = completed.task.execution_epoch;
+    if session.append_verified_candidate(candidate).is_err() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"task_id": scope.task_id})),
+            "goal verified candidate history append failed"
+        );
+        return;
+    }
+    if session.deliver_verified_candidate(candidate).await.is_err() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"task_id": scope.task_id})),
+            "goal verified candidate delivery failed"
+        );
+        return;
+    }
+    match goals
+        .mark_completed_session_goal_delivered(&scope.task_id, &scope.session_id, completion_epoch)
+        .await
+    {
+        Ok(GoalTransitionResult::Applied) => {}
+        Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) | Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"task_id": scope.task_id})),
+                "goal completion delivery marking failed"
+            );
+        }
+    }
+}
+
 async fn exact_running_goal_requires_owner(
     goals: &Arc<dyn GoalTaskRegistry>,
     scope: &GoalExecutionScope,
@@ -1051,27 +1114,13 @@ impl GoalExecutor for GoalExecutionHost {
                             .await
                         {
                             Ok(GoalTransitionResult::Applied) => {
-                                if let Err(error) = session.append_verified_candidate(&candidate) {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note,
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(
-                                            ::serde_json::json!({
-                                                "task_id": scope.task_id,
-                                                "error": format!("{error:#}"),
-                                            })
-                                        ),
-                                        "goal verified candidate history append failed"
-                                    );
-                                }
-                                // Transport delivery is owned by the adapters
-                                // introduced later in the stack. Do not claim
-                                // the durable delivery fact merely because the
-                                // session-local history append succeeded.
+                                append_deliver_completed_goal(
+                                    &goals,
+                                    &scope,
+                                    session.as_mut(),
+                                    &candidate,
+                                )
+                                .await;
                             }
                             Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
                             | Err(_) => {}
@@ -1222,22 +1271,227 @@ impl GoalExecutor for GoalExecutionHost {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, atomic::Ordering},
+        sync::{Arc, Mutex, atomic::Ordering},
         time::Duration,
     };
 
     use super::{
-        GoalVerifierOutcome, INJECTED_GOAL_TRANSITION_ERRORS, exact_running_goal_requires_owner,
-        is_exact_running_goal_task, parse_goal_verifier_response, session_binding_for_task,
+        GoalVerifierOutcome, INJECTED_GOAL_TRANSITION_ERRORS, append_deliver_completed_goal,
+        exact_running_goal_requires_owner, is_exact_running_goal_task,
+        parse_goal_verifier_response, session_binding_for_task,
     };
     use crate::{
         control_plane::{
             GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
             GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskStatus,
         },
-        goal_mode::{GoalExecutionScope, GoalTurnKind},
+        goal_mode::{GoalExecutionScope, GoalSessionLease, GoalTurnKind},
     };
     use tokio::time::{sleep, timeout};
+    use zeroclaw_api::model_provider::ChatMessage;
+
+    struct RecordingDeliveryLease {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        append_fails: bool,
+        delivery_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalSessionLease for RecordingDeliveryLease {
+        fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _working_history: Vec<ChatMessage>,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+            anyhow::bail!("not used by delivery test")
+        }
+
+        fn append_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("append");
+            if self.append_fails {
+                anyhow::bail!("injected append failure")
+            }
+            Ok(())
+        }
+
+        async fn deliver_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("deliver");
+            if self.delivery_fails {
+                anyhow::bail!("injected delivery failure")
+            }
+            Ok(())
+        }
+    }
+
+    async fn completed_goal_for_delivery_test(
+        store: &Arc<SqliteTaskStore>,
+        scope: &GoalExecutionScope,
+    ) {
+        let task = TaskRecord {
+            id: scope.task_id.clone(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@alice:example.test".into()),
+            session_id: Some(scope.session_id.clone()),
+            execution_epoch: scope.execution_epoch,
+            started_at: "2026-08-23T00:00:00Z".into(),
+            finished_at: None,
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    task,
+                    GoalTaskRecord {
+                        task_id: scope.task_id.clone(),
+                        objective: "complete the objective".into(),
+                        success_criteria: "complete".into(),
+                        effective_token_limit: None,
+                        effective_cost_limit_usd: None,
+                        pause_reason: None,
+                        pause_description: None,
+                        blockers: Vec::new(),
+                        pending_call_id: None,
+                        pending_call_epoch: None,
+                        pending_reserved_tokens: None,
+                        pending_reserved_cost_usd: None,
+                        accounting_state: GoalAccountingState::Complete,
+                        resume_safety: GoalResumeSafety::Clean,
+                    },
+                )
+                .await
+                .expect("create delivery test goal"),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &scope.task_id,
+                    &scope.session_id,
+                    scope.execution_epoch,
+                    TaskStatus::Completed,
+                    None,
+                )
+                .await
+                .expect("complete delivery test goal"),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_completion_marks_delivery_only_after_append_and_send() {
+        let directory = tempfile::tempdir().expect("temporary control plane");
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
+        let scope = GoalExecutionScope {
+            task_id: "goal-delivery".into(),
+            session_id: "session-delivery".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        completed_goal_for_delivery_test(&store, &scope).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut session = RecordingDeliveryLease {
+            events: Arc::clone(&events),
+            append_fails: false,
+            delivery_fails: false,
+        };
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+
+        append_deliver_completed_goal(&goals, &scope, &mut session, "verified candidate").await;
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["append", "deliver"]);
+        assert!(
+            goals
+                .current_goal_status_for_session(&scope.session_id)
+                .await
+                .expect("read delivery test goal")
+                .expect("delivery test goal remains")
+                .task
+                .delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_history_append_prevents_delivery_marking() {
+        let directory = tempfile::tempdir().expect("temporary control plane");
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
+        let scope = GoalExecutionScope {
+            task_id: "goal-append-failure".into(),
+            session_id: "session-append-failure".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        completed_goal_for_delivery_test(&store, &scope).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut session = RecordingDeliveryLease {
+            events: Arc::clone(&events),
+            append_fails: true,
+            delivery_fails: false,
+        };
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+
+        append_deliver_completed_goal(&goals, &scope, &mut session, "verified candidate").await;
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["append"]);
+        assert!(
+            !goals
+                .current_goal_status_for_session(&scope.session_id)
+                .await
+                .expect("read delivery test goal")
+                .expect("delivery test goal remains")
+                .task
+                .delivered
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_keeps_completed_goal_undelivered() {
+        let directory = tempfile::tempdir().expect("temporary control plane");
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
+        let scope = GoalExecutionScope {
+            task_id: "goal-delivery-failure".into(),
+            session_id: "session-delivery-failure".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        completed_goal_for_delivery_test(&store, &scope).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut session = RecordingDeliveryLease {
+            events: Arc::clone(&events),
+            append_fails: false,
+            delivery_fails: true,
+        };
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+
+        append_deliver_completed_goal(&goals, &scope, &mut session, "verified candidate").await;
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["append", "deliver"]);
+        let current = goals
+            .current_goal_status_for_session(&scope.session_id)
+            .await
+            .expect("read delivery test goal")
+            .expect("delivery test goal remains");
+        assert_eq!(current.task.status, TaskStatus::Completed);
+        assert!(!current.task.delivered);
+    }
 
     #[test]
     fn task_binding_uses_the_exact_durable_route_and_principal() {
