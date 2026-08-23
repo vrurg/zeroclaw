@@ -125,6 +125,10 @@ use zeroclaw_runtime::agent::loop_::{
     scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
+use zeroclaw_runtime::goal_mode::{
+    GoalExecutionScope, GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding,
+    GoalSessionLease,
+};
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer};
 use zeroclaw_runtime::platform;
@@ -7940,13 +7944,153 @@ async fn dispatch_worker(
 struct ChannelAgentRuntime {
     ctx: Arc<ChannelRuntimeContext>,
     foreground_sessions: Arc<SessionActorQueue>,
+    goal_foreground_enabled: bool,
+}
+
+/// Durable channel-owned Matrix delivery route for a Goal session.
+///
+/// Goal Mode stores this opaque value in `TaskRecord::originator_route`.
+/// Runtime only compares it as a trusted binding; Matrix-specific decoding
+/// stays with the channel owner. The thread anchor is intentionally excluded:
+/// Matrix roots and their follow-ups share one canonical Goal session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixGoalRouteV1 {
+    version: u8,
+    channel_key: String,
+    reply_target: String,
+}
+
+impl MatrixGoalRouteV1 {
+    const VERSION: u8 = 1;
+
+    fn new(channel_key: String, reply_target: String) -> anyhow::Result<Self> {
+        if !is_matrix_goal_channel_key(&channel_key) || reply_target.trim().is_empty() {
+            anyhow::bail!("invalid Matrix Goal route");
+        }
+        Ok(Self {
+            version: Self::VERSION,
+            channel_key,
+            reply_target,
+        })
+    }
+
+    #[cfg(test)]
+    fn encode(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).context("encode Matrix Goal route")
+    }
+
+    fn decode(route: &str) -> anyhow::Result<Self> {
+        let parsed: Self = serde_json::from_str(route).context("decode Matrix Goal route")?;
+        if parsed.version != Self::VERSION {
+            anyhow::bail!("unsupported Matrix Goal route version");
+        }
+        Self::new(parsed.channel_key, parsed.reply_target)
+    }
+}
+
+fn is_matrix_goal_channel_key(channel_key: &str) -> bool {
+    channel_key == "matrix"
+        || channel_key
+            .strip_prefix("matrix.")
+            .is_some_and(|alias| !alias.trim().is_empty())
+}
+
+#[cfg(test)]
+#[test]
+fn matrix_goal_route_round_trips_alias_and_room_without_thread_state() {
+    let route = MatrixGoalRouteV1::new(
+        "matrix.primary".to_string(),
+        "!room:example.test".to_string(),
+    )
+    .unwrap();
+    let encoded = route.encode().unwrap();
+    assert_eq!(MatrixGoalRouteV1::decode(&encoded).unwrap(), route);
+    assert!(MatrixGoalRouteV1::decode("not-a-route").is_err());
+    assert!(MatrixGoalRouteV1::new("discord.primary".to_string(), "room".to_string()).is_err());
+}
+
+/// Stable channel-session adapter registered with the daemon-owned Goal host.
+///
+/// It holds only the currently active channel generation. Route ownership,
+/// agent runtime state, history, queues, and channel handles remain owned by
+/// that generation's [`AgentRouter`]. Failed preparation never publishes a
+/// generation, preserving the channel supervisor's retry semantics.
+#[derive(Clone, Default)]
+pub struct ChannelGoalSessionAdapter {
+    generation: Arc<RwLock<Option<Arc<AgentRouter>>>>,
+}
+
+impl ChannelGoalSessionAdapter {
+    /// Construct an unbound adapter for one daemon generation.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn publish_generation(&self, router: Arc<AgentRouter>) {
+        *self.generation.write() = Some(router);
+    }
+
+    fn clear_generation(&self, router: &Arc<AgentRouter>) {
+        let mut active = self.generation.write();
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, router))
+        {
+            *active = None;
+        }
+    }
+
+    fn runtime_for_binding(
+        &self,
+        binding: &GoalSessionBinding,
+    ) -> anyhow::Result<Arc<ChannelAgentRuntime>> {
+        let route = MatrixGoalRouteV1::decode(binding.route())?;
+        let Some(router) = self.generation.read().as_ref().cloned() else {
+            anyhow::bail!("channel Goal adapter has no active generation");
+        };
+        router
+            .resolve_goal_runtime(binding.agent(), &route.channel_key)
+            .ok_or_else(|| anyhow::anyhow!("Matrix Goal binding is not owned by this generation"))
+    }
+}
+
+#[async_trait::async_trait]
+impl GoalSessionAdapter for ChannelGoalSessionAdapter {
+    fn owns(&self, binding: &GoalSessionBinding) -> bool {
+        binding
+            .principal_id()
+            .is_some_and(|principal| !principal.trim().is_empty())
+            && self.runtime_for_binding(binding).is_ok()
+    }
+
+    async fn model_binding(
+        &self,
+        binding: &GoalSessionBinding,
+    ) -> anyhow::Result<GoalHostModelBinding> {
+        let runtime = self.runtime_for_binding(binding)?;
+        Ok(GoalHostModelBinding {
+            provider_ref: runtime.ctx.model_provider_ref.as_str().to_string(),
+            model: runtime.ctx.model.as_str().to_string(),
+        })
+    }
+
+    async fn acquire(
+        &self,
+        _scope: &GoalExecutionScope,
+        _binding: &GoalSessionBinding,
+    ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+        anyhow::bail!("Matrix Goal execution lease is not wired")
+    }
 }
 
 impl ChannelAgentRuntime {
     fn new(ctx: Arc<ChannelRuntimeContext>) -> Self {
+        let goal_foreground_enabled = ctx.prompt_config.goal.enabled;
         Self {
             ctx,
             foreground_sessions: Arc::new(SessionActorQueue::new(32, 30, 600)),
+            goal_foreground_enabled,
         }
     }
 }
@@ -8015,6 +8159,18 @@ impl AgentRouter {
             return Some(Arc::clone(ctx));
         }
         None
+    }
+
+    fn resolve_goal_runtime(
+        &self,
+        agent: &str,
+        channel_key: &str,
+    ) -> Option<Arc<ChannelAgentRuntime>> {
+        self.owner_by_channel_key
+            .get(channel_key)
+            .filter(|owner| owner.as_str() == agent)
+            .and_then(|_| self.by_agent.get(agent))
+            .cloned()
     }
 }
 
@@ -8598,8 +8754,9 @@ async fn run_message_dispatch_loop(
                     // to expire, then feeds the combined message through the normal
                     // worker path below.
                     let debounce_ctx = Arc::clone(&ctx);
-                    let debounce_foreground_sessions = is_matrix_channel_name(&msg.channel)
-                        .then(|| Arc::clone(&agent_runtime.foreground_sessions));
+                    let debounce_foreground_sessions = (agent_runtime.goal_foreground_enabled
+                        && is_matrix_channel_name(&msg.channel))
+                    .then(|| Arc::clone(&agent_runtime.foreground_sessions));
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
@@ -8648,8 +8805,9 @@ async fn run_message_dispatch_loop(
         };
 
         let worker_ctx = Arc::clone(&ctx);
-        let worker_foreground_sessions = is_matrix_channel_name(&msg.channel)
-            .then(|| Arc::clone(&agent_runtime.foreground_sessions));
+        let worker_foreground_sessions = (agent_runtime.goal_foreground_enabled
+            && is_matrix_channel_name(&msg.channel))
+        .then(|| Arc::clone(&agent_runtime.foreground_sessions));
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
@@ -12055,7 +12213,7 @@ pub struct PreparedChannels {
 enum PreparedChannelsState {
     WaitingForReload,
     Ready {
-        router: AgentRouter,
+        router: Arc<AgentRouter>,
         configured_channels: Vec<ConfiguredChannel>,
         initial_backoff_secs: u64,
         max_backoff_secs: u64,
@@ -12093,7 +12251,7 @@ impl PreparedChannels {
                 }
                 drop(tx);
 
-                run_message_dispatch_loop(rx, router.clone(), *max_in_flight).await;
+                run_message_dispatch_loop(rx, router.as_ref().clone(), *max_in_flight).await;
 
                 for handle in listener_handles {
                     let _ = handle.await;
@@ -12101,6 +12259,33 @@ impl PreparedChannels {
 
                 Ok(())
             }
+        }
+    }
+
+    /// Run this prepared generation while publishing it to the stable Goal
+    /// adapter immediately before listeners accept inbound work.
+    ///
+    /// A failed preparation cannot reach this method. When the supervised
+    /// listener exits, only this exact generation is cleared, so an older
+    /// supervisor attempt cannot erase a replacement generation.
+    pub async fn run_with_goal_adapter(
+        &self,
+        adapter: &ChannelGoalSessionAdapter,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let Some(router) = self.goal_router() else {
+            return self.run(cancel).await;
+        };
+        adapter.publish_generation(Arc::clone(&router));
+        let result = self.run(cancel).await;
+        adapter.clear_generation(&router);
+        result
+    }
+
+    fn goal_router(&self) -> Option<Arc<AgentRouter>> {
+        match &self.state {
+            PreparedChannelsState::WaitingForReload => None,
+            PreparedChannelsState::Ready { router, .. } => Some(Arc::clone(router)),
         }
     }
 }
@@ -12850,7 +13035,7 @@ pub async fn prepare_channels(
     // registered before any inbound work is accepted.
     Ok(PreparedChannels {
         state: PreparedChannelsState::Ready {
-            router,
+            router: Arc::new(router),
             configured_channels: configured_channels_for_listeners
                 .expect("configured channels initialized on first agent's channel setup"),
             initial_backoff_secs: config
@@ -15080,6 +15265,21 @@ temperature = 0.3
             "matrix aliases owned by one agent must contend on one foreground lease"
         );
         drop(primary_lease);
+    }
+
+    #[test]
+    fn channel_goal_foreground_queue_stays_disabled_by_default() {
+        let disabled = ChannelAgentRuntime::new(router_test_ctx());
+        assert!(!disabled.goal_foreground_enabled);
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        let enabled_ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(config),
+            ..(*router_test_ctx()).clone()
+        });
+        let enabled = ChannelAgentRuntime::new(enabled_ctx);
+        assert!(enabled.goal_foreground_enabled);
     }
 
     #[test]
