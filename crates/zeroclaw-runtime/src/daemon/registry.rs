@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
+use crate::goal_mode::GoalSessionAdapter;
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
@@ -64,6 +65,9 @@ pub struct DaemonRegistry {
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
+    /// Immutable transport/session owners supplied before the daemon begins
+    /// listener supervision for this generation.
+    goal_session_adapters: Vec<Arc<dyn GoalSessionAdapter>>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
@@ -120,6 +124,17 @@ impl DaemonRegistry {
         self
     }
 
+    /// Register one non-RPC live-session owner for the daemon-generation Goal
+    /// host. The daemon owns the resulting adapter router; registrations are
+    /// consumed before any listener begins accepting work.
+    pub fn register_goal_session_adapter(
+        &mut self,
+        adapter: Arc<dyn GoalSessionAdapter>,
+    ) -> &mut Self {
+        self.goal_session_adapters.push(adapter);
+        self
+    }
+
     #[cfg(test)]
     fn has_mqtt_start(&self) -> bool {
         self.mqtt_start.is_some()
@@ -143,6 +158,15 @@ impl DaemonRegistry {
 
     pub(crate) fn take_mqtt_start(&mut self) -> Option<MqttStarter> {
         self.mqtt_start.take()
+    }
+
+    pub(crate) fn take_goal_session_adapters(&mut self) -> Vec<Arc<dyn GoalSessionAdapter>> {
+        std::mem::take(&mut self.goal_session_adapters)
+    }
+
+    #[cfg(test)]
+    fn goal_session_adapter_count(&self) -> usize {
+        self.goal_session_adapters.len()
     }
 
     /// Set the shared SOP engine for this daemon iteration.
@@ -169,6 +193,36 @@ impl DaemonRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goal_mode::{
+        GoalExecutionScope, GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding,
+        GoalSessionLease,
+    };
+    use anyhow::bail;
+    use async_trait::async_trait;
+
+    struct TestGoalSessionAdapter;
+
+    #[async_trait]
+    impl GoalSessionAdapter for TestGoalSessionAdapter {
+        fn owns(&self, _binding: &GoalSessionBinding) -> bool {
+            false
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            bail!("test adapter does not resolve model bindings")
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            bail!("test adapter does not acquire leases")
+        }
+    }
 
     fn gateway_starter() -> GatewayStarter {
         Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
@@ -239,5 +293,16 @@ mod tests {
         assert!(!registry.has_socket_start());
         assert!(!registry.has_wss_start());
         assert!(!registry.has_mqtt_start());
+    }
+
+    #[test]
+    fn goal_adapter_slots_are_separate_from_component_starters() {
+        let mut registry = DaemonRegistry::new();
+
+        assert_eq!(registry.goal_session_adapter_count(), 0);
+        registry.register_goal_session_adapter(Arc::new(TestGoalSessionAdapter));
+        assert_eq!(registry.goal_session_adapter_count(), 1);
+        assert_eq!(registry.take_goal_session_adapters().len(), 1);
+        assert_eq!(registry.goal_session_adapter_count(), 0);
     }
 }

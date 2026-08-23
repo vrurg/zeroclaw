@@ -135,10 +135,10 @@ pub struct RpcContext {
     /// Cost tracking. `None` when cost tracking is disabled.
     pub cost_tracker: Option<Arc<CostTracker>>,
 
-    /// Dormant Goal executor bound to the same canonical RPC session owner.
-    /// Command adapters are introduced separately; this field only keeps the
-    /// execution owner attached to daemon lifecycle state.
-    pub goal_executor: Option<Arc<dyn crate::goal_mode::GoalExecutor>>,
+    /// Dormant Goal controller shared with every trusted command surface.
+    /// Command adapters are introduced separately; this field keeps the
+    /// daemon-owned controller attached to the canonical RPC session owner.
+    pub goal_runtime: Option<Arc<crate::goal_mode::GoalRuntime>>,
 
     /// Daemon-wide event broadcast. RPC handlers subscribe to forward
     /// events as JSON-RPC notifications (`logs/subscribe`).
@@ -189,7 +189,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -211,7 +211,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -237,7 +237,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: Some(event_tx),
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -263,7 +263,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -289,7 +289,7 @@ impl RpcContext {
             session_backend: None,
             memory: Some(memory),
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -315,7 +315,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: Some(cost_tracker),
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -342,7 +342,7 @@ impl RpcContext {
             session_backend,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx: None,
             gateway_shutdown_tx: None,
@@ -369,7 +369,7 @@ impl RpcContext {
             session_backend: None,
             memory: None,
             cost_tracker: None,
-            goal_executor: None,
+            goal_runtime: None,
             event_tx: None,
             reload_tx,
             gateway_shutdown_tx,

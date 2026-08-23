@@ -604,89 +604,99 @@ pub async fn run(
         crate::health::mark_component_ok("control-plane");
     }
 
-    if let Some(channels_start) = registry.take_channels_start() {
-        if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
-            let channels_start = std::sync::Arc::new(channels_start);
-            let cancel_for_supervisor = channels_cancel.clone();
-            handles.push(spawn_component_supervisor(
-                "channels",
-                initial_backoff,
-                max_backoff,
-                channels_cancel.clone(),
-                move || {
-                    let cfg = channels_cfg.clone();
-                    let start = channels_start.clone();
-                    let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
-                },
-            ));
-        } else {
-            crate::health::mark_component_ok("channels");
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "No channels configured; channel supervisor disabled"
-            );
-        }
-    } else {
-        crate::health::mark_component_ok("channels");
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Channels subsystem not wired; channel supervisor disabled"
-        );
-    }
-
     // RPC transports: Unix socket and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
+    let rpc_sessions = if need_rpc_ctx {
+        use crate::rpc::session::SessionStore;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let session_queue = std::sync::Arc::new(SessionActorQueue::new(32, 30, 600));
+        let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue.clone()));
+        let reaper_queue = std::sync::Arc::clone(&session_queue);
+        zeroclaw_spawn::spawn!(async move {
+            const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+            let mut interval = tokio::time::interval(TICK);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let queue_evicted = reaper_queue.evict_idle().await;
+                if queue_evicted > 0 {
+                    let span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        channel = "rpc",
+                    );
+                    let _guard = span.enter();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "evicted_queue_slots": queue_evicted,
+                            })),
+                        "Session queue: released idle actor-queue slots"
+                    );
+                    crate::util::release_freed_heap();
+                }
+            }
+        });
+        Some(sessions)
+    } else {
+        None
+    };
+
+    let mut goal_session_adapters = registry.take_goal_session_adapters();
+    if let Some(sessions) = &rpc_sessions {
+        goal_session_adapters.push(std::sync::Arc::new(
+            crate::goal_mode::RpcGoalSessionAdapter::new(std::sync::Arc::clone(sessions)),
+        ));
+    }
+    let goal_cost_tracker = if config.goal.enabled {
+        crate::cost::CostTracker::get_or_init_global_for_goal(config.cost.clone(), &config.data_dir)
+    } else {
+        None
+    };
+    let goal_runtime = crate::control_plane::control_plane()
+        .zip(goal_cost_tracker.as_ref())
+        .and_then(|(control_plane, cost_tracker)| {
+            let executor: std::sync::Arc<dyn crate::goal_mode::GoalExecutor> =
+                std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                    goal_session_adapters,
+                    std::sync::Arc::clone(&control_plane.goals),
+                    std::sync::Arc::new(config.clone()),
+                    std::sync::Arc::clone(cost_tracker),
+                ));
+            match crate::goal_mode::GoalRuntime::new(
+                std::sync::Arc::new(config.clone()),
+                std::sync::Arc::clone(&control_plane.goals),
+                std::sync::Arc::clone(cost_tracker),
+                executor,
+                control_plane.boot_id.clone(),
+            ) {
+                Ok(runtime) => Some(std::sync::Arc::new(runtime)),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": error.to_string() })),
+                        "Goal runtime is unavailable for this daemon generation"
+                    );
+                    None
+                }
+            }
+        });
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
-        use crate::rpc::session::SessionStore;
-        use zeroclaw_infra::session_queue::SessionActorQueue;
-
-        let session_queue = std::sync::Arc::new(SessionActorQueue::new(32, 30, 600));
-        let sessions = std::sync::Arc::new(SessionStore::new(64, session_queue.clone()));
-
-        {
-            let reaper_queue = std::sync::Arc::clone(&session_queue);
-            zeroclaw_spawn::spawn!(async move {
-                const TICK: std::time::Duration = std::time::Duration::from_secs(60);
-                let mut interval = tokio::time::interval(TICK);
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    let queue_evicted = reaper_queue.evict_idle().await;
-                    if queue_evicted > 0 {
-                        let span = ::zeroclaw_log::info_span!(
-                            target: "zeroclaw_log_internal_scope",
-                            "zeroclaw_scope",
-                            channel = "rpc",
-                        );
-                        let _guard = span.enter();
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note,
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_attrs(::serde_json::json!({
-                                "evicted_queue_slots": queue_evicted,
-                            })),
-                            "Session queue: released idle actor-queue slots"
-                        );
-                        crate::util::release_freed_heap();
-                    }
-                }
-            });
-        }
+        let Some(sessions) = rpc_sessions.as_ref().cloned() else {
+            anyhow::bail!("RPC session store is unavailable");
+        };
         let session_backend = zeroclaw_infra::make_session_backend(
             &config.data_dir,
             &config.channels.session_backend,
@@ -741,30 +751,9 @@ pub async fn run(
             None
         };
 
-        let cost_tracker = if config.goal.enabled {
-            crate::cost::CostTracker::get_or_init_global_for_goal(
-                config.cost.clone(),
-                &config.data_dir,
-            )
-        } else {
+        let cost_tracker = goal_cost_tracker.clone().or_else(|| {
             crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-        };
-        let goal_executor = crate::control_plane::control_plane()
-            .zip(cost_tracker.as_ref())
-            .map(|(control_plane, cost_tracker)| {
-                let executor: std::sync::Arc<dyn crate::goal_mode::GoalExecutor> =
-                    std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
-                        vec![std::sync::Arc::new(
-                            crate::goal_mode::RpcGoalSessionAdapter::new(std::sync::Arc::clone(
-                                &sessions,
-                            )),
-                        )],
-                        std::sync::Arc::clone(&control_plane.goals),
-                        std::sync::Arc::new(config.clone()),
-                        std::sync::Arc::clone(cost_tracker),
-                    ));
-                executor
-            });
+        });
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -775,7 +764,7 @@ pub async fn run(
             // supervisor. Without this the RPC/zerocode-TUI turn path has no
             // tracker to record into and model cost is silently dropped
             cost_tracker,
-            goal_executor,
+            goal_runtime: goal_runtime.clone(),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
@@ -791,6 +780,40 @@ pub async fn run(
     } else {
         None
     };
+
+    if let Some(channels_start) = registry.take_channels_start() {
+        if has_supervised_channels(&config) {
+            let channels_cfg = config.clone();
+            let channels_start = std::sync::Arc::new(channels_start);
+            let cancel_for_supervisor = channels_cancel.clone();
+            handles.push(spawn_component_supervisor(
+                "channels",
+                initial_backoff,
+                max_backoff,
+                channels_cancel.clone(),
+                move || {
+                    let cfg = channels_cfg.clone();
+                    let start = channels_start.clone();
+                    let cancel = cancel_for_supervisor.clone();
+                    async move { start(cfg, cancel).await }
+                },
+            ));
+        } else {
+            crate::health::mark_component_ok("channels");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "No channels configured; channel supervisor disabled"
+            );
+        }
+    } else {
+        crate::health::mark_component_ok("channels");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Channels subsystem not wired; channel supervisor disabled"
+        );
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
@@ -1007,6 +1030,11 @@ pub async fn run(
     for handle in remaining {
         let _ = handle.await;
     }
+
+    // Keep the daemon-generation Goal controller alive until every component
+    // has stopped. Later lifecycle cutover work will fence and quiesce owned
+    // Goal executors before this generation is released.
+    drop(goal_runtime);
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
