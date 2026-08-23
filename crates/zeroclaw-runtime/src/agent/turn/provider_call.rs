@@ -250,13 +250,11 @@ pub(crate) async fn call_provider(
                                 if terminal.policy.usage_chargeability()
                                     == zeroclaw_providers::TerminalUsageChargeability::Billable
                                     && let Some(usage) = terminal.failure.usage.clone()
-                                    && !scope.record_rejected_stream_usage(usage.clone())
                                 {
-                                    record_rejected_tool_loop_cost_usage(
-                                        ctx.provider_name,
-                                        ctx.model,
-                                        &usage,
-                                    );
+                                    // Reliable owns its task-local rejected-attempt handoff.
+                                    // A direct no-replay failure reaches the outer turn error
+                                    // boundary, which is its one accounting owner.
+                                    let _ = scope.record_rejected_stream_usage(usage);
                                 }
                                 if terminal.policy.recovery()
                                     == zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
@@ -713,6 +711,7 @@ mod streaming_fallback_tests {
 
     struct DirectTerminalStreamProvider {
         non_stream_calls: AtomicUsize,
+        usage: TokenUsage,
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -930,8 +929,9 @@ mod streaming_fallback_tests {
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             Box::pin(futures_util::stream::iter(vec![Err(
                 zeroclaw_api::model_provider::StreamError::TerminalCompletion(
-                    zeroclaw_api::model_provider::TerminalCompletionFailure::from(
+                    zeroclaw_api::model_provider::TerminalCompletionFailure::new(
                         zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        Some(self.usage.clone()),
                     ),
                 ),
             )]))
@@ -1000,6 +1000,11 @@ mod streaming_fallback_tests {
     async fn direct_terminal_stream_without_reliable_candidate_never_replays() {
         let provider = DirectTerminalStreamProvider {
             non_stream_calls: AtomicUsize::new(0),
+            usage: TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            },
         };
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
@@ -1025,19 +1030,38 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let error = call_provider(
-            &ctx,
-            &provider,
-            "test-model",
-            &[ChatMessage::user("go")],
-            None,
-            true,
-            0,
-        )
-        .await
-        .expect("dispatch returns the terminal provider outcome")
-        .chat_result
-        .expect_err("a direct provider has no exact fallback candidate");
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let (error, before_outer_accounting, recorded) = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), async {
+                    let error = call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await
+                    .expect("dispatch returns the terminal provider outcome")
+                    .chat_result
+                    .expect_err("a direct provider has no exact fallback candidate");
+                    let before_outer_accounting = *turn_usage.lock();
+                    let usage = super::super::execution::rejected_terminal_usage(&error)
+                        .expect("outer turn can recover the typed terminal usage")
+                        .clone();
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        "direct-provider",
+                        "test-model",
+                        &usage,
+                    );
+                    (error, before_outer_accounting, *turn_usage.lock())
+                }),
+            )
+            .await;
 
         assert_eq!(
             zeroclaw_api::model_provider::terminal_completion_error(&error),
@@ -1048,6 +1072,12 @@ mod streaming_fallback_tests {
             0,
             "missing Reliable candidate identity must not replay the request"
         );
+        assert_eq!(before_outer_accounting.input_tokens, 0);
+        assert_eq!(before_outer_accounting.output_tokens, 0);
+        assert_eq!(before_outer_accounting.last_input_tokens, 0);
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.last_input_tokens, 0);
     }
 
     #[tokio::test]
