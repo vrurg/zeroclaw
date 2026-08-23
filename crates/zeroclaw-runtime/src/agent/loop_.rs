@@ -1002,6 +1002,51 @@ pub use super::turn::{
     thinking_status_round, thinking_status_text,
 };
 
+/// Run one Goal-owned parent turn with the controller's fixed loop envelope.
+///
+/// Live-session adapters resolve their own model, tools, approval policy, and
+/// canonical-history prefix into `exec`. This helper keeps the Goal-only
+/// execution rules in one place: no transport delivery, memory injection,
+/// steering, receipts, or SOP reassembly; cancellation remains scoped to the
+/// exact Goal epoch; and provider usage is collected through the Goal's
+/// task-local accounting path.
+pub async fn run_goal_parent_tool_loop(
+    exec: ResolvedAgentExecution<'_>,
+    history: &mut Vec<ChatMessage>,
+    channel_name: &str,
+    cancellation: CancellationToken,
+    image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    agent_alias: Option<&str>,
+) -> Result<String> {
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .scope(
+            Some(ToolLoopCostTrackingContext::usage_only()),
+            run_tool_call_loop(ToolLoop {
+                exec,
+                history,
+                channel_name,
+                channel_reply_target: None,
+                cancellation_token: Some(cancellation),
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache,
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                agent_alias,
+                parent_agent_alias: None,
+                turn_id: &turn_id,
+                sop_reassembly: None,
+            }),
+        )
+        .await
+}
+
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
 pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {

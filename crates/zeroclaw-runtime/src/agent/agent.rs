@@ -1128,7 +1128,6 @@ impl Agent {
         mut working_history: Vec<ChatMessage>,
         cancellation: CancellationToken,
     ) -> Result<(String, Vec<ChatMessage>)> {
-        let turn_id = Self::new_turn_id();
         let effective_model = self.model_name.clone();
         let tool_protocol_prompts = self.tool_protocol_prompts()?;
         let knobs = crate::agent::loop_::LoopKnobs {
@@ -1146,10 +1145,10 @@ impl Agent {
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>();
-        let turn_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-            Some(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()),
-            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+        let response = crate::agent::turn::scope_tool_protocol_prompts(
+            Arc::clone(&tool_protocol_prompts),
+            crate::agent::loop_::run_goal_parent_tool_loop(
+                crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: self.model_provider.as_ref(),
                         provider_name: &self.model_provider_name,
@@ -1183,30 +1182,12 @@ impl Agent {
                         knobs: &knobs,
                     },
                 ),
-                history: &mut working_history,
-                channel_name: &self.channel_name,
-                channel_reply_target: None,
-                cancellation_token: Some(cancellation),
-                on_delta: None,
-                shared_budget: None,
-                channel: None,
-                collected_receipts: None,
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: Some(&mut self.image_cache),
-                memory: None,
-                ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                agent_alias: agent_alias_for_loop.as_deref(),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-                sop_reassembly: None,
-            }),
-        );
-        let turn_loop = Box::pin(turn_loop);
-        let response = crate::agent::turn::scope_tool_protocol_prompts(
-            Arc::clone(&tool_protocol_prompts),
-            turn_loop,
+                &mut working_history,
+                &self.channel_name,
+                cancellation,
+                Some(&mut self.image_cache),
+                agent_alias_for_loop.as_deref(),
+            ),
         )
         .await?;
         Ok((response, working_history))
