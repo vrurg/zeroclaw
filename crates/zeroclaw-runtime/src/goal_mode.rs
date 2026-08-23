@@ -15,8 +15,8 @@ use zeroclaw_config::{cost::CostTracker, schema::Config};
 
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalResumeSafety,
-    GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult, TaskKind, TaskRecord,
-    TaskStatus,
+    GoalSessionFence, GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult,
+    TaskKind, TaskRecord, TaskStatus,
 };
 
 mod execution;
@@ -925,7 +925,7 @@ impl GoalRuntime {
             .list_nonterminal_goal_statuses()
             .await
             .map_err(GoalRuntimeError::control_plane)?;
-        let mut cancelled = 0;
+        let mut affected = Vec::new();
         for current in nonterminal
             .into_iter()
             .filter(|current| matches_revoked_policy(&current.task))
@@ -940,41 +940,46 @@ impl GoalRuntime {
                     "nonterminal Goal has an empty durable session binding during policy revocation",
                 )));
             }
-            match self
-                .goals
-                .finish_session_goal(
+            affected.push(current);
+        }
+        if affected.is_empty() {
+            return Ok(0);
+        }
+
+        let fences = affected
+            .iter()
+            .map(|current| {
+                let session_id = current.task.session_id.as_deref().ok_or_else(|| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "nonterminal Goal lost its durable session binding during policy revocation",
+                    ))
+                })?;
+                Ok(GoalSessionFence::new(
                     &current.task.id,
                     session_id,
                     current.task.execution_epoch,
-                    TaskStatus::Cancelled,
-                    Some("goal_policy_revoked".into()),
-                )
-                .await
-                .map_err(GoalRuntimeError::control_plane)?
-            {
-                GoalTransitionResult::Applied => {
-                    self.quiesce_exact_goal(&current.task, session_id).await?;
-                    cancelled += 1;
+                ))
+            })
+            .collect::<Result<Vec<_>, GoalRuntimeError>>()?;
+        match self
+            .goals
+            .cancel_session_goals(&fences, "goal_policy_revoked")
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied => {
+                for (current, fence) in affected.iter().zip(&fences) {
+                    self.quiesce_exact_goal(&current.task, &fence.session_id)
+                        .await?;
                 }
-                GoalTransitionResult::Missing => {}
-                GoalTransitionResult::Stale => {
-                    let still_nonterminal = self
-                        .goals
-                        .current_goal_status_for_session(session_id)
-                        .await
-                        .map_err(GoalRuntimeError::control_plane)?
-                        .is_some_and(|latest| {
-                            latest.task.id == current.task.id && !latest.task.status.is_terminal()
-                        });
-                    if still_nonterminal {
-                        return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
-                            "nonterminal Goal changed while policy revocation was fencing it",
-                        )));
-                    }
-                }
+                Ok(affected.len())
+            }
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "Goal policy revocation did not commit atomically",
+                )))
             }
         }
-        Ok(cancelled)
     }
 
     async fn pause_session_for_reason(

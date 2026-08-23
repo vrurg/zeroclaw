@@ -3,8 +3,9 @@
 use std::sync::{Arc, Barrier};
 
 use zeroclaw_runtime::control_plane::{
-    ControlPlaneHandle, GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
-    GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    ControlPlaneHandle, GoalAccountingState, GoalResumeSafety, GoalSessionFence, GoalTaskRecord,
+    GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry,
+    TaskStatus,
 };
 
 fn session_goal(id: &str, session_id: &str) -> (TaskRecord, GoalTaskRecord) {
@@ -169,6 +170,58 @@ async fn running_goal_enumeration_excludes_paused_terminal_and_unrelated_tasks()
     assert_eq!(running.len(), 1);
     assert_eq!(running[0].task.id, "running-goal");
     assert_eq!(running[0].task.execution_epoch, 1);
+}
+
+#[tokio::test]
+async fn policy_revocation_cancels_all_exact_goals_or_rolls_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (first, first_goal) = session_goal("policy-first", "session-policy-first");
+    let (second, second_goal) = session_goal("policy-second", "session-policy-second");
+    store
+        .create_or_replace_session_goal(first, first_goal)
+        .await
+        .unwrap();
+    store
+        .create_or_replace_session_goal(second, second_goal)
+        .await
+        .unwrap();
+
+    let first_fence = GoalSessionFence::new("policy-first", "session-policy-first", 1);
+    let missing_fence = GoalSessionFence::new("missing-goal", "session-policy-missing", 1);
+    assert_eq!(
+        store
+            .cancel_session_goals(&[first_fence.clone(), missing_fence], "goal_policy_revoked",)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Missing,
+        "a failed batch must not leave an earlier exact Goal cancelled"
+    );
+    let first_after_rollback = store
+        .current_goal_for_session("session-policy-first")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_after_rollback.status, TaskStatus::Running);
+    assert_eq!(first_after_rollback.execution_epoch, 1);
+
+    let second_fence = GoalSessionFence::new("policy-second", "session-policy-second", 1);
+    assert_eq!(
+        store
+            .cancel_session_goals(&[first_fence, second_fence], "goal_policy_revoked",)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    for session_id in ["session-policy-first", "session-policy-second"] {
+        let goal = store
+            .current_goal_for_session(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, TaskStatus::Cancelled);
+        assert_eq!(goal.execution_epoch, 2);
+    }
 }
 
 #[tokio::test]

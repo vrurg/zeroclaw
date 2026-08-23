@@ -87,6 +87,32 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// Exact durable Goal fence used by one atomic policy-revocation transition.
+///
+/// The lifecycle owner derives these values from canonical Goal rows before
+/// policy cutover. The store checks every fence in one transaction so a
+/// failed cutover cannot leave only a prefix of the affected Goals cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalSessionFence {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+}
+
+impl GoalSessionFence {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        execution_epoch: i64,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            execution_epoch,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -418,6 +444,14 @@ pub trait GoalTaskRegistry: Send + Sync {
         expected_epoch: i64,
         status: TaskStatus,
         error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Atomically cancel exact nonterminal Goal fences during one policy
+    /// cutover. A stale or missing fence rolls back every earlier transition.
+    async fn cancel_session_goals(
+        &self,
+        fences: &[GoalSessionFence],
+        error: &str,
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Guard one serialized logical provider operation admission.

@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalResumeSafety,
-    GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult,
+    GoalSessionFence, GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalTransitionResult,
     TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
@@ -1396,6 +1396,53 @@ impl GoalTaskRegistry for SqliteTaskStore {
         } else {
             goal_transition_absence(&conn, task_id)
         }
+    }
+
+    async fn cancel_session_goals(
+        &self,
+        fences: &[GoalSessionFence],
+        error: &str,
+    ) -> Result<GoalTransitionResult> {
+        if fences.is_empty() {
+            return Ok(GoalTransitionResult::Applied);
+        }
+        if error.trim().is_empty() {
+            anyhow::bail!("policy revocation requires a nonempty terminal error");
+        }
+        let mut seen = std::collections::HashSet::with_capacity(fences.len());
+        if fences.iter().any(|fence| !seen.insert(&fence.task_id)) {
+            anyhow::bail!("policy revocation contains a duplicate Goal task fence");
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic Goal policy revocation")?;
+        for fence in fences {
+            let changed = tx.execute(
+                "UPDATE tasks
+                    SET status = 'cancelled', error = COALESCE(?4, error),
+                        finished_at = COALESCE(finished_at, ?5),
+                        execution_epoch = execution_epoch + 1
+                  WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                    AND execution_epoch = ?3 AND execution_epoch < 9223372036854775807
+                    AND status IN ('running','paused')
+                    AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = tasks.id)",
+                params![
+                    &fence.task_id,
+                    &fence.session_id,
+                    fence.execution_epoch,
+                    error,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            if changed != 1 {
+                return goal_transition_absence(&tx, &fence.task_id);
+            }
+        }
+        tx.commit()
+            .context("commit atomic Goal policy revocation")?;
+        Ok(GoalTransitionResult::Applied)
     }
 
     async fn admit_pending_call(
