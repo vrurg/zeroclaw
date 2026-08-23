@@ -7846,27 +7846,6 @@ async fn dispatch_worker(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
-    let _foreground_lease = match foreground_sessions {
-        Some(foreground_sessions) if is_matrix_channel_name(&msg.channel) => {
-            match foreground_sessions
-                .acquire(&conversation_history_key(&msg))
-                .await
-            {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                        "matrix foreground session lease is unavailable"
-                    );
-                    return;
-                }
-            }
-        }
-        _ => None,
-    };
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
@@ -7901,6 +7880,41 @@ async fn dispatch_worker(
             previous.completion.wait().await;
         }
     }
+
+    // Install and apply interruption before waiting for the Matrix foreground
+    // lease. A newer same-session message must be able to cancel an active
+    // worker rather than wait behind its lease until the queue times out.
+    let _foreground_lease = match foreground_sessions {
+        Some(foreground_sessions) if is_matrix_channel_name(&msg.channel) => {
+            match foreground_sessions
+                .acquire(&conversation_history_key(&msg))
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "matrix foreground session lease is unavailable"
+                    );
+                    if register_in_flight {
+                        let mut active = in_flight.lock().await;
+                        if active
+                            .get(&sender_scope_key)
+                            .is_some_and(|state| state.task_id == task_id)
+                        {
+                            active.remove(&sender_scope_key);
+                        }
+                    }
+                    completion.mark_done();
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
 
     process_channel_message(ctx, msg, cancellation_token).await;
 
@@ -22320,6 +22334,66 @@ BTC is currently around $65,000 based on latest tool output."#
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_interrupts_before_waiting_for_the_foreground_session_lease() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::Off,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut runtime_ctx)
+            .expect("test context has no other owners")
+            .interrupt_on_new_message
+            .matrix = true;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            for (id, content, timestamp) in [
+                ("msg-1", "first request", 1),
+                ("msg-2", "second request", 2),
+            ] {
+                tx.send(zeroclaw_api::channel::ChannelMessage {
+                    id: id.to_string(),
+                    sender: "@alice:example.test".to_string(),
+                    reply_target: "!room:example.test".to_string(),
+                    content: content.to_string(),
+                    channel: "matrix".into(),
+                    channel_alias: Some("default".to_string()),
+                    timestamp,
+                    explicitly_addressed: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+                if id == "msg-1" {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            }
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        let finalized_messages = channel_impl.finalized_messages.lock().await;
+        assert_eq!(
+            finalized_messages.len(),
+            1,
+            "the second Matrix message must cancel the lease holder instead of timing out behind it"
+        );
+        assert!(finalized_messages[0].contains("response-2"));
     }
 
     #[tokio::test]
