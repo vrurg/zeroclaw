@@ -2311,15 +2311,28 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    if let Err(error) = append_sender_turn_strict(ctx, sender_key, turn) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
-            "Failed to persist session turn"
-        );
+    // Keep the ordinary channel contract best-effort: a failed persistence
+    // write is observable, but must not remove the current turn from the
+    // in-process model context. Goal completion deliberately uses the strict
+    // sibling below instead.
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+
+    if let Some(store) = &ctx.session_store {
+        if let Err(error) = store.append(sender_key, &turn) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                "Failed to persist session turn"
+            );
+        }
     }
+
+    append_sender_turn_in_memory(ctx, sender_key, turn);
 }
 
 /// Persist one canonical channel turn before exposing it in the in-memory
@@ -2343,6 +2356,11 @@ fn append_sender_turn_strict(
             .context("persist channel session turn")?;
     }
 
+    append_sender_turn_in_memory(ctx, sender_key, turn);
+    Ok(())
+}
+
+fn append_sender_turn_in_memory(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Use the user-configured max_history_messages (fall back to
     // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
     let max_history = {
@@ -2363,7 +2381,6 @@ fn append_sender_turn_strict(
     while turns.len() > max_history {
         turns.remove(0);
     }
-    Ok(())
 }
 
 /// Extract tool-call (assistant with tool_call content) and tool-result
@@ -16608,6 +16625,59 @@ api_key = "anthropic-key"
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
+    }
+
+    #[test]
+    fn ordinary_history_append_survives_persistence_failure_but_goal_append_does_not() {
+        struct FailingBackend;
+
+        impl SessionBackend for FailingBackend {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                Vec::new()
+            }
+
+            fn append(&self, _key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected persistence failure"))
+            }
+
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+        }
+
+        let ctx = ChannelRuntimeContext {
+            session_store: Some(Arc::new(FailingBackend)),
+            ..(*router_test_ctx()).clone()
+        };
+
+        append_sender_turn(&ctx, "ordinary", ChatMessage::user("keep this turn"));
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ordinary = histories
+            .get("ordinary")
+            .expect("ordinary history keeps a best-effort turn");
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].role, "user");
+        assert_eq!(ordinary[0].content, "keep this turn");
+        drop(histories);
+
+        assert!(
+            append_sender_turn_strict(&ctx, "goal", ChatMessage::assistant("verified")).is_err()
+        );
+        assert!(
+            ctx.conversation_histories
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get("goal")
+                .is_none(),
+            "a failed strict Goal append must not create an in-memory delivery claim"
+        );
     }
 
     #[test]
