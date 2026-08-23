@@ -8066,6 +8066,28 @@ fn matrix_goal_route_round_trips_alias_and_room_without_thread_state() {
     assert!(MatrixGoalRouteV1::new("discord.primary".to_string(), "room".to_string()).is_err());
 }
 
+#[cfg(test)]
+#[test]
+fn matrix_goal_adapter_owns_a_valid_binding_shape_without_an_active_generation() {
+    let route = MatrixGoalRouteV1::new(
+        "matrix.primary".to_string(),
+        "!room:example.test".to_string(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+
+    assert!(is_owned_matrix_goal_binding(
+        &route,
+        Some("@alice:example.test")
+    ));
+    assert!(!is_owned_matrix_goal_binding(&route, None));
+    assert!(!is_owned_matrix_goal_binding(
+        "not-a-route",
+        Some("@alice:example.test")
+    ));
+}
+
 /// Stable channel-session adapter registered with the daemon-owned Goal host.
 ///
 /// It holds only the currently active channel generation. Route ownership,
@@ -8111,6 +8133,11 @@ impl ChannelGoalSessionAdapter {
     }
 }
 
+fn is_owned_matrix_goal_binding(route: &str, principal_id: Option<&str>) -> bool {
+    principal_id.is_some_and(|principal| !principal.trim().is_empty())
+        && MatrixGoalRouteV1::decode(route).is_ok()
+}
+
 struct ChannelGoalExecutionSession {
     _queue_guard: SessionGuard,
     runtime: Arc<ChannelAgentRuntime>,
@@ -8122,10 +8149,7 @@ struct ChannelGoalExecutionSession {
 #[async_trait::async_trait]
 impl GoalSessionAdapter for ChannelGoalSessionAdapter {
     fn owns(&self, binding: &GoalSessionBinding) -> bool {
-        binding
-            .principal_id()
-            .is_some_and(|principal| !principal.trim().is_empty())
-            && self.runtime_for_binding(binding).is_ok()
+        is_owned_matrix_goal_binding(binding.route(), binding.principal_id())
     }
 
     async fn model_binding(
