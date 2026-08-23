@@ -89,7 +89,7 @@ pub use crate::telegram::TelegramChannel;
 pub use crate::whatsapp_web::WhatsAppWebChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_infra::session_queue::{SessionActorQueue, SessionGuard};
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
@@ -8070,6 +8070,13 @@ impl ChannelGoalSessionAdapter {
     }
 }
 
+struct ChannelGoalExecutionSession {
+    _queue_guard: SessionGuard,
+    runtime: Arc<ChannelAgentRuntime>,
+    route: MatrixGoalRouteV1,
+    session_id: String,
+}
+
 #[async_trait::async_trait]
 impl GoalSessionAdapter for ChannelGoalSessionAdapter {
     fn owns(&self, binding: &GoalSessionBinding) -> bool {
@@ -8092,10 +8099,96 @@ impl GoalSessionAdapter for ChannelGoalSessionAdapter {
 
     async fn acquire(
         &self,
-        _scope: &GoalExecutionScope,
-        _binding: &GoalSessionBinding,
+        scope: &GoalExecutionScope,
+        binding: &GoalSessionBinding,
     ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
-        anyhow::bail!("Matrix Goal execution lease is not wired")
+        if scope.session_id != binding.session_id() {
+            anyhow::bail!("Matrix Goal scope does not match its session binding");
+        }
+        let route = MatrixGoalRouteV1::decode(binding.route())?;
+        let runtime = self.runtime_for_binding(binding)?;
+        let queue_guard = runtime
+            .foreground_sessions
+            .acquire(&scope.session_id)
+            .await
+            .context("Matrix Goal foreground lease is unavailable")?;
+
+        // A channel supervisor may have replaced its generation while this
+        // Goal waited for the foreground slot. Re-resolve after acquisition so
+        // an old executor cannot run against a successor's live session.
+        let current = self.runtime_for_binding(binding)?;
+        if !Arc::ptr_eq(&runtime, &current) {
+            anyhow::bail!("Matrix Goal generation changed while waiting for the lease");
+        }
+
+        Ok(Box::new(ChannelGoalExecutionSession {
+            _queue_guard: queue_guard,
+            runtime,
+            route,
+            session_id: scope.session_id.clone(),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl GoalSessionLease for ChannelGoalExecutionSession {
+    fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+        let mut history = self
+            .runtime
+            .ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&self.session_id)
+            .cloned()
+            .unwrap_or_default();
+        if history
+            .first()
+            .is_none_or(|message| message.role != "system")
+        {
+            history.insert(
+                0,
+                ChatMessage::system(self.runtime.ctx.system_prompt.as_str()),
+            );
+        }
+        Ok(history)
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _working_history: Vec<ChatMessage>,
+        _cancellation: CancellationToken,
+    ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+        // The next PR7 slice refactors the normal channel route resolver into
+        // a key-based seam before wiring this call. Until then, failing closed
+        // is safer than silently ignoring an active session's model override.
+        anyhow::bail!("Matrix Goal parent turn awaits canonical route resolution")
+    }
+
+    fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
+        append_sender_turn_strict(
+            self.runtime.ctx.as_ref(),
+            &self.session_id,
+            ChatMessage::assistant(candidate),
+        )
+    }
+
+    async fn deliver_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
+        let channel = self
+            .runtime
+            .ctx
+            .channels_by_name
+            .get(&self.route.channel_key)
+            .ok_or_else(|| anyhow::anyhow!("Matrix Goal delivery channel is unavailable"))?;
+        let safe_candidate = redact_channel_outbound_leaks(
+            candidate,
+            &self.runtime.ctx.prompt_config.security.leak_detection,
+            outbound_content_format_for_channel(&self.route.channel_key),
+        );
+        channel
+            .send_final(&SendMessage::new(&safe_candidate, &self.route.reply_target))
+            .await
+            .context("deliver verified Matrix Goal candidate")
     }
 }
 
