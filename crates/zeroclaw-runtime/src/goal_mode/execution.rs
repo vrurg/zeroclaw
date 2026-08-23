@@ -5,6 +5,9 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -39,6 +42,11 @@ const VERIFIER_BLOCKER_MAX_COUNT: usize = 16;
 const VERIFIER_BLOCKER_MESSAGE_MAX_SCALARS: usize = 1_024;
 const GOAL_EXECUTOR_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const GOAL_TRANSITION_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+static INJECTED_GOAL_TRANSITION_ERRORS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+const INJECTED_GOAL_TRANSITION_ERROR_TASK_ID: &str = "goal-storage-error";
 
 #[derive(Debug)]
 struct GoalBudgetExhausted;
@@ -108,7 +116,28 @@ async fn finish_goal_or_retain_ownership(
     reason: &str,
 ) {
     loop {
-        match goals
+        #[cfg(test)]
+        let transition = if scope.task_id == INJECTED_GOAL_TRANSITION_ERROR_TASK_ID
+            && INJECTED_GOAL_TRANSITION_ERRORS
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            Err(anyhow::anyhow!("injected goal terminal transition failure"))
+        } else {
+            goals
+                .finish_session_goal(
+                    &scope.task_id,
+                    &scope.session_id,
+                    scope.execution_epoch,
+                    TaskStatus::Failed,
+                    Some(reason.into()),
+                )
+                .await
+        };
+        #[cfg(not(test))]
+        let transition = goals
             .finish_session_goal(
                 &scope.task_id,
                 &scope.session_id,
@@ -116,8 +145,9 @@ async fn finish_goal_or_retain_ownership(
                 TaskStatus::Failed,
                 Some(reason.into()),
             )
-            .await
-        {
+            .await;
+
+        match transition {
             Ok(GoalTransitionResult::Applied | GoalTransitionResult::Missing) => return,
             Ok(GoalTransitionResult::Stale)
                 if !exact_running_goal_requires_owner(goals, scope).await =>
@@ -1142,11 +1172,14 @@ impl GoalExecutor for GoalExecutionDriver {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
 
     use super::{
-        GoalVerifierOutcome, exact_running_goal_requires_owner, is_exact_running_goal_task,
-        parse_goal_verifier_response,
+        GoalVerifierOutcome, INJECTED_GOAL_TRANSITION_ERRORS, exact_running_goal_requires_owner,
+        is_exact_running_goal_task, parse_goal_verifier_response,
     };
     use crate::{
         control_plane::{
@@ -1155,6 +1188,7 @@ mod tests {
         },
         goal_mode::{GoalExecutionScope, GoalTurnKind},
     };
+    use tokio::time::{sleep, timeout};
 
     #[tokio::test]
     async fn stale_transition_keeps_ownership_when_exact_task_still_runs() {
@@ -1222,22 +1256,129 @@ mod tests {
         drop(connection);
         let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
 
-        assert_eq!(
-            store
-                .finish_session_goal(
-                    "goal-a",
-                    "session-a",
-                    1,
-                    TaskStatus::Failed,
-                    Some("goal_execution_host_unavailable".into()),
-                )
-                .await
-                .expect("guarded transition"),
-            GoalTransitionResult::Stale
-        );
         let goals: Arc<dyn GoalTaskRegistry> = store;
-        assert!(exact_running_goal_requires_owner(&goals, &scope).await);
+        let retained = tokio::spawn({
+            let goals = Arc::clone(&goals);
+            let scope = scope.clone();
+            async move {
+                super::finish_goal_or_retain_ownership(
+                    &goals,
+                    &scope,
+                    "goal_execution_host_unavailable",
+                )
+                .await;
+            }
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !retained.is_finished(),
+            "an exact Running task must retain executor ownership after Stale"
+        );
+
+        let connection = rusqlite::Connection::open(directory.path().join("control_plane.db"))
+            .expect("open test control plane for fence");
+        connection
+            .execute(
+                "UPDATE tasks SET status = 'failed', execution_epoch = 2 WHERE id = ?1",
+                ["goal-a"],
+            )
+            .expect("fence the malformed goal");
+        drop(connection);
+        timeout(Duration::from_secs(2), retained)
+            .await
+            .expect("ownership loop must observe a durable fence")
+            .expect("ownership task must not panic");
+        assert!(
+            !exact_running_goal_requires_owner(&goals, &scope).await,
+            "a newer terminal epoch must release ownership"
+        );
         assert!(is_exact_running_goal_task(&task, &scope));
+    }
+
+    #[tokio::test]
+    async fn transition_storage_error_retains_ownership_until_terminal_transition_commits() {
+        let directory = tempfile::tempdir().expect("temporary control plane");
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).expect("control plane"));
+        let scope = GoalExecutionScope {
+            task_id: "goal-storage-error".into(),
+            session_id: "session-storage-error".into(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = TaskRecord {
+            id: scope.task_id.clone(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some(scope.session_id.clone()),
+            execution_epoch: 1,
+            started_at: "2026-08-23T00:00:00Z".into(),
+            finished_at: None,
+        };
+        store
+            .create_or_replace_session_goal(
+                task.clone(),
+                GoalTaskRecord {
+                    task_id: task.id.clone(),
+                    objective: "complete the objective".into(),
+                    success_criteria: "complete".into(),
+                    effective_token_limit: None,
+                    effective_cost_limit_usd: None,
+                    pause_reason: None,
+                    pause_description: None,
+                    blockers: Vec::new(),
+                    pending_call_id: None,
+                    pending_call_epoch: None,
+                    pending_reserved_tokens: None,
+                    pending_reserved_cost_usd: None,
+                    accounting_state: GoalAccountingState::Complete,
+                    resume_safety: GoalResumeSafety::Clean,
+                },
+            )
+            .await
+            .expect("create goal");
+
+        INJECTED_GOAL_TRANSITION_ERRORS.store(1, Ordering::SeqCst);
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let retained = tokio::spawn({
+            let goals = Arc::clone(&goals);
+            let scope = scope.clone();
+            async move {
+                super::finish_goal_or_retain_ownership(
+                    &goals,
+                    &scope,
+                    "goal_execution_host_unavailable",
+                )
+                .await;
+            }
+        });
+
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !retained.is_finished(),
+            "a transient storage error must not release Goal ownership"
+        );
+        timeout(Duration::from_secs(2), retained)
+            .await
+            .expect("ownership loop must retry after transient storage failure")
+            .expect("ownership task must not panic");
+        let terminal = goals
+            .current_goal_for_session(&scope.session_id)
+            .await
+            .expect("read terminal goal")
+            .expect("goal remains retained after terminal transition");
+        assert_eq!(terminal.status, TaskStatus::Failed);
     }
 
     #[test]
