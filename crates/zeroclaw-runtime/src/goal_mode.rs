@@ -818,13 +818,13 @@ impl GoalRuntime {
             .filter(|current| matches_session_owner(&current.task))
         {
             let Some(session_id) = current.task.session_id.as_deref() else {
-                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                    "running Goal has no durable session binding during runtime cutover"
+                return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "running Goal has no durable session binding during runtime cutover",
                 )));
             };
             if session_id.trim().is_empty() {
-                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                    "running Goal has an empty durable session binding during runtime cutover"
+                return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "running Goal has an empty durable session binding during runtime cutover",
                 )));
             }
             let result = self
@@ -858,8 +858,8 @@ impl GoalRuntime {
                                 && latest.task.status == TaskStatus::Running
                         });
                     if still_running {
-                        return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                            "running Goal changed while runtime cutover was fencing it"
+                        return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                            "running Goal changed while runtime cutover was fencing it",
                         )));
                     }
                 }
@@ -931,13 +931,13 @@ impl GoalRuntime {
             .filter(|current| matches_revoked_policy(&current.task))
         {
             let Some(session_id) = current.task.session_id.as_deref() else {
-                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                    "nonterminal Goal has no durable session binding during policy revocation"
+                return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "nonterminal Goal has no durable session binding during policy revocation",
                 )));
             };
             if session_id.trim().is_empty() {
-                return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                    "nonterminal Goal has an empty durable session binding during policy revocation"
+                return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "nonterminal Goal has an empty durable session binding during policy revocation",
                 )));
             }
             match self
@@ -967,8 +967,8 @@ impl GoalRuntime {
                             latest.task.id == current.task.id && !latest.task.status.is_terminal()
                         });
                     if still_nonterminal {
-                        return Err(GoalRuntimeError::control_plane(anyhow::anyhow!(
-                            "nonterminal Goal changed while policy revocation was fencing it"
+                        return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                            "nonterminal Goal changed while policy revocation was fencing it",
                         )));
                     }
                 }
