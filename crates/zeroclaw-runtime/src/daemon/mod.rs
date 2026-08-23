@@ -752,12 +752,14 @@ pub async fn run(
         let goal_executor = crate::control_plane::control_plane()
             .zip(cost_tracker.as_ref())
             .map(|(control_plane, cost_tracker)| {
-                std::sync::Arc::new(crate::goal_mode::SessionGoalExecutor::new(
-                    std::sync::Arc::clone(&sessions),
+                crate::goal_mode::goal_executor_for_host(
+                    std::sync::Arc::new(crate::goal_mode::RpcGoalExecutionHost::new(
+                        std::sync::Arc::clone(&sessions),
+                    )),
                     std::sync::Arc::clone(&control_plane.goals),
                     std::sync::Arc::new(config.clone()),
                     std::sync::Arc::clone(cost_tracker),
-                )) as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>
+                )
             });
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),

@@ -1,8 +1,7 @@
-//! Concrete internal host for one session-bound Goal executor.
+//! Shared Goal lifecycle driver and the RPC live-session host adapter.
 //!
-//! The command adapters remain deferred. This module binds the existing RPC
-//! session owner, Reliable accounting report, control-plane pending slot, and
-//! canonical JSONL ledger without introducing another provider or task layer.
+//! The driver owns durable Goal control and accounting. The RPC adapter owns
+//! only its existing session queue, agent lock, and canonical history access.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -18,7 +17,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ChatRequest};
 use zeroclaw_config::{cost::CostTracker, schema::Config};
 use zeroclaw_providers::dispatch::{AccountedAttempt, AttemptUsageOutcome};
 
-use super::{GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor};
+use super::{
+    GoalExecutionHost, GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope,
+    GoalExecutionSession, GoalExecutor, GoalHostModelBinding,
+};
+use crate::agent::agent::Agent;
 use crate::agent::agent::build_session_model_provider;
 use crate::agent::cost::{
     GoalOperationAccounting, GoalOperationRequest, GoalToolExecutionFence, goal_pricing_rates,
@@ -95,19 +98,25 @@ enum GoalVerifierOutcome {
     Blocked(String, Vec<crate::control_plane::GoalBlocker>),
 }
 
-async fn acquire_session_slot(
-    queue: Arc<zeroclaw_infra::session_queue::SessionActorQueue>,
-    session_id: String,
-) -> Result<
-    zeroclaw_infra::session_queue::SessionGuard,
-    zeroclaw_infra::session_queue::SessionQueueError,
-> {
-    queue.acquire(&session_id).await
+/// Construct the shared Goal executor over one host-owned live session model.
+pub fn goal_executor_for_host(
+    host: Arc<dyn GoalExecutionHost>,
+    goals: Arc<dyn GoalTaskRegistry>,
+    config: Arc<Config>,
+    cost_tracker: Arc<CostTracker>,
+) -> Arc<dyn GoalExecutor> {
+    Arc::new(GoalExecutionDriver {
+        host,
+        goals,
+        config,
+        cost_tracker,
+        executors: Arc::new(Mutex::new(HashMap::new())),
+    })
 }
 
-/// Daemon-composed Goal executor over the existing RPC session host.
-pub(crate) struct SessionGoalExecutor {
-    sessions: Arc<SessionStore>,
+/// Private shared lifecycle driver; hosts retain live-session ownership.
+struct GoalExecutionDriver {
+    host: Arc<dyn GoalExecutionHost>,
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
@@ -121,22 +130,7 @@ struct RegisteredGoalExecutor {
     handle: Option<JoinHandle<()>>,
 }
 
-impl SessionGoalExecutor {
-    pub(crate) fn new(
-        sessions: Arc<SessionStore>,
-        goals: Arc<dyn GoalTaskRegistry>,
-        config: Arc<Config>,
-        cost_tracker: Arc<CostTracker>,
-    ) -> Self {
-        Self {
-            sessions,
-            goals,
-            config,
-            cost_tracker,
-            executors: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
+impl GoalExecutionDriver {
     async fn session_executor_is_active(&self, session_id: &str) -> bool {
         let mut executors = self.executors.lock().await;
         executors.retain(|_, executor| {
@@ -148,6 +142,96 @@ impl SessionGoalExecutor {
         executors
             .values()
             .any(|executor| executor.session_id == session_id)
+    }
+}
+
+/// RPC adapter that retains ownership of its in-memory session store.
+pub struct RpcGoalExecutionHost {
+    sessions: Arc<SessionStore>,
+}
+
+impl RpcGoalExecutionHost {
+    /// Bind Goal execution to the daemon's existing RPC session owner.
+    pub fn new(sessions: Arc<SessionStore>) -> Self {
+        Self { sessions }
+    }
+}
+
+struct RpcGoalExecutionSession {
+    _queue_guard: zeroclaw_infra::session_queue::SessionGuard,
+    agent: tokio::sync::OwnedMutexGuard<Agent>,
+}
+
+#[async_trait]
+impl GoalExecutionHost for RpcGoalExecutionHost {
+    async fn model_binding(
+        &self,
+        session_id: &str,
+        expected_agent: &str,
+    ) -> Option<GoalHostModelBinding> {
+        if self.sessions.get_agent_alias(session_id).await.as_deref() != Some(expected_agent) {
+            return None;
+        }
+        let agent = self.sessions.get_agent(session_id).await?;
+        let (provider_ref, model, _) = agent.lock().await.goal_model_binding();
+        Some(GoalHostModelBinding {
+            provider_ref,
+            model,
+        })
+    }
+
+    async fn acquire(
+        &self,
+        scope: &GoalExecutionScope,
+        expected_agent: &str,
+    ) -> anyhow::Result<Box<dyn GoalExecutionSession>> {
+        let queue_guard = self
+            .sessions
+            .session_queue
+            .acquire(&scope.session_id)
+            .await
+            .context("goal RPC foreground lease is unavailable")?;
+        if self
+            .sessions
+            .get_agent_alias(&scope.session_id)
+            .await
+            .as_deref()
+            != Some(expected_agent)
+        {
+            anyhow::bail!("goal RPC session agent binding changed while waiting for lease");
+        }
+        let agent = self
+            .sessions
+            .get_agent(&scope.session_id)
+            .await
+            .context("goal RPC session disappeared while waiting for lease")?;
+        let agent = agent.lock_owned().await;
+        Ok(Box::new(RpcGoalExecutionSession {
+            _queue_guard: queue_guard,
+            agent,
+        }))
+    }
+}
+
+#[async_trait]
+impl GoalExecutionSession for RpcGoalExecutionSession {
+    fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+        self.agent.goal_working_history()
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        working_history: Vec<ChatMessage>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+        self.agent
+            .run_goal_tool_turn(working_history, cancellation)
+            .await
+    }
+
+    fn append_verified_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
+        self.agent.append_verified_goal_candidate(candidate);
+        Ok(())
     }
 }
 
@@ -591,21 +675,16 @@ fn validate_verifier_blockers(
 }
 
 #[async_trait]
-impl GoalExecutor for SessionGoalExecutor {
+impl GoalExecutor for GoalExecutionDriver {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
         if self.session_executor_is_active(&request.session_id).await {
             return GoalExecutionReadiness::ExecutorBusy;
         }
-        if self
-            .sessions
-            .get_agent_alias(&request.session_id)
+        let Some(binding) = self
+            .host
+            .model_binding(&request.session_id, &request.agent)
             .await
-            .as_deref()
-            != Some(request.agent.as_str())
-        {
-            return GoalExecutionReadiness::BindingUnavailable;
-        }
-        let Some(agent) = self.sessions.get_agent(&request.session_id).await else {
+        else {
             return GoalExecutionReadiness::BindingUnavailable;
         };
         if build_session_model_provider(
@@ -618,24 +697,23 @@ impl GoalExecutor for SessionGoalExecutor {
             return GoalExecutionReadiness::VerifierUnavailable;
         }
         if request.cost_limit_usd.is_some() {
-            let (provider_ref, model, _temperature) = agent.lock().await.goal_model_binding();
             let fallback_options = zeroclaw_providers::provider_runtime_options_for_agent(
                 &self.config,
                 &request.agent,
             );
             let options = zeroclaw_providers::options_for_provider_ref(
                 &self.config,
-                &provider_ref,
+                &binding.provider_ref,
                 &fallback_options,
             );
             let Ok(plan) = zeroclaw_providers::resolve_routed_model_operation_plan_with_options(
                 &self.config,
-                &provider_ref,
+                &binding.provider_ref,
                 &self.config.reliability,
                 &self.config.model_routes,
-                &model,
+                &binding.model,
                 &options,
-                &model,
+                &binding.model,
             ) else {
                 return GoalExecutionReadiness::PricingUnavailable;
             };
@@ -652,11 +730,10 @@ impl GoalExecutor for SessionGoalExecutor {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let executor_key = scope.task_id.clone();
-        let sessions = Arc::clone(&self.sessions);
+        let host = Arc::clone(&self.host);
         let goals = Arc::clone(&self.goals);
         let config = Arc::clone(&self.config);
         let cost_tracker = Arc::clone(&self.cost_tracker);
-        let session_queue = Arc::clone(&self.sessions.session_queue);
         let worker_scope = scope.clone();
         // Hold the registry lock across spawn and publication. `spawn` does
         // not await, and the worker never locks this registry, so pause/cancel
@@ -673,14 +750,6 @@ impl GoalExecutor for SessionGoalExecutor {
         }
         let handle = zeroclaw_spawn::spawn!(async move {
             let scope = worker_scope;
-            let queue_guard =
-                match acquire_session_slot(session_queue, scope.session_id.clone()).await {
-                    Ok(queue_guard) => queue_guard,
-                    Err(_) => return,
-                };
-            if scope.cancellation.is_cancelled() {
-                return;
-            }
             let Some(current) = goals
                 .current_goal_status_for_session(&scope.session_id)
                 .await
@@ -694,14 +763,39 @@ impl GoalExecutor for SessionGoalExecutor {
             else {
                 return;
             };
-            let Some(agent) = sessions.get_agent(&scope.session_id).await else {
-                return;
+            let expected_agent = current.task.agent.clone();
+            let mut session = match host.acquire(&scope, &expected_agent).await {
+                Ok(session) => session,
+                Err(_) => {
+                    let _ = goals
+                        .finish_session_goal(
+                            &scope.task_id,
+                            &scope.session_id,
+                            scope.execution_epoch,
+                            TaskStatus::Failed,
+                            Some("goal_execution_host_unavailable".into()),
+                        )
+                        .await;
+                    return;
+                }
             };
-            let agent_guard = agent.lock_owned().await;
             if scope.cancellation.is_cancelled() {
                 return;
             }
-            let _queue_guard = queue_guard;
+            let Some(current) = goals
+                .current_goal_status_for_session(&scope.session_id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|current| {
+                    current.task.id == scope.task_id
+                        && current.task.execution_epoch == scope.execution_epoch
+                        && current.task.status == TaskStatus::Running
+                        && current.task.agent == expected_agent
+                })
+            else {
+                return;
+            };
             let accountant: Arc<dyn GoalOperationAccounting> =
                 Arc::new(GoalOperationAccountant::new(
                     Arc::clone(&goals),
@@ -710,8 +804,7 @@ impl GoalExecutor for SessionGoalExecutor {
                     scope.clone(),
                     current.task.agent.clone(),
                 ));
-            let mut agent = agent_guard;
-            let mut transcript = match agent.goal_working_history() {
+            let mut transcript = match session.working_history() {
                 Ok(history) => history,
                 Err(_) => {
                     let _ = goals
@@ -750,7 +843,7 @@ impl GoalExecutor for SessionGoalExecutor {
                             }),
                             crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE.scope(
                                 Some(Arc::clone(&tool_execution_fence)),
-                                agent.run_goal_tool_turn(transcript, scope.cancellation.clone()),
+                                session.run_parent_turn(transcript, scope.cancellation.clone()),
                             ),
                         ),
                     )
@@ -818,7 +911,23 @@ impl GoalExecutor for SessionGoalExecutor {
                             .await
                         {
                             Ok(GoalTransitionResult::Applied) => {
-                                agent.append_verified_goal_candidate(candidate);
+                                if let Err(error) = session.append_verified_candidate(candidate) {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note,
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "task_id": scope.task_id,
+                                                "error": format!("{error:#}"),
+                                            })
+                                        ),
+                                        "goal verified candidate history append failed"
+                                    );
+                                }
                                 // Transport delivery is owned by the adapters
                                 // introduced later in the stack. Do not claim
                                 // the durable delivery fact merely because the

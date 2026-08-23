@@ -20,7 +20,10 @@ use crate::control_plane::{
 };
 
 mod execution;
-pub(crate) use execution::SessionGoalExecutor;
+mod host;
+
+pub use execution::{RpcGoalExecutionHost, goal_executor_for_host};
+pub use host::{GoalExecutionHost, GoalExecutionSession, GoalHostModelBinding};
 
 const INITIAL_GOAL_EXECUTION_EPOCH: i64 = 1;
 
