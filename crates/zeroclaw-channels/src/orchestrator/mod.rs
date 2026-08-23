@@ -15478,6 +15478,31 @@ temperature = 0.3
         );
     }
 
+    #[test]
+    fn stale_goal_adapter_generation_cannot_clear_its_replacement() {
+        let adapter = ChannelGoalSessionAdapter::new();
+        let first = Arc::new(AgentRouter::single(router_test_ctx()));
+        let replacement = Arc::new(AgentRouter::single(router_test_ctx()));
+
+        adapter.publish_generation(Arc::clone(&first));
+        adapter.publish_generation(Arc::clone(&replacement));
+        adapter.clear_generation(&first);
+
+        let active = adapter
+            .generation
+            .read()
+            .as_ref()
+            .cloned()
+            .expect("replacement generation remains active");
+        assert!(
+            Arc::ptr_eq(&active, &replacement),
+            "an old channel supervisor must not clear a replacement generation"
+        );
+
+        adapter.clear_generation(&replacement);
+        assert!(adapter.generation.read().is_none());
+    }
+
     #[tokio::test]
     async fn agent_router_multi_shares_one_foreground_lease_across_an_agents_matrix_aliases() {
         let ops_ctx = router_test_ctx();
