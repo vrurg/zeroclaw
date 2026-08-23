@@ -718,6 +718,35 @@ pub async fn run(
         }
     }
 
+    // An agent removal or disablement revokes retained Goal work bound to
+    // that durable alias. Do this before listeners start: otherwise a stale
+    // executor could make another provider call under an agent the current
+    // configuration no longer authorizes.
+    if config.goal.enabled
+        && let Some(goal_runtime) = &goal_runtime
+    {
+        loop {
+            match goal_runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                    is_goal_agent_revoked_by_config(&config, &task.agent)
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                        "Goal agent-policy revocation failed; delaying listener startup"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
 
@@ -2557,6 +2586,18 @@ fn has_supervised_channels(config: &Config) -> bool {
     config.channels.has_any_enabled()
 }
 
+/// Whether a retained Goal's configured agent has been removed or disabled.
+///
+/// `TaskRecord::agent` is the canonical durable agent binding. Resolve the
+/// live revocation fact from the prospective configuration instead of copying
+/// an agent-enable snapshot into Goal control state.
+fn is_goal_agent_revoked_by_config(config: &Config, agent_alias: &str) -> bool {
+    config
+        .agents
+        .get(agent_alias)
+        .is_none_or(|agent| !agent.enabled)
+}
+
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
 // The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
@@ -2585,6 +2626,27 @@ mod tests {
             ..Default::default()
         };
         config.agents.insert(agent_alias.to_string(), agent);
+    }
+
+    #[test]
+    fn goal_agent_revocation_uses_current_configured_agent_enablement() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.agents.insert(
+            "active".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        config.agents.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        assert!(!is_goal_agent_revoked_by_config(&config, "active"));
+        assert!(is_goal_agent_revoked_by_config(&config, "disabled"));
+        assert!(is_goal_agent_revoked_by_config(&config, "removed"));
     }
 
     async fn recv_log_event(
