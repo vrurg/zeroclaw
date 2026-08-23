@@ -4,7 +4,10 @@ use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
@@ -67,6 +70,20 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    generation: u64,
+    replacement_reserved: bool,
+}
+
+/// Immutable metadata for an already-live RPC session.
+///
+/// `session/new` uses this to distinguish a same-ID reconnect from a genuine
+/// replacement without exposing the mutable session record to the dispatcher.
+#[derive(Clone, Debug)]
+pub(crate) struct LiveRpcSession {
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub chat_mode: crate::rpc::types::ChatMode,
+    pub owner_tui_id: Option<String>,
 }
 
 impl RpcSession {
@@ -88,6 +105,8 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
+            generation: 0,
+            replacement_reserved: false,
         }
     }
 
@@ -98,12 +117,45 @@ impl RpcSession {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ReservedRpcSession {
+    id: String,
+    generation: u64,
+}
+
+/// An exact set of idle session generations reserved for one `session/new`
+/// replacement. The reservation also holds one incoming capacity slot, so a
+/// fallible asynchronous Goal-disposal step cannot lose its eventual insert
+/// to an unrelated concurrent session creation.
+pub(crate) struct SessionReplacementReservation {
+    targets: Vec<ReservedRpcSession>,
+    slot: ReplacementSlot,
+}
+
+impl SessionReplacementReservation {
+    pub(crate) fn target_ids(&self) -> impl Iterator<Item = &str> {
+        self.targets.iter().map(|target| target.id.as_str())
+    }
+}
+
+struct ReplacementSlot {
+    slots: Arc<AtomicUsize>,
+}
+
+impl Drop for ReplacementSlot {
+    fn drop(&mut self) {
+        self.slots.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
+    session_generation: AtomicU64,
+    replacement_slots: Arc<AtomicUsize>,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -117,23 +169,171 @@ impl SessionStore {
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
+            session_generation: AtomicU64::new(0),
+            replacement_slots: Arc::new(AtomicUsize::new(0)),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
         }
     }
 
-    pub async fn insert(&self, id: String, session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
-        if sessions.len() >= self.max_sessions {
+        if sessions
+            .len()
+            .saturating_add(self.replacement_slots.load(Ordering::SeqCst))
+            >= self.max_sessions
+        {
             return Err("session limit reached");
         }
+        session.generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
         sessions.insert(id, session);
         Ok(())
     }
 
+    /// Reserve all currently idle siblings for one incoming session. Reserved
+    /// sessions cannot begin new turns, and the incoming capacity slot stays
+    /// unavailable to other creators until this replacement commits or is
+    /// explicitly released.
+    pub(crate) async fn reserve_idle_same_mode_replacement(
+        &self,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        incoming_id: &str,
+    ) -> Result<SessionReplacementReservation, &'static str> {
+        let in_flight: std::collections::HashSet<String> = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut sessions = self.sessions.lock().await;
+        let targets: Vec<ReservedRpcSession> = sessions
+            .iter()
+            .filter(|(id, session)| {
+                id.as_str() != incoming_id
+                    && session.owner_tui_id.as_deref() == Some(tui_id)
+                    && &session.chat_mode == chat_mode
+                    && !session.replacement_reserved
+                    && !in_flight.contains(id.as_str())
+            })
+            .map(|(id, session)| ReservedRpcSession {
+                id: id.clone(),
+                generation: session.generation,
+            })
+            .collect();
+        if sessions.len().saturating_sub(targets.len()) >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        for target in &targets {
+            let Some(session) = sessions.get_mut(&target.id) else {
+                return Err("replacement session disappeared");
+            };
+            if session.generation != target.generation || session.replacement_reserved {
+                return Err("replacement session changed");
+            }
+            session.replacement_reserved = true;
+        }
+        self.replacement_slots.fetch_add(1, Ordering::SeqCst);
+        Ok(SessionReplacementReservation {
+            targets,
+            slot: ReplacementSlot {
+                slots: Arc::clone(&self.replacement_slots),
+            },
+        })
+    }
+
+    /// Release a replacement that failed before session-map commit.
+    pub(crate) async fn release_replacement_reservation(
+        &self,
+        reservation: &SessionReplacementReservation,
+    ) {
+        let _ = &reservation.slot;
+        let mut sessions = self.sessions.lock().await;
+        for target in &reservation.targets {
+            if let Some(session) = sessions.get_mut(&target.id)
+                && session.generation == target.generation
+            {
+                session.replacement_reserved = false;
+            }
+        }
+    }
+
+    /// Atomically remove the exact reserved sessions and insert their
+    /// replacement. A changed generation is never removed by ID alone.
+    pub(crate) async fn commit_replacement(
+        &self,
+        reservation: &SessionReplacementReservation,
+        id: String,
+        mut session: RpcSession,
+    ) -> Result<Vec<(String, String)>, &'static str> {
+        let _ = &reservation.slot;
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("replacement session identifier already exists");
+        }
+        for target in &reservation.targets {
+            let Some(current) = sessions.get(&target.id) else {
+                return Err("reserved replacement session disappeared");
+            };
+            if current.generation != target.generation || !current.replacement_reserved {
+                return Err("reserved replacement session changed");
+            }
+        }
+        if sessions.len().saturating_sub(reservation.targets.len()) >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let mut evicted = Vec::with_capacity(reservation.targets.len());
+        for target in &reservation.targets {
+            if let Some(removed) = sessions.remove(&target.id) {
+                evicted.push((target.id.clone(), removed.agent_alias));
+            }
+        }
+        session.generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        sessions.insert(id, session);
+        Ok(evicted)
+    }
+
+    /// A reserved replacement target may not begin a new ordinary turn.
+    pub(crate) async fn is_replacement_reserved(&self, id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|session| session.replacement_reserved)
+    }
+
+    /// Register an in-flight turn only if no replacement has fenced this
+    /// exact live session. If a reservation wins after this check, it sees the
+    /// token and refuses to select the session as an idle target.
+    pub(crate) async fn try_register_cancel_token(
+        &self,
+        id: &str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> Option<u64> {
+        if self.is_replacement_reserved(id).await {
+            return None;
+        }
+        Some(self.register_cancel_token(id, token))
+    }
+
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
+    }
+
+    /// Return immutable identity facts for a currently live session.
+    pub(crate) async fn live_session(&self, id: &str) -> Option<LiveRpcSession> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| LiveRpcSession {
+                agent_alias: session.agent_alias.clone(),
+                workspace_dir: session.workspace_dir.clone(),
+                chat_mode: session.chat_mode.clone(),
+                owner_tui_id: session.owner_tui_id.clone(),
+            })
     }
 
     pub(crate) async fn lock_model_provider_update(
@@ -395,98 +595,6 @@ impl SessionStore {
             token.cancel();
         }
         self.sessions.lock().await.remove(id).is_some()
-    }
-
-    pub async fn evict_same_mode_sibling(
-        &self,
-        tui_id: &str,
-        chat_mode: &crate::rpc::types::ChatMode,
-        except_id: &str,
-    ) -> Vec<(String, String)> {
-        let in_flight: std::collections::HashSet<String> = self
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
-            .iter()
-            .filter(|(key, s)| {
-                key.as_str() != except_id
-                    && s.owner_tui_id.as_deref() == Some(tui_id)
-                    && &s.chat_mode == chat_mode
-                    && !in_flight.contains(key.as_str())
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                evicted.push((key, s.agent_alias));
-            }
-        }
-        evicted
-    }
-
-    /// Snapshot idle sibling IDs that a `session/new` request may genuinely
-    /// replace. The dispatcher must fence and dispose any Goal before calling
-    /// [`Self::evict_same_mode_sibling`], while the trusted session binding is
-    /// still available in this store.
-    pub async fn idle_same_mode_sibling_ids(
-        &self,
-        tui_id: &str,
-        chat_mode: &crate::rpc::types::ChatMode,
-        except_id: &str,
-    ) -> Vec<String> {
-        let in_flight: std::collections::HashSet<String> = self
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        self.sessions
-            .lock()
-            .await
-            .iter()
-            .filter(|(key, session)| {
-                key.as_str() != except_id
-                    && session.owner_tui_id.as_deref() == Some(tui_id)
-                    && &session.chat_mode == chat_mode
-                    && !in_flight.contains(key.as_str())
-            })
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    /// Remove only the exact idle sibling IDs that the dispatcher previously
-    /// fenced and disposed. Re-evaluating the broad sibling selector here
-    /// would create a race: a different session could finish a turn between
-    /// the snapshot and removal, then disappear without Goal disposal.
-    pub async fn evict_exact_idle_session_ids(
-        &self,
-        session_ids: &[String],
-    ) -> Vec<(String, String)> {
-        let in_flight: std::collections::HashSet<String> = self
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .keys()
-            .cloned()
-            .collect();
-        let mut sessions = self.sessions.lock().await;
-        let mut evicted = Vec::with_capacity(session_ids.len());
-        for session_id in session_ids {
-            if in_flight.contains(session_id) {
-                continue;
-            }
-            if let Some(session) = sessions.remove(session_id) {
-                evicted.push((session_id.clone(), session.agent_alias));
-            }
-        }
-        evicted
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -904,118 +1012,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_same_mode_sibling_drops_only_same_mode_owner() {
+    async fn replacement_reservation_fences_the_exact_idle_generation_and_capacity() {
         use crate::rpc::types::ChatMode;
-        let store = make_store(8);
-        let mk = |mode: ChatMode, owner: &str| {
-            RpcSession::new(make_agent(), "a", ".", mode).with_owner(Some(owner.to_string()))
-        };
+
+        let store = make_store(1);
         store
-            .insert("old_chat".into(), mk(ChatMode::Chat, "tui1"))
+            .insert(
+                "old".into(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                    .with_owner(Some("tui".to_string())),
+            )
             .await
-            .unwrap();
-        store
-            .insert("old_code".into(), mk(ChatMode::Acp, "tui1"))
+            .expect("insert old session");
+
+        let reservation = store
+            .reserve_idle_same_mode_replacement("tui", &ChatMode::Chat, "new")
             .await
-            .unwrap();
-        store
-            .insert("other_chat".into(), mk(ChatMode::Chat, "tui2"))
-            .await
-            .unwrap();
-        store
-            .insert("new_chat".into(), mk(ChatMode::Chat, "tui1"))
-            .await
-            .unwrap();
+            .expect("reserve exact old generation");
+        assert!(store.is_replacement_reserved("old").await);
+        assert!(
+            store
+                .try_register_cancel_token("old", tokio_util::sync::CancellationToken::new())
+                .await
+                .is_none(),
+            "a reserved session cannot begin a late ordinary turn"
+        );
+        assert!(
+            store
+                .insert(
+                    "unrelated".into(),
+                    RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
+                )
+                .await
+                .is_err(),
+            "the incoming replacement capacity slot is unavailable to other creators"
+        );
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
-            .await;
-
-        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["old_chat"]);
-        assert!(
-            store.get_agent("new_chat").await.is_some(),
-            "new session preserved"
-        );
-        assert!(
-            store.get_agent("old_code").await.is_some(),
-            "cross-mode Code session preserved"
-        );
-        assert!(
-            store.get_agent("other_chat").await.is_some(),
-            "other TUI session preserved"
-        );
-        assert!(
-            store.get_agent("old_chat").await.is_none(),
-            "abandoned same-mode session evicted"
-        );
-    }
-
-    #[tokio::test]
-    async fn evict_exact_idle_session_ids_never_removes_an_unsnapshotted_sibling() {
-        use crate::rpc::types::ChatMode;
-        let store = make_store(8);
-        let mk = |owner: &str| {
-            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
-                .with_owner(Some(owner.to_string()))
-        };
-        store.insert("disposed".into(), mk("tui1")).await.unwrap();
-        store.insert("late_idle".into(), mk("tui1")).await.unwrap();
-
-        let evicted = store
-            .evict_exact_idle_session_ids(&["disposed".to_string()])
-            .await;
-
+            .commit_replacement(
+                &reservation,
+                "new".into(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                    .with_owner(Some("tui".to_string())),
+            )
+            .await
+            .expect("commit exact replacement");
         assert_eq!(
-            evicted
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["disposed"]
+            evicted.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec!["old"]
         );
-        assert!(
-            store.get_agent("late_idle").await.is_some(),
-            "only the dispatcher-disposed snapshot may be removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn evict_same_mode_sibling_skips_in_flight_turn() {
-        use crate::rpc::types::ChatMode;
-        let store = make_store(8);
-        let mk = |mode: ChatMode, owner: &str| {
-            RpcSession::new(make_agent(), "a", ".", mode).with_owner(Some(owner.to_string()))
-        };
-        store
-            .insert("busy_chat".into(), mk(ChatMode::Chat, "tui1"))
-            .await
-            .unwrap();
-        store
-            .insert("new_chat".into(), mk(ChatMode::Chat, "tui1"))
-            .await
-            .unwrap();
-        // A registered cancel token marks a turn in flight: a spawned prompt
-        // task still holds an Agent clone, so this session must NOT be force
-        // evicted (that is the reaper's documented mid-turn freeze).
-        let token = tokio_util::sync::CancellationToken::new();
-        store.register_cancel_token("busy_chat", token.clone());
-
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
-            .await;
-
-        assert!(
-            evicted.is_empty(),
-            "in-flight same-mode session must be left to finish its turn"
-        );
-        assert!(
-            store.get_agent("busy_chat").await.is_some(),
-            "mid-turn session preserved"
-        );
-        assert!(
-            !token.is_cancelled(),
-            "eviction must not fire a mid-turn cancel token"
-        );
+        assert!(store.get_agent("old").await.is_none());
+        assert!(store.get_agent("new").await.is_some());
     }
 
     #[tokio::test]

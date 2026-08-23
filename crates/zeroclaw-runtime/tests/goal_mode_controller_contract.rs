@@ -904,6 +904,47 @@ async fn session_disposal_retries_a_durably_fenced_executor_before_deleting_cont
 }
 
 #[tokio::test]
+async fn resume_refuses_a_paused_goal_until_its_fenced_executor_quiesces() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(2),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    let ingress = matrix("session-resume-quiescence");
+    runtime
+        .submit(
+            ingress.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise resume quiescence".into(),
+            },
+        )
+        .await
+        .expect("start Goal");
+
+    assert!(
+        runtime.interrupt_session(&ingress).await.is_err(),
+        "the first external interruption leaves the exact executor fenced but unquiesced"
+    );
+    assert!(
+        runtime
+            .submit(ingress.clone(), GoalCommand::Resume)
+            .await
+            .is_err(),
+        "resume must not launch a successor while the fenced executor still fails to quiesce"
+    );
+    let current = store
+        .current_goal_for_session("session-resume-quiescence")
+        .await
+        .expect("read Goal")
+        .expect("Goal remains");
+    assert_eq!(current.status, TaskStatus::Paused);
+    assert_eq!(current.execution_epoch, 2);
+    assert_eq!(executor.launches.lock().len(), 1);
+}
+
+#[tokio::test]
 async fn runtime_cutover_fences_and_quiesces_every_running_goal() {
     let executor = Arc::new(FakeExecutor::new(
         GoalExecutionReadiness::Ready,

@@ -297,7 +297,16 @@ struct RegisteredGoalExecutor {
     session_id: String,
     epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
-    handle: Option<JoinHandle<()>>,
+    state: GoalExecutorJoinState,
+}
+
+/// Process-local join ownership for one exact Goal executor. Only one caller
+/// may await a handle; other lifecycle callers must fail closed while that
+/// proof is in flight rather than mistaking a taken handle for quiescence.
+enum GoalExecutorJoinState {
+    Running(JoinHandle<()>),
+    Joining,
+    Quiesced,
 }
 
 impl GoalExecutionHost {
@@ -320,11 +329,9 @@ impl GoalExecutionHost {
 
     async fn session_executor_is_active(&self, session_id: &str) -> bool {
         let mut executors = self.executors.lock().await;
-        executors.retain(|_, executor| {
-            executor
-                .handle
-                .as_ref()
-                .is_none_or(|handle| !handle.is_finished())
+        executors.retain(|_, executor| match &executor.state {
+            GoalExecutorJoinState::Running(handle) => !handle.is_finished(),
+            GoalExecutorJoinState::Joining | GoalExecutorJoinState::Quiesced => true,
         });
         executors
             .values()
@@ -945,11 +952,9 @@ impl GoalExecutor for GoalExecutionHost {
         // not await, and the worker never locks this registry, so pause/cancel
         // cannot observe an owned worker without its join handle.
         let mut executors = self.executors.lock().await;
-        executors.retain(|_, executor| {
-            executor
-                .handle
-                .as_ref()
-                .is_some_and(|handle| !handle.is_finished())
+        executors.retain(|_, executor| match &executor.state {
+            GoalExecutorJoinState::Running(handle) => !handle.is_finished(),
+            GoalExecutorJoinState::Joining | GoalExecutorJoinState::Quiesced => true,
         });
         if executors.contains_key(&executor_key) {
             return Err(());
@@ -1186,7 +1191,7 @@ impl GoalExecutor for GoalExecutionHost {
                 session_id: scope.session_id.clone(),
                 epoch: scope.execution_epoch,
                 cancellation: scope.cancellation,
-                handle: Some(handle),
+                state: GoalExecutorJoinState::Running(handle),
             },
         );
         Ok(())
@@ -1197,7 +1202,19 @@ impl GoalExecutor for GoalExecutionHost {
             let mut executors = self.executors.lock().await;
             match executors.get_mut(task_id) {
                 Some(executor) if executor.session_id == session_id && executor.epoch == epoch => {
-                    (Some(executor.cancellation.clone()), executor.handle.take())
+                    match std::mem::replace(&mut executor.state, GoalExecutorJoinState::Joining) {
+                        GoalExecutorJoinState::Running(handle) => {
+                            (Some(executor.cancellation.clone()), Some(handle))
+                        }
+                        GoalExecutorJoinState::Joining => {
+                            executor.state = GoalExecutorJoinState::Joining;
+                            return Err(());
+                        }
+                        GoalExecutorJoinState::Quiesced => {
+                            executor.state = GoalExecutorJoinState::Quiesced;
+                            (None, None)
+                        }
+                    }
                 }
                 Some(_) => return Err(()),
                 // A prior cancellation may already have joined the executor
@@ -1210,6 +1227,7 @@ impl GoalExecutor for GoalExecutionHost {
         if let Some(cancellation) = cancellation {
             cancellation.cancel();
         }
+        let joined_handle = handle.is_some();
         let join_failed = match handle {
             Some(mut handle) => {
                 match tokio::time::timeout(GOAL_EXECUTOR_JOIN_TIMEOUT, &mut handle).await {
@@ -1226,6 +1244,16 @@ impl GoalExecutor for GoalExecutionHost {
             }
             None => false,
         };
+        if joined_handle {
+            let mut executors = self.executors.lock().await;
+            let Some(executor) = executors.get_mut(task_id) else {
+                return Err(());
+            };
+            if executor.session_id != session_id || executor.epoch != epoch {
+                return Err(());
+            }
+            executor.state = GoalExecutorJoinState::Quiesced;
+        }
         // If forced quiescence dropped a non-cooperative foreground child
         // wrapper, its direct durable row must not remain falsely Running.
         // Cooperative children have already settled their own terminal row,

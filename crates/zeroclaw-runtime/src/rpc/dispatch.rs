@@ -1118,6 +1118,41 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
+        // A live caller-selected ID is a reconnect to the existing session,
+        // not a request to replace it. In particular, its bound Goal remains
+        // owned by that session until an explicit close/delete/kill or a true
+        // sibling replacement disposes it.
+        if resuming && let Some(existing) = self.ctx.sessions.live_session(&session_id).await {
+            let caller_owns_session = matches!(
+                (existing.owner_tui_id.as_deref(), self.tui_id.as_deref()),
+                (Some(owner), Some(caller)) if owner == caller
+            );
+            if !caller_owns_session {
+                return Err(rpc_err(
+                    SESSION_NOT_OWNED,
+                    "Caller does not own this session",
+                ));
+            }
+            if existing.agent_alias != req.agent_alias || existing.chat_mode != chat_mode {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "Live session binding does not match session/new parameters",
+                ));
+            }
+            let message_count = self
+                .ctx
+                .sessions
+                .history_len(&session_id)
+                .await
+                .unwrap_or_default();
+            return to_result(SessionNewResult {
+                session_id,
+                agent_alias: existing.agent_alias,
+                message_count,
+                workspace_dir: existing.workspace_dir,
+            });
+        }
+
         // Resuming an ACP session with no caller cwd: recover the original
         // working directory from the persisted store so the rehydrated session
         // keeps its own cwd instead of falling back to the agent workspace dir.
@@ -1215,86 +1250,103 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        // A caller-controlled session ID can collide with an existing live
-        // session. Dispose its exact Goal before `insert` replaces the map
-        // entry, otherwise a fenced executor could outlive its session.
-        self.dispose_goal_before_session_removal(&session_id)
-            .await?;
-
-        let idle_siblings = if let Some(tui_id) = self.tui_id.as_deref()
+        // Reserve exact idle sibling generations before any asynchronous Goal
+        // disposal. The reservation holds an incoming capacity slot and gates
+        // new sibling turns, so a failed or delayed replacement cannot delete
+        // Goal control state while leaving its owning live session behind.
+        let replacement = if let Some(tui_id) = self.tui_id.as_deref()
             && req.keep_siblings != Some(true)
         {
             self.ctx
                 .sessions
-                .idle_same_mode_sibling_ids(tui_id, &chat_mode, &session_id)
+                .reserve_idle_same_mode_replacement(tui_id, &chat_mode, &session_id)
                 .await
+                .map(Some)
+                .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?
         } else {
-            Vec::new()
+            None
         };
-        // Capture and fence every genuine replacement while its trusted RPC
-        // binding is still present. Same-ID reattachment is excluded above.
-        for sibling_id in &idle_siblings {
-            self.dispose_goal_before_session_removal(sibling_id).await?;
+        if let Some(reservation) = replacement.as_ref() {
+            for sibling_id in reservation.target_ids() {
+                if let Err(error) = self.dispose_goal_before_session_removal(sibling_id).await {
+                    self.ctx
+                        .sessions
+                        .release_replacement_reservation(reservation)
+                        .await;
+                    return Err(error);
+                }
+            }
         }
 
-        self.ctx
-            .sessions
-            .insert(
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
-
-        if let Some(ref tui_id) = self.tui_id
-            && req.keep_siblings != Some(true)
-        {
-            let evicted = self
+        let new_session =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        let evicted = if let Some(reservation) = replacement.as_ref() {
+            match self
                 .ctx
                 .sessions
-                .evict_exact_idle_session_ids(&idle_siblings)
-                .await;
-            if !evicted.is_empty() {
-                if let Some(ref hooks) = self.ctx.hooks {
-                    for (sid, _) in &evicted {
-                        hooks.fire_session_end(sid, "rpc").await;
-                    }
+                .commit_replacement(reservation, session_id.clone(), new_session)
+                .await
+            {
+                Ok(evicted) => evicted,
+                Err(_) => {
+                    self.ctx
+                        .sessions
+                        .release_replacement_reservation(reservation)
+                        .await;
+                    return Err(rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"));
                 }
-                let span = ::zeroclaw_log::info_span!(
-                    target: "zeroclaw_log_internal_scope",
-                    "zeroclaw_scope",
-                    session_key = %session_id,
-                    agent_alias = %req.agent_alias,
-                    channel = "rpc",
-                );
-                let _guard = span.enter();
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_attrs(::serde_json::json!({
-                            "tui_id": tui_id,
-                            "evicted": evicted.iter().map(|(id, _)| id).collect::<Vec<_>>(),
-                        })),
-                    "Evicted abandoned same-mode session(s) on session/new"
-                );
-                // Every evicted session was idle (no in-flight turn), so its
-                // removal above dropped the last Agent strong ref and freed the
-                // history. Trimming now actually returns those pages.
-                crate::util::release_freed_heap();
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_attrs(::serde_json::json!({
-                            "evicted_count": evicted.len(),
-                        })),
-                    "Trimmed glibc arenas after same-mode session eviction"
-                );
             }
+        } else {
+            self.ctx
+                .sessions
+                .insert(session_id.clone(), new_session)
+                .await
+                .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+            Vec::new()
+        };
+
+        if let Some(ref tui_id) = self.tui_id
+            && !evicted.is_empty()
+        {
+            if let Some(ref hooks) = self.ctx.hooks {
+                for (sid, _) in &evicted {
+                    hooks.fire_session_end(sid, "rpc").await;
+                }
+            }
+            let span = ::zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                session_key = %session_id,
+                agent_alias = %req.agent_alias,
+                channel = "rpc",
+            );
+            let _guard = span.enter();
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "tui_id": tui_id,
+                        "evicted": evicted.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                    })),
+                "Evicted abandoned same-mode session(s) on session/new"
+            );
+            // Every evicted session was idle (no in-flight turn), so its
+            // removal above dropped the last Agent strong ref and freed the
+            // history. Trimming now actually returns those pages.
+            crate::util::release_freed_heap();
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "evicted_count": evicted.len(),
+                    })),
+                "Trimmed glibc arenas after same-mode session eviction"
+            );
         }
 
         enum AcpSessionNewLoad {
@@ -1462,6 +1514,14 @@ impl RpcDispatcher {
         let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         };
+        if self
+            .ctx
+            .sessions
+            .is_replacement_reserved(&req.session_id)
+            .await
+        {
+            return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
+        }
         self.dispose_goal_before_session_removal(&req.session_id)
             .await?;
         agent
@@ -1532,6 +1592,10 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        if self.ctx.sessions.is_replacement_reserved(sid).await {
+            return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
+        }
 
         self.dispose_goal_before_session_removal(sid).await?;
 
@@ -1825,7 +1889,12 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        let cancel_generation = self
+            .ctx
+            .sessions
+            .try_register_cancel_token(sid, cancel.clone())
+            .await
+            .ok_or_else(|| rpc_err(SESSION_BUSY, "Session is being replaced"))?;
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -2545,6 +2614,14 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        if self
+            .ctx
+            .sessions
+            .is_replacement_reserved(&req.session_id)
+            .await
+        {
+            return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
+        }
         self.dispose_goal_before_session_removal(&req.session_id)
             .await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
@@ -7302,6 +7379,31 @@ mod tests {
         assert!(
             sessions.get_agent("sibling-new").await.is_some(),
             "the new session must survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_with_a_live_id_reattaches_without_replacing_the_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-same-id-reconnect".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "same-live-session", Some(true)).await;
+        let original = sessions
+            .get_agent("same-live-session")
+            .await
+            .expect("initial session exists");
+
+        new_chat_session_for_eviction_test(&dispatcher, "same-live-session", Some(true)).await;
+        let reattached = sessions
+            .get_agent("same-live-session")
+            .await
+            .expect("reattached session exists");
+
+        assert!(
+            Arc::ptr_eq(&original, &reattached),
+            "a same-ID reconnect must retain the existing live session and its bound Goal"
         );
     }
 

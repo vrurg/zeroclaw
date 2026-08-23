@@ -581,18 +581,31 @@ pub async fn run(
         ));
     }
 
-    if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+    if crate::control_plane::control_plane().is_none() {
+        match crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
             .await
             .map(crate::control_plane::init_control_plane)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
-            "control-plane failed to start; supervision disabled for this run"
-        );
+        {
+            Ok(_) => {}
+            Err(e) if !config.goal.enabled => {
+                // A disabled Goal surface is a revoking generation. Without
+                // the canonical control plane we cannot fence retained Goal
+                // records, so continuing would allow a later re-enable to
+                // revive work that this generation was required to cancel.
+                return Err(e.context(
+                    "control-plane startup failed while disabled Goal Mode requires durable revocation",
+                ));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "error": format!("{e:#}") })),
+                    "control-plane failed to start; supervision disabled for this run"
+                );
+            }
+        }
     }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.

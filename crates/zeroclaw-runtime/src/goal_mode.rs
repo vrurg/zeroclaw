@@ -1300,6 +1300,11 @@ impl GoalRuntime {
     }
 
     async fn resume(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        // A durable pause can precede a failed executor join. Re-establish
+        // quiescence before a resumed epoch is even preflighted; otherwise a
+        // fake or transport-specific executor could launch a successor while
+        // the fenced predecessor remains active.
+        self.retry_pending_quiescence().await?;
         let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
