@@ -8202,10 +8202,28 @@ impl ChannelGoalSessionAdapter {
         let Some(route) = Self::matrix_goal_route(task) else {
             return false;
         };
-        if !config
+        let Some(agent) = config.agents.get(&task.agent).filter(|agent| agent.enabled) else {
+            return false;
+        };
+        let bindings_declared = config
             .agents
-            .get(&task.agent)
-            .is_some_and(|agent| agent.enabled)
+            .values()
+            .any(|agent| !agent.channels.is_empty());
+        if bindings_declared {
+            if !agent
+                .channels
+                .iter()
+                .any(|channel| channel.as_str() == route.channel_key)
+            {
+                return false;
+            }
+        } else if config.resolved_runtime_agent_alias().or_else(|| {
+            config
+                .agents
+                .iter()
+                .find(|(_, candidate)| candidate.enabled)
+                .map(|(alias, _)| alias.as_str())
+        }) != Some(task.agent.as_str())
         {
             return false;
         }
@@ -15946,6 +15964,28 @@ temperature = 0.3
                 ),
             ),
             "preparation-time policy reconciliation must reject a revoked Matrix principal"
+        );
+        let mut reassigned = prospective_config.clone();
+        reassigned.agents.get_mut("main").unwrap().channels.clear();
+        reassigned.agents.insert(
+            "other".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["matrix.primary".into()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            !ChannelGoalSessionAdapter::owns_task_policy_in_config(
+                &reassigned,
+                &task(
+                    "reassigned",
+                    "main",
+                    &owned_route,
+                    Some("@alice:example.test")
+                ),
+            ),
+            "preparation-time policy reconciliation must reject a Matrix alias reassigned to another agent"
         );
         assert!(
             !ChannelGoalSessionAdapter::owns_task_policy_in_generation(
