@@ -756,6 +756,10 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
+        Arc::new(
+            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
+                .with_subagent_caller(is_subagent_caller),
+        ),
         Arc::new(SendMessageToPeerTool::new(
             Arc::new(root_config.clone()),
             agent_alias,
@@ -780,16 +784,14 @@ pub fn all_tools_with_runtime(
         Arc::new(TodoWriteTool::new()),
     ];
 
+    let is_goal_subagent =
+        is_subagent_caller && crate::agent::cost::current_goal_child_scope().is_some();
+
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
     // model out from under the parent (the switch signal is process-wide).
     if is_subagent_caller {
         tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
-    } else {
-        tool_arcs.push(Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(false),
-        ));
     }
 
     // Register discord_search if any configured Discord alias has
@@ -1708,6 +1710,14 @@ pub fn all_tools_with_runtime(
 
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
+
+    // Ordinary subagents retain their existing registry. A Goal-owned child is
+    // narrower: it must not start recursive or independent parent-only work
+    // under the Goal's durable scope. Apply this after every built-in has been
+    // registered, including `delegate`.
+    if is_goal_subagent {
+        tool_arcs.retain(|tool| !crate::agent::agent::is_goal_child_excluded_tool(tool.name()));
+    }
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
@@ -3816,7 +3826,11 @@ const = true
         assert!(!names.contains(&"read_skill"));
     }
 
-    fn registry_names(tmp: &TempDir, is_subagent_caller: bool) -> Vec<String> {
+    fn registry_names(
+        tmp: &TempDir,
+        is_subagent_caller: bool,
+        agents: &HashMap<String, AliasedAgentConfig>,
+    ) -> Vec<String> {
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
             backend: "markdown".into(),
@@ -3838,7 +3852,7 @@ const = true
             &zeroclaw_config::schema::HttpRequestConfig::default(),
             &zeroclaw_config::schema::WebFetchConfig::default(),
             tmp.path(),
-            &HashMap::new(),
+            agents,
             None,
             &cfg,
             None,
@@ -3852,26 +3866,67 @@ const = true
     }
 
     #[test]
-    fn model_switch_present_for_top_level_absent_for_subagent() {
+    fn ordinary_subagent_registry_preserves_pre_goal_capabilities() {
         let tmp = TempDir::new().unwrap();
-        let top = registry_names(&tmp, false);
+        let agents = HashMap::from([(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.researcher".into(),
+                ..Default::default()
+            },
+        )]);
+        let top = registry_names(&tmp, false, &agents);
         assert!(
             top.iter().any(|n| n == ModelSwitchTool::NAME),
             "top-level agent must keep model_switch"
         );
-        let subagent = registry_names(&tmp, true);
+        let subagent = registry_names(&tmp, true, &agents);
         assert!(
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
         );
         assert!(
-            !subagent.iter().any(|n| n == SpawnSubagentTool::NAME),
-            "subagent must not receive child-creation capability"
+            subagent.iter().any(|n| n == SpawnSubagentTool::NAME),
+            "ordinary subagent registry must retain its pre-Goal spawn_subagent tool"
         );
         assert!(
-            top.iter().any(|n| n == SpawnSubagentTool::NAME),
-            "top-level agent retains foreground child capability"
+            subagent.iter().any(|n| n == DelegateTool::NAME),
+            "ordinary subagent registry must retain its pre-Goal delegate tool"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_subagent_registry_excludes_recursive_child_tools() {
+        let tmp = TempDir::new().unwrap();
+        let agents = HashMap::from([(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.researcher".into(),
+                ..Default::default()
+            },
+        )]);
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                let names = registry_names(&tmp, true, &agents);
+                assert!(
+                    !names.iter().any(|name| name == DelegateTool::NAME),
+                    "Goal child must not receive delegate"
+                );
+                assert!(
+                    !names.iter().any(|name| name == SpawnSubagentTool::NAME),
+                    "Goal child must not receive spawn_subagent"
+                );
+            })
+            .await;
     }
 
     #[test]
