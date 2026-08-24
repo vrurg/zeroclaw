@@ -8521,8 +8521,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, _sessions, _chat_backend, acp_store) =
+        let (mut dispatcher, _sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.set_tui_id_for_test(Some("tui-acp-cwd-resume".into()));
 
         let sid = "acp-cwd-resume-001";
         let original_cwd = tmp.path().join("project-dir").to_string_lossy().to_string();
