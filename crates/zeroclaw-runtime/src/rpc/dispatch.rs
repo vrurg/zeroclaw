@@ -1529,9 +1529,10 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
-        let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
+        let Some(live_session) = self.ctx.sessions.live_session(&req.session_id).await else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         };
+        let agent = live_session.agent();
         if self
             .ctx
             .sessions
@@ -1541,7 +1542,7 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
         let goal_ingress = self
-            .fence_goal_for_live_session_removal(&req.session_id)
+            .fence_goal_for_live_session_removal(&req.session_id, &live_session)
             .await?;
         agent
             .lock()
@@ -1579,7 +1580,12 @@ impl RpcDispatcher {
             // promptly.
             drop(agent);
         }
-        if !self.ctx.sessions.remove(&req.session_id).await {
+        if !self
+            .ctx
+            .sessions
+            .remove_exact(&req.session_id, live_session.generation())
+            .await
+        {
             if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
                 && let Some((ingress, fence)) = goal_ingress.as_ref()
             {
@@ -1626,21 +1632,15 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
 
-        let goal_ingress = self.fence_goal_for_live_session_removal(sid).await?;
+        let Some(live_session) = self.ctx.sessions.live_session(sid).await else {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        };
+        let goal_ingress = self
+            .fence_goal_for_live_session_removal(sid, &live_session)
+            .await?;
 
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-
-        let agent_alias = self
-            .ctx
-            .sessions
-            .get_agent_alias(sid)
-            .await
-            .unwrap_or_default();
+        let chat_mode = live_session.chat_mode.clone();
+        let agent_alias = live_session.agent_alias.clone();
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
             "zeroclaw_scope",
@@ -1685,7 +1685,11 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = self.ctx.sessions.kill_session(sid).await;
+        let killed = self
+            .ctx
+            .sessions
+            .kill_session_exact(sid, live_session.generation())
+            .await;
         if killed {
             if let Some((ingress, fence)) = goal_ingress.as_ref() {
                 self.delete_fenced_goal_after_session_removal(ingress, fence)
@@ -2661,17 +2665,26 @@ impl RpcDispatcher {
         {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
+        let Some(live_session) = self.ctx.sessions.live_session(&req.session_id).await else {
+            return to_result(SessionDeleteResult {
+                session_id: req.session_id,
+                deleted: true,
+            });
+        };
         let goal_ingress = self
-            .fence_goal_for_live_session_removal(&req.session_id)
+            .fence_goal_for_live_session_removal(&req.session_id, &live_session)
             .await?;
-        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
-            agent
-                .lock()
-                .await
-                .channel_handles()
-                .unregister_channel("rpc");
-        }
-        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        live_session
+            .agent()
+            .lock()
+            .await
+            .channel_handles()
+            .unregister_channel("rpc");
+        let existed = self
+            .ctx
+            .sessions
+            .remove_exact(&req.session_id, live_session.generation())
+            .await;
         if existed && let Some((ingress, fence)) = goal_ingress.as_ref() {
             self.delete_fenced_goal_after_session_removal(ingress, fence)
                 .await?;
@@ -2699,15 +2712,28 @@ impl RpcDispatcher {
         &self,
         session_id: &str,
     ) -> Result<Option<crate::goal_mode::GoalIngressContext>, JsonRpcError> {
-        let Some(agent) = self.ctx.sessions.get_agent_alias(session_id).await else {
+        let Some(live_session) = self.ctx.sessions.live_session(session_id).await else {
             return Ok(None);
         };
-        let Some(Some(tui_id)) = self.ctx.sessions.session_owner_tui_id(session_id).await else {
+        self.goal_ingress_for_exact_live_session(session_id, &live_session)
+    }
+
+    fn goal_ingress_for_exact_live_session(
+        &self,
+        session_id: &str,
+        live_session: &crate::rpc::session::LiveRpcSession,
+    ) -> Result<Option<crate::goal_mode::GoalIngressContext>, JsonRpcError> {
+        let Some(tui_id) = live_session.owner_tui_id.as_deref() else {
             return Ok(None);
         };
-        crate::goal_mode::GoalIngressContext::zero_code(session_id, agent, "rpc", tui_id)
-            .map(Some)
-            .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))
+        crate::goal_mode::GoalIngressContext::zero_code(
+            session_id,
+            &live_session.agent_alias,
+            "rpc",
+            tui_id,
+        )
+        .map(Some)
+        .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))
     }
 
     /// Fence an exact RPC-bound Goal before removing its live session.
@@ -2776,6 +2802,7 @@ impl RpcDispatcher {
     async fn fence_goal_for_live_session_removal(
         &self,
         session_id: &str,
+        live_session: &crate::rpc::session::LiveRpcSession,
     ) -> Result<
         Option<(
             crate::goal_mode::GoalIngressContext,
@@ -2783,7 +2810,8 @@ impl RpcDispatcher {
         )>,
         JsonRpcError,
     > {
-        let Some(ingress) = self.goal_ingress_for_live_session(session_id).await? else {
+        let Some(ingress) = self.goal_ingress_for_exact_live_session(session_id, live_session)?
+        else {
             return Ok(None);
         };
         let Some(fence) = self.fence_goal_before_session_removal(&ingress).await? else {

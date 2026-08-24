@@ -12648,6 +12648,9 @@ impl PreparedChannels {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         let Some(router) = self.goal_router() else {
+            if let Some(goal_runtime) = goal_runtime {
+                revoke_matrix_goals_without_active_generation(goal_runtime).await?;
+            }
             return self.run(cancel).await;
         };
 
@@ -12732,6 +12735,21 @@ impl PreparedChannels {
             PreparedChannelsState::Ready { router, .. } => Some(Arc::clone(router)),
         }
     }
+}
+
+/// Revoke retained Matrix Goals when this daemon generation has no active
+/// channel router. The route parser remains channel-owned; runtime only calls
+/// this through its registered channel lifecycle boundary.
+pub async fn revoke_matrix_goals_without_active_generation(
+    goal_runtime: Arc<GoalRuntime>,
+) -> Result<()> {
+    goal_runtime
+        .cancel_nonterminal_goals_for_policy_revocation(
+            ChannelGoalSessionAdapter::is_matrix_goal_task,
+        )
+        .await
+        .context("revoke Matrix Goals without an active channel generation")?;
+    Ok(())
 }
 
 /// Prepare all configured channel contexts before any listener accepts work.

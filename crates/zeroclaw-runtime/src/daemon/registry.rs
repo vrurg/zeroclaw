@@ -39,6 +39,10 @@ pub type GatewayStarter = Box<
 pub type ChannelsStarter =
     Box<dyn Fn(Config, CancellationToken, Option<Arc<GoalRuntime>>) -> StarterFuture + Send + Sync>;
 
+/// Reconciles retained channel-owned Goals when no channel supervisor will
+/// start for this daemon generation.
+pub type ChannelGoalRevoker = Box<dyn Fn(Arc<GoalRuntime>) -> StarterFuture + Send + Sync>;
+
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
     dyn Fn(
@@ -63,6 +67,7 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
+    channel_goal_revoker: Option<ChannelGoalRevoker>,
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
@@ -94,6 +99,11 @@ impl DaemonRegistry {
 
     pub fn register_channels(&mut self, starter: ChannelsStarter) -> &mut Self {
         self.channels_start = Some(starter);
+        self
+    }
+
+    pub fn register_channel_goal_revoker(&mut self, revoker: ChannelGoalRevoker) -> &mut Self {
+        self.channel_goal_revoker = Some(revoker);
         self
     }
 
@@ -147,6 +157,10 @@ impl DaemonRegistry {
 
     pub(crate) fn take_channels_start(&mut self) -> Option<ChannelsStarter> {
         self.channels_start.take()
+    }
+
+    pub(crate) fn take_channel_goal_revoker(&mut self) -> Option<ChannelGoalRevoker> {
+        self.channel_goal_revoker.take()
     }
 
     pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {

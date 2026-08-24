@@ -4820,6 +4820,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     zeroclaw_channels::orchestrator::ChannelGoalSessionAdapter::new(),
                 );
                 registry.register_goal_session_adapter(goal_session_adapter.clone());
+                registry.register_channel_goal_revoker(Box::new(|goal_runtime| {
+                    Box::pin(async move {
+                        zeroclaw_channels::orchestrator::revoke_matrix_goals_without_active_generation(
+                            goal_runtime,
+                        )
+                        .await
+                    })
+                }));
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();

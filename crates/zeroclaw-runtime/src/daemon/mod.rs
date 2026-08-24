@@ -898,6 +898,15 @@ pub async fn run(
         None
     };
 
+    if !has_supervised_channels(&config)
+        && let Some(goal_runtime) = &goal_runtime
+    {
+        let revoker = registry.take_channel_goal_revoker().ok_or_else(|| {
+            anyhow::anyhow!("channel Goal revoker is unavailable while no channel supervisor runs")
+        })?;
+        revoker(std::sync::Arc::clone(goal_runtime)).await?;
+    }
+
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();

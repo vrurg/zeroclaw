@@ -77,13 +77,24 @@ pub struct RpcSession {
 ///
 /// `session/new` uses this to distinguish a same-ID reconnect from a genuine
 /// replacement without exposing the mutable session record to the dispatcher.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct LiveRpcSession {
     pub agent_alias: String,
     pub workspace_dir: String,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
     generation: u64,
+    agent: Arc<Mutex<Agent>>,
+}
+
+impl LiveRpcSession {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn agent(&self) -> Arc<Mutex<Agent>> {
+        Arc::clone(&self.agent)
+    }
 }
 
 impl RpcSession {
@@ -379,6 +390,21 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }
 
+    /// Snapshot one exact live generation for a lifecycle operation. Callers
+    /// must use its generation for removal; an ID can name a later reconnect.
+    pub(crate) async fn live_session(&self, id: &str) -> Option<LiveRpcSession> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        Some(LiveRpcSession {
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            chat_mode: session.chat_mode.clone(),
+            owner_tui_id: session.owner_tui_id.clone(),
+            generation: session.generation,
+            agent: Arc::clone(&session.agent),
+        })
+    }
+
     /// Snapshot reconnect identity and history while the exact live session is
     /// still present. `session/new` must not validate an unversioned identity
     /// and then turn a concurrent removal into a successful empty reconnect.
@@ -393,6 +419,7 @@ impl SessionStore {
                     chat_mode: session.chat_mode.clone(),
                     owner_tui_id: session.owner_tui_id.clone(),
                     generation: session.generation,
+                    agent: Arc::clone(&session.agent),
                 },
                 Arc::clone(&session.agent),
             )
@@ -667,6 +694,28 @@ impl SessionStore {
         self.sessions.lock().await.remove(id).is_some()
     }
 
+    /// Remove only the captured live generation. A same-ID reconnect that
+    /// wins during Goal fencing must remain reachable.
+    pub(crate) async fn remove_exact(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(id)
+            .is_none_or(|session| session.generation != generation)
+        {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
+    }
+
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
     /// session doesn't exist, `Some(None)` if it exists but is unowned (e.g.
     /// created by an anonymous connection), `Some(Some(id))` if owned by `id`.
@@ -747,6 +796,27 @@ impl SessionStore {
             token.cancel();
         }
         self.sessions.lock().await.remove(id).is_some()
+    }
+
+    /// Admin-kill only the captured live generation.
+    pub(crate) async fn kill_session_exact(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(id)
+            .is_none_or(|session| session.generation != generation)
+        {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
