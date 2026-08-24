@@ -8083,6 +8083,35 @@ fn matrix_goal_route_round_trips_alias_and_room_without_thread_state() {
     assert!(MatrixGoalRouteV1::new("discord.primary".to_string(), "room".to_string()).is_err());
 }
 
+#[cfg(test)]
+#[test]
+fn legacy_channel_owner_skips_disabled_default_and_is_deterministic() {
+    let mut config = Config::default();
+    config.agents.clear();
+    config.agents.insert(
+        "default".to_string(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    for alias in ["zeta", "alpha"] {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    assert_eq!(
+        legacy_channel_owner(&config),
+        Some("alpha"),
+        "legacy routing and prospective Goal policy must retain the same enabled fallback owner"
+    );
+}
+
 /// Stable channel-session adapter registered with the daemon-owned Goal host.
 ///
 /// It holds only the currently active channel generation. Route ownership,
@@ -12452,11 +12481,7 @@ fn build_owner_by_channel_key(
     // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
     // continue to work.
     if !collected_channel_keys.is_empty() {
-        let fallback_owner = config
-            .resolved_runtime_agent_alias()
-            .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
-            .map(ToString::to_string)
-            .or_else(|| enabled_agents.first().cloned());
+        let fallback_owner = legacy_channel_owner(config).map(ToString::to_string);
 
         if let Some(owner_alias) = fallback_owner {
             for channel_key in collected_channel_keys {
