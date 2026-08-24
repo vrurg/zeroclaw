@@ -588,3 +588,263 @@ async fn terminal_goal_stays_current_until_explicit_disposal() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn legacy_mutators_cannot_bypass_session_goal_epoch_fencing() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("guarded-only", "session-guarded-only");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .update_status("guarded-only", TaskStatus::Paused, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .claim_owner("guarded-only", 2, "boot-b")
+            .await
+            .is_err()
+    );
+    assert!(store.heartbeat("guarded-only", "boot-a").await.is_err());
+    assert!(
+        store
+            .update_goal_limits("guarded-only", Some(5), None)
+            .await
+            .is_err()
+    );
+    assert!(store.update_goal_pause("guarded-only", None).await.is_err());
+    assert!(
+        store
+            .pause_goal_task(
+                "guarded-only",
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .resume_goal_task("guarded-only", 2, "boot-b", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .set_continuation_context("guarded-only", None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn terminal_goal_with_unpaired_tool_phase_cannot_be_replaced() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("unpaired-terminal", "session-unpaired-terminal");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .begin_goal_tool_phase("unpaired-terminal", "session-unpaired-terminal", 1)
+        .await
+        .unwrap();
+    store
+        .finish_session_goal(
+            "unpaired-terminal",
+            "session-unpaired-terminal",
+            1,
+            TaskStatus::Failed,
+            Some("tool pairing incomplete".into()),
+        )
+        .await
+        .unwrap();
+    let (replacement, replacement_goal) =
+        session_goal("replacement-tool", "session-unpaired-terminal");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(replacement, replacement_goal)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale
+    );
+}
+
+#[tokio::test]
+async fn duplicate_task_id_never_reports_a_phantom_session_goal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (first, first_goal) = session_goal("shared-id", "session-first");
+    store
+        .create_or_replace_session_goal(first, first_goal)
+        .await
+        .unwrap();
+    store
+        .finish_session_goal("shared-id", "session-first", 1, TaskStatus::Completed, None)
+        .await
+        .unwrap();
+    let (second, second_goal) = session_goal("shared-id", "session-second");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(second, second_goal)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale
+    );
+    assert!(
+        store
+            .current_goal_for_session("session-second")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn restart_pauses_an_unpaired_tool_phase_without_erasing_its_pause_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("restart-tool", "session-restart-tool");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .begin_goal_tool_phase("restart-tool", "session-restart-tool", 1)
+        .await
+        .unwrap();
+    drop(store);
+
+    let boot = ControlPlaneHandle::start_with_boot_id(directory.path(), "boot-b".into())
+        .await
+        .unwrap();
+    let task = boot.store.get("restart-tool").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, 2);
+    drop(boot);
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(
+        store
+            .get_goal_task("restart-tool")
+            .await
+            .unwrap()
+            .unwrap()
+            .tool_phase,
+        zeroclaw_runtime::control_plane::GoalToolPhase::InFlight
+    );
+    assert_eq!(
+        store
+            .resume_session_goal("restart-tool", "session-restart-tool", 2, 2, "boot-c")
+            .await
+            .unwrap(),
+        GoalTransitionResult::Stale
+    );
+}
+
+#[tokio::test]
+async fn restart_does_not_rewrite_a_preexisting_paused_goal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("already-paused", "session-already-paused");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .pause_session_goal(
+            "already-paused",
+            "session-already-paused",
+            1,
+            GoalPauseState {
+                reason: GoalPauseReason::OperatorPaused,
+                description: Some("keep this reason".into()),
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let boot = ControlPlaneHandle::start_with_boot_id(directory.path(), "boot-b".into())
+        .await
+        .unwrap();
+    drop(boot);
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let goal = store
+        .get_goal_task("already-paused")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::OperatorPaused));
+    assert_eq!(goal.pause_description.as_deref(), Some("keep this reason"));
+}
+
+#[tokio::test]
+async fn restart_fails_a_saturated_epoch_instead_of_losing_the_goal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("saturated", "session-saturated");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    drop(store);
+    let conn = Connection::open(directory.path().join("control_plane.db")).unwrap();
+    conn.execute(
+        "UPDATE tasks SET execution_epoch = ?1 WHERE id = 'saturated'",
+        [i64::MAX],
+    )
+    .unwrap();
+    drop(conn);
+
+    let boot = ControlPlaneHandle::start_with_boot_id(directory.path(), "boot-b".into())
+        .await
+        .unwrap();
+    let task = boot.store.get("saturated").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.execution_epoch, i64::MAX);
+    drop(boot);
+}
+
+#[tokio::test]
+async fn migration_normalizes_blank_terminal_legacy_session_bindings() {
+    let directory = tempfile::tempdir().unwrap();
+    create_v7_goal_database(directory.path(), true);
+    let db_path = directory.path().join("control_plane.db");
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO tasks (id, kind, agent, status, session_id, started_at, finished_at)
+         VALUES ('blank-terminal', 'goal', 'main', 'completed', '   ',
+                 '2026-08-24T00:00:00Z', '2026-08-24T00:00:01Z')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO goal_tasks (task_id, objective) VALUES ('blank-terminal', 'old goal')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    assert!(store.current_goal_for_session("").await.unwrap().is_none());
+    assert_eq!(
+        store
+            .get("blank-terminal")
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        None
+    );
+}

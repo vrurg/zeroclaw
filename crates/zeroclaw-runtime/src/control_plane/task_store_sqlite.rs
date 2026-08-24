@@ -249,38 +249,56 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
-fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<usize> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
     // status back to NULL/running (review finding— the documented idempotency).
-    conn.execute(
-        "INSERT INTO tasks
+    let inserted = conn
+        .execute(
+            "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
              parent_id, originator_route, delivered, idem_key, principal_id, session_id,
              execution_epoch, started_at, finished_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
-        params![
-            rec.id,
-            kind_to_db(rec.kind),
-            rec.agent,
-            status_to_db(rec.status),
-            rec.owner_pid as i64,
-            rec.owner_boot_id,
-            rec.heartbeat_at,
-            rec.depth as i64,
-            rec.parent_id,
-            rec.originator_route,
-            rec.delivered as i64,
-            rec.idem_key,
-            rec.principal_id,
-            rec.session_id,
-            rec.execution_epoch,
-            rec.started_at,
-            rec.finished_at,
-        ],
-    )
-    .context("insert task record")?;
+            params![
+                rec.id,
+                kind_to_db(rec.kind),
+                rec.agent,
+                status_to_db(rec.status),
+                rec.owner_pid as i64,
+                rec.owner_boot_id,
+                rec.heartbeat_at,
+                rec.depth as i64,
+                rec.parent_id,
+                rec.originator_route,
+                rec.delivered as i64,
+                rec.idem_key,
+                rec.principal_id,
+                rec.session_id,
+                rec.execution_epoch,
+                rec.started_at,
+                rec.finished_at,
+            ],
+        )
+        .context("insert task record")?;
+    Ok(inserted)
+}
+
+fn reject_session_goal_mutation(conn: &Connection, id: &str) -> Result<()> {
+    let session_bound = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL
+               AND length(trim(session_id)) > 0 FROM tasks WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("classify generic task mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!("session-bound goals require guarded goal transition APIs");
+    }
     Ok(())
 }
 
@@ -328,6 +346,9 @@ fn claim_task_owner_record(
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
+        if rec.kind == TaskKind::Goal {
+            anyhow::bail!("Goal tasks require the GoalTaskRegistry creation API");
+        }
         let conn = self.conn.lock();
         insert_task_record(&conn, rec)?;
         Ok(())
@@ -336,6 +357,7 @@ impl TaskRegistry for SqliteTaskStore {
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock();
+        reject_session_goal_mutation(&conn, id)?;
         // Only the heart-beating owner refreshes; prevents a stale boot from
         // resurrecting liveness it does not own.
         conn.execute(
@@ -355,12 +377,14 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_goal_mutation(&conn, id)?;
         update_task_status_record(&conn, id, status, output, error)?;
         Ok(())
     }
 
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_goal_mutation(&conn, id)?;
         claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
         Ok(())
     }

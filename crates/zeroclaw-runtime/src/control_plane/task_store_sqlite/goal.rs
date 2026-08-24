@@ -33,6 +33,23 @@ fn transition_failure(
     })
 }
 
+fn reject_session_goal_legacy_mutation(conn: &Connection, task_id: &str) -> Result<()> {
+    let session_bound = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL
+               AND length(trim(session_id)) > 0 FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("classify legacy goal mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!("session-bound goals require guarded goal transition APIs");
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
     if version < 1 {
         conn.execute_batch(
@@ -206,16 +223,26 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         ] {
             add_column_if_missing(conn, "goal_tasks", column, sql)?;
         }
-        // Legacy rows predate session ownership. Keep terminal audit rows
-        // readable, but fence nonterminal rows before the new admission
-        // trigger makes their old binding invalid.
+        // Legacy rows predate session ownership. Blank values have never been
+        // valid bindings, so normalize them to NULL before creating the
+        // partial uniqueness index. Terminal audit rows stay readable but are
+        // never eligible as a session's current Goal.
+        conn.execute(
+            "UPDATE tasks SET session_id = NULL
+              WHERE kind = 'goal' AND session_id IS NOT NULL
+                AND length(trim(session_id)) = 0",
+            [],
+        )
+        .context("normalize blank legacy goal sessions")?;
+        // Fence nonterminal legacy rows before the new admission trigger makes
+        // their missing binding invalid.
         conn.execute(
             "UPDATE tasks
                 SET status = 'failed', error = COALESCE(error, 'legacy_goal_missing_session'),
                     finished_at = COALESCE(finished_at, ?1),
                     execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
-              WHERE kind = 'goal' AND (session_id IS NULL OR length(trim(session_id)) = 0)
+              WHERE kind = 'goal' AND session_id IS NULL
                 AND status IN ('running', 'paused')",
             params![chrono::Utc::now().to_rfc3339()],
         )
@@ -302,12 +329,12 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
 
 impl SqliteTaskStore {
     /// Reconcile Goal rows that were interrupted by a prior daemon boot. A
-    /// pending operation or unmatched tool phase cannot be safely replayed;
-    /// a clean running Goal pauses for an explicit later resume.
+    /// pending operation cannot be safely replayed; a clean or explicitly
+    /// unpaired tool phase pauses for an explicit later operator decision.
     pub fn reconcile_goal_boot_state(&self, boot_id: &str) -> Result<u64> {
         let mut conn = self.conn.lock();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start goal boot reconciliation")?;
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
@@ -318,7 +345,7 @@ impl SqliteTaskStore {
                      WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                        AND owner_boot_id != ?1
               ) AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
-                   OR accounting_state != 'complete' OR tool_phase != 'clean')",
+                   OR accounting_state != 'complete')",
             params![boot_id],
         )?;
         let failed = tx.execute(
@@ -333,36 +360,61 @@ impl SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
                        AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
-                            OR accounting_state != 'complete' OR tool_phase != 'clean')
+                            OR accounting_state != 'complete')
                 )",
             params![boot_id, &now],
         )?;
-        let paused = tx.execute(
-            "UPDATE tasks
-                SET status = 'paused', execution_epoch = execution_epoch + 1
-              WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
-                AND owner_boot_id != ?1 AND execution_epoch < 9223372036854775807
-                AND EXISTS (
-                    SELECT 1 FROM goal_tasks
-                     WHERE task_id = tasks.id AND pending_call_id IS NULL
-                       AND pending_call_epoch IS NULL AND accounting_state = 'complete'
-                       AND tool_phase = 'clean'
-                )",
-            params![boot_id],
+        let mut paused_ids = Vec::new();
+        let mut exhausted_ids = Vec::new();
+        let mut stmt = tx.prepare(
+            "SELECT tasks.id, tasks.execution_epoch
+               FROM tasks JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+              WHERE tasks.kind = 'goal' AND tasks.session_id IS NOT NULL
+                AND tasks.status = 'running' AND tasks.owner_boot_id != ?1
+                AND goal_tasks.pending_call_id IS NULL
+                AND goal_tasks.pending_call_epoch IS NULL
+                AND goal_tasks.accounting_state = 'complete'",
         )?;
-        tx.execute(
-            "UPDATE goal_tasks
-                SET pause_reason = 'daemon_restarted', pause_description = 'daemon restart',
-                    blockers_json = '[]'
-              WHERE task_id IN (
-                    SELECT id FROM tasks
-                     WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'paused'
-                       AND owner_boot_id != ?1
-              )",
-            params![boot_id],
-        )?;
+        let interrupted = stmt
+            .query_map(params![boot_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        for (task_id, epoch) in interrupted {
+            if epoch < i64::MAX {
+                let changed = tx.execute(
+                    "UPDATE tasks SET status = 'paused', execution_epoch = execution_epoch + 1
+                      WHERE id = ?1 AND status = 'running' AND execution_epoch = ?2",
+                    params![&task_id, epoch],
+                )?;
+                if changed == 1 {
+                    paused_ids.push(task_id);
+                }
+            } else {
+                let changed = tx.execute(
+                    "UPDATE tasks
+                        SET status = 'failed', error = COALESCE(error, 'goal_epoch_exhausted'),
+                            finished_at = COALESCE(finished_at, ?2)
+                      WHERE id = ?1 AND status = 'running' AND execution_epoch = ?3",
+                    params![&task_id, &now, epoch],
+                )?;
+                if changed == 1 {
+                    exhausted_ids.push(task_id);
+                }
+            }
+        }
+        for task_id in &paused_ids {
+            tx.execute(
+                "UPDATE goal_tasks
+                    SET pause_reason = 'daemon_restarted', pause_description = 'daemon restart',
+                        blockers_json = '[]'
+                  WHERE task_id = ?1",
+                params![task_id],
+            )?;
+        }
         tx.commit().context("commit goal boot reconciliation")?;
-        Ok((failed + paused) as u64)
+        Ok((failed + paused_ids.len() + exhausted_ids.len()) as u64)
     }
 }
 
@@ -530,41 +582,42 @@ fn tool_phase_from_db(value: String) -> rusqlite::Result<GoalToolPhase> {
     }
 }
 
-fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
+fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<usize> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
     let (effective_token_limit, effective_cost_limit_usd) =
         goal_limits_to_db(rec.effective_token_limit, rec.effective_cost_limit_usd)?;
-    conn.execute(
-        "INSERT INTO goal_tasks
+    let inserted = conn
+        .execute(
+            "INSERT INTO goal_tasks
             (task_id, objective, success_criteria, effective_token_limit, effective_cost_limit_usd,
              pause_reason, pause_description, blockers_json, pending_call_id, pending_call_epoch,
              pending_reserved_tokens, pending_reserved_cost_usd, accounting_state, tool_phase)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(task_id) DO NOTHING",
-        params![
-            rec.task_id,
-            rec.objective,
-            rec.success_criteria,
-            effective_token_limit,
-            effective_cost_limit_usd,
-            pause_reason,
-            rec.pause_description,
-            blockers_json,
-            rec.pending_call_id,
-            rec.pending_call_epoch,
-            rec.pending_reserved_tokens
-                .map(token_limit_to_db)
-                .transpose()?,
-            rec.pending_reserved_cost_usd
-                .map(cost_limit_to_db)
-                .transpose()?,
-            accounting_state_to_db(rec.accounting_state),
-            tool_phase_to_db(rec.tool_phase),
-        ],
-    )
-    .context("insert goal task record")?;
-    Ok(())
+            params![
+                rec.task_id,
+                rec.objective,
+                rec.success_criteria,
+                effective_token_limit,
+                effective_cost_limit_usd,
+                pause_reason,
+                rec.pause_description,
+                blockers_json,
+                rec.pending_call_id,
+                rec.pending_call_epoch,
+                rec.pending_reserved_tokens
+                    .map(token_limit_to_db)
+                    .transpose()?,
+                rec.pending_reserved_cost_usd
+                    .map(cost_limit_to_db)
+                    .transpose()?,
+                accounting_state_to_db(rec.accounting_state),
+                tool_phase_to_db(rec.tool_phase),
+            ],
+        )
+        .context("insert goal task record")?;
+    Ok(inserted)
 }
 
 fn update_goal_pause_record(
@@ -637,6 +690,13 @@ impl GoalTaskRegistry for SqliteTaskStore {
         continuation_context: Option<TaskContinuationContext>,
     ) -> Result<()> {
         ensure_goal_task_identity(&task, &goal)?;
+        if task
+            .session_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            anyhow::bail!("session-bound goals require guarded goal transition APIs");
+        }
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
@@ -658,6 +718,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 "SELECT * FROM tasks
               WHERE agent = ?1
                 AND kind = 'goal'
+                AND session_id IS NULL
                 AND status IN ('running','paused')
               ORDER BY started_at DESC, rowid DESC
               LIMIT 1",
@@ -687,6 +748,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 "SELECT * FROM tasks
               WHERE agent = ?1
                 AND kind = 'goal'
+                AND session_id IS NULL
                 AND status IN ('running','paused')
                 AND (?2 IS NULL OR originator_route = ?2)
                 AND (?3 IS NULL OR principal_id = ?3)
@@ -721,6 +783,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 "SELECT id FROM tasks
                  WHERE agent = ?1
                    AND kind = 'goal'
+                   AND session_id IS NULL
                    AND status IN ('running','paused')
                    AND (?2 IS NULL OR originator_route = ?2)
                    AND (?3 IS NULL OR principal_id = ?3)
@@ -751,19 +814,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
     }
 
     async fn update_goal_objective(&self, task_id: &str, objective: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        let updated = conn
-            .execute(
-                "UPDATE goal_tasks
-                    SET objective = ?1
-                  WHERE task_id = ?2",
-                params![objective, task_id],
-            )
-            .context("update goal objective")?;
-        if updated == 0 {
-            anyhow::bail!("goal task {task_id} has no goal extension row");
-        }
-        Ok(())
+        let _ = (task_id, objective);
+        anyhow::bail!("Goal objectives are immutable")
     }
 
     async fn update_goal_limits(
@@ -775,6 +827,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let (effective_token_limit, effective_cost_limit_usd) =
             goal_limits_to_db(token_limit, cost_limit_usd)?;
         let conn = self.conn.lock();
+        reject_session_goal_legacy_mutation(&conn, task_id)?;
         let updated = conn
             .execute(
                 "UPDATE goal_tasks
@@ -792,6 +845,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
 
     async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_goal_legacy_mutation(&conn, task_id)?;
         let updated = update_goal_pause_record(&conn, task_id, pause)?;
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
@@ -804,6 +858,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let tx = conn
             .transaction()
             .context("start pause goal task transaction")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
         ensure_goal_task_row(&tx, task_id)?;
         let updated = update_task_status_record(&tx, task_id, TaskStatus::Paused, None, None)?;
         if updated == 0 {
@@ -828,6 +883,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let tx = conn
             .transaction()
             .context("start resume goal task transaction")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
         ensure_goal_task_row(&tx, task_id)?;
         if let Some(context) = continuation_context {
             upsert_continuation_context(&tx, task_id, &context)?;
@@ -854,6 +910,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         context: Option<TaskContinuationContext>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_goal_legacy_mutation(&conn, task_id)?;
         ensure_goal_task_row(&conn, task_id)?;
         match context {
             Some(context) => upsert_continuation_context(&conn, task_id, &context)?,
@@ -885,6 +942,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
     }
 
     async fn current_goal_for_session(&self, session_id: &str) -> Result<Option<TaskRecord>> {
+        if session_id.trim().is_empty() {
+            return Ok(None);
+        }
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT * FROM tasks WHERE kind = 'goal' AND session_id = ?1",
@@ -941,6 +1001,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             let settled = tx
                 .query_row(
                     "SELECT pending_call_id IS NULL AND pending_call_epoch IS NULL
+                            AND tool_phase = 'clean'
                        FROM goal_tasks WHERE task_id = ?1",
                     params![&current.id],
                     |row| row.get::<_, bool>(0),
@@ -954,8 +1015,12 @@ impl GoalTaskRegistry for SqliteTaskStore {
             tx.execute("DELETE FROM tasks WHERE id = ?1", params![&current.id])
                 .context("delete terminal session goal control state")?;
         }
-        insert_task_record(&tx, task)?;
-        insert_goal_task_record(&tx, goal)?;
+        if insert_task_record(&tx, task)? != 1 {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        if insert_goal_task_record(&tx, goal)? != 1 {
+            anyhow::bail!("new session goal task row has no matching extension insertion");
+        }
         tx.commit()
             .context("commit create or replace session goal transaction")?;
         Ok(GoalTransitionResult::Applied)
@@ -1301,6 +1366,34 @@ mod tests {
         }
     }
 
+    /// Test-only constructor for pre-v8 legacy rows. Production code must use
+    /// the guarded session APIs; these historical rows exist only to preserve
+    /// read/compatibility coverage.
+    fn insert_legacy_goal(s: &SqliteTaskStore, mut task: TaskRecord, goal: GoalTaskRecord) {
+        task.session_id = None;
+        task.execution_epoch = 0;
+        let conn = s.conn.lock();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_insert;
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;",
+        )
+        .unwrap();
+        assert_eq!(insert_task_record(&conn, task).unwrap(), 1);
+        assert_eq!(insert_goal_task_record(&conn, goal).unwrap(), 1);
+    }
+
+    fn insert_legacy_goal_task_without_extension(s: &SqliteTaskStore, mut task: TaskRecord) {
+        task.session_id = None;
+        task.execution_epoch = 0;
+        let conn = s.conn.lock();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_insert;
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;",
+        )
+        .unwrap();
+        assert_eq!(insert_task_record(&conn, task).unwrap(), 1);
+    }
+
     fn continuation_context() -> TaskContinuationContext {
         TaskContinuationContext {
             channel: "telegram".into(),
@@ -1322,12 +1415,12 @@ mod tests {
         old_goal.kind = TaskKind::Goal;
         old_goal.originator_route = Some("route-old".into());
         old_goal.started_at = "2026-06-18T00:00:00Z".into();
-        s.create(old_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, old_goal);
 
         let mut newer_terminal_goal = rec("done-goal", "main", 1, "boot-1");
         newer_terminal_goal.kind = TaskKind::Goal;
         newer_terminal_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(newer_terminal_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, newer_terminal_goal);
         s.update_status("done-goal", TaskStatus::Completed, None, None)
             .await
             .unwrap();
@@ -1339,7 +1432,7 @@ mod tests {
         let mut latest_active_goal = rec("latest-goal", "main", 1, "boot-1");
         latest_active_goal.kind = TaskKind::Goal;
         latest_active_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(latest_active_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, latest_active_goal);
 
         let got = s
             .latest_active_goal_for_agent("main")
@@ -1364,21 +1457,21 @@ mod tests {
         other_route_goal.originator_route = Some("route-b".into());
         other_route_goal.principal_id = Some("principal-a".into());
         other_route_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(other_route_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, other_route_goal);
 
         let mut other_principal_goal = rec("other-principal", "main", 1, "boot-1");
         other_principal_goal.kind = TaskKind::Goal;
         other_principal_goal.originator_route = Some("route-a".into());
         other_principal_goal.principal_id = Some("principal-b".into());
         other_principal_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(other_principal_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, other_principal_goal);
 
         let mut wanted_goal = rec("wanted", "main", 1, "boot-1");
         wanted_goal.kind = TaskKind::Goal;
         wanted_goal.originator_route = Some("route-a".into());
         wanted_goal.principal_id = Some("principal-a".into());
         wanted_goal.started_at = "2026-06-18T00:00:00Z".into();
-        s.create(wanted_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, wanted_goal);
 
         let got = s
             .latest_active_goal_for_context("main", Some("route-a"), Some("principal-a"))
@@ -1402,14 +1495,14 @@ mod tests {
         first_goal.originator_route = Some("route-a".into());
         first_goal.principal_id = Some("principal-a".into());
         first_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(first_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, first_goal);
 
         let mut second_goal = rec("second-goal", "main", 1, "boot-1");
         second_goal.kind = TaskKind::Goal;
         second_goal.originator_route = Some("route-b".into());
         second_goal.principal_id = Some("principal-b".into());
         second_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(second_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, second_goal);
 
         let got = s
             .latest_active_goal_for_agent("main")
@@ -1441,7 +1534,7 @@ mod tests {
         older_valid_goal.originator_route = Some("route-a".into());
         older_valid_goal.principal_id = Some("principal-a".into());
         older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(older_valid_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, older_valid_goal);
 
         {
             let conn = s.conn.lock();
@@ -1454,7 +1547,7 @@ mod tests {
         unreadable_newer_goal.originator_route = Some("route-a".into());
         unreadable_newer_goal.principal_id = Some("principal-a".into());
         unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(unreadable_newer_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, unreadable_newer_goal);
         {
             let conn = s.conn.lock();
             conn.execute(
@@ -1485,12 +1578,12 @@ mod tests {
         older_valid_goal.kind = TaskKind::Goal;
         older_valid_goal.originator_route = Some("route-valid".into());
         older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(older_valid_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, older_valid_goal);
 
         let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
         unreadable_newer_goal.kind = TaskKind::Goal;
         unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(unreadable_newer_goal).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, unreadable_newer_goal);
         {
             let conn = s.conn.lock();
             conn.execute(
@@ -1514,7 +1607,8 @@ mod tests {
         let mut task = rec("goal-1", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
         task.status = TaskStatus::Paused;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             GoalTaskRecord {
                 task_id: "goal-1".into(),
@@ -1536,10 +1630,7 @@ mod tests {
                 tool_phase: GoalToolPhase::Clean,
                 success_criteria: String::new(),
             },
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         let task = s.get("goal-1").await.unwrap().unwrap();
         let goal = s.get_goal_task("goal-1").await.unwrap().unwrap();
@@ -1725,13 +1816,11 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-limit-validation", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             goal_record("goal-limit-validation", "validate limits"),
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         let err = s
             .update_goal_limits("goal-limit-validation", Some(i64::MAX as u64 + 1), None)
@@ -1753,13 +1842,11 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-sqlite-limit-validation", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             goal_record("goal-sqlite-limit-validation", "validate SQLite limits"),
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         let conn = s.conn.lock();
         let err = conn
@@ -1798,13 +1885,11 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-corrupt-limit", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             goal_record("goal-corrupt-limit", "reject legacy corrupt limit"),
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         {
             let conn = s.conn.lock();
@@ -1831,7 +1916,7 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-without-extension", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create(task).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, task);
 
         let err = s
             .update_goal_limits("goal-without-extension", Some(100), None)
@@ -1891,7 +1976,8 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-paused", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             GoalTaskRecord {
                 task_id: "goal-paused".into(),
@@ -1909,10 +1995,7 @@ mod tests {
                 tool_phase: GoalToolPhase::Clean,
                 success_criteria: String::new(),
             },
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         s.pause_goal_task(
             "goal-paused",
@@ -1942,7 +2025,8 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-operator-paused", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             GoalTaskRecord {
                 task_id: "goal-operator-paused".into(),
@@ -1960,10 +2044,7 @@ mod tests {
                 tool_phase: GoalToolPhase::Clean,
                 success_criteria: String::new(),
             },
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         s.pause_goal_task(
             "goal-operator-paused",
@@ -2001,7 +2082,7 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-missing-extension", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create(task).await.unwrap();
+        insert_legacy_goal_task_without_extension(&s, task);
 
         let err = s
             .pause_goal_task(
@@ -2026,7 +2107,8 @@ mod tests {
         let mut task = rec("goal-resume", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
         task.status = TaskStatus::Paused;
-        s.create_goal(
+        insert_legacy_goal(
+            &s,
             task,
             GoalTaskRecord {
                 task_id: "goal-resume".into(),
@@ -2048,10 +2130,7 @@ mod tests {
                 tool_phase: GoalToolPhase::Clean,
                 success_criteria: String::new(),
             },
-            None,
-        )
-        .await
-        .unwrap();
+        );
 
         s.resume_goal_task("goal-resume", 42, "boot-2", None)
             .await
