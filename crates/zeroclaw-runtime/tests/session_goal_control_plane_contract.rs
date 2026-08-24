@@ -1041,6 +1041,45 @@ async fn restart_pauses_settled_goals_and_fails_unsettled_operations() {
 }
 
 #[tokio::test]
+async fn boot_recovery_preserves_saturated_epoch_as_an_integer() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("saturated", "session-saturated");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    drop(store);
+
+    let database = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    database
+        .execute(
+            "UPDATE tasks SET execution_epoch = ?1 WHERE id = 'saturated'",
+            [i64::MAX],
+        )
+        .unwrap();
+    drop(database);
+
+    let handle = ControlPlaneHandle::start_with_boot_id(directory.path(), "boot-b".into())
+        .await
+        .unwrap();
+    let task = handle.store.get("saturated").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, i64::MAX);
+    drop(handle);
+
+    let database = rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+    let epoch_type: String = database
+        .query_row(
+            "SELECT typeof(execution_epoch) FROM tasks WHERE id = 'saturated'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(epoch_type, "integer");
+}
+
+#[tokio::test]
 async fn restart_marks_pending_accounting_unknown_even_with_a_prior_error() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();

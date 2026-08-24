@@ -453,7 +453,8 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
         "UPDATE tasks
             SET status = 'failed', error = COALESCE(error, 'legacy_goal_missing_session'),
                 finished_at = COALESCE(finished_at, ?1),
-                execution_epoch = execution_epoch + 1
+                execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                    THEN execution_epoch + 1 ELSE execution_epoch END
           WHERE kind = 'goal' AND session_id IS NULL
             AND status IN ('running','paused')",
         params![&now],
@@ -462,7 +463,8 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
         "UPDATE tasks
             SET status = 'failed', error = COALESCE(error, 'legacy_goal_missing_success_criteria'),
                 finished_at = COALESCE(finished_at, ?1),
-                execution_epoch = execution_epoch + 1
+                execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                    THEN execution_epoch + 1 ELSE execution_epoch END
           WHERE kind = 'goal' AND session_id IS NOT NULL
             AND status IN ('running','paused')
             AND EXISTS (
@@ -493,7 +495,8 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
         "UPDATE tasks
             SET status = 'failed', error = COALESCE(error, 'accounting_outcome_unknown'),
                 finished_at = COALESCE(finished_at, ?2),
-                execution_epoch = execution_epoch + 1
+                execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                    THEN execution_epoch + 1 ELSE execution_epoch END
           WHERE kind = 'goal' AND session_id IS NOT NULL
             AND status IN ('running','paused') AND owner_boot_id != ?1
             AND EXISTS (
@@ -525,7 +528,8 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
     )?;
     let paused = tx.execute(
         "UPDATE tasks
-            SET status = 'paused', execution_epoch = execution_epoch + 1
+            SET status = 'paused', execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                THEN execution_epoch + 1 ELSE execution_epoch END
           WHERE kind = 'goal' AND status = 'running' AND session_id IS NOT NULL
             AND owner_boot_id != ?1
             AND EXISTS (
