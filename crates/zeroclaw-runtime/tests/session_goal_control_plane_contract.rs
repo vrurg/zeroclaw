@@ -1218,6 +1218,45 @@ async fn restart_pauses_settled_goals_and_fails_unsettled_operations() {
 }
 
 #[tokio::test]
+async fn boot_finishes_crash_interrupted_session_goal_disposal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("disposed-before-crash", "session-disposed-before-crash");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "disposed-before-crash",
+                "session-disposed-before-crash",
+                1,
+                TaskStatus::Cancelled,
+                Some("session_disposed".into()),
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let handle =
+        ControlPlaneHandle::start_with_boot_id(directory.path(), "boot-after-crash".into())
+            .await
+            .unwrap();
+    assert!(
+        handle
+            .store
+            .get("disposed-before-crash")
+            .await
+            .unwrap()
+            .is_none(),
+        "boot must finish a durable session-disposal marker left after live-session removal"
+    );
+}
+
+#[tokio::test]
 async fn restart_marks_pending_accounting_unknown_even_with_a_prior_error() {
     let directory = tempfile::tempdir().unwrap();
     let store = SqliteTaskStore::new(directory.path()).unwrap();

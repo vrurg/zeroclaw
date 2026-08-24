@@ -449,6 +449,25 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
     let mut conn = store.conn.lock();
     let tx = conn.transaction().context("start goal boot recovery")?;
     let now = chrono::Utc::now().to_rfc3339();
+    // A session owner commits its own removal before hard-deleting the exact
+    // fenced Goal. If the process dies in that gap, the durable terminal
+    // marker is sufficient to finish disposal on the next boot; no session
+    // tombstone or process-local retry state is required.
+    let disposed = tx.execute(
+        "DELETE FROM tasks
+          WHERE kind = 'goal' AND status = 'cancelled'
+            AND error = 'session_disposed'
+            AND EXISTS (
+                SELECT 1 FROM goal_tasks
+                 WHERE task_id = tasks.id
+                   AND ((pending_call_id IS NULL
+                         AND pending_call_epoch IS NULL
+                         AND pending_reserved_tokens IS NULL
+                         AND pending_reserved_cost_usd IS NULL)
+                        OR accounting_state = 'outcome_unknown')
+            )",
+        [],
+    )?;
     let legacy = tx.execute(
         "UPDATE tasks
             SET status = 'failed', error = COALESCE(error, 'legacy_goal_missing_session'),
@@ -536,7 +555,7 @@ pub(crate) fn recover_on_boot(store: &SqliteTaskStore, boot_id: &str) -> Result<
         params![boot_id],
     )?;
     tx.commit().context("commit goal boot recovery")?;
-    Ok(legacy + legacy_missing_criteria + uncertain + paused)
+    Ok(disposed + legacy + legacy_missing_criteria + uncertain + paused)
 }
 
 fn ensure_goal_task_identity(task: &TaskRecord, goal: &GoalTaskRecord) -> Result<()> {

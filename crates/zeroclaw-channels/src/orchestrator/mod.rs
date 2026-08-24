@@ -8195,6 +8195,40 @@ impl ChannelGoalSessionAdapter {
                 .any(|room| room == &route.reply_target))
     }
 
+    fn owns_task_policy_in_config(
+        config: &Config,
+        task: &zeroclaw_runtime::control_plane::TaskRecord,
+    ) -> bool {
+        let Some(route) = Self::matrix_goal_route(task) else {
+            return false;
+        };
+        if !config
+            .agents
+            .get(&task.agent)
+            .is_some_and(|agent| agent.enabled)
+        {
+            return false;
+        }
+        let Some(matrix) = matrix_config_for_goal_route(config, &route.channel_key) else {
+            return false;
+        };
+        let Some(alias) = route.channel_key.strip_prefix("matrix.") else {
+            return false;
+        };
+        let Some(principal) = task.principal_id.as_deref() else {
+            return false;
+        };
+        crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("matrix", alias),
+            principal,
+            crate::allowlist::Match::CaseInsensitive,
+        ) && (matrix.allowed_rooms.is_empty()
+            || matrix
+                .allowed_rooms
+                .iter()
+                .any(|room| room == &route.reply_target))
+    }
+
     /// Identify a retained Goal that is durably bound to a Matrix session.
     ///
     /// This is intentionally independent of the active generation: lifecycle
@@ -12752,6 +12786,23 @@ pub async fn revoke_matrix_goals_without_active_generation(
     Ok(())
 }
 
+/// Revoke only Matrix Goals which the prospective configuration no longer
+/// authorizes. This runs before channel preparation so a preparation failure
+/// cannot leave revoked records paused and later resumable.
+pub async fn revoke_matrix_goals_revoked_by_config(
+    goal_runtime: Arc<GoalRuntime>,
+    config: &Config,
+) -> Result<()> {
+    goal_runtime
+        .cancel_nonterminal_goals_for_policy_revocation(|task| {
+            ChannelGoalSessionAdapter::is_matrix_goal_task(task)
+                && !ChannelGoalSessionAdapter::owns_task_policy_in_config(config, task)
+        })
+        .await
+        .context("revoke Matrix Goals removed by prospective configuration")?;
+    Ok(())
+}
+
 /// Prepare all configured channel contexts before any listener accepts work.
 #[allow(clippy::too_many_lines)]
 pub async fn prepare_channels(
@@ -15754,6 +15805,13 @@ temperature = 0.3
     #[test]
     fn channel_generation_cutover_selects_only_its_owned_matrix_goals() {
         let mut config = Config::default();
+        config.agents.insert(
+            "main".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.peer_groups.insert(
             "matrix_primary".to_string(),
             peer_group("matrix.primary", &["@alice:example.test"], false),
@@ -15765,6 +15823,7 @@ temperature = 0.3
                 ..Default::default()
             },
         );
+        let prospective_config = config.clone();
         let ctx = Arc::new(ChannelRuntimeContext {
             prompt_config: Arc::new(config),
             ..(*router_test_ctx()).clone()
@@ -15843,6 +15902,15 @@ temperature = 0.3
             &router,
             &task("owned", "main", &owned_route, Some("@alice:example.test")),
         ));
+        assert!(ChannelGoalSessionAdapter::owns_task_policy_in_config(
+            &prospective_config,
+            &task(
+                "owned-config",
+                "main",
+                &owned_route,
+                Some("@alice:example.test")
+            ),
+        ));
         assert!(
             ChannelGoalSessionAdapter::owns_task_policy_in_generation(
                 &router,
@@ -15866,6 +15934,18 @@ temperature = 0.3
                 ),
             ),
             "a retained Matrix Goal loses authorization when its principal leaves the peer group"
+        );
+        assert!(
+            !ChannelGoalSessionAdapter::owns_task_policy_in_config(
+                &prospective_config,
+                &task(
+                    "revoked-principal-config",
+                    "main",
+                    &owned_route,
+                    Some("@bob:example.test"),
+                ),
+            ),
+            "preparation-time policy reconciliation must reject a revoked Matrix principal"
         );
         assert!(
             !ChannelGoalSessionAdapter::owns_task_policy_in_generation(

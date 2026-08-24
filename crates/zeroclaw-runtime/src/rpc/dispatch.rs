@@ -1586,9 +1586,7 @@ impl RpcDispatcher {
             .remove_exact(&req.session_id, live_session.generation())
             .await
         {
-            if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
-                && let Some((ingress, fence)) = goal_ingress.as_ref()
-            {
+            if let Some((ingress, fence)) = goal_ingress.as_ref() {
                 self.delete_fenced_goal_after_session_removal(ingress, fence)
                     .await?;
             }
@@ -1650,47 +1648,44 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        if matches!(chat_mode, ChatMode::Acp) {
-            let store = self
-                .ctx
-                .acp_session_store
-                .clone()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
-            let sid_owned = sid.to_string();
-            let marked =
-                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
-            match marked {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "session/kill: live ACP session had no durable row to tombstone"
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to mark ACP session killed: {e}"),
-                    ));
-                }
-                Err(e) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to mark ACP session killed: {e}"),
-                    ));
-                }
-            }
-        }
-
         let killed = self
             .ctx
             .sessions
             .kill_session_exact(sid, live_session.generation())
             .await;
         if killed {
+            if matches!(chat_mode, ChatMode::Acp) {
+                let store =
+                    self.ctx.acp_session_store.clone().ok_or_else(|| {
+                        rpc_err(INTERNAL_ERROR, "ACP session store is not available")
+                    })?;
+                let sid_owned = sid.to_string();
+                let marked =
+                    tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned))
+                        .await;
+                match marked {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "session/kill: live ACP session had no durable row to tombstone"
+                    ),
+                    Ok(Err(e)) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to mark ACP session killed: {e}"),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to mark ACP session killed: {e}"),
+                        ));
+                    }
+                }
+            }
             if let Some((ingress, fence)) = goal_ingress.as_ref() {
                 self.delete_fenced_goal_after_session_removal(ingress, fence)
                     .await?;
@@ -1707,9 +1702,7 @@ impl RpcDispatcher {
                 "session/kill: session terminated by admin"
             );
         } else {
-            if self.ctx.sessions.get_agent(sid).await.is_none()
-                && let Some((ingress, fence)) = goal_ingress.as_ref()
-            {
+            if let Some((ingress, fence)) = goal_ingress.as_ref() {
                 self.delete_fenced_goal_after_session_removal(ingress, fence)
                     .await?;
             }
@@ -2685,7 +2678,7 @@ impl RpcDispatcher {
             .sessions
             .remove_exact(&req.session_id, live_session.generation())
             .await;
-        if existed && let Some((ingress, fence)) = goal_ingress.as_ref() {
+        if let Some((ingress, fence)) = goal_ingress.as_ref() {
             self.delete_fenced_goal_after_session_removal(ingress, fence)
                 .await?;
         }
@@ -2693,7 +2686,7 @@ impl RpcDispatcher {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         // Remove from persistent backend — try raw id, then prefixed variants.
-        if let Some(ref backend) = self.ctx.session_backend {
+        if existed && let Some(ref backend) = self.ctx.session_backend {
             for key in &[
                 req.session_id.clone(),
                 format!("rpc_{}", req.session_id),

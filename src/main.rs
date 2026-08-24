@@ -4838,6 +4838,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let goal_session_adapter = goal_session_adapter.clone();
                         Box::pin(async move {
+                            if let Some(goal_runtime) = goal_runtime.as_ref() {
+                                zeroclaw_channels::orchestrator::revoke_matrix_goals_revoked_by_config(
+                                    std::sync::Arc::clone(goal_runtime),
+                                    &config,
+                                )
+                                .await?;
+                            }
                             Box::pin(zeroclaw_channels::orchestrator::prepare_channels(
                                 config,
                                 Some(canvas_store),
