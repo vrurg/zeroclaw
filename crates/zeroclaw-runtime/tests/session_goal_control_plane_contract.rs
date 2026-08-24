@@ -644,6 +644,16 @@ async fn legacy_mutators_cannot_bypass_session_goal_epoch_fencing() {
             .await
             .is_err()
     );
+    assert!(
+        !store
+            .reconcile_lost("guarded-only", "boot-b")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get("guarded-only").await.unwrap().unwrap().status,
+        TaskStatus::Running
+    );
 }
 
 #[tokio::test]

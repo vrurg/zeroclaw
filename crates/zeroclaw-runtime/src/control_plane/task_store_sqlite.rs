@@ -439,6 +439,16 @@ impl TaskRegistry for SqliteTaskStore {
         if rec.status.is_terminal() || !is_authoritative(&rec, now_boot_id) {
             return Ok(false);
         }
+        // Session-bound Goals require epoch-fenced lifecycle transitions. Their
+        // restart recovery is owned by the Goal registry, not this generic reaper.
+        if rec.kind == TaskKind::Goal
+            && rec
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+        {
+            return Ok(false);
+        }
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE tasks SET status = 'lost', finished_at = ?1
