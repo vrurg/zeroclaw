@@ -904,6 +904,106 @@ async fn session_disposal_retries_a_durably_fenced_executor_before_deleting_cont
 }
 
 #[tokio::test]
+async fn idempotent_pause_retries_a_prior_failed_executor_quiescence() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(1),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    let ingress = matrix("session-pause-retry");
+    runtime
+        .submit(
+            ingress.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise idempotent pause retry".into(),
+            },
+        )
+        .await
+        .expect("start Goal");
+    let task_id = store
+        .current_goal_for_session("session-pause-retry")
+        .await
+        .expect("read Goal")
+        .expect("Goal exists")
+        .id;
+
+    assert!(
+        runtime
+            .submit(ingress.clone(), GoalCommand::Pause)
+            .await
+            .is_err(),
+        "the first pause retains a durable fence when executor quiescence fails"
+    );
+    assert_eq!(
+        runtime
+            .submit(ingress, GoalCommand::Pause)
+            .await
+            .expect("idempotent pause retries the exact fence")
+            .key,
+        GoalMessageKey::AlreadyPaused
+    );
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [
+            (task_id.clone(), "session-pause-retry".to_owned(), 1),
+            (task_id, "session-pause-retry".to_owned(), 1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn idempotent_cancel_retries_a_prior_failed_executor_quiescence() {
+    let executor = Arc::new(
+        FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
+            .with_cancel_failures(1),
+    );
+    let (runtime, store, _, _) = controller(Arc::clone(&executor));
+    let ingress = matrix("session-cancel-retry");
+    runtime
+        .submit(
+            ingress.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the work".into(),
+                objective: "exercise idempotent cancel retry".into(),
+            },
+        )
+        .await
+        .expect("start Goal");
+    let task_id = store
+        .current_goal_for_session("session-cancel-retry")
+        .await
+        .expect("read Goal")
+        .expect("Goal exists")
+        .id;
+
+    assert!(
+        runtime
+            .submit(ingress.clone(), GoalCommand::Cancel)
+            .await
+            .is_err(),
+        "the first cancel retains a durable fence when executor quiescence fails"
+    );
+    assert_eq!(
+        runtime
+            .submit(ingress, GoalCommand::Cancel)
+            .await
+            .expect("idempotent cancel retries the exact fence")
+            .key,
+        GoalMessageKey::AlreadyCancelled
+    );
+    assert_eq!(
+        executor.cancellations.lock().as_slice(),
+        [
+            (task_id.clone(), "session-cancel-retry".to_owned(), 1),
+            (task_id, "session-cancel-retry".to_owned(), 1),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn resume_refuses_a_paused_goal_until_its_fenced_executor_quiesces() {
     let executor = Arc::new(
         FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)

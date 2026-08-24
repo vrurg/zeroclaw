@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -127,7 +127,6 @@ struct ReservedRpcSession {
 /// to an unrelated concurrent session creation.
 pub(crate) struct SessionReplacementReservation {
     targets: Vec<ReservedRpcSession>,
-    slot: ReplacementSlot,
     incoming_id: String,
     reserved_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     reserved_incoming_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -158,16 +157,6 @@ impl SessionReplacementReservation {
     }
 }
 
-struct ReplacementSlot {
-    slots: Arc<AtomicUsize>,
-}
-
-impl Drop for ReplacementSlot {
-    fn drop(&mut self) {
-        self.slots.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -175,7 +164,6 @@ pub struct SessionStore {
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     session_generation: AtomicU64,
-    replacement_slots: Arc<AtomicUsize>,
     reserved_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     reserved_incoming_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
@@ -192,7 +180,6 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             session_generation: AtomicU64::new(0),
-            replacement_slots: Arc::new(AtomicUsize::new(0)),
             reserved_generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reserved_incoming_ids: Arc::new(
                 std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -213,11 +200,7 @@ impl SessionStore {
         {
             return Err("session replacement in progress");
         }
-        if sessions
-            .len()
-            .saturating_add(self.replacement_slots.load(Ordering::SeqCst))
-            >= self.max_sessions
-        {
+        if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
         session.generation = self.session_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -226,9 +209,8 @@ impl SessionStore {
     }
 
     /// Reserve all currently idle siblings for one incoming session. Reserved
-    /// sessions cannot begin new turns, and the incoming capacity slot stays
-    /// unavailable to other creators until this replacement commits or is
-    /// explicitly released.
+    /// sessions cannot begin new turns, and only the exact incoming session
+    /// identifier is reserved until this replacement commits or is released.
     pub(crate) async fn reserve_idle_same_mode_replacement(
         &self,
         tui_id: &str,
@@ -290,12 +272,8 @@ impl SessionStore {
         for target in &targets {
             reserved.insert(target.id.clone(), target.generation);
         }
-        self.replacement_slots.fetch_add(1, Ordering::SeqCst);
         Ok(SessionReplacementReservation {
             targets,
-            slot: ReplacementSlot {
-                slots: Arc::clone(&self.replacement_slots),
-            },
             incoming_id: incoming_id.to_string(),
             reserved_generations: Arc::clone(&self.reserved_generations),
             reserved_incoming_ids: Arc::clone(&self.reserved_incoming_ids),
@@ -318,7 +296,6 @@ impl SessionStore {
         id: String,
         mut session: RpcSession,
     ) -> Result<Vec<(String, String)>, &'static str> {
-        let _ = &reservation.slot;
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&id) {
             return Err("replacement session identifier already exists");
@@ -1096,7 +1073,7 @@ mod tests {
     async fn replacement_reservation_fences_the_exact_idle_generation_and_capacity() {
         use crate::rpc::types::ChatMode;
 
-        let store = make_store(1);
+        let store = make_store(3);
         store
             .insert(
                 "old".into(),
@@ -1118,15 +1095,22 @@ mod tests {
                 .is_none(),
             "a reserved session cannot begin a late ordinary turn"
         );
+        store
+            .insert(
+                "unrelated".into(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
+            )
+            .await
+            .expect("an exact replacement reservation must not block unrelated sessions");
         assert!(
             store
                 .insert(
-                    "unrelated".into(),
+                    "new".into(),
                     RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
                 )
                 .await
                 .is_err(),
-            "the incoming replacement capacity slot is unavailable to other creators"
+            "only the exact incoming replacement identity is reserved"
         );
 
         let evicted = store
@@ -1144,6 +1128,44 @@ mod tests {
         );
         assert!(store.get_agent("old").await.is_none());
         assert!(store.get_agent("new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn dropped_replacement_reservation_releases_exact_targets_and_incoming_id() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(3);
+        store
+            .insert(
+                "old".into(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                    .with_owner(Some("tui".to_string())),
+            )
+            .await
+            .expect("insert old session");
+
+        let reservation = store
+            .reserve_idle_same_mode_replacement("tui", &ChatMode::Chat, "incoming")
+            .await
+            .expect("reserve old session");
+        drop(reservation);
+
+        assert!(
+            !store.is_replacement_reserved("old").await,
+            "dropping a cancelled replacement must release its exact target"
+        );
+        let generation = store
+            .try_register_cancel_token("old", tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("the released session may accept a later ordinary turn");
+        store.remove_cancel_token("old", generation);
+        store
+            .insert(
+                "incoming".into(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
+            )
+            .await
+            .expect("dropping a cancelled replacement must release its incoming identity");
     }
 
     #[tokio::test]

@@ -2718,11 +2718,13 @@ impl RpcDispatcher {
                 crate::control_plane::GoalTransitionResult::Applied
                 | crate::control_plane::GoalTransitionResult::Missing,
             ) => Ok(()),
-            Ok(crate::control_plane::GoalTransitionResult::Stale) => Err(rpc_err(
-                INTERNAL_ERROR,
-                "Goal session disposal is not safely fenced",
-            )),
-            Err(_) => Err(rpc_err(INTERNAL_ERROR, "Goal session disposal failed")),
+            Ok(crate::control_plane::GoalTransitionResult::Stale) | Err(_) => {
+                // The owning session has already been removed or atomically
+                // replaced. Keep an exact runtime-owned retry alive rather
+                // than returning with terminal Goal control state orphaned.
+                Arc::clone(goal_runtime).schedule_fenced_session_goal_cleanup(ingress.clone());
+                Ok(())
+            }
         }
     }
 

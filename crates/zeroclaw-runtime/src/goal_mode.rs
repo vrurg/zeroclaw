@@ -4,7 +4,7 @@
 //! Later stages supply those concrete boundaries; this stage owns only the
 //! exact command grammar and session-bound controller facade.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -634,6 +634,17 @@ pub struct GoalRuntime {
     /// authority: SQLite remains canonical and a fresh process owns no old
     /// executor to cancel.
     pending_quiescence: Mutex<HashMap<(String, String), GoalSessionFence>>,
+    /// Exact terminal Goals whose owning live session has been fenced for
+    /// disposal. The session owner marks this cleanup eligible only after its
+    /// own replacement/removal commit. This is a process-local retry owner;
+    /// the task plane remains the sole durable lifecycle authority.
+    pending_disposal_cleanup: Mutex<HashMap<(String, String), PendingGoalDisposal>>,
+}
+
+#[derive(Clone)]
+struct PendingGoalDisposal {
+    ingress: GoalIngressContext,
+    fence: GoalSessionFence,
 }
 
 impl GoalRuntime {
@@ -656,6 +667,7 @@ impl GoalRuntime {
             boot_id: required_ingress_value(boot_id.into())?,
             admission_cutover: RwLock::new(false),
             pending_quiescence: Mutex::new(HashMap::new()),
+            pending_disposal_cleanup: Mutex::new(HashMap::new()),
         })
     }
 
@@ -735,7 +747,7 @@ impl GoalRuntime {
             return Ok(GoalTransitionResult::Missing);
         }
 
-        if !current.task.status.is_terminal() {
+        let terminal_task = if !current.task.status.is_terminal() {
             let result = self
                 .goals
                 .finish_session_goal(
@@ -764,7 +776,22 @@ impl GoalRuntime {
             {
                 return Ok(GoalTransitionResult::Stale);
             }
-        }
+            reloaded.task
+        } else {
+            current.task
+        };
+
+        self.pending_disposal_cleanup.lock().await.insert(
+            (terminal_task.id.clone(), ingress.session_id().to_string()),
+            PendingGoalDisposal {
+                ingress: ingress.clone(),
+                fence: GoalSessionFence::new(
+                    &terminal_task.id,
+                    ingress.session_id(),
+                    terminal_task.execution_epoch,
+                ),
+            },
+        );
 
         Ok(GoalTransitionResult::Applied)
     }
@@ -775,26 +802,72 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let pending = {
+            let pending = self.pending_disposal_cleanup.lock().await;
+            pending
+                .values()
+                .find(|pending| pending.ingress == *ingress)
+                .cloned()
+        };
+        let Some(pending) = pending else {
+            return Ok(GoalTransitionResult::Missing);
+        };
         let Some(current) = self
             .goals
             .current_goal_status_for_session(ingress.session_id())
             .await
             .map_err(GoalRuntimeError::control_plane)?
         else {
+            self.pending_disposal_cleanup
+                .lock()
+                .await
+                .remove(&(pending.fence.task_id, pending.fence.session_id));
             return Ok(GoalTransitionResult::Missing);
         };
-        if !task_matches_ingress(&current.task, ingress) || !current.task.status.is_terminal() {
+        if current.task.id != pending.fence.task_id
+            || current.task.execution_epoch != pending.fence.execution_epoch
+            || !task_matches_ingress(&current.task, ingress)
+            || !current.task.status.is_terminal()
+        {
             return Ok(GoalTransitionResult::Stale);
         }
 
-        self.goals
+        let result = self
+            .goals
             .dispose_session_goal(
-                &current.task.id,
+                &pending.fence.task_id,
                 ingress.session_id(),
-                current.task.execution_epoch,
+                pending.fence.execution_epoch,
             )
             .await
-            .map_err(GoalRuntimeError::control_plane)
+            .map_err(GoalRuntimeError::control_plane)?;
+        if matches!(
+            result,
+            GoalTransitionResult::Applied | GoalTransitionResult::Missing
+        ) {
+            self.pending_disposal_cleanup
+                .lock()
+                .await
+                .remove(&(pending.fence.task_id, pending.fence.session_id));
+        }
+        Ok(result)
+    }
+
+    /// Retry post-removal Goal control-plane cleanup without keeping an RPC
+    /// request alive. Only a session owner calls this after it has committed
+    /// removal of the matching live session; the exact task/epoch fence
+    /// prevents a later successor from being deleted by this retry.
+    pub fn schedule_fenced_session_goal_cleanup(self: Arc<Self>, ingress: GoalIngressContext) {
+        tokio::spawn(async move {
+            loop {
+                match self.delete_fenced_session_goal(&ingress).await {
+                    Ok(GoalTransitionResult::Applied | GoalTransitionResult::Missing) => break,
+                    Ok(GoalTransitionResult::Stale) | Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
     }
 
     /// Interrupt a live session without disposing it. A clean Goal pauses so
