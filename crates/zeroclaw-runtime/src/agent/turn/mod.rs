@@ -889,6 +889,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             provider_request_model,
             &provider_request_messages,
             request_tools,
@@ -907,11 +908,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         // Reliable reports its actually served candidate; direct providers
-        // intentionally retain the requested route as the accounting fallback.
+        // retain the effective route selected for this request (which may be
+        // a vision or hook-selected alternate rather than the base route).
         let (served_provider, served_model) = accepted_route
             .as_ref()
             .map(|route| (route.provider_ref(), route.model()))
-            .unwrap_or((ctx.provider_name, provider_request_model));
+            .unwrap_or((active_model_provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -981,8 +983,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     && let Some(usage) = execution::rejected_terminal_usage(&e)
                 {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
+                        served_provider,
+                        served_model,
                         usage,
                     );
                 }

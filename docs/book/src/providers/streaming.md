@@ -66,6 +66,14 @@ The current provider stream is never paused and resumed mid-read; tool
 execution happens after that stream reaches `Final`, and the next turn is a
 fresh streaming call.
 
+Provider-side tools are different: `PreExecutedToolCall` and
+`PreExecutedToolResult` describe work already performed by the provider, not
+client-executable calls. If a stream that reported either event lacks a
+trustworthy final response, it is an explicit non-replayable failure. The
+runtime must not retry the request because that could repeat provider-side
+work. Provider adapters must preserve this boundary on every interrupted
+stream exit, not only on a clean terminal event.
+
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
 
 ## Transport completion and timeouts

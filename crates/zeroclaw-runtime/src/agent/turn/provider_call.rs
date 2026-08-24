@@ -154,6 +154,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
@@ -239,8 +240,8 @@ pub(crate) async fn call_provider(
                                     scope.record_rejected_stream_usage(usage.clone());
                                 if !recorded_by_reliable && !visible_partial_terminal {
                                     record_rejected_tool_loop_cost_usage(
-                                        ctx.provider_name,
-                                        ctx.model,
+                                        active_model_provider_name,
+                                        active_model,
                                         &usage,
                                     );
                                 }
@@ -253,10 +254,10 @@ pub(crate) async fn call_provider(
                             {
                                 // Capture identity before usage accounting
                                 // consumes the provisional Reliable attempt.
-                                // Only that exact pre-existing entry permits
+                                // Only a distinct pre-existing candidate permits
                                 // one non-stream recovery.
-                                let has_exact_reliable_candidate =
-                                    scope.has_pending_reliable_stream_attempt();
+                                let has_distinct_reliable_candidate = scope
+                                    .has_distinct_reliable_stream_recovery_candidate();
                                 if terminal.policy.usage_chargeability()
                                     == zeroclaw_providers::TerminalUsageChargeability::Billable
                                     && let Some(usage) = terminal.failure.usage.clone()
@@ -268,7 +269,7 @@ pub(crate) async fn call_provider(
                                 }
                                 if terminal.policy.recovery()
                                     == zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
-                                    || !has_exact_reliable_candidate
+                                    || !has_distinct_reliable_candidate
                                 {
                                     (Err(stream_err), false, false, String::new())
                                 } else {
@@ -322,8 +323,8 @@ pub(crate) async fn call_provider(
                                 && !scope.record_rejected_stream_usage(usage.clone())
                             {
                                 record_rejected_tool_loop_cost_usage(
-                                    ctx.provider_name,
-                                    ctx.model,
+                                    active_model_provider_name,
+                                    active_model,
                                     &usage,
                                 );
                             }
@@ -703,6 +704,7 @@ mod streaming_fallback_tests {
         TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
         TurnUsage,
     };
+    use crate::cost::CostTracker;
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
@@ -1073,6 +1075,7 @@ mod streaming_fallback_tests {
                     call_provider(
                         &ctx,
                         &provider,
+                        "test-provider",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -1136,6 +1139,7 @@ mod streaming_fallback_tests {
                     let error = call_provider(
                         &ctx,
                         &provider,
+                        "direct-provider",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -1178,6 +1182,77 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
+    async fn single_reliable_terminal_stream_preserves_typed_cause_without_recovery() {
+        let selected = std::sync::Arc::new(DirectTerminalStreamProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            usage: TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            },
+            visible_partial: false,
+        });
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "only".to_string(),
+                Box::new(std::sync::Arc::clone(&selected)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "requested-provider",
+            model: "requested-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "requested-provider",
+            "requested-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns terminal provider outcome")
+        .chat_result
+        .expect_err("single Reliable candidate cannot recover a terminal stream");
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit),
+            "the original provider terminal cause must remain visible"
+        );
+        assert_eq!(
+            selected.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "a single candidate must not receive a non-stream recovery request"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_executed_tool_empty_stream_never_replays_request() {
         let provider = PreExecutedToolThenEmptyProvider {
             non_stream_calls: AtomicUsize::new(0),
@@ -1209,6 +1284,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1257,19 +1333,41 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let error = call_provider(
-            &ctx,
-            &provider,
-            "test-model",
-            &[ChatMessage::user("go")],
-            None,
-            true,
-            0,
-        )
-        .await
-        .expect("dispatch returns the provider outcome")
-        .chat_result
-        .expect_err("a completed semantic-empty request must fail");
+        let workspace = tempfile::TempDir::new().expect("temporary cost workspace");
+        let tracker = std::sync::Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .expect("cost tracker"),
+        );
+        let pricing = std::collections::HashMap::from([(
+            "selected-provider".to_string(),
+            std::collections::HashMap::from([
+                ("selected-model.input".to_string(), 1.0),
+                ("selected-model.output".to_string(), 1.0),
+            ]),
+        )]);
+        let cost_context = ToolLoopCostTrackingContext::new(tracker, std::sync::Arc::new(pricing));
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_context),
+                call_provider(
+                    &ctx,
+                    &provider,
+                    "selected-provider",
+                    "selected-model",
+                    &[ChatMessage::user("go")],
+                    None,
+                    true,
+                    0,
+                ),
+            )
+            .await
+            .expect("dispatch returns the provider outcome")
+            .chat_result
+            .expect_err("a completed semantic-empty request must fail");
 
         assert!(
             error
@@ -1280,6 +1378,17 @@ mod streaming_fallback_tests {
             provider.non_stream_calls.load(Ordering::Relaxed),
             0,
             "a completed semantic-empty request must not be sent again"
+        );
+        let cost_record =
+            std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+                .expect("rejected usage must be recorded against the selected route");
+        let stored: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(cost_record.lines().next().expect("one cost record"))
+                .expect("cost record parses");
+        assert_eq!(stored.usage.model, "selected-model");
+        assert!(
+            stored.usage.cost_usd > 0.0,
+            "selected-provider pricing proves direct rejected usage used the active route, not ctx's base route"
         );
     }
 
@@ -1329,6 +1438,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1392,6 +1502,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,

@@ -82,6 +82,7 @@ pub(crate) struct ReliableCallAccounting {
     next_attempt_id: usize,
     pending_stream_attempt: Option<ReliableRejectedAttempt>,
     stream_resume_after: Option<ReliableEntryId>,
+    stream_recovery_has_distinct_candidate: bool,
     stream_recovery_semantic_empty: bool,
 }
 
@@ -241,6 +242,7 @@ fn begin_reliable_stream_attempt(
     model: &str,
     model_slot: usize,
     entry_index: usize,
+    has_distinct_recovery_candidate: bool,
 ) {
     let Some((entry_id, attempt_id)) = begin_reliable_attempt(model_slot, entry_index) else {
         return;
@@ -257,6 +259,7 @@ fn begin_reliable_stream_attempt(
             attempt: attempt_id,
         });
         accounting.stream_resume_after = Some(entry_id);
+        accounting.stream_recovery_has_distinct_candidate = has_distinct_recovery_candidate;
     });
 }
 
@@ -288,14 +291,16 @@ pub(crate) fn record_rejected_stream_usage(usage: TokenUsage) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the current dispatch-scoped stream belongs to a Reliable entry.
-///
-/// A runtime recovery can advance only an exact selected Reliable candidate.
-/// Direct providers have no such candidate identity, so replaying their
-/// request would violate the no-identity terminal-delivery contract.
-pub(crate) fn has_pending_reliable_stream_attempt() -> bool {
+/// Whether the selected stream has a distinct non-streaming Reliable candidate
+/// to try. A single-candidate recovery would only skip the failed entry and
+/// replace its typed terminal cause with aggregate exhaustion.
+pub(crate) fn has_distinct_reliable_stream_recovery_candidate() -> bool {
     RELIABLE_CALL_ACCOUNTING
-        .try_with(|accounting| accounting.lock().pending_stream_attempt.is_some())
+        .try_with(|accounting| {
+            let accounting = accounting.lock();
+            accounting.pending_stream_attempt.is_some()
+                && accounting.stream_recovery_has_distinct_candidate
+        })
         .unwrap_or(false)
 }
 
@@ -3146,7 +3151,25 @@ impl ModelProvider for ReliableModelProvider {
                 tools: request.tools,
                 thinking: request.thinking,
             };
-            begin_reliable_stream_attempt(entry, &current_model, 0, entry_index);
+            let has_distinct_recovery_candidate =
+                self.model_chain(model)
+                    .iter()
+                    .enumerate()
+                    .any(|(model_slot, _)| {
+                        self.model_providers.iter().enumerate().any(
+                            |(candidate_index, candidate)| {
+                                (model_slot != 0 || candidate_index != entry_index)
+                                    && !self.provider_should_skip_for_cooldown(candidate)
+                            },
+                        )
+                    });
+            begin_reliable_stream_attempt(
+                entry,
+                &current_model,
+                0,
+                entry_index,
+                has_distinct_recovery_candidate,
+            );
             let stream = ProviderDispatch::from_ref(model_provider).stream_chat(
                 req,
                 &current_model,

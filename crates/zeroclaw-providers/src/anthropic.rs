@@ -234,6 +234,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 /// `tool_result.content` accepts either a plain string or a list of nested
@@ -432,6 +434,8 @@ struct NativeContentIn {
     text: Option<String>,
     #[serde(default)]
     thinking: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
     /// Signature for integrity verification of thinking blocks.
     #[serde(default)]
     signature: Option<String>,
@@ -596,7 +600,8 @@ impl AnthropicModelProvider {
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
-                | NativeContentOut::Thinking { .. } => {}
+                | NativeContentOut::Thinking { .. }
+                | NativeContentOut::RedactedThinking { .. } => {}
             }
         }
     }
@@ -648,20 +653,30 @@ impl AnthropicModelProvider {
         {
             for part in reasoning.split('\n') {
                 if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
-                    let thinking = block
-                        .get("thinking")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let signature = block
-                        .get("signature")
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-                    blocks.push(NativeContentOut::Thinking {
-                        thinking,
-                        signature,
-                    });
+                    if let Some(data) = block
+                        .get("redacted_thinking")
+                        .and_then(|data| data.as_str())
+                        .filter(|data| !data.is_empty())
+                    {
+                        blocks.push(NativeContentOut::RedactedThinking {
+                            data: data.to_string(),
+                        });
+                    } else {
+                        let thinking = block
+                            .get("thinking")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let signature = block
+                            .get("signature")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        blocks.push(NativeContentOut::Thinking {
+                            thinking,
+                            signature,
+                        });
+                    }
                 }
             }
         }
@@ -1878,14 +1893,18 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
-                        && !thinking.is_empty()
-                    {
+                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref()) {
                         let json_block = serde_json::json!({
                             "thinking": thinking,
                             "signature": block.signature.as_deref().unwrap_or(""),
                         });
                         thinking_parts.push(json_block.to_string());
+                    }
+                }
+                "redacted_thinking" => {
+                    if let Some(data) = block.data.as_deref().filter(|data| !data.is_empty()) {
+                        thinking_parts
+                            .push(serde_json::json!({ "redacted_thinking": data }).to_string());
                     }
                 }
                 "tool_use" => {
@@ -2114,6 +2133,21 @@ impl AnthropicModelProvider {
             .await;
     }
 
+    /// A provider-side tool may already have performed work even though no
+    /// client-executable `ToolCall` was emitted. Preserve that non-replayable
+    /// boundary on every interrupted SSE exit; otherwise the runtime can retry
+    /// the request and run the provider-side operation twice.
+    async fn emit_pre_executed_provider_tool_failure(
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+        usage: Option<TokenUsage>,
+    ) {
+        let _ = tx
+            .send(Err(StreamError::SemanticEmpty(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(usage),
+            )))
+            .await;
+    }
+
     /// Inner loop split out of `parse_anthropic_sse` so unit tests can feed a
     /// `Cursor<&[u8]>` directly without spinning up a mock HTTP server.
     async fn parse_anthropic_sse_from_reader<R>(
@@ -2144,7 +2178,10 @@ impl AnthropicModelProvider {
         let mut terminal_completion_error = None;
         let mut saw_server_tool_activity = false;
         let mut saw_client_tool_activity = false;
-        let mut saw_visible_text = false;
+        // Mirror the runtime's terminal classification over the assembled
+        // stream. A `<think>` block can span text deltas, so per-delta
+        // stripping could mistake its closing delta for user-visible text.
+        let mut streamed_text = String::new();
         // The block summary only feeds the DEBUG `message_stop` event. Avoid
         // per-block String and map allocations when that event is disabled.
         let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
@@ -2197,6 +2234,8 @@ impl AnthropicModelProvider {
                             !saw_server_tool_activity && !saw_client_tool_activity,
                         )
                         .await;
+                    } else if saw_server_tool_activity {
+                        Self::emit_pre_executed_provider_tool_failure(tx, usage).await;
                     } else {
                         if let Some(usage) = usage.clone() {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
@@ -2232,6 +2271,8 @@ impl AnthropicModelProvider {
                             !saw_server_tool_activity && !saw_client_tool_activity,
                         )
                         .await;
+                    } else if saw_server_tool_activity {
+                        Self::emit_pre_executed_provider_tool_failure(tx, usage).await;
                     } else {
                         if let Some(usage) = usage {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
@@ -2348,20 +2389,26 @@ impl AnthropicModelProvider {
                             // complete `ToolCall` event.
                             saw_client_tool_activity = true;
                             if let Some(index) = content_block_index.filter(|_| started) {
-                                let state = StreamingToolState {
-                                    id: block
-                                        .get("id")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    name: block
-                                        .get("name")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    input_json: String::new(),
-                                };
-                                if tool_blocks.insert(index, state).is_some() {
+                                let id = block.get("id").and_then(|value| value.as_str());
+                                let name = block.get("name").and_then(|value| value.as_str());
+                                if let (Some(id), Some(name)) = (
+                                    id.filter(|id| !id.is_empty()),
+                                    name.filter(|name| !name.is_empty()),
+                                ) {
+                                    let state = StreamingToolState {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        input_json: String::new(),
+                                    };
+                                    if tool_blocks.insert(index, state).is_some() {
+                                        terminal_completion_error.get_or_insert(
+                                            TerminalCompletionError::InvalidTerminalReason,
+                                        );
+                                    }
+                                } else {
+                                    // A malformed client-tool header must never become an
+                                    // executable empty `ToolCall` at block stop.
+                                    invalid_tool_block_indices.insert(index);
                                     terminal_completion_error.get_or_insert(
                                         TerminalCompletionError::InvalidTerminalReason,
                                     );
@@ -2386,6 +2433,12 @@ impl AnthropicModelProvider {
                             && content_block_kinds
                                 .get(&index)
                                 .is_some_and(|kind| kind == "tool_use")
+                    });
+                    let is_open_provider_tool = index.is_some_and(|index| {
+                        open_content_block_indices.contains(&index)
+                            && content_block_kinds.get(&index).is_some_and(|kind| {
+                                matches!(kind.as_str(), "server_tool_use" | "mcp_tool_use")
+                            })
                     });
                     let delta = event.get("delta").filter(|delta| delta.is_object());
                     let delta_type = delta
@@ -2419,7 +2472,7 @@ impl AnthropicModelProvider {
                                 } else {
                                     match delta.get("text").and_then(|text| text.as_str()) {
                                         Some(text) if !text.is_empty() => {
-                                            saw_visible_text = true;
+                                            streamed_text.push_str(text);
                                             if tx
                                                 .send(Ok(StreamEvent::TextDelta(
                                                     StreamChunk::delta(text.to_string()),
@@ -2462,6 +2515,18 @@ impl AnthropicModelProvider {
                                         if let Some(index) = index {
                                             invalid_tool_block_indices.insert(index);
                                         }
+                                        terminal_completion_error.get_or_insert(
+                                            TerminalCompletionError::InvalidTerminalReason,
+                                        );
+                                    }
+                                    Some(_) if is_open_provider_tool => {
+                                        // Provider-side tools own their input internally. Their
+                                        // JSON deltas are valid protocol traffic, but cannot be
+                                        // converted into client-executable ToolCall events.
+                                    }
+                                    None if is_open_provider_tool => {
+                                        // Provider-owned input is not executable by the client,
+                                        // but it is still protocol data and must be a string.
                                         terminal_completion_error.get_or_insert(
                                             TerminalCompletionError::InvalidTerminalReason,
                                         );
@@ -2659,7 +2724,8 @@ impl AnthropicModelProvider {
                         }
                         if saw_server_tool_activity
                             && !saw_client_tool_activity
-                            && !saw_visible_text
+                            && zeroclaw_api::model_provider::strip_think_tags(&streamed_text)
+                                .is_empty()
                         {
                             let _ = tx
                                 .send(Err(StreamError::SemanticEmpty(
@@ -2693,6 +2759,8 @@ impl AnthropicModelProvider {
                             !saw_server_tool_activity && !saw_client_tool_activity,
                         )
                         .await;
+                    } else if saw_server_tool_activity {
+                        Self::emit_pre_executed_provider_tool_failure(tx, usage).await;
                     } else {
                         if let Some(usage) = usage {
                             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
@@ -2725,12 +2793,18 @@ impl AnthropicModelProvider {
             return;
         }
 
-        if let Some(usage) = Self::streaming_usage(
+        let usage = Self::streaming_usage(
             input_tokens,
             output_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
-        ) {
+        );
+        if saw_server_tool_activity {
+            Self::emit_pre_executed_provider_tool_failure(tx, usage).await;
+            return;
+        }
+
+        if let Some(usage) = usage {
             let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
         }
         crate::stream_guard::finish_sse_stream(tx, false, "message_stop").await;
@@ -4125,6 +4199,187 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(failure.has_pre_executed_tool_activity());
         assert!(!failure.is_replayable());
         assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(5));
+    }
+
+    #[tokio::test]
+    async fn streaming_server_tool_with_split_think_only_text_is_not_final() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<think>internal\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" reasoning</think>\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::SemanticEmpty(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "think-only text must not make provider-tool activity final"
+        );
+        assert!(
+            failure.is_some_and(|failure| failure.has_pre_executed_tool_activity()),
+            "provider-tool activity must remain non-replayable"
+        );
+    }
+
+    async fn assert_interrupted_server_tool_stream_is_not_replayable(tail: &str) {
+        use std::io::Cursor;
+
+        let bytes = format!(
+            "event: message_start\n\\\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\\\n\
+event: content_block_start\n\\\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"server_tool_use\"}}}}\n\n\\\n\
+{tail}"
+        );
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::SemanticEmpty(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "interrupted provider-tool stream must not be Final"
+        );
+        let failure = failure.expect("provider-tool activity must survive every interrupted exit");
+        assert!(failure.has_pre_executed_tool_activity());
+        assert!(!failure.is_replayable());
+        assert_eq!(failure.usage.and_then(|usage| usage.input_tokens), Some(10));
+    }
+
+    #[tokio::test]
+    async fn streaming_server_tool_eof_is_not_replayable() {
+        assert_interrupted_server_tool_stream_is_not_replayable("").await;
+    }
+
+    #[tokio::test]
+    async fn streaming_server_tool_malformed_event_is_not_replayable() {
+        assert_interrupted_server_tool_stream_is_not_replayable("data: {malformed-json}\n\n").await;
+    }
+
+    #[tokio::test]
+    async fn streaming_server_tool_provider_error_is_not_replayable() {
+        assert_interrupted_server_tool_stream_is_not_replayable(
+            "event: error\n\\\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\"}}\n\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn streaming_provider_tool_input_deltas_are_not_client_tool_calls() {
+        use std::io::Cursor;
+
+        for kind in ["server_tool_use", "mcp_tool_use"] {
+            let bytes = format!(
+                "event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{kind}\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut emitted_client_tool = false;
+            let mut failure = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::ToolCall(_)) => emitted_client_tool = true,
+                    Err(StreamError::SemanticEmpty(error)) => failure = Some(error),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            assert!(
+                !emitted_client_tool,
+                "{kind} is provider-owned, not executable by the client"
+            );
+            assert!(
+                failure.is_some_and(|failure| failure.has_pre_executed_tool_activity()),
+                "{kind} input JSON must preserve the provider-tool no-replay boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_malformed_client_tool_header_never_emits_empty_tool_call() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":null,\"name\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut tool_calls = Vec::new();
+        let mut terminal = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::ToolCall(call)) => tool_calls.push(call),
+                Err(StreamError::TerminalCompletion(error)) => terminal = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            tool_calls.is_empty(),
+            "invalid tool headers must not emit executable calls"
+        );
+        assert_eq!(
+            terminal.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
     }
 
     #[tokio::test]
@@ -6431,7 +6686,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_drops_empty_thinking_blocks() {
+    fn native_response_preserves_empty_thinking_blocks() {
         let json = r#"{
             "stop_reason": "end_turn",
             "content": [
@@ -6441,7 +6696,52 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp).expect("valid response");
-        assert!(result.reasoning_content.is_none());
+        let reasoning = result.reasoning_content.expect("empty thinking preserved");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_xyz");
+    }
+
+    #[test]
+    fn native_tool_continuation_preserves_redacted_thinking_before_tool_use() {
+        let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "redacted_thinking", "data": "opaque-provider-payload"},
+                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "status"}}
+            ]
+        }))
+        .expect("fixture must deserialize");
+        let parsed = AnthropicModelProvider::parse_native_response(response)
+            .expect("native tool response must parse");
+        let history = vec![
+            ChatMessage::user("check status"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": parsed.text.unwrap_or_default(),
+                    "reasoning_content": parsed.reasoning_content,
+                    "tool_calls": parsed.tool_calls,
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "toolu_1", "content": "ready"}).to_string(),
+            ),
+        ];
+
+        let (_, native_messages) = AnthropicModelProvider::convert_messages(&history);
+        let wire = serde_json::to_value(&native_messages).expect("request must serialize");
+        let assistant = wire
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant continuation present");
+        let blocks = assistant["content"].as_array().expect("assistant blocks");
+        assert_eq!(blocks[0]["type"], "redacted_thinking");
+        assert_eq!(blocks[0]["data"], "opaque-provider-payload");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_1");
     }
 
     #[test]
