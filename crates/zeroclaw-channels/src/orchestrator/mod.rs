@@ -8217,14 +8217,7 @@ impl ChannelGoalSessionAdapter {
             {
                 return false;
             }
-        } else if config.resolved_runtime_agent_alias().or_else(|| {
-            config
-                .agents
-                .iter()
-                .find(|(_, candidate)| candidate.enabled)
-                .map(|(alias, _)| alias.as_str())
-        }) != Some(task.agent.as_str())
-        {
+        } else if legacy_channel_owner(config) != Some(task.agent.as_str()) {
             return false;
         }
         let Some(matrix) = matrix_config_for_goal_route(config, &route.channel_key) else {
@@ -8286,6 +8279,23 @@ fn matrix_config_for_goal_route<'a>(
             .matrix
             .get(channel_key.strip_prefix("matrix.")?),
     }
+}
+
+/// Match the channel router's legacy ownership fallback exactly. Explicit
+/// bindings are authoritative when present; this is only for configurations
+/// that predate per-agent channel ownership.
+fn legacy_channel_owner(config: &Config) -> Option<&str> {
+    config
+        .resolved_runtime_agent_alias()
+        .filter(|alias| config.agents.get(*alias).is_some_and(|agent| agent.enabled))
+        .or_else(|| {
+            config
+                .agents
+                .iter()
+                .filter(|(_, agent)| agent.enabled)
+                .map(|(alias, _)| alias.as_str())
+                .min()
+        })
 }
 
 fn is_owned_matrix_goal_binding(route: &str, principal_id: Option<&str>) -> bool {
