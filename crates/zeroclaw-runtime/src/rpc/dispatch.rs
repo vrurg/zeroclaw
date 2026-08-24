@@ -1273,14 +1273,17 @@ impl RpcDispatcher {
                         .await;
                     return Err(rpc_err(INTERNAL_ERROR, "Replacement session disappeared"));
                 };
-                if let Err(error) = self.fence_goal_before_session_removal(&ingress).await {
-                    self.ctx
-                        .sessions
-                        .release_replacement_reservation(reservation)
-                        .await;
-                    return Err(error);
+                match self.fence_goal_before_session_removal(&ingress).await {
+                    Ok(Some(fence)) => fenced_replacements.push((ingress, fence)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.ctx
+                            .sessions
+                            .release_replacement_reservation(reservation)
+                            .await;
+                        return Err(error);
+                    }
                 }
-                fenced_replacements.push(ingress);
             }
         }
 
@@ -1316,8 +1319,8 @@ impl RpcDispatcher {
         // their terminal Goal control rows can be hard-deleted. A failed
         // replacement above retained those rows rather than deleting a Goal
         // from a session that remained live.
-        for ingress in &fenced_replacements {
-            self.delete_fenced_goal_after_session_removal(ingress)
+        for (ingress, fence) in &fenced_replacements {
+            self.delete_fenced_goal_after_session_removal(ingress, fence)
                 .await?;
         }
 
@@ -1577,10 +1580,16 @@ impl RpcDispatcher {
             drop(agent);
         }
         if !self.ctx.sessions.remove(&req.session_id).await {
+            if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
+                && let Some((ingress, fence)) = goal_ingress.as_ref()
+            {
+                self.delete_fenced_goal_after_session_removal(ingress, fence)
+                    .await?;
+            }
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
-        if let Some(ingress) = goal_ingress.as_ref() {
-            self.delete_fenced_goal_after_session_removal(ingress)
+        if let Some((ingress, fence)) = goal_ingress.as_ref() {
+            self.delete_fenced_goal_after_session_removal(ingress, fence)
                 .await?;
         }
         if let Some(ref hooks) = self.ctx.hooks {
@@ -1678,8 +1687,8 @@ impl RpcDispatcher {
 
         let killed = self.ctx.sessions.kill_session(sid).await;
         if killed {
-            if let Some(ingress) = goal_ingress.as_ref() {
-                self.delete_fenced_goal_after_session_removal(ingress)
+            if let Some((ingress, fence)) = goal_ingress.as_ref() {
+                self.delete_fenced_goal_after_session_removal(ingress, fence)
                     .await?;
             }
             if let Some(ref hooks) = self.ctx.hooks {
@@ -1694,6 +1703,12 @@ impl RpcDispatcher {
                 "session/kill: session terminated by admin"
             );
         } else {
+            if self.ctx.sessions.get_agent(sid).await.is_none()
+                && let Some((ingress, fence)) = goal_ingress.as_ref()
+            {
+                self.delete_fenced_goal_after_session_removal(ingress, fence)
+                    .await?;
+            }
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2657,8 +2672,8 @@ impl RpcDispatcher {
                 .unregister_channel("rpc");
         }
         let existed = self.ctx.sessions.remove(&req.session_id).await;
-        if existed && let Some(ingress) = goal_ingress.as_ref() {
-            self.delete_fenced_goal_after_session_removal(ingress)
+        if existed && let Some((ingress, fence)) = goal_ingress.as_ref() {
+            self.delete_fenced_goal_after_session_removal(ingress, fence)
                 .await?;
         }
         if existed && let Some(ref hooks) = self.ctx.hooks {
@@ -2703,16 +2718,23 @@ impl RpcDispatcher {
     async fn fence_goal_before_session_removal(
         &self,
         ingress: &crate::goal_mode::GoalIngressContext,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Option<crate::control_plane::GoalSessionFence>, JsonRpcError> {
         let Some(goal_runtime) = &self.ctx.goal_runtime else {
-            return Ok(());
+            return Ok(None);
         };
-        match goal_runtime.fence_session_for_disposal(ingress).await {
-            Ok(
-                crate::control_plane::GoalTransitionResult::Applied
-                | crate::control_plane::GoalTransitionResult::Missing,
-            ) => Ok(()),
-            Ok(crate::control_plane::GoalTransitionResult::Stale) => Err(rpc_err(
+        match goal_runtime
+            .fence_session_for_disposal_with_fence(ingress)
+            .await
+        {
+            Ok((crate::control_plane::GoalTransitionResult::Applied, Some(fence))) => {
+                Ok(Some(fence))
+            }
+            Ok((crate::control_plane::GoalTransitionResult::Missing, _)) => Ok(None),
+            Ok((crate::control_plane::GoalTransitionResult::Applied, None)) => Err(rpc_err(
+                INTERNAL_ERROR,
+                "Goal session disposal fence is incomplete",
+            )),
+            Ok((crate::control_plane::GoalTransitionResult::Stale, _)) => Err(rpc_err(
                 INTERNAL_ERROR,
                 "Goal session disposal is not safely quiesced",
             )),
@@ -2723,11 +2745,15 @@ impl RpcDispatcher {
     async fn delete_fenced_goal_after_session_removal(
         &self,
         ingress: &crate::goal_mode::GoalIngressContext,
+        fence: &crate::control_plane::GoalSessionFence,
     ) -> Result<(), JsonRpcError> {
         let Some(goal_runtime) = &self.ctx.goal_runtime else {
             return Ok(());
         };
-        match goal_runtime.delete_fenced_session_goal(ingress).await {
+        match goal_runtime
+            .delete_fenced_session_goal(ingress, fence)
+            .await
+        {
             Ok(
                 crate::control_plane::GoalTransitionResult::Applied
                 | crate::control_plane::GoalTransitionResult::Missing,
@@ -2736,7 +2762,9 @@ impl RpcDispatcher {
                 // The owning session has already been removed or atomically
                 // replaced. Keep an exact runtime-owned retry alive rather
                 // than returning with terminal Goal control state orphaned.
-                Arc::clone(goal_runtime).schedule_fenced_session_goal_cleanup(ingress.clone());
+                goal_runtime
+                    .schedule_fenced_session_goal_cleanup(ingress.clone(), fence.clone())
+                    .await;
                 Ok(())
             }
         }
@@ -2748,12 +2776,20 @@ impl RpcDispatcher {
     async fn fence_goal_for_live_session_removal(
         &self,
         session_id: &str,
-    ) -> Result<Option<crate::goal_mode::GoalIngressContext>, JsonRpcError> {
+    ) -> Result<
+        Option<(
+            crate::goal_mode::GoalIngressContext,
+            crate::control_plane::GoalSessionFence,
+        )>,
+        JsonRpcError,
+    > {
         let Some(ingress) = self.goal_ingress_for_live_session(session_id).await? else {
             return Ok(None);
         };
-        self.fence_goal_before_session_removal(&ingress).await?;
-        Ok(Some(ingress))
+        let Some(fence) = self.fence_goal_before_session_removal(&ingress).await? else {
+            return Ok(None);
+        };
+        Ok(Some((ingress, fence)))
     }
 
     /// Fence an exact RPC-bound Goal when an external cancellation leaves the
@@ -10784,7 +10820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_close_disposes_exact_rpc_goal_before_session_removal() {
+    async fn session_close_disposes_exact_rpc_goal_after_session_removal() {
         use crate::control_plane::{
             GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
             SqliteTaskStore, TaskKind, TaskRecord, TaskStatus,
@@ -10916,7 +10952,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "Goal control state must be disposed before the RPC session disappears"
+            "Goal control state must be disposed after the RPC session disappears"
         );
         assert_eq!(
             executor.cancellations.lock().unwrap().as_slice(),

@@ -4,7 +4,11 @@
 //! Later stages supply those concrete boundaries; this stage owns only the
 //! exact command grammar and session-bound controller facade.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -645,6 +649,7 @@ pub struct GoalRuntime {
 struct PendingGoalDisposal {
     ingress: GoalIngressContext,
     fence: GoalSessionFence,
+    retry_scheduled: bool,
 }
 
 impl GoalRuntime {
@@ -720,9 +725,13 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
-        match self.fence_session_for_disposal(ingress).await? {
-            GoalTransitionResult::Applied => self.delete_fenced_session_goal(ingress).await,
-            result => Ok(result),
+        let (transition, fence) = self.fence_session_for_disposal_with_fence(ingress).await?;
+        match (transition, fence) {
+            (GoalTransitionResult::Applied, Some(fence)) => {
+                self.delete_fenced_session_goal(ingress, &fence).await
+            }
+            (GoalTransitionResult::Applied, None) => Ok(GoalTransitionResult::Missing),
+            (result, _) => Ok(result),
         }
     }
 
@@ -734,6 +743,16 @@ impl GoalRuntime {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        Ok(self.fence_session_for_disposal_with_fence(ingress).await?.0)
+    }
+
+    /// Fence and return the exact terminal Goal token that a session owner
+    /// must carry across its own removal commit. The token is derived once
+    /// from canonical state; cleanup never reselects a Goal from ingress.
+    pub async fn fence_session_for_disposal_with_fence(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<(GoalTransitionResult, Option<GoalSessionFence>), GoalRuntimeError> {
         self.retry_pending_quiescence().await?;
         let Some(current) = self
             .goals
@@ -741,10 +760,10 @@ impl GoalRuntime {
             .await
             .map_err(GoalRuntimeError::control_plane)?
         else {
-            return Ok(GoalTransitionResult::Missing);
+            return Ok((GoalTransitionResult::Missing, None));
         };
         if !task_matches_ingress(&current.task, ingress) {
-            return Ok(GoalTransitionResult::Missing);
+            return Ok((GoalTransitionResult::Missing, None));
         }
 
         let terminal_task = if !current.task.status.is_terminal() {
@@ -760,7 +779,7 @@ impl GoalRuntime {
                 .await
                 .map_err(GoalRuntimeError::control_plane)?;
             if result != GoalTransitionResult::Applied {
-                return Ok(result);
+                return Ok((result, None));
             }
             self.quiesce_exact_goal(&current.task, ingress.session_id())
                 .await?;
@@ -770,30 +789,32 @@ impl GoalRuntime {
                 .await
                 .map_err(GoalRuntimeError::control_plane)?
             else {
-                return Ok(GoalTransitionResult::Missing);
+                return Ok((GoalTransitionResult::Missing, None));
             };
             if reloaded.task.id != current.task.id || !task_matches_ingress(&reloaded.task, ingress)
             {
-                return Ok(GoalTransitionResult::Stale);
+                return Ok((GoalTransitionResult::Stale, None));
             }
             reloaded.task
         } else {
             current.task
         };
 
+        let fence = GoalSessionFence::new(
+            &terminal_task.id,
+            ingress.session_id(),
+            terminal_task.execution_epoch,
+        );
         self.pending_disposal_cleanup.lock().await.insert(
             (terminal_task.id.clone(), ingress.session_id().to_string()),
             PendingGoalDisposal {
                 ingress: ingress.clone(),
-                fence: GoalSessionFence::new(
-                    &terminal_task.id,
-                    ingress.session_id(),
-                    terminal_task.execution_epoch,
-                ),
+                fence: fence.clone(),
+                retry_scheduled: false,
             },
         );
 
-        Ok(GoalTransitionResult::Applied)
+        Ok((GoalTransitionResult::Applied, Some(fence)))
     }
 
     /// Hard-delete an already fenced terminal Goal after the owning session is
@@ -801,17 +822,28 @@ impl GoalRuntime {
     pub async fn delete_fenced_session_goal(
         &self,
         ingress: &GoalIngressContext,
+        fence: &GoalSessionFence,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {
-        let pending = {
-            let pending = self.pending_disposal_cleanup.lock().await;
-            pending
-                .values()
-                .find(|pending| pending.ingress == *ingress)
-                .cloned()
-        };
+        self.delete_exact_fenced_session_goal(ingress, fence).await
+    }
+
+    async fn delete_exact_fenced_session_goal(
+        &self,
+        ingress: &GoalIngressContext,
+        fence: &GoalSessionFence,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let pending = self
+            .pending_disposal_cleanup
+            .lock()
+            .await
+            .get(&(fence.task_id.clone(), fence.session_id.clone()))
+            .cloned();
         let Some(pending) = pending else {
             return Ok(GoalTransitionResult::Missing);
         };
+        if pending.ingress != *ingress || pending.fence != *fence {
+            return Ok(GoalTransitionResult::Stale);
+        }
         let Some(current) = self
             .goals
             .current_goal_status_for_session(ingress.session_id())
@@ -829,7 +861,11 @@ impl GoalRuntime {
             || !task_matches_ingress(&current.task, ingress)
             || !current.task.status.is_terminal()
         {
-            return Ok(GoalTransitionResult::Stale);
+            self.pending_disposal_cleanup
+                .lock()
+                .await
+                .remove(&(pending.fence.task_id, pending.fence.session_id));
+            return Ok(GoalTransitionResult::Missing);
         }
 
         let result = self
@@ -857,12 +893,40 @@ impl GoalRuntime {
     /// request alive. Only a session owner calls this after it has committed
     /// removal of the matching live session; the exact task/epoch fence
     /// prevents a later successor from being deleted by this retry.
-    pub fn schedule_fenced_session_goal_cleanup(self: Arc<Self>, ingress: GoalIngressContext) {
+    pub async fn schedule_fenced_session_goal_cleanup(
+        self: &Arc<Self>,
+        ingress: GoalIngressContext,
+        fence: GoalSessionFence,
+    ) {
+        let key = (fence.task_id.clone(), fence.session_id.clone());
+        let should_schedule = {
+            let mut pending = self.pending_disposal_cleanup.lock().await;
+            let Some(pending) = pending.get_mut(&key) else {
+                return;
+            };
+            if pending.ingress != ingress || pending.fence != fence || pending.retry_scheduled {
+                return;
+            }
+            pending.retry_scheduled = true;
+            true
+        };
+        if !should_schedule {
+            return;
+        }
+        let runtime: Weak<Self> = Arc::downgrade(self);
         zeroclaw_spawn::spawn!(async move {
             loop {
-                match self.delete_fenced_session_goal(&ingress).await {
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                let result = runtime
+                    .delete_exact_fenced_session_goal(&ingress, &fence)
+                    .await;
+                drop(runtime);
+                match result {
                     Ok(GoalTransitionResult::Applied | GoalTransitionResult::Missing) => break,
-                    Ok(GoalTransitionResult::Stale) | Err(_) => {
+                    Ok(GoalTransitionResult::Stale) => break,
+                    Err(_) => {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }

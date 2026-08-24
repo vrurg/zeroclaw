@@ -904,6 +904,78 @@ async fn session_disposal_retries_a_durably_fenced_executor_before_deleting_cont
 }
 
 #[tokio::test]
+async fn stale_disposal_fence_retires_without_touching_a_successor() {
+    let executor = Arc::new(FakeExecutor::new(
+        GoalExecutionReadiness::Ready,
+        LaunchAction::Succeed,
+    ));
+    let (runtime, store, _, _) = controller(executor);
+    let ingress = matrix("session-dispose-successor");
+
+    runtime
+        .submit(
+            ingress.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the first task".into(),
+                objective: "create a disposal fence".into(),
+            },
+        )
+        .await
+        .expect("start first Goal");
+    let first_id = store
+        .current_goal_for_session("session-dispose-successor")
+        .await
+        .expect("read first Goal")
+        .expect("first Goal exists")
+        .id;
+
+    let (transition, fence) = runtime
+        .fence_session_for_disposal_with_fence(&ingress)
+        .await
+        .expect("fence first Goal");
+    assert_eq!(transition, GoalTransitionResult::Applied);
+    let fence = fence.expect("a successful fence has an exact token");
+
+    runtime
+        .submit(
+            ingress.clone(),
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "complete the successor task".into(),
+                objective: "replace the terminal predecessor".into(),
+            },
+        )
+        .await
+        .expect("terminal predecessor permits a successor");
+    let successor = store
+        .current_goal_for_session("session-dispose-successor")
+        .await
+        .expect("read successor")
+        .expect("successor exists");
+    assert_ne!(successor.id, first_id);
+
+    assert_eq!(
+        runtime
+            .delete_fenced_session_goal(&ingress, &fence)
+            .await
+            .expect("old fence cleanup is safe"),
+        GoalTransitionResult::Missing,
+        "a successor retires the old cleanup token instead of leaving a retry loop"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("session-dispose-successor")
+            .await
+            .expect("read successor after stale cleanup")
+            .expect("successor remains")
+            .id,
+        successor.id,
+        "an old fence must never delete the successor"
+    );
+}
+
+#[tokio::test]
 async fn idempotent_pause_retries_a_prior_failed_executor_quiescence() {
     let executor = Arc::new(
         FakeExecutor::new(GoalExecutionReadiness::Ready, LaunchAction::Succeed)
