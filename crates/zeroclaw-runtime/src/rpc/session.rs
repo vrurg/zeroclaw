@@ -169,6 +169,29 @@ impl SessionReplacementReservation {
     }
 }
 
+/// An exact live generation held across one fallible session-disposal commit.
+///
+/// Unlike a replacement reservation, this has no incoming session. It keeps
+/// the captured generation from being replaced while a durable companion
+/// store commits the disposal decision.
+pub(crate) struct SessionLifecycleReservation {
+    id: String,
+    generation: u64,
+    reserved_generations: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+impl Drop for SessionLifecycleReservation {
+    fn drop(&mut self) {
+        let mut generations = self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if generations.get(&self.id) == Some(&self.generation) {
+            generations.remove(&self.id);
+        }
+    }
+}
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -211,6 +234,15 @@ impl SessionStore {
             .contains(&id)
         {
             return Err("session replacement in progress");
+        }
+        if sessions.get(&id).is_some_and(|current| {
+            self.reserved_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                == Some(&current.generation)
+        }) {
+            return Err("session lifecycle operation in progress");
         }
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
@@ -349,6 +381,35 @@ impl SessionStore {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(id)
                 == Some(&session.generation)
+        })
+    }
+
+    /// Reserve one exact live generation while its durable disposal companion
+    /// is committed. A failed companion commit drops this guard and leaves the
+    /// live session untouched; a successful one must use
+    /// [`Self::kill_reserved_exact`] to remove this same generation.
+    pub(crate) async fn reserve_exact_lifecycle_removal(
+        &self,
+        id: &str,
+        generation: u64,
+    ) -> Option<SessionLifecycleReservation> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        if session.generation != generation {
+            return None;
+        }
+        let mut reserved = self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if reserved.contains_key(id) {
+            return None;
+        }
+        reserved.insert(id.to_string(), generation);
+        Some(SessionLifecycleReservation {
+            id: id.to_string(),
+            generation,
+            reserved_generations: Arc::clone(&self.reserved_generations),
         })
     }
 
@@ -682,6 +743,14 @@ impl SessionStore {
     }
 
     pub async fn remove(&self, id: &str) -> bool {
+        if self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+        {
+            return false;
+        }
         if let Some((_, token)) = self
             .cancel_tokens
             .lock()
@@ -701,6 +770,15 @@ impl SessionStore {
         if sessions
             .get(id)
             .is_none_or(|session| session.generation != generation)
+        {
+            return false;
+        }
+        if self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            == Some(&generation)
         {
             return false;
         }
@@ -807,6 +885,15 @@ impl SessionStore {
         {
             return false;
         }
+        if self
+            .reserved_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            == Some(&generation)
+        {
+            return false;
+        }
         if let Some((_, token)) = self
             .cancel_tokens
             .lock()
@@ -817,6 +904,39 @@ impl SessionStore {
             token.cancel();
         }
         sessions.remove(id).is_some()
+    }
+
+    /// Remove only a generation held by an exact lifecycle reservation.
+    ///
+    /// The reservation prevents a same-ID reconnect from becoming the target
+    /// while a durable ACP kill marker is being written.
+    pub(crate) async fn kill_reserved_exact(
+        &self,
+        reservation: &SessionLifecycleReservation,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&reservation.id)
+            .is_none_or(|session| session.generation != reservation.generation)
+            || self
+                .reserved_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&reservation.id)
+                != Some(&reservation.generation)
+        {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&reservation.id)
+        {
+            self.record_cancel_cause(&reservation.id, CancelCause::AdminKill);
+            token.cancel();
+        }
+        sessions.remove(&reservation.id).is_some()
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -857,6 +977,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::types::ChatMode;
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
@@ -1343,6 +1464,51 @@ mod tests {
             .expect("same-id successor remains live");
         assert_ne!(successor.generation(), original.generation());
         assert_eq!(successor.agent_alias, "successor-agent");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_reservation_blocks_same_id_replacement_until_released() {
+        let store = SessionStore::new(4, Arc::new(SessionActorQueue::new(4, 10, 60)));
+        store
+            .insert(
+                "shared".into(),
+                RpcSession::new(make_agent(), "old-agent", ".", ChatMode::Acp),
+            )
+            .await
+            .expect("insert original session");
+        let original = store
+            .live_session("shared")
+            .await
+            .expect("snapshot original generation");
+
+        let reservation = store
+            .reserve_exact_lifecycle_removal("shared", original.generation())
+            .await
+            .expect("reserve exact lifecycle generation");
+        assert!(
+            store
+                .insert(
+                    "shared".into(),
+                    RpcSession::new(make_agent(), "successor-agent", ".", ChatMode::Acp),
+                )
+                .await
+                .is_err(),
+            "a durable disposal commit must not be able to tombstone a same-ID successor"
+        );
+        assert!(
+            !store
+                .kill_session_exact("shared", original.generation())
+                .await,
+            "only the reservation holder may remove its exact generation"
+        );
+
+        drop(reservation);
+        assert!(
+            store
+                .kill_session_exact("shared", original.generation())
+                .await,
+            "dropping an aborted durable disposal must restore normal lifecycle handling"
+        );
     }
 
     #[tokio::test]

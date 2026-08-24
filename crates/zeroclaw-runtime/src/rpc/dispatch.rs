@@ -1633,6 +1633,16 @@ impl RpcDispatcher {
         let Some(live_session) = self.ctx.sessions.live_session(sid).await else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         };
+        let lifecycle_reservation = if matches!(live_session.chat_mode, ChatMode::Acp) {
+            self.ctx
+                .sessions
+                .reserve_exact_lifecycle_removal(sid, live_session.generation())
+                .await
+                .ok_or_else(|| rpc_err(SESSION_BUSY, "Session is being replaced"))
+                .map(Some)?
+        } else {
+            None
+        };
         let goal_ingress = self
             .fence_goal_for_live_session_removal(sid, &live_session)
             .await?;
@@ -1648,44 +1658,48 @@ impl RpcDispatcher {
         );
         let _guard = span.enter();
 
-        let killed = self
-            .ctx
-            .sessions
-            .kill_session_exact(sid, live_session.generation())
-            .await;
-        if killed {
-            if matches!(chat_mode, ChatMode::Acp) {
-                let store =
-                    self.ctx.acp_session_store.clone().ok_or_else(|| {
-                        rpc_err(INTERNAL_ERROR, "ACP session store is not available")
-                    })?;
-                let sid_owned = sid.to_string();
-                let marked =
-                    tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned))
-                        .await;
-                match marked {
-                    Ok(Ok(true)) => {}
-                    Ok(Ok(false)) => ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "session/kill: live ACP session had no durable row to tombstone"
-                    ),
-                    Ok(Err(e)) => {
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to mark ACP session killed: {e}"),
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to mark ACP session killed: {e}"),
-                        ));
-                    }
+        if matches!(chat_mode, ChatMode::Acp) {
+            let store = self
+                .ctx
+                .acp_session_store
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let sid_owned = sid.to_string();
+            let marked =
+                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
+            match marked {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "session/kill: live ACP session had no durable row to tombstone"
+                ),
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
                 }
             }
+        }
+        let killed = match lifecycle_reservation.as_ref() {
+            Some(reservation) => self.ctx.sessions.kill_reserved_exact(reservation).await,
+            None => {
+                self.ctx
+                    .sessions
+                    .kill_session_exact(sid, live_session.generation())
+                    .await
+            }
+        };
+        if killed {
             if let Some((ingress, fence)) = goal_ingress.as_ref() {
                 self.delete_fenced_goal_after_session_removal(ingress, fence)
                     .await?;
@@ -8706,6 +8720,50 @@ mod tests {
         assert!(
             sessions.get_agent(sid).await.is_none(),
             "failed rehydrate must leave the session absent from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_kill_store_failure_keeps_live_session_reachable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config.clone(), &data_dir);
+        let sid = "acp-kill-store-failure-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+
+        let context = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let missing_store_dispatcher = RpcDispatcher::new(context, tx, "test-peer".into());
+
+        assert!(
+            missing_store_dispatcher
+                .handle_session_kill(&json!({ "session_id": sid }))
+                .await
+                .is_err(),
+            "a kill without durable ACP tombstoning must fail"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "a failed durable tombstone must not remove the live generation"
+        );
+        assert!(
+            !acp_store.is_session_killed(sid).unwrap(),
+            "failed tombstoning must leave the durable row restorable"
         );
     }
 
