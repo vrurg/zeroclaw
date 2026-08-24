@@ -4,14 +4,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -58,6 +58,8 @@ impl SqliteTaskStore {
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
+                 session_id      TEXT,
+                 execution_epoch INTEGER NOT NULL DEFAULT 0,
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
@@ -103,7 +105,26 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    goal::migrate_schema(conn, version)?;
+    // Schema versions are a single durable contract. In particular, a failed
+    // session-uniqueness index creation must not leave a pre-v8 database with
+    // only some of the new task columns installed.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("begin control-plane schema migration")?;
+    if version < 8 {
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "session_id",
+            "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "execution_epoch",
+            "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    goal::migrate_schema(&tx, version)?;
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -116,6 +137,8 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             "control-plane DB was created by a newer schema version"
         );
     }
+    tx.commit()
+        .context("commit control-plane schema migration")?;
     Ok(())
 }
 
@@ -192,6 +215,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -231,9 +256,9 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             parent_id, originator_route, delivered, idem_key, principal_id, session_id,
+             execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -249,6 +274,8 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
@@ -418,6 +445,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }

@@ -30,6 +30,53 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
+    /// The durable fence for one admitted high-level provider operation.
+    #[serde(default)]
+    pub pending_call_id: Option<String>,
+    /// Epoch that admitted `pending_call_id`; paired with the pending id.
+    #[serde(default)]
+    pub pending_call_epoch: Option<i64>,
+    /// Conservative token reservation for the pending logical operation.
+    #[serde(default)]
+    pub pending_reserved_tokens: Option<u64>,
+    /// Conservative cost reservation for the pending logical operation.
+    #[serde(default)]
+    pub pending_reserved_cost_usd: Option<f64>,
+    /// Whether canonical accounting is complete enough to admit another call.
+    #[serde(default)]
+    pub accounting_state: GoalAccountingState,
+    /// Reversible pairing state around a Goal-owned tool side effect.
+    #[serde(default)]
+    pub tool_phase: GoalToolPhase,
+    /// Immutable operator-supplied criteria used by the mandatory verifier.
+    #[serde(default)]
+    pub success_criteria: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAccountingState {
+    #[default]
+    Complete,
+    Missing,
+    Invalid,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalToolPhase {
+    #[default]
+    Clean,
+    InFlight,
+}
+
+/// Result of an exact guarded Goal control-plane mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTransitionResult {
+    Applied,
+    Stale,
+    Missing,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +338,96 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<TaskContinuationContext>>;
+
+    /// Current Goal for an exact session, terminal rows included until explicit
+    /// replacement or disposal.
+    async fn current_goal_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// Atomically create a session-bound Goal or replace only a terminal,
+    /// fully-settled predecessor.
+    async fn create_or_replace_session_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn pause_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn resume_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn finish_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn admit_pending_call_with_reservation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+        reserved_tokens: Option<u64>,
+        reserved_cost_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn settle_pending_call(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+        accounting_state: GoalAccountingState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn begin_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn complete_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn update_session_goal_limits(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn delete_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
 }
 
 #[cfg(test)]

@@ -94,6 +94,14 @@ pub struct TaskRecord {
     pub idem_key: Option<String>,
     #[serde(default)]
     pub principal_id: Option<String>,
+    /// Canonical session binding for a Goal. Unrelated tasks and legacy rows
+    /// may omit it, but new Goal tasks must bind exactly one nonblank session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Durable executor fence for a Goal. A resumed executor must own a newer
+    /// epoch before it can mutate the canonical task state.
+    #[serde(default)]
+    pub execution_epoch: i64,
     /// Task registration/start timestamp in RFC3339 form.
     pub started_at: String,
     /// Terminal transition timestamp in RFC3339 form.
