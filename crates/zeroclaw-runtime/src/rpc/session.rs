@@ -1299,6 +1299,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_exact_lifecycle_removal_preserves_same_id_successor() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "shared".into(),
+                RpcSession::new(make_agent(), "old-agent", ".", ChatMode::Chat),
+            )
+            .await
+            .expect("insert original session");
+        let original = store
+            .live_session("shared")
+            .await
+            .expect("snapshot original generation");
+
+        // Model the gap while a Goal disposal fence awaits quiescence: the
+        // identifier is reused for a later live session before the old close
+        // or kill reaches the session store.
+        store
+            .insert(
+                "shared".into(),
+                RpcSession::new(make_agent(), "successor-agent", ".", ChatMode::Chat),
+            )
+            .await
+            .expect("insert same-id successor");
+
+        assert!(
+            !store.remove_exact("shared", original.generation()).await,
+            "a stale close must not remove a successor"
+        );
+        assert!(
+            !store
+                .kill_session_exact("shared", original.generation())
+                .await,
+            "a stale admin kill must not remove a successor"
+        );
+
+        let successor = store
+            .live_session("shared")
+            .await
+            .expect("same-id successor remains live");
+        assert_ne!(successor.generation(), original.generation());
+        assert_eq!(successor.agent_alias, "successor-agent");
+    }
+
+    #[tokio::test]
     async fn cancel_nonexistent_returns_false() {
         let store = make_store(4);
         assert!(!store.cancel_session("nope"));
