@@ -1537,7 +1537,8 @@ impl RpcDispatcher {
         {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
-        self.dispose_goal_before_session_removal(&req.session_id)
+        let goal_ingress = self
+            .fence_goal_for_live_session_removal(&req.session_id)
             .await?;
         agent
             .lock()
@@ -1578,6 +1579,10 @@ impl RpcDispatcher {
         if !self.ctx.sessions.remove(&req.session_id).await {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
+        if let Some(ingress) = goal_ingress.as_ref() {
+            self.delete_fenced_goal_after_session_removal(ingress)
+                .await?;
+        }
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -1612,7 +1617,7 @@ impl RpcDispatcher {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
 
-        self.dispose_goal_before_session_removal(sid).await?;
+        let goal_ingress = self.fence_goal_for_live_session_removal(sid).await?;
 
         let chat_mode = self
             .ctx
@@ -1673,6 +1678,10 @@ impl RpcDispatcher {
 
         let killed = self.ctx.sessions.kill_session(sid).await;
         if killed {
+            if let Some(ingress) = goal_ingress.as_ref() {
+                self.delete_fenced_goal_after_session_removal(ingress)
+                    .await?;
+            }
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
             }
@@ -2637,7 +2646,8 @@ impl RpcDispatcher {
         {
             return Err(rpc_err(SESSION_BUSY, "Session is being replaced"));
         }
-        self.dispose_goal_before_session_removal(&req.session_id)
+        let goal_ingress = self
+            .fence_goal_for_live_session_removal(&req.session_id)
             .await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
@@ -2647,6 +2657,10 @@ impl RpcDispatcher {
                 .unregister_channel("rpc");
         }
         let existed = self.ctx.sessions.remove(&req.session_id).await;
+        if existed && let Some(ingress) = goal_ingress.as_ref() {
+            self.delete_fenced_goal_after_session_removal(ingress)
+                .await?;
+        }
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -2728,20 +2742,18 @@ impl RpcDispatcher {
         }
     }
 
-    // Direct close/delete/kill has no successor session-map transaction. Keep
-    // its existing synchronous disposal ordering; replacement uses the split
-    // fence/commit/delete protocol above because its session-map commit can
-    // still fail after Goal quiescence.
-    async fn dispose_goal_before_session_removal(
+    /// Fence an exact live RPC Goal before session removal. The caller owns
+    /// the subsequent session-map/durable kill commit and must invoke the
+    /// post-removal cleanup only after that commit succeeds.
+    async fn fence_goal_for_live_session_removal(
         &self,
         session_id: &str,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Option<crate::goal_mode::GoalIngressContext>, JsonRpcError> {
         let Some(ingress) = self.goal_ingress_for_live_session(session_id).await? else {
-            return Ok(());
+            return Ok(None);
         };
         self.fence_goal_before_session_removal(&ingress).await?;
-        self.delete_fenced_goal_after_session_removal(&ingress)
-            .await
+        Ok(Some(ingress))
     }
 
     /// Fence an exact RPC-bound Goal when an external cancellation leaves the

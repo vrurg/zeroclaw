@@ -858,7 +858,7 @@ impl GoalRuntime {
     /// removal of the matching live session; the exact task/epoch fence
     /// prevents a later successor from being deleted by this retry.
     pub fn schedule_fenced_session_goal_cleanup(self: Arc<Self>, ingress: GoalIngressContext) {
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             loop {
                 match self.delete_fenced_session_goal(&ingress).await {
                     Ok(GoalTransitionResult::Applied | GoalTransitionResult::Missing) => break,

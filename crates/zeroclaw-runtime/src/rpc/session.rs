@@ -83,6 +83,7 @@ pub(crate) struct LiveRpcSession {
     pub workspace_dir: String,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    generation: u64,
 }
 
 impl RpcSession {
@@ -382,16 +383,27 @@ impl SessionStore {
     /// still present. `session/new` must not validate an unversioned identity
     /// and then turn a concurrent removal into a successful empty reconnect.
     pub(crate) async fn reconnect_snapshot(&self, id: &str) -> Option<(LiveRpcSession, usize)> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(id)?;
-        let live = LiveRpcSession {
-            agent_alias: session.agent_alias.clone(),
-            workspace_dir: session.workspace_dir.clone(),
-            chat_mode: session.chat_mode.clone(),
-            owner_tui_id: session.owner_tui_id.clone(),
+        let (live, agent) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            (
+                LiveRpcSession {
+                    agent_alias: session.agent_alias.clone(),
+                    workspace_dir: session.workspace_dir.clone(),
+                    chat_mode: session.chat_mode.clone(),
+                    owner_tui_id: session.owner_tui_id.clone(),
+                    generation: session.generation,
+                },
+                Arc::clone(&session.agent),
+            )
         };
-        let history_len = session.agent.lock().await.history().len();
-        Some((live, history_len))
+        let history_len = agent.lock().await.history().len();
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|session| session.generation == live.generation)
+            .then_some((live, history_len))
     }
 
     pub(crate) async fn lock_model_provider_update(
