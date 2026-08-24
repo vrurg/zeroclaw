@@ -259,6 +259,10 @@ mod tests {
         Box::new(|_| Box::pin(async { Ok(()) }))
     }
 
+    fn channel_goal_revoker() -> ChannelGoalRevoker {
+        Box::new(|_| Box::pin(async { Ok(()) }))
+    }
+
     #[test]
     fn new_registry_has_no_start_hooks() {
         let registry = DaemonRegistry::new();
@@ -319,5 +323,20 @@ mod tests {
         assert_eq!(registry.goal_session_adapter_count(), 1);
         assert_eq!(registry.take_goal_session_adapters().len(), 1);
         assert_eq!(registry.goal_session_adapter_count(), 0);
+    }
+
+    #[test]
+    fn channel_goal_revoker_is_owned_separately_from_channel_startup() {
+        let mut registry = DaemonRegistry::new();
+        registry
+            .register_channels(channels_starter())
+            .register_channel_goal_revoker(channel_goal_revoker());
+
+        assert!(registry.take_channel_goal_revoker().is_some());
+        assert!(
+            registry.take_channels_start().is_some(),
+            "taking the no-generation revoker must not consume channel startup"
+        );
+        assert!(registry.take_channel_goal_revoker().is_none());
     }
 }
