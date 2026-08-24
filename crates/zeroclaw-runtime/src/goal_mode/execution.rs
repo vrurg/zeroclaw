@@ -105,6 +105,26 @@ async fn acquire_session_slot(
     queue.acquire(&session_id).await
 }
 
+/// Resolve a worker-startup failure through the same exact durable fence used
+/// by ordinary executor failures. A stale or missing result means another
+/// lifecycle owner already changed the goal; it must never leave this scope's
+/// Running row behind.
+async fn fail_executor_startup(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+    reason: &str,
+) {
+    let _ = goals
+        .finish_session_goal(
+            &scope.task_id,
+            &scope.session_id,
+            scope.execution_epoch,
+            TaskStatus::Failed,
+            Some(reason.into()),
+        )
+        .await;
+}
+
 /// Daemon-composed Goal executor over the existing RPC session host.
 pub(crate) struct SessionGoalExecutor {
     sessions: Arc<SessionStore>,
@@ -673,11 +693,15 @@ impl GoalExecutor for SessionGoalExecutor {
         }
         let handle = zeroclaw_spawn::spawn!(async move {
             let scope = worker_scope;
-            let queue_guard =
-                match acquire_session_slot(session_queue, scope.session_id.clone()).await {
-                    Ok(queue_guard) => queue_guard,
-                    Err(_) => return,
-                };
+            let queue_guard = match acquire_session_slot(session_queue, scope.session_id.clone())
+                .await
+            {
+                Ok(queue_guard) => queue_guard,
+                Err(_) => {
+                    fail_executor_startup(&goals, &scope, "goal_executor_queue_unavailable").await;
+                    return;
+                }
+            };
             if scope.cancellation.is_cancelled() {
                 return;
             }
@@ -692,9 +716,11 @@ impl GoalExecutor for SessionGoalExecutor {
                         && current.task.status == TaskStatus::Running
                 })
             else {
+                fail_executor_startup(&goals, &scope, "goal_executor_startup_binding_failed").await;
                 return;
             };
             let Some(agent) = sessions.get_agent(&scope.session_id).await else {
+                fail_executor_startup(&goals, &scope, "goal_executor_session_missing").await;
                 return;
             };
             let agent_guard = agent.lock_owned().await;
@@ -949,7 +975,106 @@ impl GoalExecutor for SessionGoalExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{GoalVerifierOutcome, parse_goal_verifier_response};
+    use std::{sync::Arc, time::Duration};
+
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_config::{
+        cost::CostTracker,
+        schema::{Config, CostConfig},
+    };
+
+    use super::{GoalVerifierOutcome, SessionGoalExecutor, parse_goal_verifier_response};
+    use crate::{
+        control_plane::{
+            GoalAccountingState, GoalResumeSafety, GoalTaskRecord, GoalTaskRegistry,
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        },
+        goal_mode::{GoalExecutionScope, GoalExecutor, GoalTurnKind},
+        rpc::session::SessionStore,
+    };
+
+    #[tokio::test]
+    async fn queue_acquisition_failure_fails_the_exact_running_goal() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "queue-failure".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@alice:example.test".into()),
+            session_id: Some("session-a".into()),
+            execution_epoch: 0,
+            started_at: "2026-08-24T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "finish the task".into(),
+            success_criteria: "the task is complete".into(),
+            effective_token_limit: Some(64),
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+            pending_call_id: None,
+            pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            resume_safety: GoalResumeSafety::Clean,
+        };
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            0, 1, 60,
+        ));
+        let sessions = Arc::new(SessionStore::new(1, queue));
+        let cost_dir = tempfile::tempdir().unwrap();
+        let executor = SessionGoalExecutor::new(
+            sessions,
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), cost_dir.path()).unwrap()),
+        );
+
+        executor
+            .launch(GoalExecutionScope {
+                task_id: "queue-failure".into(),
+                session_id: "session-a".into(),
+                execution_epoch: 1,
+                turn_kind: GoalTurnKind::Start,
+                cancellation: CancellationToken::new(),
+                operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = store.get("queue-failure").await.unwrap().unwrap();
+                if current.status != TaskStatus::Running {
+                    return current;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup failure must resolve the running goal");
+        let current = store.get("queue-failure").await.unwrap().unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(current.execution_epoch, 2);
+    }
 
     #[test]
     fn verifier_complete_requires_exact_schema_and_no_blockers() {
