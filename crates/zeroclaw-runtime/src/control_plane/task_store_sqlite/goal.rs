@@ -322,6 +322,55 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         )
         .context("apply control-plane schema v9")?;
     }
+    if version < 10 {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS trg_goal_tasks_mutable_state_insert;
+             DROP TRIGGER IF EXISTS trg_goal_tasks_mutable_state_update;
+             CREATE TRIGGER trg_goal_tasks_mutable_state_insert
+                 BEFORE INSERT ON goal_tasks FOR EACH ROW
+                 WHEN (NEW.pending_call_id IS NULL AND (
+                           NEW.pending_call_epoch IS NOT NULL
+                        OR NEW.pending_reserved_tokens IS NOT NULL
+                        OR NEW.pending_reserved_cost_usd IS NOT NULL))
+                   OR (NEW.pending_call_id IS NOT NULL AND (
+                           length(trim(NEW.pending_call_id)) = 0
+                        OR NEW.pending_call_epoch < 1
+                        OR (NEW.effective_token_limit IS NOT NULL
+                            AND NEW.pending_reserved_tokens IS NULL)
+                        OR (NEW.effective_cost_limit_usd IS NOT NULL
+                            AND NEW.pending_reserved_cost_usd IS NULL)))
+                   OR (NEW.pending_reserved_tokens IS NOT NULL
+                       AND NEW.pending_reserved_tokens < 0)
+                   OR (NEW.pending_reserved_cost_usd IS NOT NULL
+                       AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                                AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
+                 BEGIN SELECT RAISE(ABORT, 'invalid goal pending operation state'); END;
+             CREATE TRIGGER trg_goal_tasks_mutable_state_update
+                 BEFORE UPDATE OF pending_call_id, pending_call_epoch,
+                                  pending_reserved_tokens, pending_reserved_cost_usd,
+                                  effective_token_limit, effective_cost_limit_usd ON goal_tasks
+                 FOR EACH ROW
+                 WHEN (NEW.pending_call_id IS NULL AND (
+                           NEW.pending_call_epoch IS NOT NULL
+                        OR NEW.pending_reserved_tokens IS NOT NULL
+                        OR NEW.pending_reserved_cost_usd IS NOT NULL))
+                   OR (NEW.pending_call_id IS NOT NULL AND (
+                           length(trim(NEW.pending_call_id)) = 0
+                        OR NEW.pending_call_epoch < 1
+                        OR (NEW.effective_token_limit IS NOT NULL
+                            AND NEW.pending_reserved_tokens IS NULL)
+                        OR (NEW.effective_cost_limit_usd IS NOT NULL
+                            AND NEW.pending_reserved_cost_usd IS NULL)))
+                   OR (NEW.pending_reserved_tokens IS NOT NULL
+                       AND NEW.pending_reserved_tokens < 0)
+                   OR (NEW.pending_reserved_cost_usd IS NOT NULL
+                       AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                                AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
+                 BEGIN SELECT RAISE(ABORT, 'invalid goal pending operation state'); END;
+             PRAGMA user_version = 10;",
+        )
+        .context("apply control-plane schema v10")?;
+    }
     Ok(())
 }
 
@@ -340,10 +389,9 @@ impl SqliteTaskStore {
             "UPDATE goal_tasks SET accounting_state = 'outcome_unknown'
               WHERE task_id IN (
                     SELECT id FROM tasks
-                     WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
+                     WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND owner_boot_id != ?1
-              ) AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
-                   OR accounting_state != 'complete')",
+              ) AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
         )
         .context("classify interrupted goal accounting")?;
@@ -354,17 +402,31 @@ impl SqliteTaskStore {
                     finished_at = COALESCE(finished_at, ?2),
                     execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
-              WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
+              WHERE kind = 'goal' AND session_id IS NOT NULL
                 AND owner_boot_id != ?1
                 AND EXISTS (
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
-                       AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
-                            OR accounting_state != 'complete')
+                       AND ((pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
+                            OR (tasks.status IN ('running', 'paused')
+                                AND accounting_state != 'complete'))
                 )",
                 params![boot_id, &now],
             )
             .context("fail interrupted goal accounting")?;
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pending_call_id = NULL, pending_call_epoch = NULL,
+                    pending_reserved_tokens = NULL, pending_reserved_cost_usd = NULL
+              WHERE task_id IN (
+                    SELECT id FROM tasks
+                     WHERE kind = 'goal' AND session_id IS NOT NULL
+                       AND owner_boot_id != ?1
+              ) AND accounting_state = 'outcome_unknown'
+                AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
+            params![boot_id],
+        )
+        .context("clear classified interrupted goal operation")?;
         tx.execute(
             "UPDATE goal_tasks
                 SET pause_reason = 'daemon_restarted',
@@ -997,7 +1059,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
             let settled = tx
                 .query_row(
                     "SELECT pending_call_id IS NULL AND pending_call_epoch IS NULL
-                            AND tool_phase = 'clean'
                        FROM goal_tasks WHERE task_id = ?1",
                     params![&current.id],
                     |row| row.get::<_, bool>(0),
