@@ -423,6 +423,12 @@ impl AccountedChatScope {
     pub fn record_stream_semantic_rejection_usage(&self, usage: crate::traits::TokenUsage) {
         accounting::record_stream_semantic_rejection_usage(usage);
     }
+
+    /// Retain an informational terminal attempt in the physical report while
+    /// suppressing usage that must not enter rejected-attempt cost accounting.
+    pub fn suppress_informational_terminal_stream_usage(&self) {
+        accounting::suppress_informational_terminal_stream_usage();
+    }
 }
 
 /// Commit a semantically accepted route for the existing fallback presenter.

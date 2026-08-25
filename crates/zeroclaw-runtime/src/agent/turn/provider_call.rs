@@ -32,6 +32,22 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_visible_text: String,
 }
 
+fn account_terminal_stream_rejection(
+    scope: &zeroclaw_providers::dispatch::AccountedChatScope,
+    terminal: &StreamTerminalCompletion,
+) {
+    match terminal.policy.usage_chargeability() {
+        zeroclaw_providers::TerminalUsageChargeability::Billable => {
+            if let Some(usage) = terminal.failure.usage.clone() {
+                scope.record_stream_semantic_rejection_usage(usage);
+            }
+        }
+        zeroclaw_providers::TerminalUsageChargeability::Informational => {
+            scope.suppress_informational_terminal_stream_usage();
+        }
+    }
+}
+
 pub(crate) async fn announce_llm_request(
     ctx: &TurnCtx<'_>,
     request_messages: &[ChatMessage],
@@ -236,12 +252,7 @@ pub(crate) async fn call_provider(
                             let should_recover = if let Some(terminal) = stream_err
                                 .downcast_ref::<StreamTerminalCompletion>()
                             {
-                                if terminal.policy.usage_chargeability()
-                                    == zeroclaw_providers::TerminalUsageChargeability::Billable
-                                    && let Some(usage) = terminal.failure.usage.clone()
-                                {
-                                    scope.record_stream_semantic_rejection_usage(usage);
-                                }
+                                account_terminal_stream_rejection(&scope, terminal);
 
                                 terminal.policy.recovery()
                                     == zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
@@ -650,9 +661,9 @@ mod streaming_fallback_tests {
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::StreamEvent;
     use zeroclaw_config::schema::PacingConfig;
-    use zeroclaw_providers::ModelProvider;
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
+    use zeroclaw_providers::{ModelProvider, anthropic::AnthropicModelProvider};
 
     struct EmptyStreamThenTextProvider {
         non_stream_calls: AtomicUsize,
@@ -672,6 +683,57 @@ mod streaming_fallback_tests {
 
     struct NonStreamingFallbackProvider {
         calls: AtomicUsize,
+    }
+
+    async fn anthropic_refusal_provider(
+        visible_text: bool,
+    ) -> (AnthropicModelProvider, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::header, routing::post};
+        use tokio::net::TcpListener;
+
+        let response = if visible_text {
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+        } else {
+            concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+        };
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move { ([(header::CONTENT_TYPE, "text/event-stream")], response) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server serves requests");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        (provider, server)
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -1384,5 +1446,236 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_informational_refusal_stream_does_not_charge_observed_usage() {
+        let (provider, server) = anthropic_refusal_provider(false).await;
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "anthropic.test",
+            model: "claude-test",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), async {
+                    let outcome = call_provider(
+                        &ctx,
+                        &provider,
+                        "anthropic.test",
+                        "claude-test",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await?;
+                    crate::agent::cost::settle_provider_attempts(&outcome.attempts, None);
+                    Ok::<_, anyhow::Error>(outcome)
+                }),
+            )
+            .await
+            .expect("terminal outcome stays in the provider-call result");
+        server.abort();
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(
+                &outcome
+                    .chat_result
+                    .expect_err("refusal is not a final response"),
+            ),
+            Some(zeroclaw_api::model_provider::TerminalCompletionError::Refusal)
+        );
+        assert!(matches!(
+            outcome.attempts.as_slice(),
+            [attempt]
+                if matches!(
+                    attempt.outcome(),
+                    zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                        observed: None
+                    }
+                )
+        ));
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 0);
+        assert_eq!(recorded.output_tokens, 0);
+        assert_eq!(recorded.cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn reliable_informational_refusal_stream_does_not_charge_before_fallback() {
+        let (primary, server) = anthropic_refusal_provider(false).await;
+        let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(std::sync::Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "anthropic.test",
+            model: "claude-test",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), async {
+                    let outcome = call_provider(
+                        &ctx,
+                        &provider,
+                        "anthropic.test",
+                        "claude-test",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await?;
+                    crate::agent::cost::settle_provider_attempts(&outcome.attempts, Some(1));
+                    Ok::<_, anyhow::Error>(outcome)
+                }),
+            )
+            .await
+            .expect("Reliable recovery stays in the provider-call result");
+        server.abort();
+
+        assert_eq!(
+            outcome
+                .chat_result
+                .expect("fallback response succeeds")
+                .text
+                .as_deref(),
+            Some("fallback response")
+        );
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(matches!(
+            outcome.attempts[0].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 0);
+        assert_eq!(recorded.output_tokens, 0);
+        assert_eq!(recorded.cost_usd, 0.0);
+    }
+
+    #[tokio::test]
+    async fn output_bearing_refusal_stream_remains_billable_once() {
+        let (provider, server) = anthropic_refusal_provider(true).await;
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "anthropic.test",
+            model: "claude-test",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), async {
+                    let outcome = call_provider(
+                        &ctx,
+                        &provider,
+                        "anthropic.test",
+                        "claude-test",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    )
+                    .await?;
+                    crate::agent::cost::settle_provider_attempts(&outcome.attempts, None);
+                    Ok::<_, anyhow::Error>(outcome)
+                }),
+            )
+            .await
+            .expect("terminal outcome stays in the provider-call result");
+        server.abort();
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(
+                &outcome
+                    .chat_result
+                    .expect_err("refusal is not a final response"),
+            ),
+            Some(zeroclaw_api::model_provider::TerminalCompletionError::Refusal)
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
     }
 }
