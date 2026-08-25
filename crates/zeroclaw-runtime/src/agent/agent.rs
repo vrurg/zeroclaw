@@ -12,6 +12,7 @@ use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -1063,6 +1064,146 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Build a detached provider-visible transcript for a Goal parent turn.
+    ///
+    /// Goal execution owns this transcript and discards it on every
+    /// non-complete exit.  It must never borrow or mutate canonical session
+    /// history while a candidate is still awaiting verification.
+    pub(crate) fn goal_working_history(&self) -> Result<Vec<ChatMessage>> {
+        if self.history.is_empty() {
+            return Ok(vec![ChatMessage::system(self.build_system_prompt()?)]);
+        }
+        Ok(self.tool_dispatcher.to_provider_messages(&self.history))
+    }
+
+    /// Return the live configured parent binding without constructing another
+    /// provider path.  The Goal controller uses this only for host readiness;
+    /// each tool-loop call still reports its actual route through the ordinary
+    /// Reliable/direct-provider accounting path.
+    pub(crate) fn goal_model_binding(&self) -> (String, String) {
+        (self.model_provider_name.clone(), self.model_name.clone())
+    }
+
+    /// Append the sole controller-verified Goal candidate to canonical
+    /// session history.
+    pub(crate) fn append_verified_goal_candidate(&mut self, candidate: String) {
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(candidate)));
+    }
+
+    /// Run a Goal parent turn against a caller-owned working transcript.
+    ///
+    /// This follows the ordinary tool-loop and configured provider path, but
+    /// intentionally omits canonical-history replay, autosave, response-cache
+    /// reads/writes, steering, and transport delivery.  The caller receives
+    /// the mutated transient transcript and decides whether a verified final
+    /// candidate may later enter canonical history.
+    pub(crate) async fn run_goal_parent_turn(
+        &mut self,
+        working_history: Vec<ChatMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<(String, Vec<ChatMessage>)> {
+        let last_user = working_history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .context("Goal parent transcript has no user directive")?;
+        if last_user.content.trim().is_empty() {
+            anyhow::bail!("Goal parent transcript has a blank user directive");
+        }
+
+        let effective_model = self.model_name.clone();
+        let tool_protocol_prompts = self.tool_protocol_prompts()?;
+        // `goal_working_history` already returns the dispatcher-normalized
+        // provider representation. Vision selection remains inside the shared
+        // loop, exactly as for an ordinary tool-loop iteration.
+        let split_idx = working_history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(working_history.len());
+        let mut loop_history = working_history[..split_idx].to_vec();
+        let mut loop_new_messages = working_history[split_idx..].to_vec();
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+        };
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let cost_context = self.tool_loop_cost_tracking_context();
+        let agent_alias = self.observer_agent_alias();
+        let turn_id = Self::new_turn_id();
+
+        let run = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+            Some(cost_context),
+            crate::agent::turn::scope_tool_protocol_prompts(
+                tool_protocol_prompts,
+                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                        crate::agent::loop_::ResolvedModelAccess {
+                            model_provider: self.model_provider.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &effective_model,
+                            temperature: self.temperature,
+                        },
+                        crate::agent::loop_::ResolvedIo {
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            silent: false,
+                            approval: self.approval_manager.as_deref(),
+                            multimodal_config: &self.multimodal_config,
+                            // Keep this field borrow separate from the mutable
+                            // image cache borrowed below.
+                            config: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|config| config.config.as_deref()),
+                            hooks: self.hook_runner.as_deref(),
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            receipt_generator: None,
+                        },
+                        crate::agent::loop_::ResolvedRuntimeKnobs {
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.effective_context_budget(),
+                            knobs: &knobs,
+                        },
+                    ),
+                    history: &mut loop_history,
+                    channel_name: &self.channel_name,
+                    channel_reply_target: None,
+                    cancellation_token: Some(cancellation),
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: Some(&mut loop_new_messages),
+                    image_cache: Some(&mut self.image_cache),
+                    memory: None,
+                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                    agent_alias: agent_alias.as_deref(),
+                    parent_agent_alias: None,
+                    turn_id: &turn_id,
+                    sop_reassembly: None,
+                }),
+            ),
+        );
+        let response = zeroclaw_providers::reliable::scope_provider_fallback(run).await?;
+        loop_history.extend(loop_new_messages);
+        Ok((response, loop_history))
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
@@ -3500,6 +3641,34 @@ mod tests {
             .await
             .expect_err("whitespace-only turn must fail");
         assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn goal_parent_turn_keeps_canonical_history_read_only() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        agent.seed_history(&[ChatMessage::user("ordinary prior turn")]);
+        let canonical_before = agent.history().to_vec();
+
+        let mut working = agent.goal_working_history().expect("working history");
+        working.push(ChatMessage::user("complete the goal"));
+        let (response, transcript) = agent
+            .run_goal_parent_turn(working, CancellationToken::new())
+            .await
+            .expect("Goal parent turn succeeds");
+
+        assert_eq!(response, "done");
+        assert!(transcript.iter().any(|message| message.content == "done"));
+        assert_eq!(agent.history().len(), canonical_before.len());
+        assert!(
+            agent
+                .history()
+                .iter()
+                .zip(&canonical_before)
+                .all(|(actual, expected)| format!("{actual:?}") == format!("{expected:?}"))
+        );
     }
 
     // ── model-fallback notice (silent downgrade surfacing) ──────────────

@@ -18,6 +18,10 @@ use crate::control_plane::{
 };
 
 mod execution;
+mod host;
+
+pub use execution::GoalExecutionHost;
+pub use host::{GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease};
 
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
@@ -420,6 +424,7 @@ pub enum GoalTurnKind {
 pub struct GoalExecutionScope {
     pub task_id: String,
     pub session_id: String,
+    pub binding: GoalSessionBinding,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
@@ -454,8 +459,7 @@ impl GoalExecutionScope {
 
 #[derive(Debug, Clone)]
 pub struct GoalExecutionPreflight {
-    pub session_id: String,
-    pub agent: String,
+    pub binding: GoalSessionBinding,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
 }
@@ -472,6 +476,12 @@ pub enum GoalExecutionReadiness {
 pub trait GoalExecutor: Send + Sync {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
+
+    /// Quiesce an exact fenced executor after its durable state transition.
+    /// Dormant/fake executors need no work.
+    async fn cancel(&self, _task_id: &str, _session_id: &str, _epoch: i64) -> Result<(), ()> {
+        Ok(())
+    }
 }
 
 struct CurrentGoal {
@@ -569,7 +579,10 @@ impl GoalRuntime {
             }
             Err(error) => return Err(error),
         };
-        match self.preflight(&ingress, token_limit, cost_limit_usd).await {
+        match self
+            .preflight(&ingress, token_limit, cost_limit_usd)
+            .await?
+        {
             GoalExecutionReadiness::Ready => {}
             GoalExecutionReadiness::PricingUnavailable if cost_limit_usd.is_some() => {
                 return Ok(GoalResponse::message(GoalMessageKey::PricingUnavailable));
@@ -732,6 +745,16 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            let _ = self
+                .executor
+                .cancel(
+                    &current.task.id,
+                    ingress.session_id(),
+                    current.task.execution_epoch,
+                )
+                .await;
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Paused,
@@ -760,7 +783,7 @@ impl GoalRuntime {
                 current.goal.effective_token_limit,
                 current.goal.effective_cost_limit_usd,
             )
-            .await
+            .await?
         {
             GoalExecutionReadiness::Ready => {}
             GoalExecutionReadiness::PricingUnavailable
@@ -822,6 +845,16 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            let _ = self
+                .executor
+                .cancel(
+                    &current.task.id,
+                    ingress.session_id(),
+                    current.task.execution_epoch,
+                )
+                .await;
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Cancelled,
@@ -847,6 +880,13 @@ impl GoalRuntime {
         let scope = GoalExecutionScope {
             task_id: task_id.to_owned(),
             session_id: ingress.session_id.clone(),
+            binding: GoalSessionBinding::new(
+                ingress.session_id.clone(),
+                ingress.agent.clone(),
+                ingress.route.clone(),
+                ingress.principal_id.clone(),
+            )
+            .map_err(GoalRuntimeError::control_plane)?,
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
@@ -891,15 +931,22 @@ impl GoalRuntime {
         ingress: &GoalIngressContext,
         token_limit: Option<u64>,
         cost_limit_usd: Option<f64>,
-    ) -> GoalExecutionReadiness {
-        self.executor
+    ) -> Result<GoalExecutionReadiness, GoalRuntimeError> {
+        let binding = GoalSessionBinding::new(
+            ingress.session_id.clone(),
+            ingress.agent.clone(),
+            ingress.route.clone(),
+            ingress.principal_id.clone(),
+        )
+        .map_err(GoalRuntimeError::control_plane)?;
+        Ok(self
+            .executor
             .preflight(&GoalExecutionPreflight {
-                session_id: ingress.session_id.clone(),
-                agent: ingress.agent.clone(),
+                binding,
                 token_limit,
                 cost_limit_usd,
             })
-            .await
+            .await)
     }
 
     fn resolve_limits(
