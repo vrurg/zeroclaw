@@ -1,8 +1,12 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::pricing::ModelRates;
 
@@ -188,6 +192,303 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
+/// Exact request facts presented to the existing configured provider path for
+/// one Goal-owned logical operation. This is transient admission input, never
+/// durable Goal state or a provider-specific factory.
+#[derive(Clone)]
+pub(crate) struct GoalOperationRequest {
+    pub(crate) model_provider: String,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    pub(crate) messages: Vec<zeroclaw_api::model_provider::ChatMessage>,
+    pub(crate) tools: Vec<crate::tools::ToolSpec>,
+}
+
+/// One strictly validated usage event from an actual provider attempt.
+pub(crate) struct GoalUsageEvent {
+    pub(crate) model_provider: String,
+    pub(crate) model: String,
+    pub(crate) usage: CostTokenUsage,
+}
+
+/// The complete, provider-neutral accounting settlement for one admitted
+/// logical Goal operation.
+pub(crate) struct GoalOperationSettlement {
+    pub(crate) accounting_state: crate::control_plane::GoalAccountingState,
+    pub(crate) pricing_complete: bool,
+    pub(crate) usage_events: Vec<GoalUsageEvent>,
+}
+
+/// Private bridge from the ordinary configured provider loop to a Goal
+/// execution owner. Reliable behavior remains entirely inside the normal
+/// provider path; the owner only admits and settles its logical operation.
+#[async_trait]
+pub(crate) trait GoalOperationAccounting: Send + Sync {
+    fn config(&self) -> &Config;
+
+    async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+    async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()>;
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
+}
+
+/// Durable tool-result pairing fence for one Goal execution scope. It is
+/// installed only by the Goal driver; ordinary turns do not observe it.
+pub(crate) struct GoalToolPhaseFence {
+    goals: Arc<dyn crate::control_plane::GoalTaskRegistry>,
+    task_id: String,
+    session_id: String,
+    epoch: i64,
+    in_flight: AtomicBool,
+}
+
+impl GoalToolPhaseFence {
+    pub(crate) fn new(
+        goals: Arc<dyn crate::control_plane::GoalTaskRegistry>,
+        task_id: String,
+        session_id: String,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            goals,
+            task_id,
+            session_id,
+            epoch,
+            in_flight: AtomicBool::new(false),
+        }
+    }
+
+    async fn begin(&self) -> anyhow::Result<()> {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        match self
+            .goals
+            .begin_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            crate::control_plane::GoalTransitionResult::Applied => Ok(()),
+            crate::control_plane::GoalTransitionResult::Stale
+            | crate::control_plane::GoalTransitionResult::Missing => {
+                self.in_flight.store(false, Ordering::Release);
+                anyhow::bail!("goal tool phase is stale")
+            }
+        }
+    }
+
+    async fn complete(&self) -> anyhow::Result<()> {
+        if !self.in_flight.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self
+            .goals
+            .complete_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            crate::control_plane::GoalTransitionResult::Applied => {
+                self.in_flight.store(false, Ordering::Release);
+                Ok(())
+            }
+            crate::control_plane::GoalTransitionResult::Stale
+            | crate::control_plane::GoalTransitionResult::Missing => {
+                anyhow::bail!("goal tool phase completion is stale")
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_TOOL_PHASE_FENCE: Option<Arc<GoalToolPhaseFence>>;
+}
+
+/// Mark the durable phase immediately before an executable tool batch starts.
+pub(crate) async fn begin_goal_tool_phase_if_scoped() -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() {
+        fence.begin().await?;
+    }
+    Ok(())
+}
+
+/// Clear the durable phase only after the runtime has appended paired tool
+/// results to the working transcript.
+pub(crate) async fn complete_goal_tool_phase_if_scoped() -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() {
+        fence.complete().await?;
+    }
+    Ok(())
+}
+
+/// Admit an operation only when an enclosing Goal execution owner scoped the
+/// existing model loop. Ordinary sessions never enter this branch.
+pub(crate) async fn admit_goal_operation_if_scoped(
+    request: GoalOperationRequest,
+) -> anyhow::Result<()> {
+    if request.model_provider.trim().is_empty() || request.model.trim().is_empty() {
+        anyhow::bail!("goal operation is missing its provider route");
+    }
+    if request.temperature.is_some_and(|value| !value.is_finite()) {
+        anyhow::bail!("goal operation has a non-finite temperature");
+    }
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.admit(request).await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
+    GOAL_OPERATION_ACCOUNTING
+        .try_with(|accounting| accounting.is_some())
+        .unwrap_or(false)
+}
+
+pub(crate) fn goal_pricing_rates(
+    config: &Config,
+    model_provider_name: &str,
+    model: &str,
+) -> ModelRates {
+    let configured = provider_pricing(&build_model_provider_pricing(config), model_provider_name)
+        .map(|pricing| resolve_rates_opt(pricing, model))
+        .unwrap_or_default();
+    let live = (!configured.is_complete())
+        .then(|| live_pricing_for(model_provider_name, model))
+        .flatten();
+    let mut rates = configured.or(live.unwrap_or_default());
+    if let Some((input, output, cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: Some(input),
+            output_per_mtok: Some(output),
+            cached_input_per_mtok: Some(cached),
+        });
+    }
+    rates
+}
+
+fn goal_usage_from_provider_attempt(
+    config: &Config,
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> anyhow::Result<CostTokenUsage> {
+    let input_tokens = usage
+        .input_tokens
+        .ok_or_else(|| anyhow::Error::msg("goal usage is missing input tokens"))?;
+    let output_tokens = usage
+        .output_tokens
+        .ok_or_else(|| anyhow::Error::msg("goal usage is missing output tokens"))?;
+    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+    if cached_input_tokens > input_tokens {
+        anyhow::bail!("goal usage reports cached input greater than total input");
+    }
+    let total_tokens = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| anyhow::Error::msg("goal usage token total overflows u64"))?;
+    if total_tokens == 0 {
+        anyhow::bail!("goal usage reports zero total tokens");
+    }
+
+    let rates = goal_pricing_rates(config, model_provider_name, model);
+    for rate in [
+        rates.input_per_mtok,
+        rates.output_per_mtok,
+        rates.cached_input_per_mtok,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !rate.is_finite() || rate < 0.0 {
+            anyhow::bail!("goal usage resolved an invalid pricing rate");
+        }
+    }
+    let pricing_available = rates.input_per_mtok.is_some() && rates.output_per_mtok.is_some();
+    let mut cost_usage = CostTokenUsage::new_with_cache(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        rates.input_per_mtok.unwrap_or(0.0),
+        rates.cached_input_per_mtok.unwrap_or(0.0),
+        rates.output_per_mtok.unwrap_or(0.0),
+    );
+    cost_usage.pricing_available = pricing_available;
+    Ok(cost_usage)
+}
+
+fn combine_goal_accounting_state(
+    current: crate::control_plane::GoalAccountingState,
+    next: crate::control_plane::GoalAccountingState,
+) -> crate::control_plane::GoalAccountingState {
+    use crate::control_plane::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
+    match (current, next) {
+        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
+        (Invalid, _) | (_, Invalid) => Invalid,
+        (Missing, _) | (_, Missing) => Missing,
+        (Complete, Complete) => Complete,
+    }
+}
+
+fn goal_operation_settlement(
+    config: &Config,
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> GoalOperationSettlement {
+    use crate::control_plane::GoalAccountingState;
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    let mut accounting_state = if attempts.is_empty() {
+        GoalAccountingState::Missing
+    } else {
+        GoalAccountingState::Complete
+    };
+    let mut pricing_complete = true;
+    let mut usage_events = Vec::new();
+    for attempt in attempts {
+        let (usage, outcome_state) = match attempt.outcome() {
+            AttemptUsageOutcome::Complete(usage) => (Some(usage), GoalAccountingState::Complete),
+            AttemptUsageOutcome::Missing => (None, GoalAccountingState::Missing),
+            AttemptUsageOutcome::Invalid { .. } => (None, GoalAccountingState::Invalid),
+            AttemptUsageOutcome::OutcomeUnknown { observed } => {
+                (observed.as_ref(), GoalAccountingState::OutcomeUnknown)
+            }
+        };
+        accounting_state = combine_goal_accounting_state(accounting_state, outcome_state);
+        let Some(usage) = usage else { continue };
+        match goal_usage_from_provider_attempt(
+            config,
+            attempt.provider_ref(),
+            attempt.model(),
+            usage,
+        ) {
+            Ok(usage) => {
+                if !usage.pricing_available {
+                    pricing_complete = false;
+                }
+                usage_events.push(GoalUsageEvent {
+                    model_provider: attempt.provider_ref().to_string(),
+                    model: attempt.model().to_string(),
+                    usage,
+                });
+            }
+            Err(_) => {
+                accounting_state =
+                    combine_goal_accounting_state(accounting_state, GoalAccountingState::Invalid);
+            }
+        }
+    }
+    GoalOperationSettlement {
+        accounting_state,
+        pricing_complete,
+        usage_events,
+    }
+}
+
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
@@ -288,10 +589,19 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub(crate) fn settle_provider_attempts(
+pub(crate) async fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
-) {
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        return accounting
+            .settle(goal_operation_settlement(accounting.config(), attempts))
+            .await;
+    }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -301,6 +611,7 @@ pub(crate) fn settle_provider_attempts(
             updates_context_window_fill,
         );
     }
+    Ok(())
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -556,7 +867,9 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), None);
+                settle_provider_attempts(report.attempts(), None)
+                    .await
+                    .unwrap();
             })
             .await;
 
@@ -572,6 +885,104 @@ mod tests {
         assert_eq!(records[1].usage.model, "model-b");
         assert!((records[0].usage.cost_usd - 1.0).abs() < 1e-12);
         assert!((records[1].usage.cost_usd - 3.0).abs() < 1e-12);
+    }
+
+    struct RecordingGoalOperationAccounting {
+        config: Config,
+        requests: Mutex<Vec<GoalOperationRequest>>,
+        settlements: Mutex<Vec<GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for RecordingGoalOperationAccounting {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()> {
+            self.requests.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+            self.settlements.lock().push(settlement);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_scope_receives_full_actual_attempt_report_without_ordinary_settlement() {
+        let accounting = Arc::new(RecordingGoalOperationAccounting {
+            config: Config::default(),
+            requests: Mutex::new(Vec::new()),
+            settlements: Mutex::new(Vec::new()),
+        });
+        let provider = PricedLeaf {
+            alias: "goal-wrapper",
+        };
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    admit_goal_operation_if_scoped(GoalOperationRequest {
+                        model_provider: "configured.primary".into(),
+                        model: "configured-model".into(),
+                        temperature: Some(0.2),
+                        thinking: None,
+                        messages: messages.clone(),
+                        tools: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                    scope
+                        .scope(async {
+                            with_exact_dispatch_route(
+                                "actual.fallback".into(),
+                                "actual-model".into(),
+                                ProviderDispatch::from_ref(&provider).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        })
+                        .await;
+                    scope.mark_logical_success();
+                    let report = scope.take();
+                    settle_provider_attempts(report.attempts(), Some(0))
+                        .await
+                        .unwrap();
+                },
+            )
+            .await;
+
+        let requests = accounting.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_provider, "configured.primary");
+        assert_eq!(requests[0].model, "configured-model");
+        drop(requests);
+        let settlements = accounting.settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].accounting_state,
+            crate::control_plane::GoalAccountingState::Complete
+        );
+        assert!(!settlements[0].pricing_complete);
+        assert_eq!(settlements[0].usage_events.len(), 1);
+        assert_eq!(
+            settlements[0].usage_events[0].model_provider,
+            "actual.fallback"
+        );
+        assert_eq!(settlements[0].usage_events[0].model, "actual-model");
     }
 
     struct PricedLeaf {
