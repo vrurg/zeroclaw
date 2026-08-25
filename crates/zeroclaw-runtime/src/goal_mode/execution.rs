@@ -701,7 +701,10 @@ fn conservative_cost_reservation(
 mod tests {
     use std::sync::Arc;
 
-    use super::{GoalExecutionDriver, VerifierOutcome, parse_verifier_response};
+    use super::{
+        GoalExecutionDriver, GoalOperationAccountant, GoalOperationAccounting, VerifierOutcome,
+        parse_verifier_response,
+    };
     use async_trait::async_trait;
     use zeroclaw_config::{
         cost::CostTracker,
@@ -882,5 +885,109 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("generic Goal driver did not complete the exact session task");
+    }
+
+    #[tokio::test]
+    async fn ledger_write_failure_settles_the_exact_pending_operation_as_unknown() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied,
+        );
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation("goal-task", "session", 1, "call", None, None)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        std::fs::create_dir_all(directory.path().join("state").join("costs.jsonl")).unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let accountant = GoalOperationAccountant::new(
+            goals,
+            Arc::new(Config::default()),
+            tracker,
+            scope,
+            "main".into(),
+        );
+        *accountant.active.lock().await = Some(super::ActiveGoalOperation {
+            call_id: "call".into(),
+            cost_limit_required: false,
+            _permit: permit,
+        });
+
+        assert!(
+            accountant
+                .settle(super::GoalOperationSettlement {
+                    accounting_state: crate::control_plane::GoalAccountingState::Complete,
+                    pricing_complete: true,
+                    usage_events: vec![super::GoalUsageEvent {
+                        model_provider: "actual.provider".into(),
+                        model: "actual-model".into(),
+                        usage: crate::cost::types::TokenUsage::new(
+                            "actual-model",
+                            1,
+                            1,
+                            0,
+                            1.0,
+                            1.0,
+                            0.0,
+                        ),
+                    }],
+                })
+                .await
+                .is_err()
+        );
+        let goal = store.get_goal_task("goal-task").await.unwrap().unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            crate::control_plane::GoalAccountingState::OutcomeUnknown,
+        );
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
     }
 }
