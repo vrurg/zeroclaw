@@ -454,11 +454,22 @@ pub struct GoalExecutionScope {
     pub cancellation: CancellationToken,
 }
 
-/// Read-only facts the fake execution seam must validate before launch.
+/// Read-only facts an execution host uses to plan one exact Goal turn.
+///
+/// The controller supplies only Goal-owned declaration, binding, and accounting
+/// facts. Provider selection and request construction stay inside the concrete
+/// host, keeping this transport-neutral boundary extractable.
 #[derive(Debug, Clone)]
 pub struct GoalExecutionPreflight {
+    /// The task and epoch that the prospective execution scope must own.
+    pub task_id: String,
     pub session_id: String,
+    pub execution_epoch: i64,
+    pub turn_kind: GoalTurnKind,
     pub agent: String,
+    /// Immutable durable declaration from which the host constructs its turn.
+    pub objective: String,
+    pub success_criteria: String,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
     /// Durable ledger totals before the next logical operation.
@@ -611,8 +622,19 @@ impl GoalRuntime {
             }
             Err(error) => return Err(error),
         };
+        let id = Uuid::new_v4().to_string();
         match self
-            .preflight(&ingress, token_limit, cost_limit_usd, (0, 0.0, true))
+            .preflight(
+                &ingress,
+                &id,
+                1,
+                GoalTurnKind::Start,
+                &objective,
+                &success_criteria,
+                token_limit,
+                cost_limit_usd,
+                (0, 0.0, true),
+            )
             .await
         {
             GoalExecutionReadiness::Ready(reservation)
@@ -644,7 +666,6 @@ impl GoalRuntime {
                 return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
             }
         }
-        let id = Uuid::new_v4().to_string();
         let task = TaskRecord {
             id: id.clone(),
             kind: TaskKind::Goal,
@@ -943,14 +964,24 @@ impl GoalRuntime {
     async fn preflight(
         &self,
         ingress: &GoalIngressContext,
+        task_id: &str,
+        execution_epoch: i64,
+        turn_kind: GoalTurnKind,
+        objective: &str,
+        success_criteria: &str,
         token_limit: Option<u64>,
         cost_limit_usd: Option<f64>,
         totals: (u64, f64, bool),
     ) -> GoalExecutionReadiness {
         self.executor
             .preflight(&GoalExecutionPreflight {
+                task_id: task_id.to_owned(),
                 session_id: ingress.session_id.clone(),
+                execution_epoch,
+                turn_kind,
                 agent: ingress.agent.clone(),
+                objective: objective.to_owned(),
+                success_criteria: success_criteria.to_owned(),
                 token_limit,
                 cost_limit_usd,
                 known_token_usage: totals.0,
@@ -996,6 +1027,11 @@ impl GoalRuntime {
         match self
             .preflight(
                 ingress,
+                &current.task.id,
+                current.task.execution_epoch + 1,
+                GoalTurnKind::Resume,
+                &current.goal.objective,
+                &current.goal.success_criteria,
                 current.goal.effective_token_limit,
                 current.goal.effective_cost_limit_usd,
                 totals,
@@ -1255,13 +1291,15 @@ mod tests {
 
     struct FakeExecutor {
         readiness: Mutex<GoalExecutionReadiness>,
+        preflights: Mutex<Vec<GoalExecutionPreflight>>,
         launches: Mutex<Vec<GoalExecutionScope>>,
         fail_launch: bool,
     }
 
     #[async_trait]
     impl GoalExecutor for FakeExecutor {
-        async fn preflight(&self, _: &GoalExecutionPreflight) -> GoalExecutionReadiness {
+        async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
+            self.preflights.lock().push(request.clone());
             *self.readiness.lock()
         }
 
@@ -1297,6 +1335,7 @@ mod tests {
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(readiness),
+            preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch,
         });
@@ -1321,11 +1360,61 @@ mod tests {
         }
     }
 
+    struct DerivingExecutor;
+
+    #[async_trait]
+    impl GoalExecutor for DerivingExecutor {
+        async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
+            let turn_overhead = match request.turn_kind {
+                GoalTurnKind::Start => 1,
+                GoalTurnKind::Resume => 2,
+                GoalTurnKind::Continue => 3,
+            };
+            let declaration_len = request
+                .objective
+                .chars()
+                .count()
+                .checked_add(request.success_criteria.chars().count())
+                .and_then(|count| count.checked_add(turn_overhead))
+                .and_then(|count| u64::try_from(count).ok());
+            GoalExecutionReadiness::Ready(GoalOperationReservation {
+                token_count: declaration_len,
+                cost_usd: Some(0.0),
+            })
+        }
+
+        async fn launch(&self, _scope: GoalExecutionScope) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
     fn ready() -> GoalExecutionReadiness {
         GoalExecutionReadiness::Ready(GoalOperationReservation {
             token_count: Some(1),
             cost_usd: Some(0.0),
         })
+    }
+
+    fn preflight_for(
+        objective: &str,
+        success_criteria: &str,
+        turn_kind: GoalTurnKind,
+    ) -> GoalExecutionPreflight {
+        GoalExecutionPreflight {
+            task_id: "task".into(),
+            session_id: "session".into(),
+            execution_epoch: 1,
+            turn_kind,
+            agent: "main".into(),
+            objective: objective.into(),
+            success_criteria: success_criteria.into(),
+            token_limit: Some(100),
+            cost_limit_usd: None,
+            known_token_usage: 0,
+            known_cost_usd: 0.0,
+            token_accounting_complete: true,
+            cost_accounting_complete: true,
+        }
     }
 
     fn record_goal_usage(tracker: &CostTracker, task_id: String, total_tokens: u64) {
@@ -1501,6 +1590,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_preflight_receives_the_exact_durable_declaration_and_binding() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        let command = GoalCommand::Start {
+            budget: GoalBudgetRequest::Defaults,
+            success_criteria: "validate the exact declaration".into(),
+            objective: "plan this specific goal".into(),
+        };
+
+        assert_eq!(
+            runtime.submit(ingress(), command).await.unwrap().key,
+            GoalMessageKey::Started
+        );
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let preflights = executor.preflights.lock();
+        assert_eq!(preflights.len(), 1);
+        let preflight = &preflights[0];
+        assert_eq!(preflight.task_id, task.id);
+        assert_eq!(preflight.session_id, "session");
+        assert_eq!(preflight.execution_epoch, task.execution_epoch);
+        assert_eq!(preflight.turn_kind, GoalTurnKind::Start);
+        assert_eq!(preflight.objective, "plan this specific goal");
+        assert_eq!(preflight.success_criteria, "validate the exact declaration");
+    }
+
+    #[tokio::test]
+    async fn reservation_derivation_uses_declaration_and_turn_shape() {
+        let executor = DerivingExecutor;
+        let start = executor
+            .preflight(&preflight_for("objective", "criteria", GoalTurnKind::Start))
+            .await;
+        let changed_declaration = executor
+            .preflight(&preflight_for(
+                "longer objective",
+                "criteria",
+                GoalTurnKind::Start,
+            ))
+            .await;
+        let resume = executor
+            .preflight(&preflight_for(
+                "objective",
+                "criteria",
+                GoalTurnKind::Resume,
+            ))
+            .await;
+
+        assert_eq!(
+            start,
+            GoalExecutionReadiness::Ready(GoalOperationReservation {
+                token_count: Some(18),
+                cost_usd: Some(0.0),
+            })
+        );
+        assert_ne!(start, changed_declaration);
+        assert_ne!(start, resume);
+    }
+
+    #[tokio::test]
     async fn budget_update_keeps_a_paused_goal_paused_until_explicit_resume() {
         let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
@@ -1549,6 +1699,11 @@ mod tests {
         assert_eq!(resumed.status, TaskStatus::Running);
         assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
         assert_eq!(executor.launches.lock().len(), 2);
+        let preflights = executor.preflights.lock();
+        let resume_preflight = preflights.last().unwrap();
+        assert_eq!(resume_preflight.task_id, resumed.id);
+        assert_eq!(resume_preflight.execution_epoch, resumed.execution_epoch);
+        assert_eq!(resume_preflight.turn_kind, GoalTurnKind::Resume);
     }
 
     #[tokio::test]
@@ -1806,6 +1961,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(ready()),
+            preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -2106,6 +2262,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(ready()),
+            preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -2194,6 +2351,7 @@ mod tests {
     async fn stale_executor_launch_is_discarded_after_an_epoch_is_fenced() {
         let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
+        let preflight = executor.preflights.lock()[0].clone();
         let task = store
             .current_goal_for_session("session")
             .await
@@ -2216,9 +2374,9 @@ mod tests {
             runtime
                 .launch_exact(
                     ingress(),
-                    &task.id,
-                    task.execution_epoch,
-                    GoalTurnKind::Start,
+                    &preflight.task_id,
+                    preflight.execution_epoch,
+                    preflight.turn_kind,
                 )
                 .await
                 .unwrap()
