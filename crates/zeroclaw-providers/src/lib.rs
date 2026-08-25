@@ -654,6 +654,22 @@ impl ResolvedModelOperationPlan {
     /// Return a checked conservative token reservation for every candidate and
     /// retry that one logical operation may use.
     pub fn conservative_token_reservation(&self, input_tokens: u64) -> anyhow::Result<u64> {
+        self.conservative_token_reservation_for_request(input_tokens, None)
+    }
+
+    /// Return a checked conservative token reservation for every candidate and
+    /// retry that one logical operation may use with the request's native
+    /// thinking parameters applied.
+    ///
+    /// Native-thinking providers may raise their wire-level output limit above
+    /// the configured bound. Keeping that adjustment in the provider-neutral
+    /// operation plan makes callers reserve for the same request shape that
+    /// provider construction will send, without constructing a provider.
+    pub fn conservative_token_reservation_for_request(
+        &self,
+        input_tokens: u64,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> anyhow::Result<u64> {
         if self.candidates.is_empty() {
             anyhow::bail!("model operation plan has no candidates");
         }
@@ -666,8 +682,9 @@ impl ResolvedModelOperationPlan {
                     candidate.model
                 );
             }
+            let max_output_tokens = candidate.max_output_tokens_for_request(thinking)?;
             let per_attempt = input_tokens
-                .checked_add(u64::from(candidate.max_output_tokens))
+                .checked_add(u64::from(max_output_tokens))
                 .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
             let candidate_total = per_attempt
                 .checked_mul(u64::from(candidate.attempt_count))
@@ -676,6 +693,38 @@ impl ResolvedModelOperationPlan {
                 .checked_add(candidate_total)
                 .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))
         })
+    }
+}
+
+impl ResolvedModelOperationCandidate {
+    fn max_output_tokens_for_request(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    ) -> anyhow::Result<u32> {
+        let Some(thinking) = thinking else {
+            return Ok(self.max_output_tokens);
+        };
+
+        let family = self
+            .provider_ref
+            .split_once('.')
+            .map_or(self.provider_ref.as_str(), |(family, _)| family);
+        let supports_native_thinking = match canonicalize_v2_model_provider_name(family) {
+            "anthropic" => anthropic::anthropic_model_supports_native_thinking(&self.model),
+            "bedrock" => bedrock::bedrock_model_supports_native_thinking(&self.model),
+            _ => false,
+        };
+        if !supports_native_thinking {
+            return Ok(self.max_output_tokens);
+        }
+
+        // Anthropic and Bedrock require the wire-level limit to be strictly
+        // greater than the native-thinking budget.
+        let minimum = thinking
+            .budget_tokens
+            .checked_add(1)
+            .ok_or_else(|| anyhow::Error::msg("native thinking output bound overflows"))?;
+        Ok(self.max_output_tokens.max(minimum))
     }
 }
 
@@ -4567,6 +4616,39 @@ mod tests {
         assert_eq!(
             plan.conservative_token_reservation(100).unwrap(),
             3 * (100 + u64::from(BASELINE_MAX_TOKENS))
+        );
+    }
+
+    #[test]
+    fn operation_plan_reserves_native_thinking_wire_output_bounds() {
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+
+        let plan = ResolvedModelOperationPlan {
+            candidates: vec![
+                ResolvedModelOperationCandidate {
+                    provider_ref: "anthropic.primary".to_string(),
+                    model: "claude-sonnet-4-6".to_string(),
+                    max_output_tokens: 100,
+                    attempt_count: 1,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "aws-bedrock".to_string(),
+                    model: "anthropic.claude-sonnet-4-6-v1:0".to_string(),
+                    max_output_tokens: 200,
+                    attempt_count: 1,
+                },
+            ],
+        };
+
+        assert_eq!(
+            plan.conservative_token_reservation_for_request(
+                50,
+                Some(NativeThinkingParams {
+                    budget_tokens: 10_000,
+                }),
+            )
+            .unwrap(),
+            20_102
         );
     }
 
