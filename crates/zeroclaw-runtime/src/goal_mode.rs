@@ -364,6 +364,8 @@ pub enum GoalMessageKey {
     InputTooLong,
     BudgetExhausted,
     AccountingIncomplete,
+    ReservationUnavailable,
+    ReservationExceedsBudget,
     ToolPhaseNonResumable,
     Terminal,
     ExecutorStartFailed,
@@ -459,11 +461,29 @@ pub struct GoalExecutionPreflight {
     pub agent: String,
     pub token_limit: Option<u64>,
     pub cost_limit_usd: Option<f64>,
+    /// Durable ledger totals before the next logical operation.
+    pub known_token_usage: u64,
+    pub known_cost_usd: f64,
+    /// Completeness is explicit because a lower-bound total cannot safely
+    /// admit a new operation under a finite limit.
+    pub token_accounting_complete: bool,
+    pub cost_accounting_complete: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Conservative capacity required by one logical Goal operation.
+///
+/// Concrete execution hosts derive it from PR1's provider/model operation
+/// plan. The controller deliberately receives only the resulting dimensions,
+/// preserving its transport- and provider-neutral extraction boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GoalOperationReservation {
+    pub token_count: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GoalExecutionReadiness {
-    Ready,
+    Ready(GoalOperationReservation),
     PricingUnavailable,
     VerifierUnavailable,
 }
@@ -490,6 +510,8 @@ enum GoalResumeReadiness {
     AccountingIncomplete,
     ToolPhase,
     BudgetExhausted,
+    ReservationUnavailable,
+    ReservationExceedsBudget,
     PricingUnavailable,
     VerifierUnavailable,
 }
@@ -589,8 +611,31 @@ impl GoalRuntime {
             }
             Err(error) => return Err(error),
         };
-        match self.preflight(&ingress, token_limit, cost_limit_usd).await {
-            GoalExecutionReadiness::Ready => {}
+        match self
+            .preflight(&ingress, token_limit, cost_limit_usd, (0, 0.0, true))
+            .await
+        {
+            GoalExecutionReadiness::Ready(reservation)
+                if reservation_is_available(token_limit, cost_limit_usd, reservation)
+                    && reservation_fits_budget(
+                        0,
+                        0.0,
+                        token_limit,
+                        cost_limit_usd,
+                        reservation,
+                    ) => {}
+            GoalExecutionReadiness::Ready(reservation)
+                if !reservation_is_available(token_limit, cost_limit_usd, reservation) =>
+            {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationUnavailable,
+                ));
+            }
+            GoalExecutionReadiness::Ready(_) => {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationExceedsBudget,
+                ));
+            }
             GoalExecutionReadiness::PricingUnavailable if cost_limit_usd.is_some() => {
                 return Ok(GoalResponse::message(GoalMessageKey::PricingUnavailable));
             }
@@ -770,6 +815,16 @@ impl GoalRuntime {
             GoalResumeReadiness::BudgetExhausted => {
                 return Ok(GoalResponse::message(GoalMessageKey::BudgetExhausted));
             }
+            GoalResumeReadiness::ReservationUnavailable => {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationUnavailable,
+                ));
+            }
+            GoalResumeReadiness::ReservationExceedsBudget => {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationExceedsBudget,
+                ));
+            }
             GoalResumeReadiness::AccountingIncomplete => {
                 return Ok(GoalResponse::message(GoalMessageKey::AccountingIncomplete));
             }
@@ -890,6 +945,7 @@ impl GoalRuntime {
         ingress: &GoalIngressContext,
         token_limit: Option<u64>,
         cost_limit_usd: Option<f64>,
+        totals: (u64, f64, bool),
     ) -> GoalExecutionReadiness {
         self.executor
             .preflight(&GoalExecutionPreflight {
@@ -897,6 +953,10 @@ impl GoalRuntime {
                 agent: ingress.agent.clone(),
                 token_limit,
                 cost_limit_usd,
+                known_token_usage: totals.0,
+                known_cost_usd: totals.1,
+                token_accounting_complete: true,
+                cost_accounting_complete: totals.2,
             })
             .await
     }
@@ -927,29 +987,52 @@ impl GoalRuntime {
         if !settled {
             return GoalResumeReadiness::AccountingIncomplete;
         }
+        if current.goal.effective_cost_limit_usd.is_some() && !totals.2 {
+            return GoalResumeReadiness::AccountingIncomplete;
+        }
         if current.goal.tool_phase != GoalToolPhase::Clean {
             return GoalResumeReadiness::ToolPhase;
-        }
-        if current
-            .goal
-            .effective_token_limit
-            .is_some_and(|limit| totals.0 >= limit)
-            || current
-                .goal
-                .effective_cost_limit_usd
-                .is_some_and(|limit| totals.1 >= limit)
-        {
-            return GoalResumeReadiness::BudgetExhausted;
         }
         match self
             .preflight(
                 ingress,
                 current.goal.effective_token_limit,
                 current.goal.effective_cost_limit_usd,
+                totals,
             )
             .await
         {
-            GoalExecutionReadiness::Ready => GoalResumeReadiness::Ready,
+            GoalExecutionReadiness::Ready(_reservation)
+                if budget_is_exhausted(
+                    totals.0,
+                    totals.1,
+                    current.goal.effective_token_limit,
+                    current.goal.effective_cost_limit_usd,
+                ) =>
+            {
+                GoalResumeReadiness::BudgetExhausted
+            }
+            GoalExecutionReadiness::Ready(reservation)
+                if !reservation_is_available(
+                    current.goal.effective_token_limit,
+                    current.goal.effective_cost_limit_usd,
+                    reservation,
+                ) =>
+            {
+                GoalResumeReadiness::ReservationUnavailable
+            }
+            GoalExecutionReadiness::Ready(reservation)
+                if !reservation_fits_budget(
+                    totals.0,
+                    totals.1,
+                    current.goal.effective_token_limit,
+                    current.goal.effective_cost_limit_usd,
+                    reservation,
+                ) =>
+            {
+                GoalResumeReadiness::ReservationExceedsBudget
+            }
+            GoalExecutionReadiness::Ready(_) => GoalResumeReadiness::Ready,
             GoalExecutionReadiness::PricingUnavailable
                 if current.goal.effective_cost_limit_usd.is_some() =>
             {
@@ -1056,6 +1139,59 @@ fn transition_message(result: GoalTransitionResult, applied: GoalMessageKey) -> 
         GoalTransitionResult::Stale => GoalMessageKey::Stale,
         GoalTransitionResult::Missing => GoalMessageKey::NoCurrentGoal,
     }
+}
+
+fn budget_is_exhausted(
+    known_tokens: u64,
+    known_cost_usd: f64,
+    token_limit: Option<u64>,
+    cost_limit_usd: Option<f64>,
+) -> bool {
+    token_limit.is_some_and(|limit| known_tokens >= limit)
+        || cost_limit_usd
+            .is_some_and(|limit| !known_cost_usd.is_finite() || known_cost_usd >= limit)
+}
+
+fn reservation_is_available(
+    token_limit: Option<u64>,
+    cost_limit_usd: Option<f64>,
+    reservation: GoalOperationReservation,
+) -> bool {
+    (token_limit.is_none() || reservation.token_count.is_some())
+        && (cost_limit_usd.is_none()
+            || reservation
+                .cost_usd
+                .is_some_and(|cost| cost.is_finite() && cost >= 0.0))
+}
+
+fn reservation_fits_budget(
+    known_tokens: u64,
+    known_cost_usd: f64,
+    token_limit: Option<u64>,
+    cost_limit_usd: Option<f64>,
+    reservation: GoalOperationReservation,
+) -> bool {
+    if budget_is_exhausted(known_tokens, known_cost_usd, token_limit, cost_limit_usd) {
+        return false;
+    }
+    let token_fit = match token_limit {
+        Some(limit) => reservation
+            .token_count
+            .and_then(|reserved| known_tokens.checked_add(reserved))
+            .is_some_and(|projected| projected <= limit),
+        None => true,
+    };
+    let cost_fit = match cost_limit_usd {
+        Some(limit) => reservation.cost_usd.is_some_and(|reserved| {
+            reserved.is_finite()
+                && reserved >= 0.0
+                && known_cost_usd.is_finite()
+                && (known_cost_usd + reserved).is_finite()
+                && known_cost_usd + reserved <= limit
+        }),
+        None => true,
+    };
+    token_fit && cost_fit
 }
 
 fn status_projection(
@@ -1185,10 +1321,36 @@ mod tests {
         }
     }
 
+    fn ready() -> GoalExecutionReadiness {
+        GoalExecutionReadiness::Ready(GoalOperationReservation {
+            token_count: Some(1),
+            cost_usd: Some(0.0),
+        })
+    }
+
     fn record_goal_usage(tracker: &CostTracker, task_id: String, total_tokens: u64) {
         tracker
             .record_scoped_usage_with_owned_task_attribution(
                 TokenUsage::new("test-model", total_tokens, 0, 0, 0.0, 0.0, 0.0),
+                Some("main"),
+                Some(task_id),
+            )
+            .unwrap();
+    }
+
+    fn record_unpriced_goal_usage(tracker: &CostTracker, task_id: String) {
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage {
+                    model: "test-model".into(),
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    total_tokens: 1,
+                    cost_usd: 0.0,
+                    pricing_available: false,
+                    timestamp: Utc::now(),
+                },
                 Some("main"),
                 Some(task_id),
             )
@@ -1303,8 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_persists_immutable_criteria_and_launches_only_exact_epoch() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
 
         assert_eq!(
             runtime
@@ -1341,8 +1502,7 @@ mod tests {
 
     #[tokio::test]
     async fn budget_update_keeps_a_paused_goal_paused_until_explicit_resume() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         assert_eq!(
             runtime
@@ -1393,8 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_and_resume_reject_an_exhausted_budget_before_launch() {
-        let (runtime, store, executor, directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         let task = store
             .current_goal_for_session("session")
@@ -1439,9 +1598,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_cost_limit_rejects_historical_unpriced_usage() {
+        let (runtime, store, executor, directory) = controller(ready(), false);
+        let token_only = GoalCommand::Start {
+            budget: GoalBudgetRequest::Limits {
+                token_limit: Some(8),
+                cost_limit_usd: None,
+            },
+            success_criteria: "done".into(),
+            objective: "objective".into(),
+        };
+        runtime.submit(ingress(), token_only).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let tracker = CostTracker::new(CostConfig::default(), directory.path()).unwrap();
+        record_unpriced_goal_usage(&tracker, task.id.clone());
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::SetBudget(GoalBudgetRequest::Limits {
+                        token_limit: None,
+                        cost_limit_usd: Some(1.0),
+                    }),
+                )
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::BudgetUpdated
+        );
+        assert!(
+            !runtime
+                .submit(ingress(), GoalCommand::Status)
+                .await
+                .unwrap()
+                .status
+                .unwrap()
+                .resumable
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::AccountingIncomplete
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_requires_conservative_reservation_headroom() {
+        let (runtime, store, executor, directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let tracker = CostTracker::new(CostConfig::default(), directory.path()).unwrap();
+        record_goal_usage(&tracker, task.id.clone(), 6);
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        *executor.readiness.lock() = GoalExecutionReadiness::Ready(GoalOperationReservation {
+            token_count: Some(3),
+            cost_usd: Some(0.0),
+        });
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::ReservationExceedsBudget
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_accepts_an_exact_conservative_reservation_fit() {
+        let (runtime, store, executor, directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let tracker = CostTracker::new(CostConfig::default(), directory.path()).unwrap();
+        record_goal_usage(&tracker, task.id.clone(), 7);
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Resumed
+        );
+        assert_eq!(executor.launches.lock().len(), 2);
+    }
+
+    #[tokio::test]
     async fn status_and_resume_share_pricing_readiness() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         let command = GoalCommand::Start {
             budget: GoalBudgetRequest::Limits {
                 token_limit: None,
@@ -1498,7 +1805,7 @@ mod tests {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
-            readiness: Mutex::new(GoalExecutionReadiness::Ready),
+            readiness: Mutex::new(ready()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -1540,8 +1847,7 @@ mod tests {
 
     #[tokio::test]
     async fn launch_failure_becomes_a_sanitized_terminal_state() {
-        let (runtime, store, _executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, true);
+        let (runtime, store, _executor, _directory) = controller(ready(), true);
         assert_eq!(
             runtime
                 .submit(ingress(), start_command())
@@ -1570,8 +1876,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_different_trusted_binding_cannot_select_or_mutate_the_goal() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         let other =
             GoalIngressContext::trusted("session", "other", "room", Some("principal".into()))
@@ -1598,8 +1903,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_projects_only_the_current_goal_and_sanitizes_unknown_failures() {
-        let (runtime, store, _executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, _executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         let task = store
             .current_goal_for_session("session")
@@ -1635,8 +1939,7 @@ mod tests {
 
     #[tokio::test]
     async fn unresolved_tool_phase_is_reported_and_cannot_resume() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         let task = store
             .current_goal_for_session("session")
@@ -1737,8 +2040,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_invalid_start_and_budget_values_fail_without_state_change() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         for command in [
             GoalCommand::Start {
                 budget: GoalBudgetRequest::Limits {
@@ -1803,7 +2105,7 @@ mod tests {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
-            readiness: Mutex::new(GoalExecutionReadiness::Ready),
+            readiness: Mutex::new(ready()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -1839,8 +2141,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_is_idempotent_and_terminal_states_do_not_resume_or_mutate() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         assert_eq!(
             runtime
@@ -1891,8 +2192,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_executor_launch_is_discarded_after_an_epoch_is_fenced() {
-        let (runtime, store, executor, _directory) =
-            controller(GoalExecutionReadiness::Ready, false);
+        let (runtime, store, executor, _directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
         let task = store
             .current_goal_for_session("session")
