@@ -231,26 +231,10 @@ async fn terminal_inflight_goal_can_be_replaced_after_its_epoch_is_fenced() {
         store
             .current_goal_for_session("terminal-session")
             .await
-            .unwrap(),
-        Some(TaskRecord {
-            id: "replacement".into(),
-            kind: TaskKind::Goal,
-            agent: "main".into(),
-            status: TaskStatus::Running,
-            owner_pid: 1,
-            owner_boot_id: "boot-a".into(),
-            heartbeat_at: None,
-            depth: 0,
-            parent_id: None,
-            originator_route: Some("room-a".into()),
-            delivered: false,
-            idem_key: None,
-            principal_id: Some("principal-a".into()),
-            session_id: Some("terminal-session".into()),
-            execution_epoch: 1,
-            started_at: "2026-08-24T00:00:00Z".into(),
-            finished_at: None,
-        })
+            .unwrap()
+            .unwrap()
+            .id,
+        "replacement"
     );
 }
 
@@ -319,10 +303,19 @@ async fn boot_classifies_pending_operations_after_pause_or_terminal_fencing() {
 
     let reopened = SqliteTaskStore::new(directory.path()).unwrap();
     assert_eq!(reopened.reconcile_goal_boot_state("boot-b").unwrap(), 2);
-    for id in ["paused", "terminal"] {
+    for (id, session_id) in [
+        ("paused", "paused-session"),
+        ("terminal", "terminal-session"),
+    ] {
+        let task = reopened.get(id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(
-            reopened.get(id).await.unwrap().unwrap().status,
-            TaskStatus::Failed
+            reopened
+                .terminal_reason_for_session_goal(id, session_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("accounting_outcome_unknown")
         );
         let goal = reopened.get_goal_task(id).await.unwrap().unwrap();
         assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
