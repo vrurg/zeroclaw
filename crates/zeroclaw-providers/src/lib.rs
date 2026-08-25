@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
 pub mod model_pin;
@@ -936,13 +937,41 @@ fn mentions_tools_token(message: &str) -> bool {
     false
 }
 
+/// Split a provider error message into independent clauses at `;`, newlines,
+/// and sentence-ending periods (a `.` followed by whitespace or end of
+/// input, so identifiers like `gpt-4.1` stay intact).
+///
+/// Compound provider errors can chain unrelated failures in one message;
+/// capability predicates must be evaluated within a single clause so that
+/// independent clauses cannot collectively satisfy them.
+fn error_message_clauses(message: &str) -> Vec<&str> {
+    let bytes = message.as_bytes();
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in message.char_indices() {
+        let is_boundary = match c {
+            ';' | '\n' => true,
+            '.' => bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace),
+            _ => false,
+        };
+        if is_boundary {
+            clauses.push(&message[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    clauses.push(&message[start..]);
+    clauses
+}
+
 /// Whether an endpoint explicitly rejected combining function tools with
 /// `reasoning_effort`.
 ///
 /// This predicate is intentionally narrow: callers may retry once with
 /// `reasoning_effort: "none"` only when the endpoint itself reports this exact
 /// capability mismatch. Other reasoning or tool errors must propagate
-/// unchanged.
+/// unchanged. A single clause of the message must report the relationship —
+/// unrelated clauses of a compound error (e.g. `reasoning_effort value is
+/// unsupported; tools must be an array`) do not collectively qualify.
 pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
     if !matches!(
         status,
@@ -970,22 +999,30 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         }
         Err(_) => (body.to_ascii_lowercase(), String::new()),
     };
-    let mentions_reasoning_effort = parameter == "reasoning_effort"
-        || message.contains("reasoning_effort")
-        || message.contains("reasoning effort");
-    let mentions_tools = mentions_tools_token(&message);
-    let reports_incompatibility = [
-        "not supported",
-        "unsupported",
-        "cannot be used",
-        "can't be used",
-        "incompatible",
-        "not allowed",
-    ]
-    .iter()
-    .any(|hint| message.contains(hint));
+    let clauses = error_message_clauses(&message);
+    // The structured `param` field is message-global; letting it satisfy an
+    // arbitrary clause would recreate the cross-clause false positive, so it
+    // counts as the reasoning signal only when the message has a single
+    // substantive clause for it to describe.
+    let single_clause = clauses.iter().filter(|c| !c.trim().is_empty()).count() <= 1;
+    clauses.into_iter().any(|clause| {
+        let mentions_reasoning_effort = clause.contains("reasoning_effort")
+            || clause.contains("reasoning effort")
+            || (single_clause && parameter == "reasoning_effort");
+        let mentions_tools = mentions_tools_token(clause);
+        let reports_incompatibility = [
+            "not supported",
+            "unsupported",
+            "cannot be used",
+            "can't be used",
+            "incompatible",
+            "not allowed",
+        ]
+        .iter()
+        .any(|hint| clause.contains(hint));
 
-    mentions_reasoning_effort && mentions_tools && reports_incompatibility
+        mentions_reasoning_effort && mentions_tools && reports_incompatibility
+    })
 }
 
 /// Format an error including its full source chain and sanitize the result.
@@ -1220,6 +1257,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "volcengine" | "ark" | "doubao-cn" => "doubao",
         // Gemini CLI is its own typed slot (subprocess runtime).
         "gemini-cli" => "gemini_cli",
+        // Grok Build CLI is its own typed slot (subprocess runtime).
+        "grok-cli" | "grokcli" => "grok_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1995,6 +2034,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("lmstudio", "LM Studio", true),
@@ -3135,6 +3175,15 @@ mod tests {
     fn factory_gemini_cli() {}
 
     #[test]
+    fn factory_grok_cli() {
+        let error = match create_model_provider("grok_cli", None) {
+            Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
     }
@@ -3513,6 +3562,13 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
+        // `listed_model_providers_are_constructible` skip list); `custom` is
+        // excluded (URI required); `grok_cli` is excluded because ACP requires
+        // an explicit absolute working_directory. Dedicated factory tests cover
+        // each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3604,6 +3660,11 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
+            // Grok ACP deliberately refuses the daemon cwd as an implicit
+            // trust boundary; a typed alias must provide working_directory.
+            if model_provider.name == "grok_cli" {
+                continue;
+            }
             assert!(
                 create_model_provider(model_provider.name, Some("provider-test-credential"))
                     .is_ok(),
@@ -3679,6 +3740,63 @@ mod tests {
         assert!(rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_requires_conflict_within_one_clause() {
+        // Independent clauses of a compound error must not collectively
+        // satisfy the predicate: neither clause below reports a relationship
+        // between tools and reasoning effort, so retrying with
+        // reasoning_effort "none" would silently downgrade the operator's
+        // configured effort before the unrelated tools error propagates.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported; tools must be an array"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "reasoning_effort value is unsupported; tools must be an array"
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid. Tools are not allowed for this endpoint."}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is unsupported\ntools are not allowed"
+        ));
+
+        // The structured `param` field must not bridge clauses either: it is
+        // message-global, so in a compound error it cannot supply the
+        // reasoning signal for an unrelated tools clause — in either order.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are unsupported; reasoning_effort value is invalid","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid; tools are unsupported","param":"reasoning_effort"}}"#
+        ));
+
+        // A single-clause structured error may rely on `param` alone for the
+        // reasoning signal.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are not supported at the requested effort","param":"reasoning_effort"}}"#
+        ));
+
+        // A genuine relationship stated in one clause still matches, even
+        // when other clauses surround it.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"The request was rejected. reasoning_effort cannot be used with tools. Remove one and retry."}}"#
+        ));
+        // A sentence-internal period (e.g. a version number) is not a clause
+        // boundary.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
         ));
     }
 

@@ -86,15 +86,6 @@ impl StreamInterruptedAfterOutput {
             StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
         }
     }
-
-    pub(crate) fn terminal_failure(
-        &self,
-    ) -> Option<&zeroclaw_api::model_provider::TerminalCompletionFailure> {
-        match &self.cause {
-            StreamInterruptionCause::Transport { .. } => None,
-            StreamInterruptionCause::Terminal(failure) => Some(failure),
-        }
-    }
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
