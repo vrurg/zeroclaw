@@ -1,13 +1,16 @@
 //! The resolved per-agent execution context the turn engine requires.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::dispatch::with_exact_dispatch_route;
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
-use super::{LoopKnobs, ModelSwitchCallback};
+use super::{LoopKnobs, ModelSwitchCallback, ToolLoopCancelled};
 use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
@@ -28,6 +31,21 @@ pub struct ResolvedModelAccess<'a> {
 
 impl ResolvedModelAccess<'_> {
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+        self.run_model_query_with_control(request, None, None).await
+    }
+
+    /// Run a direct resolved-model operation without allowing an enclosing
+    /// timeout or cancellation boundary to drop its accounted provider scope.
+    ///
+    /// This is crate-private because it composes the existing resolved model
+    /// path; it neither constructs providers nor changes their retry, routing,
+    /// or streaming semantics.
+    pub(crate) async fn run_model_query_with_control(
+        &self,
+        request: ChatRequest<'_>,
+        cancellation_token: Option<&CancellationToken>,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -60,13 +78,35 @@ impl ResolvedModelAccess<'_> {
         .await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
-        let result = scope
-            .scope(with_exact_dispatch_route(
-                self.provider_name.to_string(),
-                self.model.to_string(),
-                dispatcher.chat(request, self.model, self.temperature),
-            ))
-            .await;
+        let chat_future = scope.scope(with_exact_dispatch_route(
+            self.provider_name.to_string(),
+            self.model.to_string(),
+            dispatcher.chat(request, self.model, self.temperature),
+        ));
+        let result = match (timeout, cancellation_token) {
+            (Some(timeout), Some(cancellation_token)) => {
+                tokio::select! {
+                    biased;
+                    result = tokio::time::timeout(timeout, chat_future) => match result {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::Error::msg("resolved model operation timed out")),
+                    },
+                    () = cancellation_token.cancelled() => Err(ToolLoopCancelled.into()),
+                }
+            }
+            (Some(timeout), None) => match tokio::time::timeout(timeout, chat_future).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::Error::msg("resolved model operation timed out")),
+            },
+            (None, Some(cancellation_token)) => {
+                tokio::select! {
+                    biased;
+                    result = chat_future => result,
+                    () = cancellation_token.cancelled() => Err(ToolLoopCancelled.into()),
+                }
+            }
+            (None, None) => chat_future.await,
+        };
         if result.is_ok() {
             scope.mark_logical_success();
         }
@@ -247,6 +287,8 @@ mod run_model_query_tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion, ToolCall,
@@ -320,6 +362,40 @@ mod run_model_query_tests {
         }
         fn alias(&self) -> &str {
             "usage-provider"
+        }
+    }
+
+    struct PendingProvider;
+
+    #[async_trait]
+    impl ModelProvider for PendingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            std::future::pending().await
+        }
+    }
+
+    impl Attributable for PendingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "pending-provider"
         }
     }
 
@@ -441,6 +517,84 @@ mod run_model_query_tests {
             .await
             .expect("query ok");
         assert_eq!(resp.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn controlled_query_settles_goal_accounting_after_timeout() {
+        let provider = PendingProvider;
+        let messages = [ChatMessage::user("hi")];
+        let accounting = Arc::new(RecordingGoalOperationAccounting {
+            config: Config::default(),
+            settlements: Mutex::new(Vec::new()),
+        });
+
+        let error = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "custom",
+                        model: "test-model",
+                        temperature: None,
+                    }
+                    .run_model_query_with_control(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        None,
+                        Some(Duration::from_millis(1)),
+                    )
+                    .await
+                    .expect_err("timed provider operation must fail")
+                },
+            )
+            .await;
+
+        assert_eq!(error.to_string(), "resolved model operation timed out");
+        assert_eq!(accounting.settlements.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn controlled_query_settles_goal_accounting_after_cancellation() {
+        let provider = PendingProvider;
+        let messages = [ChatMessage::user("hi")];
+        let accounting = Arc::new(RecordingGoalOperationAccounting {
+            config: Config::default(),
+            settlements: Mutex::new(Vec::new()),
+        });
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "custom",
+                        model: "test-model",
+                        temperature: None,
+                    }
+                    .run_model_query_with_control(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        Some(&cancellation),
+                        None,
+                    )
+                    .await
+                    .expect_err("cancelled provider operation must fail")
+                },
+            )
+            .await;
+
+        assert!(crate::agent::turn::is_tool_loop_cancelled(&error));
+        assert_eq!(accounting.settlements.lock().unwrap().len(), 1);
     }
 
     // Scoped: an accumulation-only cost context is present, so the seam records

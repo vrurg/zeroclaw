@@ -173,7 +173,6 @@ impl Tool for SpawnSubagentTool {
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
-
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
@@ -192,8 +191,16 @@ impl Tool for SpawnSubagentTool {
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
+        let goal_child = crate::goal_mode::GoalChildTask::create(
+            crate::control_plane::TaskKind::Subagent,
+            self.parent_alias.clone(),
+            u32::from(self.is_subagent_caller),
+        )
+        .await?;
         let cp_task_id = run_id.clone();
-        if let Some(cp) = crate::control_plane::control_plane() {
+        if goal_child.is_none()
+            && let Some(cp) = crate::control_plane::control_plane()
+        {
             let _ = cp
                 .store
                 .create(crate::control_plane::TaskRecord {
@@ -240,7 +247,18 @@ impl Tool for SpawnSubagentTool {
         .await;
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
-        if let Some(cp) = crate::control_plane::control_plane() {
+        if let Some(child) = goal_child.as_ref() {
+            let (success, output, error) = match &run_result {
+                Ok(response) if !response.trim().is_empty() => (true, Some(response.clone()), None),
+                Ok(_) => (
+                    false,
+                    None,
+                    Some("goal subagent completed without output".to_owned()),
+                ),
+                Err(error) => (false, None, Some(format!("subagent run failed: {error}"))),
+            };
+            child.settle(success, output, error).await?;
+        } else if let Some(cp) = crate::control_plane::control_plane() {
             let (status, output, error) = match &run_result {
                 Ok(resp) => (
                     crate::control_plane::TaskStatus::Completed,
@@ -257,6 +275,20 @@ impl Tool for SpawnSubagentTool {
                 .store
                 .update_status(&cp_task_id, status, output, error)
                 .await;
+        }
+
+        if goal_child.is_some() {
+            return match run_result {
+                Ok(response) if response.trim().is_empty() => {
+                    anyhow::bail!("Goal subagent completed without output")
+                }
+                Ok(response) => Ok(ToolResult {
+                    success: true,
+                    output: response.into(),
+                    error: None,
+                }),
+                Err(error) => Err(error.context("Goal subagent run failed")),
+            };
         }
 
         match run_result {

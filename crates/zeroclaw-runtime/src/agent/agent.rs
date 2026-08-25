@@ -24,10 +24,18 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
-/// Child creation stays unavailable to a Goal parent until the foreground
-/// propagation stage can carry exact Goal scope into the child runtime.
+/// Goal parents retain only foreground child entry points. The scoped child
+/// bridge supplies exact lifecycle and accounting attribution; child registries
+/// then remove these entry points again to prevent recursion.
 pub(crate) fn goal_parent_excluded_tools() -> &'static [&'static str] {
-    &["delegate", "spawn_subagent"]
+    &[]
+}
+
+/// Goal foreground children must not create or supervise another child.
+/// This is deliberately a small runtime-local predicate so a future Goal
+/// crate can own the policy without exporting a new cross-crate abstraction.
+pub(crate) fn is_goal_child_excluded_tool(name: &str) -> bool {
+    matches!(name, "delegate" | "spawn_subagent")
 }
 
 pub fn build_session_model_provider(
@@ -3738,11 +3746,11 @@ mod tests {
     }
 
     #[test]
-    fn goal_parent_excludes_child_creation_until_scope_propagation_exists() {
-        assert_eq!(
-            goal_parent_excluded_tools(),
-            &["delegate", "spawn_subagent"]
-        );
+    fn goal_parent_retains_only_foreground_child_entry_points() {
+        assert_eq!(goal_parent_excluded_tools(), &[] as &[&str]);
+        assert!(is_goal_child_excluded_tool("delegate"));
+        assert!(is_goal_child_excluded_tool("spawn_subagent"));
+        assert!(!is_goal_child_excluded_tool("file_read"));
     }
 
     // ── model-fallback notice (silent downgrade surfacing) ──────────────
