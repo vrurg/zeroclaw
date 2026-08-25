@@ -6316,6 +6316,10 @@ async fn process_channel_message_body(
         .as_ref()
         .filter(|_| is_matrix_goal_command(&msg))
         .map(|_| msg.clone());
+    // The standalone `channel start` entry point has no control-plane owner.
+    // Recognize Goal syntax anyway so it fails closed rather than becoming an
+    // ordinary model prompt on an unwired execution surface.
+    let unwired_matrix_goal_command = matrix_goal.is_none() && is_matrix_goal_command(&msg);
     // `/new` is a session-destruction command for Matrix. Capture it before
     // hooks for the same reason as Goal commands: a hook may cancel delivery,
     // but it cannot retarget the authenticated session that will be disposed.
@@ -6403,6 +6407,18 @@ async fn process_channel_message_body(
         if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original) {
             let _ = channel
                 .send_final(&SendMessage::reply_to(&original, rendered))
+                .await;
+        }
+        return;
+    }
+
+    if unwired_matrix_goal_command {
+        if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg) {
+            let _ = channel
+                .send_final(&SendMessage::reply_to(
+                    &msg,
+                    channel_runtime_cli_string("goal-response-disabled"),
+                ))
                 .await;
         }
         return;

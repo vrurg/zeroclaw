@@ -1961,6 +1961,8 @@ pub struct ConfigDeleteResult {}
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SessionGoalResult {
     pub key: String,
+    #[serde(default)]
+    pub status: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]

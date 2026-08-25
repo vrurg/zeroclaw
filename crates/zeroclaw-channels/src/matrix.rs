@@ -2455,11 +2455,11 @@ mod inbound {
         // suffix is presentation syntax, not part of Goal's shared grammar.
         let localpart = bot_user_id.localpart();
         let bare_mxid = bot_user_id.as_str().trim_start_matches('@');
-        if let Some(suffix) = command.strip_prefix("/goal@")
-            && let Some(index) = suffix.find(char::is_whitespace)
-            && matches!(&suffix[..index], target if target == localpart || target == bare_mxid)
-        {
-            return Some(format!("/goal{}", &suffix[index..]));
+        if let Some(suffix) = command.strip_prefix("/goal@") {
+            let index = suffix.find(char::is_whitespace).unwrap_or(suffix.len());
+            if matches!(&suffix[..index], target if target == localpart || target == bare_mxid) {
+                return Some(format!("/goal{}", &suffix[index..]));
+            }
         }
 
         let candidates = [
@@ -5013,6 +5013,14 @@ mod tests {
             assert_eq!(
                 normalize_goal_command("/goal@goalbot:example.org status", bot, Some("Goal Bot")),
                 Some(command.into())
+            );
+            assert_eq!(
+                normalize_goal_command("/goal@goalbot:example.org", bot, Some("Goal Bot")),
+                Some("/goal".into())
+            );
+            assert_eq!(
+                normalize_goal_command("/goal@other:example.org status", bot, Some("Goal Bot")),
+                None
             );
             assert_eq!(
                 normalize_goal_command("/goals status", bot, Some("Goal Bot")),

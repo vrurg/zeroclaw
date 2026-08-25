@@ -181,8 +181,17 @@ fn is_goal_command(input: &str) -> bool {
         })
 }
 
-fn render_goal_command_result(key: &str) -> String {
-    let fluent_key = match key {
+fn render_goal_command_result(key: &str, status: Option<&serde_json::Value>) -> String {
+    let normalized_key = key
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect::<String>();
+    let fluent_key = match normalized_key.as_str() {
         "Help" => "zc-goal-help",
         "Disabled" => "zc-goal-disabled",
         "InvalidConfiguration" => "zc-goal-invalid-configuration",
@@ -209,7 +218,11 @@ fn render_goal_command_result(key: &str) -> String {
         "Stale" => "zc-goal-stale",
         _ => "zc-goal-controller-unavailable",
     };
-    crate::i18n::t(fluent_key)
+    let mut rendered = crate::i18n::t(fluent_key);
+    if let Some(status) = status {
+        rendered.push_str(&format!("\n{status}"));
+    }
+    rendered
 }
 
 /// Result of a background model-catalog fetch, routed back so the Loading
@@ -1058,7 +1071,7 @@ impl Chat {
                 continue;
             }
             let text = match update.result {
-                Ok(result) => render_goal_command_result(&result.key),
+                Ok(result) => render_goal_command_result(&result.key, result.status.as_ref()),
                 Err(error) => {
                     crate::i18n::t_args("zc-goal-controller-failed", &[("error", &error)])
                 }
