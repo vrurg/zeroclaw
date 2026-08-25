@@ -16,6 +16,8 @@ use crate::control_plane::{
     GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
 
+mod host;
+
 /// Bound durable, user-supplied Goal text before it can reach SQLite or a
 /// future verifier prompt. This is the same 20k-character envelope used for
 /// other durable user-authored prompt material, but is kept local to this
