@@ -1820,7 +1820,10 @@ fn operation_plan_runtime_provider_kind(
     provider_ref: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> String {
-    let reference_kind = split_v2_colon_url(provider_ref).0;
+    let reference = split_v2_colon_url(provider_ref).0;
+    let reference_kind = reference
+        .split_once('.')
+        .map_or(reference, |(family, _)| family);
     let kind = options
         .provider_kind
         .as_deref()
