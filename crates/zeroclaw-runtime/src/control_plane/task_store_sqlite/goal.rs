@@ -933,6 +933,24 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("get current goal for session")
     }
 
+    async fn terminal_reason_for_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT error FROM tasks
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')",
+            params![task_id, session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .context("get terminal session goal reason")
+    }
+
     async fn create_or_replace_session_goal(
         &self,
         mut task: TaskRecord,
@@ -1485,6 +1503,78 @@ mod tests {
                 .as_ref()
                 .map(|task| task.id.as_str()),
             Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_reason_is_projected_only_for_its_exact_session_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    session_goal_task("terminal-reason", "session-1"),
+                    goal_record("terminal-reason", "objective"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    "terminal-reason",
+                    "session-1",
+                    1,
+                    TaskStatus::Failed,
+                    Some("executor_start_failed".into()),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal("terminal-reason", "session-1")
+                .await
+                .unwrap(),
+            Some("executor_start_failed".into())
+        );
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal("terminal-reason", "other-session")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    session_goal_task("terminal-no-reason", "session-2"),
+                    goal_record("terminal-no-reason", "objective"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    "terminal-no-reason",
+                    "session-2",
+                    1,
+                    TaskStatus::Completed,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal("terminal-no-reason", "session-2")
+                .await
+                .unwrap(),
+            None
         );
     }
 
