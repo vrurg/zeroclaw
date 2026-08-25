@@ -8,6 +8,7 @@ use zeroclaw_providers::dispatch::with_exact_dispatch_route;
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
+use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -48,6 +49,15 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
+        admit_goal_operation_if_scoped(GoalOperationRequest {
+            model_provider: self.provider_name.to_string(),
+            model: self.model.to_string(),
+            temperature: self.temperature,
+            thinking: request.thinking,
+            messages: request.messages.to_vec(),
+            tools: request.tools.map_or_else(Vec::new, ToOwned::to_owned),
+        })
+        .await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
@@ -63,6 +73,7 @@ impl ResolvedModelAccess<'_> {
         let accounting = scope.take();
 
         let attempts = accounting.attempts();
+        let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
 
         let accepted_route = accounting.accepted_route().cloned();
         let (served_provider, served_model) = accepted_route
@@ -76,17 +87,26 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-                crate::agent::cost::settle_provider_attempts(
-                    &attempts[..attempts.len().saturating_sub(1)],
-                    None,
-                );
+                if goal_scoped {
+                    crate::agent::cost::settle_provider_attempts(
+                        attempts,
+                        Some(attempts.len().saturating_sub(1)),
+                    )
+                    .await?;
+                } else {
+                    crate::agent::cost::settle_provider_attempts(
+                        &attempts[..attempts.len().saturating_sub(1)],
+                        None,
+                    )
+                    .await?;
+                }
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                if let Some(usage) = response.usage.as_ref() {
+                if !goal_scoped && let Some(usage) = response.usage.as_ref() {
                     crate::agent::cost::record_tool_loop_cost_usage(
                         &served_provider,
                         &served_model,
@@ -96,7 +116,7 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None);
+                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                 Err(error)
             }
         }
