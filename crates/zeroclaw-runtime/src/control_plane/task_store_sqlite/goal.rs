@@ -398,9 +398,16 @@ impl SqliteTaskStore {
         let failed = tx
             .execute(
                 "UPDATE tasks
-                SET status = 'failed', error = COALESCE(error, 'accounting_outcome_unknown'),
+                SET status = 'failed',
+                    error = CASE WHEN EXISTS (
+                        SELECT 1 FROM goal_tasks
+                         WHERE task_id = tasks.id
+                           AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
+                    ) THEN 'accounting_outcome_unknown'
+                    ELSE COALESCE(error, 'accounting_outcome_unknown') END,
                     finished_at = COALESCE(finished_at, ?2),
-                    execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                    execution_epoch = CASE WHEN status IN ('running', 'paused')
+                        AND execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
               WHERE kind = 'goal' AND session_id IS NOT NULL
                 AND owner_boot_id != ?1
