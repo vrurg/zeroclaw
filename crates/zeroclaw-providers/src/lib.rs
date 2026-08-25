@@ -633,6 +633,12 @@ pub struct ModelProviderRuntimeOptions {
 pub struct ResolvedModelOperationCandidate {
     /// Configured provider reference used for route attribution.
     pub provider_ref: String,
+    /// Canonical provider implementation family selected by the factory.
+    ///
+    /// This can differ from `provider_ref` when an alias overrides `kind`.
+    /// It is retained in the read-only plan so request-dependent bounds use
+    /// the same factory implementation as the eventual operation.
+    pub runtime_provider_kind: String,
     /// Model served after profile and route pinning.
     pub model: String,
     /// Configured output bound, normalized to the shared baseline when unset.
@@ -705,11 +711,7 @@ impl ResolvedModelOperationCandidate {
             return Ok(self.max_output_tokens);
         };
 
-        let family = self
-            .provider_ref
-            .split_once('.')
-            .map_or(self.provider_ref.as_str(), |(family, _)| family);
-        let supports_native_thinking = match canonicalize_v2_model_provider_name(family) {
+        let supports_native_thinking = match self.runtime_provider_kind.as_str() {
             "anthropic" => anthropic::anthropic_model_supports_native_thinking(&self.model),
             "bedrock" => bedrock::bedrock_model_supports_native_thinking(&self.model),
             _ => false,
@@ -1779,6 +1781,7 @@ fn append_operation_candidates(
     primary_model_override: Option<&str>,
     max_output_tokens: u32,
     attempt_count: u32,
+    runtime_provider_kind: &str,
 ) {
     let provider_ref = format!("{family}.{alias}");
     let models = configured_models_for_alias(config, family, alias, primary_model_override);
@@ -1786,6 +1789,7 @@ fn append_operation_candidates(
     let Some((primary_model, fallback_models)) = models.split_first() else {
         candidates.push(ResolvedModelOperationCandidate {
             provider_ref,
+            runtime_provider_kind: runtime_provider_kind.to_string(),
             model: requested_model.to_string(),
             max_output_tokens,
             attempt_count,
@@ -1795,6 +1799,7 @@ fn append_operation_candidates(
 
     candidates.push(ResolvedModelOperationCandidate {
         provider_ref: provider_ref.clone(),
+        runtime_provider_kind: runtime_provider_kind.to_string(),
         model: primary_model.clone(),
         max_output_tokens,
         attempt_count,
@@ -1802,11 +1807,26 @@ fn append_operation_candidates(
     for model in fallback_models {
         candidates.push(ResolvedModelOperationCandidate {
             provider_ref: provider_ref.clone(),
+            runtime_provider_kind: runtime_provider_kind.to_string(),
             model: model.clone(),
             max_output_tokens,
             attempt_count,
         });
     }
+}
+
+fn operation_plan_runtime_provider_kind(
+    provider_ref: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> String {
+    let reference_kind = split_v2_colon_url(provider_ref).0;
+    let kind = options
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or(reference_kind);
+    canonicalize_v2_model_provider_name(kind).to_string()
 }
 
 fn operation_plan_for_ref(
@@ -1822,10 +1842,11 @@ fn operation_plan_for_ref(
     };
     let max_output_tokens = options.provider_max_tokens.unwrap_or(BASELINE_MAX_TOKENS);
 
-    let Some((family, alias)) = provider_ref.split_once('.') else {
+    let Some((family, alias)) = split_v2_colon_url(provider_ref).0.split_once('.') else {
         return Ok(ResolvedModelOperationPlan {
             candidates: vec![ResolvedModelOperationCandidate {
                 provider_ref: provider_ref.to_string(),
+                runtime_provider_kind: operation_plan_runtime_provider_kind(provider_ref, options),
                 model: requested_model.to_string(),
                 max_output_tokens,
                 attempt_count,
@@ -1837,6 +1858,7 @@ fn operation_plan_for_ref(
         return Ok(ResolvedModelOperationPlan {
             candidates: vec![ResolvedModelOperationCandidate {
                 provider_ref: provider_ref.to_string(),
+                runtime_provider_kind: operation_plan_runtime_provider_kind(provider_ref, options),
                 model: requested_model.to_string(),
                 max_output_tokens,
                 attempt_count,
@@ -1854,6 +1876,7 @@ fn operation_plan_for_ref(
         primary_model_override,
         max_output_tokens,
         attempt_count,
+        &operation_plan_runtime_provider_kind(provider_ref, options),
     );
     let mut visited = vec![format!("{family}.{alias}")];
     let entry = config
@@ -1880,6 +1903,10 @@ fn operation_plan_for_ref(
                     .provider_max_tokens
                     .unwrap_or(BASELINE_MAX_TOKENS),
                 attempt_count,
+                &operation_plan_runtime_provider_kind(
+                    &format!("{fallback_family}.{fallback_alias}"),
+                    &fallback_options,
+                ),
             );
             Ok(())
         },
@@ -4597,6 +4624,7 @@ mod tests {
 
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].provider_ref, "openai");
+        assert_eq!(plan.candidates[0].runtime_provider_kind, "openai");
         assert_eq!(plan.candidates[0].model, "gpt-test");
         assert_eq!(plan.candidates[0].max_output_tokens, BASELINE_MAX_TOKENS);
         assert_eq!(plan.candidates[0].attempt_count, 3);
@@ -4614,12 +4642,14 @@ mod tests {
             candidates: vec![
                 ResolvedModelOperationCandidate {
                     provider_ref: "anthropic.primary".to_string(),
+                    runtime_provider_kind: "anthropic".to_string(),
                     model: "claude-sonnet-4-6".to_string(),
                     max_output_tokens: 100,
                     attempt_count: 1,
                 },
                 ResolvedModelOperationCandidate {
                     provider_ref: "aws-bedrock".to_string(),
+                    runtime_provider_kind: "bedrock".to_string(),
                     model: "anthropic.claude-sonnet-4-6-v1:0".to_string(),
                     max_output_tokens: 200,
                     attempt_count: 1,
@@ -4637,6 +4667,64 @@ mod tests {
             .unwrap(),
             20_102
         );
+    }
+
+    #[test]
+    fn operation_plan_uses_factory_kind_for_native_thinking_reservations() {
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+        use zeroclaw_config::schema::{Config, CustomModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.custom.insert(
+            "proxy".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("anthropic".to_string()),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    max_tokens: Some(100),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let options = provider_runtime_options_for_alias(&config, "custom", "proxy");
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 0,
+            ..zeroclaw_config::schema::ReliabilityConfig::default()
+        };
+        let plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "custom.proxy",
+            &reliability,
+            &[],
+            "claude-sonnet-4-6",
+            &options,
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        assert_eq!(plan.candidates[0].provider_ref, "custom.proxy");
+        assert_eq!(plan.candidates[0].runtime_provider_kind, "anthropic");
+        assert_eq!(
+            plan.conservative_token_reservation_for_request(
+                1,
+                Some(NativeThinkingParams {
+                    budget_tokens: 10_000,
+                }),
+            )
+            .unwrap(),
+            10_002
+        );
+
+        let colon_plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "anthropic-custom:https://proxy.example",
+            &reliability,
+            &[],
+            "claude-sonnet-4-6",
+            &ModelProviderRuntimeOptions::default(),
+            "claude-sonnet-4-6",
+        )
+        .unwrap();
+        assert_eq!(colon_plan.candidates[0].runtime_provider_kind, "anthropic");
     }
 
     #[test]
@@ -4703,30 +4791,35 @@ mod tests {
             vec![
                 ResolvedModelOperationCandidate {
                     provider_ref: "openai.primary".to_string(),
+                    runtime_provider_kind: "openai".to_string(),
                     model: "primary-route-model".to_string(),
                     max_output_tokens: 40,
                     attempt_count: 3,
                 },
                 ResolvedModelOperationCandidate {
                     provider_ref: "openai.primary".to_string(),
+                    runtime_provider_kind: "openai".to_string(),
                     model: "primary-small".to_string(),
                     max_output_tokens: 40,
                     attempt_count: 3,
                 },
                 ResolvedModelOperationCandidate {
                     provider_ref: "openai.backup".to_string(),
+                    runtime_provider_kind: "openai".to_string(),
                     model: "backup-default".to_string(),
                     max_output_tokens: 30,
                     attempt_count: 3,
                 },
                 ResolvedModelOperationCandidate {
                     provider_ref: "openai.backup".to_string(),
+                    runtime_provider_kind: "openai".to_string(),
                     model: "backup-small".to_string(),
                     max_output_tokens: 30,
                     attempt_count: 3,
                 },
                 ResolvedModelOperationCandidate {
                     provider_ref: "openai.last".to_string(),
+                    runtime_provider_kind: "openai".to_string(),
                     model: "last-model".to_string(),
                     max_output_tokens: 20,
                     attempt_count: 3,
@@ -4743,6 +4836,7 @@ mod tests {
 
         let candidate = ResolvedModelOperationCandidate {
             provider_ref: "openai".to_string(),
+            runtime_provider_kind: "openai".to_string(),
             model: "gpt-test".to_string(),
             max_output_tokens: BASELINE_MAX_TOKENS,
             attempt_count: 1,
