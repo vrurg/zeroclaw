@@ -1,6 +1,6 @@
 # Background work lifecycle
 
-ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode defines a related target contract that is not yet wired end to end.
+ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, runtime-spawned subagents, and Goal Mode share some execution machinery, but they do not share one lifecycle or one durable store.
 
 Use this page when a change adds scheduled or autonomous work, introduces a wait or approval state, changes cancellation or restart behavior, or connects child work to an owning task. The first design question is not "how does it run in the background?" but "which subsystem owns its lifecycle?"
 
@@ -12,6 +12,7 @@ Use this page when a change adds scheduled or autonomous work, introduces a wait
 | SOP run | `SopEngine` and `SopRunStore` | Process memory by default; `data/sop/runs.db` when durable SQLite initialization succeeds |
 | Background delegation | Delegate result API, with control-plane supervision overrides when available | `<workspace>/delegate_results/<task-id>.json`; a best-effort task row in `data/control_plane.db` under a booted daemon |
 | Runtime-spawned subagent | Spawn site, with control-plane supervision when available | A best-effort task row in `data/control_plane.db` under a booted daemon |
+| Goal Mode v1 | `GoalRuntime` and the durable task control plane | A canonical `TaskKind::Goal` row and its goal extension in `data/control_plane.db`; attributed usage in the canonical cost ledger |
 
 Durable metadata is not the same as durable execution. A result file or task row can preserve what was known and let recovery mark work lost, timed out, or terminal without preserving the process-local future that was doing the work.
 
@@ -45,11 +46,40 @@ Under a booted daemon, delegate and subagent producers also write task rows to t
 
 Current delegate and subagent rows populate agent, status, owner PID and boot ID, depth, and timestamps. They leave heartbeat, parent task, route, and principal absent. Startup recovery marks prior-boot running rows `lost`; `timed_out` applies only to producers that emit stale heartbeats, which these producers do not currently do. The task row makes an interrupted child visible but does not recreate its execution.
 
-## Goal-mode target contract
+## Goal Mode v1
 
-[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the future authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. The repository contains goal storage and control-plane APIs, but production goal admission and execution are not yet wired end to end.
+Goal Mode is an experimental, opt-in foreground-work lifecycle defined by
+[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
+and [RFC #8303](https://github.com/zeroclaw-labs/zeroclaw/issues/8303). It is
+admitted only through explicit Matrix and ZeroCode commands; Web, Quickstart,
+other channels, and model-initiated Goal tools are not V1 surfaces.
 
-A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
+Each Goal is one canonical `TaskKind::Goal` record bound to one session. The
+task control plane owns its lifecycle, route, principal, and session binding;
+the Goal extension holds only Goal-specific state. A session has at most one
+current Goal. Terminal Goals remain status-visible until their session replaces
+or disposes them. Session close, delete, kill, or genuine replacement fences
+and quiesces the executor before deleting Goal control state; canonical usage
+ledger entries are retained. Explicit cancellation and policy revocation retain
+their terminal audit state while the session remains.
+
+Goal-owned parent, verifier, and permitted foreground-child model operations
+are serialized. Usage and remaining budget are derived from the canonical cost
+ledger rather than a second counter. Missing or invalid usage fails the exact
+Goal and prevents another operation. A call already admitted may cross a finite
+budget limit, so limits are admission limits rather than strict spend ceilings.
+
+The controller requires a configured verifier to decide whether an exact
+candidate is complete, needs more work, or is blocked. Only a verified complete
+candidate enters canonical session history and normal delivery. A pause or
+restart discards the process-local working transcript; explicit resume can
+therefore repeat external side effects. A restart with an unsettled operation
+fails closed rather than replaying uncertain work.
+
+Foreground `delegate` and `spawn_subagent` preserve their ordinary
+authorization and inherit Goal identity, cancellation, timeout, and usage
+attribution. Background, detached, parallel, and recursive Goal-owned child
+work is rejected because it cannot be safely supervised by V1.
 
 ## Change checklist
 
