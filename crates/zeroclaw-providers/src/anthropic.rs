@@ -152,7 +152,7 @@ struct NativeThinkingConfig {
     budget_tokens: u32,
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
+pub(crate) fn anthropic_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 

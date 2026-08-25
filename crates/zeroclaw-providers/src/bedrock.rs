@@ -610,7 +610,7 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-fn bedrock_model_supports_native_thinking(model: &str) -> bool {
+pub(crate) fn bedrock_model_supports_native_thinking(model: &str) -> bool {
     !model.contains("claude-opus-4-7")
 }
 
