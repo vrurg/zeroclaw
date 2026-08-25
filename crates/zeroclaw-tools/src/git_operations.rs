@@ -67,7 +67,7 @@ impl GitOperationsTool {
         )
     }
 
-    /// Resolve a user-provided path to an absolute path within the workspace.
+    /// Resolve a user-provided path to an allowed absolute path.
     /// Returns the workspace_dir if no path is provided.
     /// Rejects paths that escape the workspace via traversal.
     fn resolve_working_dir(&self, path: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
@@ -91,12 +91,11 @@ impl GitOperationsTool {
                     );
                     anyhow::Error::msg(format!("Cannot resolve path '{}': {}", p, e))
                 })?;
-                let workspace_canonical = self
-                    .workspace_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.workspace_dir.clone());
-                if !resolved.starts_with(&workspace_canonical) {
-                    anyhow::bail!("Path '{}' resolves outside the workspace directory", p);
+                if !self.security.is_resolved_path_allowed(&resolved) {
+                    anyhow::bail!(
+                        "Path '{}' resolves outside the workspace or allowed roots",
+                        p
+                    );
                 }
                 resolved
             }
@@ -1486,6 +1485,26 @@ mod tests {
             .execute(json!({"operation": "status", "path": "nested"}))
             .await
             .unwrap();
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("branch"));
+    }
+
+    #[tokio::test]
+    async fn git_operations_work_in_configured_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let allowed_root = TempDir::new().unwrap();
+        git_init_no_sign(allowed_root.path(), &[]);
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "status", "path": allowed_root.path()}))
+            .await
+            .unwrap();
+
         assert!(
             result.success,
             "Expected success, got error: {:?}",
