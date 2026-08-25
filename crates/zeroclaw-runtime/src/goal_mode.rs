@@ -16,6 +16,13 @@ use crate::control_plane::{
     GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
 
+/// Bound durable, user-supplied Goal text before it can reach SQLite or a
+/// future verifier prompt. This is the same 20k-character envelope used for
+/// other durable user-authored prompt material, but is kept local to this
+/// transport-neutral module so the controller can later move unchanged into a
+/// focused execution crate.
+const MAX_GOAL_DECLARATION_CHARS: usize = 20_000;
+
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GoalCommand {
@@ -53,6 +60,7 @@ pub enum GoalCommandErrorKey {
     InvalidGrammar,
     ObjectiveRequired,
     SuccessCriteriaRequired,
+    InputTooLong,
     InvalidBudget,
     InvalidArguments,
 }
@@ -69,6 +77,7 @@ impl std::fmt::Display for GoalCommandParseError {
             GoalCommandErrorKey::InvalidGrammar => "goal_invalid_grammar",
             GoalCommandErrorKey::ObjectiveRequired => "goal_objective_required",
             GoalCommandErrorKey::SuccessCriteriaRequired => "goal_success_criteria_required",
+            GoalCommandErrorKey::InputTooLong => "goal_input_too_long",
             GoalCommandErrorKey::InvalidBudget => "goal_invalid_budget",
             GoalCommandErrorKey::InvalidArguments => "goal_invalid_arguments",
         })
@@ -121,6 +130,8 @@ fn parse_start(input: &str) -> Result<GoalCommand, GoalCommandParseError> {
             if objective.trim().is_empty() {
                 return Err(objective_required());
             }
+            validate_goal_declaration(criteria)?;
+            validate_goal_declaration(objective)?;
             return Ok(GoalCommand::Start {
                 budget: parse_budget_flags(&flags, true)?,
                 success_criteria: criteria.to_owned(),
@@ -243,11 +254,20 @@ fn objective_required() -> GoalCommandParseError {
 fn success_criteria_required() -> GoalCommandParseError {
     error(GoalCommandErrorKey::SuccessCriteriaRequired)
 }
+fn input_too_long() -> GoalCommandParseError {
+    error(GoalCommandErrorKey::InputTooLong)
+}
 fn invalid_budget() -> GoalCommandParseError {
     error(GoalCommandErrorKey::InvalidBudget)
 }
 fn invalid_arguments() -> GoalCommandParseError {
     error(GoalCommandErrorKey::InvalidArguments)
+}
+
+fn validate_goal_declaration(value: &str) -> Result<(), GoalCommandParseError> {
+    (value.chars().count() <= MAX_GOAL_DECLARATION_CHARS)
+        .then_some(())
+        .ok_or_else(input_too_long)
 }
 
 /// Trusted, server-derived facts binding a Goal command to one session.
@@ -341,6 +361,9 @@ pub enum GoalMessageKey {
     InvalidCommand,
     InvalidBudget,
     SuccessCriteriaRequired,
+    InputTooLong,
+    BudgetExhausted,
+    AccountingIncomplete,
     ToolPhaseNonResumable,
     Terminal,
     ExecutorStartFailed,
@@ -382,6 +405,7 @@ pub struct GoalStatusProjection {
     pub remaining_tokens: Option<u64>,
     pub remaining_cost_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
+    pub tool_phase: GoalToolPhase,
     pub pause_reason: Option<GoalPauseReason>,
     pub pause_description: Option<String>,
     pub blockers: Vec<GoalBlocker>,
@@ -454,6 +478,20 @@ pub trait GoalExecutor: Send + Sync {
 struct CurrentGoal {
     task: TaskRecord,
     goal: GoalTaskRecord,
+}
+
+/// The complete, controller-owned answer to whether a paused Goal may resume.
+/// Keeping this decision independent of transport rendering makes `status` and
+/// `resume` consume the same durable and runtime facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalResumeReadiness {
+    Ready,
+    NotPaused,
+    AccountingIncomplete,
+    ToolPhase,
+    BudgetExhausted,
+    PricingUnavailable,
+    VerifierUnavailable,
 }
 
 /// The sole transport-neutral Goal controller facade.
@@ -531,6 +569,11 @@ impl GoalRuntime {
                 GoalMessageKey::SuccessCriteriaRequired,
             ));
         }
+        if validate_goal_declaration(&objective).is_err()
+            || validate_goal_declaration(&success_criteria).is_err()
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::InputTooLong));
+        }
         if let Some(current) = self.current_goal(&ingress).await?
             && !current.task.status.is_terminal()
         {
@@ -607,14 +650,7 @@ impl GoalRuntime {
         let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
-        let task_id = current.task.id.clone();
-        let tracker = Arc::clone(&self.cost_tracker);
-        let totals = tokio::task::spawn_blocking(move || {
-            tracker.get_usage_totals_for_task_with_pricing(&task_id)
-        })
-        .await
-        .map_err(GoalRuntimeError::accounting)?
-        .map_err(GoalRuntimeError::accounting)?;
+        let totals = self.usage_totals(&current.task.id).await?;
         let terminal_reason = if current.task.status.is_terminal() {
             self.goals
                 .terminal_reason_for_session_goal(&current.task.id, ingress.session_id())
@@ -627,7 +663,12 @@ impl GoalRuntime {
         };
         Ok(GoalResponse::status(
             key,
-            status_projection(current, totals, terminal_reason),
+            status_projection(
+                &current,
+                totals,
+                terminal_reason,
+                self.resume_readiness(&ingress, &current, totals).await,
+            ),
         ))
     }
 
@@ -720,26 +761,26 @@ impl GoalRuntime {
                 },
             ));
         }
-        if current.goal.tool_phase != GoalToolPhase::Clean {
-            return Ok(GoalResponse::message(GoalMessageKey::ToolPhaseNonResumable));
-        }
-        match self
-            .preflight(
-                &ingress,
-                current.goal.effective_token_limit,
-                current.goal.effective_cost_limit_usd,
-            )
-            .await
-        {
-            GoalExecutionReadiness::Ready => {}
-            GoalExecutionReadiness::PricingUnavailable
-                if current.goal.effective_cost_limit_usd.is_some() =>
-            {
+        let totals = self.usage_totals(&current.task.id).await?;
+        match self.resume_readiness(&ingress, &current, totals).await {
+            GoalResumeReadiness::Ready => {}
+            GoalResumeReadiness::ToolPhase => {
+                return Ok(GoalResponse::message(GoalMessageKey::ToolPhaseNonResumable));
+            }
+            GoalResumeReadiness::BudgetExhausted => {
+                return Ok(GoalResponse::message(GoalMessageKey::BudgetExhausted));
+            }
+            GoalResumeReadiness::AccountingIncomplete => {
+                return Ok(GoalResponse::message(GoalMessageKey::AccountingIncomplete));
+            }
+            GoalResumeReadiness::PricingUnavailable => {
                 return Ok(GoalResponse::message(GoalMessageKey::PricingUnavailable));
             }
-            GoalExecutionReadiness::PricingUnavailable => {}
-            GoalExecutionReadiness::VerifierUnavailable => {
+            GoalResumeReadiness::VerifierUnavailable => {
                 return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
+            }
+            GoalResumeReadiness::NotPaused => {
+                return Ok(GoalResponse::message(GoalMessageKey::Stale));
             }
         }
         match self
@@ -860,6 +901,65 @@ impl GoalRuntime {
             .await
     }
 
+    async fn usage_totals(&self, task_id: &str) -> Result<(u64, f64, bool), GoalRuntimeError> {
+        let task_id = task_id.to_owned();
+        let tracker = Arc::clone(&self.cost_tracker);
+        tokio::task::spawn_blocking(move || {
+            tracker.get_usage_totals_for_task_with_pricing(&task_id)
+        })
+        .await
+        .map_err(GoalRuntimeError::accounting)?
+        .map_err(GoalRuntimeError::accounting)
+    }
+
+    async fn resume_readiness(
+        &self,
+        ingress: &GoalIngressContext,
+        current: &CurrentGoal,
+        totals: (u64, f64, bool),
+    ) -> GoalResumeReadiness {
+        if current.task.status != TaskStatus::Paused || current.task.execution_epoch == i64::MAX {
+            return GoalResumeReadiness::NotPaused;
+        }
+        let settled = current.goal.accounting_state == GoalAccountingState::Complete
+            && current.goal.pending_call_id.is_none()
+            && current.goal.pending_call_epoch.is_none();
+        if !settled {
+            return GoalResumeReadiness::AccountingIncomplete;
+        }
+        if current.goal.tool_phase != GoalToolPhase::Clean {
+            return GoalResumeReadiness::ToolPhase;
+        }
+        if current
+            .goal
+            .effective_token_limit
+            .is_some_and(|limit| totals.0 >= limit)
+            || current
+                .goal
+                .effective_cost_limit_usd
+                .is_some_and(|limit| totals.1 >= limit)
+        {
+            return GoalResumeReadiness::BudgetExhausted;
+        }
+        match self
+            .preflight(
+                ingress,
+                current.goal.effective_token_limit,
+                current.goal.effective_cost_limit_usd,
+            )
+            .await
+        {
+            GoalExecutionReadiness::Ready => GoalResumeReadiness::Ready,
+            GoalExecutionReadiness::PricingUnavailable
+                if current.goal.effective_cost_limit_usd.is_some() =>
+            {
+                GoalResumeReadiness::PricingUnavailable
+            }
+            GoalExecutionReadiness::PricingUnavailable => GoalResumeReadiness::Ready,
+            GoalExecutionReadiness::VerifierUnavailable => GoalResumeReadiness::VerifierUnavailable,
+        }
+    }
+
     fn resolve_limits(
         &self,
         request: GoalBudgetRequest,
@@ -959,9 +1059,10 @@ fn transition_message(result: GoalTransitionResult, applied: GoalMessageKey) -> 
 }
 
 fn status_projection(
-    current: CurrentGoal,
+    current: &CurrentGoal,
     totals: (u64, f64, bool),
     terminal_error: Option<String>,
+    resume_readiness: GoalResumeReadiness,
 ) -> GoalStatusProjection {
     let settled = current.goal.accounting_state == GoalAccountingState::Complete
         && current.goal.pending_call_id.is_none()
@@ -969,12 +1070,9 @@ fn status_projection(
     let token_complete = settled;
     let cost_complete = settled && totals.2;
     GoalStatusProjection {
-        task_id: current.task.id,
+        task_id: current.task.id.clone(),
         status: current.task.status,
-        resumable: current.task.status == TaskStatus::Paused
-            && current.task.execution_epoch < i64::MAX
-            && settled
-            && current.goal.tool_phase == GoalToolPhase::Clean,
+        resumable: resume_readiness == GoalResumeReadiness::Ready,
         token_limit: current.goal.effective_token_limit,
         cost_limit_usd: current.goal.effective_cost_limit_usd,
         known_token_usage: totals.0,
@@ -990,9 +1088,10 @@ fn status_projection(
             .flatten()
             .map(|limit| (limit - totals.1).max(0.0)),
         accounting_state: current.goal.accounting_state,
+        tool_phase: current.goal.tool_phase,
         pause_reason: current.goal.pause_reason,
-        pause_description: current.goal.pause_description,
-        blockers: current.goal.blockers,
+        pause_description: current.goal.pause_description.clone(),
+        blockers: current.goal.blockers.clone(),
         delivered: current.task.delivered,
         terminal_error,
     }
@@ -1014,12 +1113,12 @@ fn sanitize_terminal_reason(reason: &str) -> String {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
-    use zeroclaw_config::schema::CostConfig;
+    use zeroclaw_config::{cost::TokenUsage, schema::CostConfig};
 
     use crate::control_plane::SqliteTaskStore;
 
     struct FakeExecutor {
-        readiness: GoalExecutionReadiness,
+        readiness: Mutex<GoalExecutionReadiness>,
         launches: Mutex<Vec<GoalExecutionScope>>,
         fail_launch: bool,
     }
@@ -1027,7 +1126,7 @@ mod tests {
     #[async_trait]
     impl GoalExecutor for FakeExecutor {
         async fn preflight(&self, _: &GoalExecutionPreflight) -> GoalExecutionReadiness {
-            self.readiness
+            *self.readiness.lock()
         }
 
         async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
@@ -1061,7 +1160,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
         let executor = Arc::new(FakeExecutor {
-            readiness,
+            readiness: Mutex::new(readiness),
             launches: Mutex::new(Vec::new()),
             fail_launch,
         });
@@ -1084,6 +1183,16 @@ mod tests {
             success_criteria: "the reported answer meets the stated objective".into(),
             objective: "produce the answer".into(),
         }
+    }
+
+    fn record_goal_usage(tracker: &CostTracker, task_id: String, total_tokens: u64) {
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test-model", total_tokens, 0, 0, 0.0, 0.0, 0.0),
+                Some("main"),
+                Some(task_id),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1131,6 +1240,22 @@ mod tests {
             "/goal start --cost-usd NaN --success-criteria done -- objective",
         ] {
             assert!(parse_goal_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn bounds_objective_and_success_criteria_in_the_parser() {
+        let over_limit = "x".repeat(MAX_GOAL_DECLARATION_CHARS + 1);
+        for command in [
+            format!("/goal start --success-criteria done -- {over_limit}"),
+            format!("/goal start --success-criteria {over_limit} -- objective"),
+        ] {
+            assert_eq!(
+                parse_goal_command(&command),
+                Err(GoalCommandParseError {
+                    key: GoalCommandErrorKey::InputTooLong,
+                })
+            );
         }
     }
 
@@ -1267,11 +1392,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_and_resume_reject_an_exhausted_budget_before_launch() {
+        let (runtime, store, executor, directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let tracker = CostTracker::new(CostConfig::default(), directory.path()).unwrap();
+        record_goal_usage(&tracker, task.id.clone(), 8);
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let projection = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(!projection.resumable);
+        assert_eq!(projection.remaining_tokens, Some(0));
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::BudgetExhausted
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_and_resume_share_pricing_readiness() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        let command = GoalCommand::Start {
+            budget: GoalBudgetRequest::Limits {
+                token_limit: None,
+                cost_limit_usd: Some(1.0),
+            },
+            success_criteria: "done".into(),
+            objective: "objective".into(),
+        };
+        runtime.submit(ingress(), command).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        *executor.readiness.lock() = GoalExecutionReadiness::PricingUnavailable;
+        assert!(
+            !runtime
+                .submit(ingress(), GoalCommand::Status)
+                .await
+                .unwrap()
+                .status
+                .unwrap()
+                .resumable
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::PricingUnavailable
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
     async fn disabled_mode_fails_closed_except_for_local_help() {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
-            readiness: GoalExecutionReadiness::Ready,
+            readiness: Mutex::new(GoalExecutionReadiness::Ready),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -1446,6 +1673,7 @@ mod tests {
             .status
             .unwrap();
         assert!(!projection.resumable);
+        assert_eq!(projection.tool_phase, GoalToolPhase::InFlight);
         assert_eq!(
             runtime
                 .submit(ingress(), GoalCommand::Resume)
@@ -1530,12 +1758,23 @@ mod tests {
                 success_criteria: "done".into(),
                 objective: " ".into(),
             },
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "done".into(),
+                objective: "x".repeat(MAX_GOAL_DECLARATION_CHARS + 1),
+            },
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "x".repeat(MAX_GOAL_DECLARATION_CHARS + 1),
+                objective: "objective".into(),
+            },
         ] {
             assert!(matches!(
                 runtime.submit(ingress(), command).await.unwrap().key,
                 GoalMessageKey::InvalidBudget
                     | GoalMessageKey::SuccessCriteriaRequired
                     | GoalMessageKey::InvalidCommand
+                    | GoalMessageKey::InputTooLong
             ));
         }
         assert_eq!(
@@ -1564,7 +1803,7 @@ mod tests {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let directory = tempfile::tempdir().unwrap();
         let executor = Arc::new(FakeExecutor {
-            readiness: GoalExecutionReadiness::Ready,
+            readiness: Mutex::new(GoalExecutionReadiness::Ready),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
