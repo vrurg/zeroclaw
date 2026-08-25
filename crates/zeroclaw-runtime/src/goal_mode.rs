@@ -3,6 +3,19 @@
 //! This module owns the shared command grammar and trusted ingress boundary.
 //! Concrete command surfaces and provider execution remain later stages.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::Utc;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use zeroclaw_config::{cost::CostTracker, schema::Config};
+
+use crate::control_plane::{
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
+};
+
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GoalCommand {
@@ -304,9 +317,774 @@ fn required(value: String) -> Result<String, GoalIngressError> {
     }
 }
 
+/// Semantic response keys. Concrete transports render these through Fluent
+/// only after their adapters are introduced in a later stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalMessageKey {
+    Help,
+    Disabled,
+    InvalidConfiguration,
+    NoCurrentGoal,
+    AlreadyActive,
+    BudgetRequired,
+    PricingUnavailable,
+    VerifierUnavailable,
+    Started,
+    Status,
+    Budget,
+    Paused,
+    AlreadyPaused,
+    Resumed,
+    Cancelled,
+    AlreadyCancelled,
+    BudgetUpdated,
+    InvalidCommand,
+    InvalidBudget,
+    SuccessCriteriaRequired,
+    ToolPhaseNonResumable,
+    Terminal,
+    ExecutorStartFailed,
+    Stale,
+}
+
+/// A transport-neutral semantic result with no rendered text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalResponse {
+    pub key: GoalMessageKey,
+    pub status: Option<GoalStatusProjection>,
+}
+
+impl GoalResponse {
+    fn message(key: GoalMessageKey) -> Self {
+        Self { key, status: None }
+    }
+
+    fn status(key: GoalMessageKey, status: GoalStatusProjection) -> Self {
+        Self {
+            key,
+            status: Some(status),
+        }
+    }
+}
+
+/// Current Goal status derived from canonical task rows and the usage ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalStatusProjection {
+    pub task_id: String,
+    pub status: TaskStatus,
+    pub resumable: bool,
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+    pub known_token_usage: u64,
+    pub known_cost_usd: f64,
+    pub token_accounting_complete: bool,
+    pub cost_accounting_complete: bool,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
+    pub accounting_state: GoalAccountingState,
+    pub pause_reason: Option<GoalPauseReason>,
+    pub pause_description: Option<String>,
+    pub blockers: Vec<GoalBlocker>,
+    pub delivered: bool,
+    pub terminal_error: Option<String>,
+}
+
+/// Process-local transcript contract. It deliberately has no durable store.
+#[derive(Debug, Default)]
+pub struct GoalWorkingTranscript {
+    turns: Vec<GoalWorkingTurn>,
+}
+
+impl GoalWorkingTranscript {
+    pub fn push(&mut self, turn: GoalWorkingTurn) {
+        self.turns.push(turn);
+    }
+
+    pub fn turns(&self) -> &[GoalWorkingTurn] {
+        &self.turns
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalWorkingTurn {
+    pub turn_kind: GoalTurnKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTurnKind {
+    Start,
+    Resume,
+    Continue,
+}
+
+/// Exact durable identity submitted to the dormant execution seam.
+#[derive(Debug, Clone)]
+pub struct GoalExecutionScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+    pub turn_kind: GoalTurnKind,
+    pub cancellation: CancellationToken,
+}
+
+/// Read-only facts the fake execution seam must validate before launch.
+#[derive(Debug, Clone)]
+pub struct GoalExecutionPreflight {
+    pub session_id: String,
+    pub agent: String,
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalExecutionReadiness {
+    Ready,
+    PricingUnavailable,
+    VerifierUnavailable,
+}
+
+/// Dormant execution seam. This stage performs no provider work.
+#[async_trait]
+pub trait GoalExecutor: Send + Sync {
+    async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
+    async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
+}
+
+struct CurrentGoal {
+    task: TaskRecord,
+    goal: GoalTaskRecord,
+}
+
+/// The sole transport-neutral Goal controller facade.
+pub struct GoalRuntime {
+    config: Arc<Config>,
+    goals: Arc<dyn GoalTaskRegistry>,
+    cost_tracker: Arc<CostTracker>,
+    executor: Arc<dyn GoalExecutor>,
+    boot_id: String,
+}
+
+impl GoalRuntime {
+    pub fn new(
+        config: Arc<Config>,
+        goals: Arc<dyn GoalTaskRegistry>,
+        cost_tracker: Arc<CostTracker>,
+        executor: Arc<dyn GoalExecutor>,
+        boot_id: impl Into<String>,
+    ) -> Result<Self, GoalIngressError> {
+        Ok(Self {
+            config,
+            goals,
+            cost_tracker,
+            executor,
+            boot_id: required(boot_id.into())?,
+        })
+    }
+
+    /// Submit an already-parsed command bound to trusted ingress.
+    pub async fn submit(
+        &self,
+        ingress: GoalIngressContext,
+        command: GoalCommand,
+    ) -> Result<GoalResponse, GoalRuntimeError> {
+        if command == GoalCommand::Help {
+            return Ok(GoalResponse::message(GoalMessageKey::Help));
+        }
+        if !self.config.goal.enabled {
+            return Ok(GoalResponse::message(GoalMessageKey::Disabled));
+        }
+        if self.config.validate().is_err() {
+            return Ok(GoalResponse::message(GoalMessageKey::InvalidConfiguration));
+        }
+        match command {
+            GoalCommand::Start {
+                budget,
+                success_criteria,
+                objective,
+            } => {
+                self.start(ingress, budget, success_criteria, objective)
+                    .await
+            }
+            GoalCommand::Status => self.status(ingress, GoalMessageKey::Status).await,
+            GoalCommand::Budget => self.status(ingress, GoalMessageKey::Budget).await,
+            GoalCommand::SetBudget(request) => self.set_budget(ingress, request).await,
+            GoalCommand::Pause => self.pause(ingress).await,
+            GoalCommand::Resume => self.resume(ingress).await,
+            GoalCommand::Cancel => self.cancel(ingress).await,
+            GoalCommand::Help => unreachable!("handled before configuration admission"),
+        }
+    }
+
+    async fn start(
+        &self,
+        ingress: GoalIngressContext,
+        request: GoalBudgetRequest,
+        success_criteria: String,
+        objective: String,
+    ) -> Result<GoalResponse, GoalRuntimeError> {
+        if objective.trim().is_empty() {
+            return Ok(GoalResponse::message(GoalMessageKey::InvalidCommand));
+        }
+        if success_criteria.trim().is_empty() {
+            return Ok(GoalResponse::message(
+                GoalMessageKey::SuccessCriteriaRequired,
+            ));
+        }
+        if let Some(current) = self.current_goal(&ingress).await?
+            && !current.task.status.is_terminal()
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::AlreadyActive));
+        }
+        let (token_limit, cost_limit_usd) = match self.resolve_limits(request) {
+            Ok(limits) => limits,
+            Err(GoalRuntimeError::BudgetRequired) => {
+                return Ok(GoalResponse::message(GoalMessageKey::BudgetRequired));
+            }
+            Err(GoalRuntimeError::InvalidBudget) => {
+                return Ok(GoalResponse::message(GoalMessageKey::InvalidBudget));
+            }
+            Err(error) => return Err(error),
+        };
+        match self.preflight(&ingress, token_limit, cost_limit_usd).await {
+            GoalExecutionReadiness::Ready => {}
+            GoalExecutionReadiness::PricingUnavailable if cost_limit_usd.is_some() => {
+                return Ok(GoalResponse::message(GoalMessageKey::PricingUnavailable));
+            }
+            GoalExecutionReadiness::PricingUnavailable => {}
+            GoalExecutionReadiness::VerifierUnavailable => {
+                return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
+            }
+        }
+        let id = Uuid::new_v4().to_string();
+        let task = TaskRecord {
+            id: id.clone(),
+            kind: TaskKind::Goal,
+            agent: ingress.agent.clone(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: self.boot_id.clone(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(ingress.route.clone()),
+            delivered: false,
+            idem_key: None,
+            principal_id: ingress.durable_principal_id().map(str::to_owned),
+            session_id: Some(ingress.session_id.clone()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: id.clone(),
+            objective,
+            success_criteria,
+            effective_token_limit: token_limit,
+            effective_cost_limit_usd: cost_limit_usd,
+            ..GoalTaskRecord::default()
+        };
+        match self
+            .goals
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied => {
+                self.launch_exact(ingress, &id, 1, GoalTurnKind::Start)
+                    .await
+            }
+            GoalTransitionResult::Stale => Ok(GoalResponse::message(GoalMessageKey::AlreadyActive)),
+            GoalTransitionResult::Missing => Ok(GoalResponse::message(GoalMessageKey::Stale)),
+        }
+    }
+
+    async fn status(
+        &self,
+        ingress: GoalIngressContext,
+        key: GoalMessageKey,
+    ) -> Result<GoalResponse, GoalRuntimeError> {
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
+        };
+        let task_id = current.task.id.clone();
+        let tracker = Arc::clone(&self.cost_tracker);
+        let totals = tokio::task::spawn_blocking(move || {
+            tracker.get_usage_totals_for_task_with_pricing(&task_id)
+        })
+        .await
+        .map_err(GoalRuntimeError::accounting)?
+        .map_err(GoalRuntimeError::accounting)?;
+        let terminal_reason = if current.task.status.is_terminal() {
+            self.goals
+                .terminal_reason_for_session_goal(&current.task.id, ingress.session_id())
+                .await
+                .map_err(GoalRuntimeError::control_plane)?
+                .as_deref()
+                .map(sanitize_terminal_reason)
+        } else {
+            None
+        };
+        Ok(GoalResponse::status(
+            key,
+            status_projection(current, totals, terminal_reason),
+        ))
+    }
+
+    async fn set_budget(
+        &self,
+        ingress: GoalIngressContext,
+        request: GoalBudgetRequest,
+    ) -> Result<GoalResponse, GoalRuntimeError> {
+        let limits = match request {
+            GoalBudgetRequest::Limits {
+                token_limit,
+                cost_limit_usd,
+            } => validate_limits(token_limit, cost_limit_usd),
+            GoalBudgetRequest::Unlimited => Ok((None, None)),
+            GoalBudgetRequest::Defaults => Err(GoalRuntimeError::InvalidBudget),
+        };
+        let (tokens, cost) = match limits {
+            Ok(value) => value,
+            Err(GoalRuntimeError::InvalidBudget) => {
+                return Ok(GoalResponse::message(GoalMessageKey::InvalidBudget));
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
+        };
+        if !matches!(
+            current.task.status,
+            TaskStatus::Running | TaskStatus::Paused
+        ) {
+            return Ok(GoalResponse::message(GoalMessageKey::Terminal));
+        }
+        let result = self
+            .goals
+            .update_session_goal_limits(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                tokens,
+                cost,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        Ok(GoalResponse::message(transition_message(
+            result,
+            GoalMessageKey::BudgetUpdated,
+        )))
+    }
+
+    async fn pause(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
+        };
+        if current.task.status == TaskStatus::Paused {
+            return Ok(GoalResponse::message(GoalMessageKey::AlreadyPaused));
+        }
+        if current.task.status != TaskStatus::Running {
+            return Ok(GoalResponse::message(GoalMessageKey::Terminal));
+        }
+        let result = self
+            .goals
+            .pause_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        Ok(GoalResponse::message(transition_message(
+            result,
+            GoalMessageKey::Paused,
+        )))
+    }
+
+    async fn resume(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
+        };
+        if current.task.status != TaskStatus::Paused {
+            return Ok(GoalResponse::message(
+                if current.task.status.is_terminal() {
+                    GoalMessageKey::Terminal
+                } else {
+                    GoalMessageKey::Stale
+                },
+            ));
+        }
+        if current.goal.tool_phase != GoalToolPhase::Clean {
+            return Ok(GoalResponse::message(GoalMessageKey::ToolPhaseNonResumable));
+        }
+        match self
+            .preflight(
+                &ingress,
+                current.goal.effective_token_limit,
+                current.goal.effective_cost_limit_usd,
+            )
+            .await
+        {
+            GoalExecutionReadiness::Ready => {}
+            GoalExecutionReadiness::PricingUnavailable
+                if current.goal.effective_cost_limit_usd.is_some() =>
+            {
+                return Ok(GoalResponse::message(GoalMessageKey::PricingUnavailable));
+            }
+            GoalExecutionReadiness::PricingUnavailable => {}
+            GoalExecutionReadiness::VerifierUnavailable => {
+                return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
+            }
+        }
+        match self
+            .goals
+            .resume_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                std::process::id(),
+                &self.boot_id,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied => {
+                self.launch_exact(
+                    ingress,
+                    &current.task.id,
+                    current.task.execution_epoch + 1,
+                    GoalTurnKind::Resume,
+                )
+                .await
+            }
+            GoalTransitionResult::Stale => Ok(GoalResponse::message(GoalMessageKey::Stale)),
+            GoalTransitionResult::Missing => {
+                Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal))
+            }
+        }
+    }
+
+    async fn cancel(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
+        };
+        if current.task.status == TaskStatus::Cancelled {
+            return Ok(GoalResponse::message(GoalMessageKey::AlreadyCancelled));
+        }
+        if current.task.status.is_terminal() {
+            return Ok(GoalResponse::message(GoalMessageKey::Terminal));
+        }
+        let result = self
+            .goals
+            .finish_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                TaskStatus::Cancelled,
+                None,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        Ok(GoalResponse::message(transition_message(
+            result,
+            GoalMessageKey::Cancelled,
+        )))
+    }
+
+    async fn launch_exact(
+        &self,
+        ingress: GoalIngressContext,
+        task_id: &str,
+        epoch: i64,
+        turn_kind: GoalTurnKind,
+    ) -> Result<GoalResponse, GoalRuntimeError> {
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
+        };
+        if current.task.id != task_id
+            || current.task.execution_epoch != epoch
+            || current.task.status != TaskStatus::Running
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
+        }
+        let scope = GoalExecutionScope {
+            task_id: task_id.to_owned(),
+            session_id: ingress.session_id.clone(),
+            execution_epoch: epoch,
+            turn_kind,
+            cancellation: CancellationToken::new(),
+        };
+        if self.executor.launch(scope).await.is_ok() {
+            return Ok(GoalResponse::message(if turn_kind == GoalTurnKind::Start {
+                GoalMessageKey::Started
+            } else {
+                GoalMessageKey::Resumed
+            }));
+        }
+        let result = self
+            .goals
+            .finish_session_goal(
+                task_id,
+                ingress.session_id(),
+                epoch,
+                TaskStatus::Failed,
+                Some("executor_start_failed".into()),
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        Ok(GoalResponse::message(transition_message(
+            result,
+            GoalMessageKey::ExecutorStartFailed,
+        )))
+    }
+
+    async fn preflight(
+        &self,
+        ingress: &GoalIngressContext,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> GoalExecutionReadiness {
+        self.executor
+            .preflight(&GoalExecutionPreflight {
+                session_id: ingress.session_id.clone(),
+                agent: ingress.agent.clone(),
+                token_limit,
+                cost_limit_usd,
+            })
+            .await
+    }
+
+    fn resolve_limits(
+        &self,
+        request: GoalBudgetRequest,
+    ) -> Result<(Option<u64>, Option<f64>), GoalRuntimeError> {
+        match request {
+            GoalBudgetRequest::Defaults => {
+                let limits = (
+                    self.config.goal.default_token_limit,
+                    self.config.goal.default_cost_limit_usd,
+                );
+                if limits.0.is_none() && limits.1.is_none() {
+                    Err(GoalRuntimeError::BudgetRequired)
+                } else {
+                    validate_limits(limits.0, limits.1)
+                }
+            }
+            GoalBudgetRequest::Limits {
+                token_limit,
+                cost_limit_usd,
+            } => validate_limits(token_limit, cost_limit_usd),
+            GoalBudgetRequest::Unlimited => Ok((None, None)),
+        }
+    }
+
+    async fn current_goal(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<Option<CurrentGoal>, GoalRuntimeError> {
+        let Some(task) = self
+            .goals
+            .current_goal_for_session(ingress.session_id())
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(None);
+        };
+        if task.agent != ingress.agent()
+            || task.originator_route.as_deref() != Some(ingress.route())
+            || task.principal_id.as_deref() != ingress.durable_principal_id()
+        {
+            return Ok(None);
+        }
+        let Some(goal) = self
+            .goals
+            .get_goal_task(&task.id)
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CurrentGoal { task, goal }))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GoalRuntimeError {
+    #[error("goal_control_plane")]
+    ControlPlane(#[source] anyhow::Error),
+    #[error("goal_budget_required")]
+    BudgetRequired,
+    #[error("goal_invalid_budget")]
+    InvalidBudget,
+    #[error("goal_accounting_unavailable")]
+    Accounting(#[source] anyhow::Error),
+}
+
+impl GoalRuntimeError {
+    fn control_plane(error: anyhow::Error) -> Self {
+        Self::ControlPlane(error)
+    }
+
+    fn accounting(error: impl Into<anyhow::Error>) -> Self {
+        Self::Accounting(error.into())
+    }
+}
+
+fn validate_limits(
+    token_limit: Option<u64>,
+    cost_limit_usd: Option<f64>,
+) -> Result<(Option<u64>, Option<f64>), GoalRuntimeError> {
+    if (token_limit.is_none() && cost_limit_usd.is_none())
+        || token_limit.is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+        || cost_limit_usd.is_some_and(|limit| !limit.is_finite() || limit <= 0.0)
+    {
+        Err(GoalRuntimeError::InvalidBudget)
+    } else {
+        Ok((token_limit, cost_limit_usd))
+    }
+}
+
+fn transition_message(result: GoalTransitionResult, applied: GoalMessageKey) -> GoalMessageKey {
+    match result {
+        GoalTransitionResult::Applied => applied,
+        GoalTransitionResult::Stale => GoalMessageKey::Stale,
+        GoalTransitionResult::Missing => GoalMessageKey::NoCurrentGoal,
+    }
+}
+
+fn status_projection(
+    current: CurrentGoal,
+    totals: (u64, f64, bool),
+    terminal_error: Option<String>,
+) -> GoalStatusProjection {
+    let settled = current.goal.accounting_state == GoalAccountingState::Complete
+        && current.goal.pending_call_id.is_none()
+        && current.goal.pending_call_epoch.is_none();
+    let token_complete = settled;
+    let cost_complete = settled && totals.2;
+    GoalStatusProjection {
+        task_id: current.task.id,
+        status: current.task.status,
+        resumable: current.task.status == TaskStatus::Paused
+            && current.task.execution_epoch < i64::MAX
+            && settled
+            && current.goal.tool_phase == GoalToolPhase::Clean,
+        token_limit: current.goal.effective_token_limit,
+        cost_limit_usd: current.goal.effective_cost_limit_usd,
+        known_token_usage: totals.0,
+        known_cost_usd: totals.1,
+        token_accounting_complete: token_complete,
+        cost_accounting_complete: cost_complete,
+        remaining_tokens: token_complete
+            .then_some(current.goal.effective_token_limit)
+            .flatten()
+            .map(|limit| limit.saturating_sub(totals.0)),
+        remaining_cost_usd: cost_complete
+            .then_some(current.goal.effective_cost_limit_usd)
+            .flatten()
+            .map(|limit| (limit - totals.1).max(0.0)),
+        accounting_state: current.goal.accounting_state,
+        pause_reason: current.goal.pause_reason,
+        pause_description: current.goal.pause_description,
+        blockers: current.goal.blockers,
+        delivered: current.task.delivered,
+        terminal_error,
+    }
+}
+
+fn sanitize_terminal_reason(reason: &str) -> String {
+    match reason {
+        "executor_start_failed"
+        | "legacy_goal_missing_session"
+        | "accounting_missing_or_invalid"
+        | "accounting_outcome_unknown"
+        | "pricing_unavailable"
+        | "candidate_empty" => reason.to_owned(),
+        _ => "goal_terminal_failure".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use zeroclaw_config::schema::CostConfig;
+
+    use crate::control_plane::SqliteTaskStore;
+
+    struct FakeExecutor {
+        readiness: GoalExecutionReadiness,
+        launches: Mutex<Vec<GoalExecutionScope>>,
+        fail_launch: bool,
+    }
+
+    #[async_trait]
+    impl GoalExecutor for FakeExecutor {
+        async fn preflight(&self, _: &GoalExecutionPreflight) -> GoalExecutionReadiness {
+            self.readiness
+        }
+
+        async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
+            if self.fail_launch {
+                return Err(());
+            }
+            self.launches.lock().push(scope);
+            Ok(())
+        }
+    }
+
+    fn enabled_config() -> Arc<Config> {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.default_token_limit = Some(8);
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        Arc::new(config)
+    }
+
+    fn controller(
+        readiness: GoalExecutionReadiness,
+        fail_launch: bool,
+    ) -> (
+        GoalRuntime,
+        Arc<SqliteTaskStore>,
+        Arc<FakeExecutor>,
+        tempfile::TempDir,
+    ) {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let executor = Arc::new(FakeExecutor {
+            readiness,
+            launches: Mutex::new(Vec::new()),
+            fail_launch,
+        });
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        (
+            GoalRuntime::new(enabled_config(), goals, tracker, executor.clone(), "boot").unwrap(),
+            store,
+            executor,
+            directory,
+        )
+    }
+
+    fn ingress() -> GoalIngressContext {
+        GoalIngressContext::trusted("session", "main", "room", Some("principal".into())).unwrap()
+    }
+
+    fn start_command() -> GoalCommand {
+        GoalCommand::Start {
+            budget: GoalBudgetRequest::Defaults,
+            success_criteria: "the reported answer meets the stated objective".into(),
+            objective: "produce the answer".into(),
+        }
+    }
 
     #[test]
     fn parses_exact_start_budget_forms() {
@@ -396,5 +1174,518 @@ mod tests {
         assert!(
             GoalIngressContext::trusted("session", "agent", "route", Some(" ".into())).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn start_persists_immutable_criteria_and_launches_only_exact_epoch() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Started
+        );
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.execution_epoch, 1);
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(goal.objective, "produce the answer");
+        assert_eq!(
+            goal.success_criteria,
+            "the reported answer meets the stated objective"
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::AlreadyActive
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn budget_update_keeps_a_paused_goal_paused_until_explicit_resume() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Pause)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Paused
+        );
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::SetBudget(GoalBudgetRequest::Limits {
+                        token_limit: Some(3),
+                        cost_limit_usd: None,
+                    }),
+                )
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::BudgetUpdated
+        );
+        let paused = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+        assert_eq!(executor.launches.lock().len(), 1);
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Resumed
+        );
+        let resumed = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, TaskStatus::Running);
+        assert_eq!(resumed.execution_epoch, paused.execution_epoch + 1);
+        assert_eq!(executor.launches.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_fails_closed_except_for_local_help() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let executor = Arc::new(FakeExecutor {
+            readiness: GoalExecutionReadiness::Ready,
+            launches: Mutex::new(Vec::new()),
+            fail_launch: false,
+        });
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let runtime = GoalRuntime::new(
+            Arc::new(Config::default()),
+            goals,
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+            executor.clone(),
+            "boot",
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Status)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Disabled
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Help)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Help
+        );
+        assert!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(executor.launches.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_failure_becomes_a_sanitized_terminal_state() {
+        let (runtime, store, _executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, true);
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::ExecutorStartFailed
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        let status = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(
+            status.terminal_error.as_deref(),
+            Some("executor_start_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_different_trusted_binding_cannot_select_or_mutate_the_goal() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let other =
+            GoalIngressContext::trusted("session", "other", "room", Some("principal".into()))
+                .unwrap();
+        assert_eq!(
+            runtime
+                .submit(other, GoalCommand::Status)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::NoCurrentGoal
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+        assert_eq!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn status_projects_only_the_current_goal_and_sanitizes_unknown_failures() {
+        let (runtime, store, _executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    TaskStatus::Failed,
+                    Some("private provider response".into()),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let projection = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(projection.task_id, task.id);
+        assert_eq!(projection.status, TaskStatus::Failed);
+        assert_eq!(
+            projection.terminal_error.as_deref(),
+            Some("goal_terminal_failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_tool_phase_is_reported_and_cannot_resume() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, "session", task.execution_epoch)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let projection = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(!projection.resumable);
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::ToolPhaseNonResumable
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pricing_readiness_blocks_only_cost_limited_admission() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::PricingUnavailable, false);
+        let token_only = GoalCommand::Start {
+            budget: GoalBudgetRequest::Limits {
+                token_limit: Some(8),
+                cost_limit_usd: None,
+            },
+            success_criteria: "done".into(),
+            objective: "objective".into(),
+        };
+        assert_eq!(
+            runtime.submit(ingress(), token_only).await.unwrap().key,
+            GoalMessageKey::Started
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    TaskStatus::Cancelled,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let cost_limited = GoalCommand::Start {
+            budget: GoalBudgetRequest::Limits {
+                token_limit: None,
+                cost_limit_usd: Some(1.0),
+            },
+            success_criteria: "done".into(),
+            objective: "objective".into(),
+        };
+        assert_eq!(
+            runtime.submit(ingress(), cost_limited).await.unwrap().key,
+            GoalMessageKey::PricingUnavailable
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_invalid_start_and_budget_values_fail_without_state_change() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        for command in [
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Limits {
+                    token_limit: None,
+                    cost_limit_usd: None,
+                },
+                success_criteria: "done".into(),
+                objective: "objective".into(),
+            },
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: " ".into(),
+                objective: "objective".into(),
+            },
+            GoalCommand::Start {
+                budget: GoalBudgetRequest::Defaults,
+                success_criteria: "done".into(),
+                objective: " ".into(),
+            },
+        ] {
+            assert!(matches!(
+                runtime.submit(ingress(), command).await.unwrap().key,
+                GoalMessageKey::InvalidBudget
+                    | GoalMessageKey::SuccessCriteriaRequired
+                    | GoalMessageKey::InvalidCommand
+            ));
+        }
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::SetBudget(GoalBudgetRequest::Defaults)
+                )
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::InvalidBudget
+        );
+        assert!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(executor.launches.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_enabled_configuration_fails_closed_before_any_launch() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let executor = Arc::new(FakeExecutor {
+            readiness: GoalExecutionReadiness::Ready,
+            launches: Mutex::new(Vec::new()),
+            fail_launch: false,
+        });
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let runtime = GoalRuntime::new(
+            Arc::new(config),
+            goals,
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+            executor.clone(),
+            "boot",
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::InvalidConfiguration
+        );
+        assert!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(executor.launches.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_is_idempotent_and_terminal_states_do_not_resume_or_mutate() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Cancel)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Cancelled
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Cancel)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::AlreadyCancelled
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Terminal
+        );
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::SetBudget(GoalBudgetRequest::Unlimited)
+                )
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Terminal
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+        assert_eq!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_executor_launch_is_discarded_after_an_epoch_is_fenced() {
+        let (runtime, store, executor, _directory) =
+            controller(GoalExecutionReadiness::Ready, false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    TaskStatus::Cancelled,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            runtime
+                .launch_exact(
+                    ingress(),
+                    &task.id,
+                    task.execution_epoch,
+                    GoalTurnKind::Start,
+                )
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Stale
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
     }
 }
