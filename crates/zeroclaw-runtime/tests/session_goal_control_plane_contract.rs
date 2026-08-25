@@ -399,7 +399,35 @@ fn sqlite_rejects_hostile_pending_and_session_mutations() {
     conn.execute("INSERT INTO goal_tasks (task_id, objective, success_criteria, pending_call_id, pending_call_epoch, pending_reserved_tokens) VALUES ('goal', 'o', 'c', 'call', 1, 1)", []).unwrap();
     assert!(
         conn.execute(
+            "UPDATE goal_tasks SET pending_call_epoch = 'not-an-epoch' WHERE task_id = 'goal'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE goal_tasks SET pending_call_epoch = 1.5 WHERE task_id = 'goal'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
             "UPDATE goal_tasks SET pending_reserved_tokens = -1 WHERE task_id = 'goal'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE goal_tasks SET pending_reserved_tokens = 'not-tokens' WHERE task_id = 'goal'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE goal_tasks SET pending_reserved_tokens = 1.5 WHERE task_id = 'goal'",
             []
         )
         .is_err()
@@ -426,6 +454,20 @@ fn sqlite_rejects_hostile_pending_and_session_mutations() {
         .is_err()
     );
     assert!(conn.execute("UPDATE goal_tasks SET pending_call_id = NULL, pending_call_epoch = NULL WHERE task_id = 'goal'", []).is_err());
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        10
+    );
+    drop(conn);
+    let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+    drop(reopened);
+    let conn = Connection::open(directory.path().join("control_plane.db")).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        10
+    );
 }
 
 #[tokio::test]

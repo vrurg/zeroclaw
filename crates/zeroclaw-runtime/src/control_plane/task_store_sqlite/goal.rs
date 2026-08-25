@@ -288,6 +288,7 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
                         OR NEW.pending_reserved_cost_usd IS NOT NULL))
                    OR (NEW.pending_call_id IS NOT NULL AND (
                            length(trim(NEW.pending_call_id)) = 0
+                        OR typeof(NEW.pending_call_epoch) != 'integer'
                         OR NEW.pending_call_epoch < 1
                         OR (NEW.effective_token_limit IS NOT NULL
                             AND NEW.pending_reserved_tokens IS NULL)
@@ -340,9 +341,11 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
                         OR (NEW.effective_cost_limit_usd IS NOT NULL
                             AND NEW.pending_reserved_cost_usd IS NULL)))
                    OR (NEW.pending_reserved_tokens IS NOT NULL
-                       AND NEW.pending_reserved_tokens < 0)
+                       AND (typeof(NEW.pending_reserved_tokens) != 'integer'
+                            OR NEW.pending_reserved_tokens < 0))
                    OR (NEW.pending_reserved_cost_usd IS NOT NULL
-                       AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                       AND (typeof(NEW.pending_reserved_cost_usd) NOT IN ('integer', 'real')
+                            OR NOT (NEW.pending_reserved_cost_usd >= 0.0
                                 AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
                  BEGIN SELECT RAISE(ABORT, 'invalid goal pending operation state'); END;
              CREATE TRIGGER trg_goal_tasks_mutable_state_update
@@ -356,15 +359,18 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
                         OR NEW.pending_reserved_cost_usd IS NOT NULL))
                    OR (NEW.pending_call_id IS NOT NULL AND (
                            length(trim(NEW.pending_call_id)) = 0
+                        OR typeof(NEW.pending_call_epoch) != 'integer'
                         OR NEW.pending_call_epoch < 1
                         OR (NEW.effective_token_limit IS NOT NULL
                             AND NEW.pending_reserved_tokens IS NULL)
                         OR (NEW.effective_cost_limit_usd IS NOT NULL
                             AND NEW.pending_reserved_cost_usd IS NULL)))
                    OR (NEW.pending_reserved_tokens IS NOT NULL
-                       AND NEW.pending_reserved_tokens < 0)
+                       AND (typeof(NEW.pending_reserved_tokens) != 'integer'
+                            OR NEW.pending_reserved_tokens < 0))
                    OR (NEW.pending_reserved_cost_usd IS NOT NULL
-                       AND NOT (NEW.pending_reserved_cost_usd >= 0.0
+                       AND (typeof(NEW.pending_reserved_cost_usd) NOT IN ('integer', 'real')
+                            OR NOT (NEW.pending_reserved_cost_usd >= 0.0
                                 AND NEW.pending_reserved_cost_usd <= 1.7976931348623157e308))
                  BEGIN SELECT RAISE(ABORT, 'invalid goal pending operation state'); END;
              PRAGMA user_version = 10;",
@@ -1848,7 +1854,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let err = conn
             .execute(
                 "INSERT INTO tasks
