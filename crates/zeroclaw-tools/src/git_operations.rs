@@ -51,26 +51,26 @@ impl GitOperationsTool {
         Ok(result)
     }
 
-    /// Check if an operation requires write access
-    fn requires_write_access(&self, operation: &str) -> bool {
+    /// Check if an operation requires write access.
+    fn requires_write_access(&self, operation: &str, args: &serde_json::Value) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert" | "worktree"
-        )
+            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
+        ) || (operation == "worktree"
+            && matches!(
+                args.get("subcommand").and_then(|value| value.as_str()),
+                Some("add" | "remove" | "prune")
+            ))
     }
 
-    #[cfg(test)]
-    fn is_read_only(&self, operation: &str) -> bool {
-        matches!(
-            operation,
-            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-        )
-    }
-
-    /// Resolve a user-provided path to an allowed absolute path.
+    /// Resolve a user-provided path authorized for the requested Git operation.
     /// Returns the workspace_dir if no path is provided.
     /// Rejects paths that escape the workspace via traversal.
-    fn resolve_working_dir(&self, path: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    fn resolve_working_dir(
+        &self,
+        path: Option<&str>,
+        requires_write_access: bool,
+    ) -> anyhow::Result<std::path::PathBuf> {
         let base = match path {
             Some(p) if !p.is_empty() => {
                 let candidate = if std::path::Path::new(p).is_absolute() {
@@ -91,11 +91,10 @@ impl GitOperationsTool {
                     );
                     anyhow::Error::msg(format!("Cannot resolve path '{}': {}", p, e))
                 })?;
-                if !self.security.is_resolved_path_allowed(&resolved) {
-                    anyhow::bail!(
-                        "Path '{}' resolves outside the workspace or allowed roots",
-                        p
-                    );
+                if !self.security.is_resolved_path_readable(&resolved)
+                    || (requires_write_access && !self.security.is_resolved_path_allowed(&resolved))
+                {
+                    anyhow::bail!("Path '{}' is not authorized for this Git operation", p);
                 }
                 resolved
             }
@@ -226,7 +225,10 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["status", "--porcelain=2", "--branch"], working_dir)
+            .run_git_command(
+                &["--no-optional-locks", "status", "--porcelain=2", "--branch"],
+                working_dir,
+            )
             .await?;
 
         // Parse git status output into structured format
@@ -291,7 +293,7 @@ impl GitOperationsTool {
         // Validate files argument against injection patterns
         self.sanitize_git_args(files)?;
 
-        let mut git_args = vec!["diff", "--unified=3"];
+        let mut git_args = vec!["--no-optional-locks", "diff", "--unified=3"];
         if cached {
             git_args.push("--cached");
         }
@@ -374,6 +376,7 @@ impl GitOperationsTool {
         let output = self
             .run_git_command(
                 &[
+                    "--no-optional-locks",
                     "log",
                     &format!("-{limit_str}"),
                     "--pretty=format:%H|%an|%ae|%ad|%s",
@@ -414,7 +417,11 @@ impl GitOperationsTool {
     ) -> anyhow::Result<ToolResult> {
         let output = self
             .run_git_command(
-                &["branch", "--format=%(refname:short)|%(HEAD)"],
+                &[
+                    "--no-optional-locks",
+                    "branch",
+                    "--format=%(refname:short)|%(HEAD)",
+                ],
                 working_dir,
             )
             .await?;
@@ -764,7 +771,10 @@ impl GitOperationsTool {
         match subcommand {
             "list" => {
                 let output = self
-                    .run_git_command(&["worktree", "list", "--porcelain"], working_dir)
+                    .run_git_command(
+                        &["--no-optional-locks", "worktree", "list", "--porcelain"],
+                        working_dir,
+                    )
                     .await?;
                 let parsed = self.parse_worktree_list(&output);
                 Ok(ToolResult {
@@ -922,7 +932,7 @@ impl Tool for GitOperationsTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional subdirectory path within the workspace to run git operations in. Defaults to workspace root."
+                    "description": "Optional repository path authorized by the agent's workspace policy. Defaults to workspace root."
                 }
             },
             "required": ["operation"]
@@ -941,8 +951,9 @@ impl Tool for GitOperationsTool {
             }
         };
 
+        let requires_write_access = self.requires_write_access(operation, &args);
         let path = args.get("path").and_then(|v| v.as_str());
-        let working_dir = match self.resolve_working_dir(path) {
+        let working_dir = match self.resolve_working_dir(path, requires_write_access) {
             Ok(d) => d,
             Err(e) => {
                 return Ok(ToolResult {
@@ -984,7 +995,7 @@ impl Tool for GitOperationsTool {
         }
 
         // Check autonomy level for write operations
-        if self.requires_write_access(operation) {
+        if requires_write_access {
             if !self.security.can_act() {
                 return Ok(ToolResult {
                     success: false,
@@ -1081,6 +1092,32 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: dir.to_path_buf(),
             allowed_roots: vec![allowed_root],
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    fn test_tool_with_read_only_root(
+        dir: &std::path::Path,
+        read_only_root: std::path::PathBuf,
+    ) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.to_path_buf(),
+            allowed_roots_read_only: vec![read_only_root],
+            ..SecurityPolicy::default()
+        });
+        GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    fn test_tool_with_write_only_root(
+        dir: &std::path::Path,
+        write_only_root: std::path::PathBuf,
+    ) -> GitOperationsTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.to_path_buf(),
+            allowed_roots_write_only: vec![write_only_root],
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
@@ -1215,42 +1252,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        assert!(tool.requires_write_access("commit"));
-        assert!(tool.requires_write_access("add"));
-        assert!(tool.requires_write_access("checkout"));
-        assert!(tool.requires_write_access("stash"));
-        assert!(tool.requires_write_access("worktree"));
+        assert!(tool.requires_write_access("commit", &json!({})));
+        assert!(tool.requires_write_access("add", &json!({})));
+        assert!(tool.requires_write_access("checkout", &json!({})));
+        assert!(tool.requires_write_access("stash", &json!({})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "add"})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "remove"})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "prune"})));
 
-        assert!(!tool.requires_write_access("status"));
-        assert!(!tool.requires_write_access("diff"));
-        assert!(!tool.requires_write_access("log"));
-        assert!(!tool.requires_write_access("branch"));
-    }
-
-    #[test]
-    fn is_read_only_detection() {
-        let tmp = TempDir::new().unwrap();
-        let tool = test_tool(tmp.path());
-
-        assert!(tool.is_read_only("status"));
-        assert!(tool.is_read_only("diff"));
-        assert!(tool.is_read_only("log"));
-        assert!(tool.is_read_only("branch"));
-
-        // worktree has write subcommands (add/remove), so it is not read-only
-        assert!(!tool.is_read_only("worktree"));
-        assert!(!tool.is_read_only("commit"));
-        assert!(!tool.is_read_only("add"));
-    }
-
-    #[test]
-    fn branch_is_not_write_gated() {
-        let tmp = TempDir::new().unwrap();
-        let tool = test_tool(tmp.path());
-
-        // Branch listing is read-only; it must not require write access
-        assert!(!tool.requires_write_access("branch"));
-        assert!(tool.is_read_only("branch"));
+        assert!(!tool.requires_write_access("status", &json!({})));
+        assert!(!tool.requires_write_access("diff", &json!({})));
+        assert!(!tool.requires_write_access("log", &json!({})));
+        assert!(!tool.requires_write_access("branch", &json!({})));
+        assert!(!tool.requires_write_access("worktree", &json!({"subcommand": "list"})));
+        assert!(!tool.requires_write_access("status", &json!({"subcommand": "add"})));
     }
 
     #[tokio::test]
@@ -1434,7 +1449,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.resolve_working_dir(None).unwrap();
+        let result = tool.resolve_working_dir(None, false).unwrap();
         assert_eq!(result, tmp.path().to_path_buf());
     }
 
@@ -1443,7 +1458,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.resolve_working_dir(Some("")).unwrap();
+        let result = tool.resolve_working_dir(Some(""), false).unwrap();
         assert_eq!(result, tmp.path().to_path_buf());
     }
 
@@ -1453,7 +1468,7 @@ mod tests {
         std::fs::create_dir(tmp.path().join("subproject")).unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.resolve_working_dir(Some("subproject")).unwrap();
+        let result = tool.resolve_working_dir(Some("subproject"), false).unwrap();
         let expected = tmp.path().join("subproject").canonicalize().unwrap();
         assert_eq!(result, expected);
     }
@@ -1463,11 +1478,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
 
-        let result = tool.resolve_working_dir(Some(".."));
+        let result = tool.resolve_working_dir(Some(".."), false);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("resolves outside the workspace"),
+            err_msg.contains("not authorized for this Git operation"),
             "Expected traversal rejection, got: {err_msg}"
         );
     }
@@ -1511,6 +1526,140 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("branch"));
+    }
+
+    #[tokio::test]
+    async fn git_operations_reject_reads_from_write_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let write_only_root = TempDir::new().unwrap();
+        git_init_no_sign(write_only_root.path(), &[]);
+        let tool =
+            test_tool_with_write_only_root(workspace.path(), write_only_root.path().to_path_buf());
+
+        for operation in ["status", "diff", "log", "branch"] {
+            let result = tool
+                .execute(json!({"operation": operation, "path": write_only_root.path()}))
+                .await
+                .unwrap();
+            assert!(
+                !result.success,
+                "{operation} must not read from a write-only root"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Invalid path")),
+                "{operation} must fail during authorization: {:?}",
+                result.error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_operations_adds_in_configured_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let allowed_root = TempDir::new().unwrap();
+        git_init_no_sign(allowed_root.path(), &[]);
+        std::fs::write(allowed_root.path().join("tracked.txt"), "content").unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({
+                "operation": "add",
+                "path": allowed_root.path(),
+                "paths": "tracked.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_reject_writes_from_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        git_init_no_sign(read_only_root.path(), &[]);
+        std::fs::write(read_only_root.path().join("tracked.txt"), "content").unwrap();
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({
+                "operation": "add",
+                "path": read_only_root.path(),
+                "paths": "tracked.txt"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "add must not write to a read-only root");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Invalid path")),
+            "add must fail during authorization: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn git_status_does_not_refresh_index_in_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &["tracked.txt"]).await;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(read_only_root.path().join("tracked.txt"), "initial").unwrap();
+        let index_path = read_only_root.path().join(".git/index");
+        let index_before = std::fs::read(&index_path).unwrap();
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"operation": "status", "path": read_only_root.path()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+        assert_eq!(
+            std::fs::read(&index_path).unwrap(),
+            index_before,
+            "status must not refresh the index in a read-only root"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_worktree_list_reads_from_configured_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        git_init_no_sign(read_only_root.path(), &[]);
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "list",
+                "path": read_only_root.path()
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
