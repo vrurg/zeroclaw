@@ -1812,6 +1812,20 @@ impl AnthropicModelProvider {
         TerminalCompletionPolicy::new(recovery, usage_chargeability)
     }
 
+    /// A streamed terminal outcome may advance only before any normalized
+    /// user-visible text or provider/client tool activity. The parser owns
+    /// this protocol fact so its policy remains available if the stream later
+    /// fails before the runtime can construct its immutable-partial wrapper.
+    fn stream_replay_safe(
+        streamed_text: &str,
+        saw_server_tool_activity: bool,
+        saw_client_tool_activity: bool,
+    ) -> bool {
+        !saw_server_tool_activity
+            && !saw_client_tool_activity
+            && zeroclaw_api::model_provider::strip_think_tags(streamed_text).is_empty()
+    }
+
     fn streaming_usage(
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
@@ -2231,7 +2245,11 @@ impl AnthropicModelProvider {
                             &terminal_policy_slot,
                             error,
                             usage,
-                            !saw_server_tool_activity && !saw_client_tool_activity,
+                            Self::stream_replay_safe(
+                                &streamed_text,
+                                saw_server_tool_activity,
+                                saw_client_tool_activity,
+                            ),
                         )
                         .await;
                     } else if saw_server_tool_activity {
@@ -2268,7 +2286,11 @@ impl AnthropicModelProvider {
                             &terminal_policy_slot,
                             terminal_error,
                             usage,
-                            !saw_server_tool_activity && !saw_client_tool_activity,
+                            Self::stream_replay_safe(
+                                &streamed_text,
+                                saw_server_tool_activity,
+                                saw_client_tool_activity,
+                            ),
                         )
                         .await;
                     } else if saw_server_tool_activity {
@@ -2715,7 +2737,11 @@ impl AnthropicModelProvider {
                             &terminal_policy_slot,
                             error,
                             usage,
-                            !saw_server_tool_activity && !saw_client_tool_activity,
+                            Self::stream_replay_safe(
+                                &streamed_text,
+                                saw_server_tool_activity,
+                                saw_client_tool_activity,
+                            ),
                         )
                         .await;
                     } else {
@@ -2756,7 +2782,11 @@ impl AnthropicModelProvider {
                             &terminal_policy_slot,
                             error,
                             usage,
-                            !saw_server_tool_activity && !saw_client_tool_activity,
+                            Self::stream_replay_safe(
+                                &streamed_text,
+                                saw_server_tool_activity,
+                                saw_client_tool_activity,
+                            ),
                         )
                         .await;
                     } else if saw_server_tool_activity {
@@ -2787,7 +2817,11 @@ impl AnthropicModelProvider {
                 &terminal_policy_slot,
                 error,
                 usage,
-                !saw_server_tool_activity && !saw_client_tool_activity,
+                Self::stream_replay_safe(
+                    &streamed_text,
+                    saw_server_tool_activity,
+                    saw_client_tool_activity,
+                ),
             )
             .await;
             return;
@@ -4423,6 +4457,111 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             context.policy().usage_chargeability(),
             TerminalUsageChargeability::Billable
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_visible_partial_refusal_is_non_replayable_and_billable() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\\
+event: content_block_start\n\\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\\
+event: content_block_delta\n\\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\\
+event: content_block_stop\n\\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\\
+event: message_delta\n\\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":4}}\n\n\\
+event: message_stop\n\\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        let slot = std::sync::Arc::new(crate::terminal::TerminalPolicySlot::default());
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, Some(slot.clone()))
+            .await;
+
+        let mut saw_final = false;
+        let mut terminal = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(failure)) => terminal = Some(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "a refusal cannot be a successful final response"
+        );
+        let terminal = terminal.expect("visible partial refusal emits one terminal failure");
+        assert_eq!(terminal.reason, TerminalCompletionError::Refusal);
+        assert_eq!(
+            terminal
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(4)
+        );
+
+        let contextual = crate::terminal::contextualize_terminal_stream_error(
+            &slot,
+            StreamError::TerminalCompletion(terminal),
+        );
+        let context = crate::terminal::terminal_completion_context(&contextual)
+            .expect("SSE refusal policy must survive stream transport");
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NoReplay
+        );
+        assert_eq!(
+            context.policy().usage_chargeability(),
+            TerminalUsageChargeability::Billable
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_pre_output_refusal_remains_retryable_and_informational() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\\
+event: message_delta\n\\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n\\
+event: message_stop\n\\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        let slot = std::sync::Arc::new(crate::terminal::TerminalPolicySlot::default());
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, Some(slot.clone()))
+            .await;
+
+        let terminal = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .expect("parser must finish")
+                .expect("terminal failure must be emitted");
+            if let Err(StreamError::TerminalCompletion(failure)) = event {
+                break failure;
+            }
+        };
+        let contextual = crate::terminal::contextualize_terminal_stream_error(
+            &slot,
+            StreamError::TerminalCompletion(terminal),
+        );
+        let context = crate::terminal::terminal_completion_context(&contextual)
+            .expect("SSE refusal policy must survive stream transport");
+        assert_eq!(context.failure().reason, TerminalCompletionError::Refusal);
+        assert_eq!(
+            context.policy().recovery(),
+            TerminalRecoveryDisposition::NextCandidate
+        );
+        assert_eq!(
+            context.policy().usage_chargeability(),
+            TerminalUsageChargeability::Informational
         );
     }
 
