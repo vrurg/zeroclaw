@@ -315,7 +315,15 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .take()
             .context("goal logical operation has no pending admission")?;
         let cost_limit_required = operation.cost_limit_required;
-        let (state, pricing_complete) = self.record_settlement(settlement).await?;
+        // A response has already crossed the provider boundary. If canonical
+        // persistence cannot prove every event reached JSONL, settle the exact
+        // pending operation as outcome-unknown before surfacing the error; the
+        // controller must never leave it resumable or replay it.
+        let recorded = self.record_settlement(settlement).await;
+        let (state, pricing_complete) = match &recorded {
+            Ok(result) => *result,
+            Err(_) => (GoalAccountingState::OutcomeUnknown, false),
+        };
         match self
             .goals
             .settle_pending_call(
@@ -333,6 +341,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             }
         }
         drop(operation);
+        recorded?;
         if state != GoalAccountingState::Complete {
             anyhow::bail!("goal accounting is incomplete");
         }
