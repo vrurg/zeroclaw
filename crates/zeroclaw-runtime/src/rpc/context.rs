@@ -167,6 +167,10 @@ pub struct RpcContext {
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
     pub hooks: Option<Arc<crate::hooks::HookRunner>>,
+
+    /// Private Goal controller for the existing RPC session runtime. Command
+    /// exposure is deliberately deferred to the later session/goal method.
+    pub goal_runtime: Option<Arc<crate::goal_mode::GoalRuntime>>,
 }
 
 impl RpcContext {
@@ -193,6 +197,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -214,6 +219,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -239,6 +245,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -264,6 +271,7 @@ impl RpcContext {
             sop_engine: Some(sop_engine),
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -289,6 +297,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -314,6 +323,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -340,6 +350,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 
@@ -366,6 +377,7 @@ impl RpcContext {
             sop_engine: None,
             sop_audit: None,
             hooks: None,
+            goal_runtime: None,
         })
     }
 }

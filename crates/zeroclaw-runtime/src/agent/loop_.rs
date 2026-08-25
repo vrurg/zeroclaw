@@ -3470,6 +3470,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
     use zeroclaw_api::channel::{
         Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
     };
@@ -3509,6 +3510,7 @@ mod tests {
         EmptySuccessTool,
         RecordingArgsTool,
         DelayTool,
+        BlockingTool,
         FailingTool,
         NamedMockTool,
         CompletesAndSignalsTool,
@@ -5226,6 +5228,41 @@ mod tests {
         max_active: Arc<AtomicUsize>,
     }
 
+    /// A controllable tool used to observe the durable Goal pairing phase at
+    /// the real dispatch boundary, while the ordinary loop owns its history.
+    struct BlockingTool {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Blocks until the test allows the prepared tool call to finish"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "completed".into(),
+                error: None,
+            })
+        }
+    }
+
     impl DelayTool {
         fn new(
             name: &str,
@@ -5285,6 +5322,173 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn goal_tool_fence_brackets_the_real_tool_loop_until_paired_history_is_appended() {
+        use crate::agent::cost::{GOAL_TOOL_EXECUTION_FENCE, GoalToolExecutionFence};
+        use crate::control_plane::{
+            GoalTaskRecord, GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, SqliteTaskStore,
+            TaskKind, TaskRecord, TaskStatus,
+        };
+
+        let dir = tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(dir.path()).unwrap());
+        // A second file-backed connection proves the phase is visible outside
+        // the worker that owns the task-local fence.
+        let observer_store = SqliteTaskStore::new(dir.path()).unwrap();
+        let task = TaskRecord {
+            id: "goal-tool-loop-fence".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("rpc".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-tool-loop".to_owned()),
+            execution_epoch: 0,
+            started_at: "2026-08-25T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    task.clone(),
+                    GoalTaskRecord {
+                        task_id: task.id.clone(),
+                        objective: "exercise the real tool loop".to_owned(),
+                        success_criteria: "produce a paired tool result".to_owned(),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let fence = Arc::new(GoalToolExecutionFence::new(
+            goals,
+            task.id.clone(),
+            "session-tool-loop".to_owned(),
+            1,
+        ));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let worker_started = Arc::clone(&started);
+        let worker_release = Arc::clone(&release);
+        let worker = zeroclaw_spawn::spawn!(async move {
+            let model_provider = ScriptedModelProvider::from_native_tool_calls(
+                vec![("call-1", "blocking_tool", "{}")],
+                "done",
+            );
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(BlockingTool {
+                started: worker_started,
+                release: worker_release,
+            })];
+            let observer = NoopObserver;
+            let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let turn_id = "goal-tool-loop-fence-turn".to_owned();
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("run the blocking tool"),
+            ];
+            let result = GOAL_TOOL_EXECUTION_FENCE
+                .scope(
+                    Some(fence),
+                    run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "mock-provider",
+                                model: "mock-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &multimodal,
+                            config: None,
+                            max_tool_iterations: 4,
+                            hooks: None,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &pacing,
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_token_budget: 0,
+                            receipt_generator: None,
+                            knobs: &knobs,
+                        },
+                        history: &mut history,
+                        channel_name: "rpc",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias: Some("main"),
+                        turn_id: &turn_id,
+                    }),
+                )
+                .await;
+            (result, history)
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the production tool loop must reach the blocking tool");
+        assert_eq!(
+            observer_store
+                .get_goal_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_phase,
+            GoalToolPhase::InFlight,
+            "the durable phase must fence the prepared batch before a tool can finish"
+        );
+
+        release.notify_one();
+        let (result, history) = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the released production tool loop must finish")
+            .expect("the tool-loop task must not panic");
+        assert_eq!(result.unwrap(), "done");
+        assert!(
+            history.iter().any(|message| message.role == "tool"),
+            "the normal loop must append the native paired tool result before clearing the fence"
+        );
+        assert_eq!(
+            observer_store
+                .get_goal_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_phase,
+            GoalToolPhase::Clean
+        );
     }
 
     /// A tool that always returns a failure with a given error reason.

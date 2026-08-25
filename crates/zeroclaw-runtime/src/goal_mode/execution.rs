@@ -5,10 +5,11 @@
 //! settlement fence around that logical operation; it deliberately knows
 //! nothing about RPC, Matrix, or a live session host.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use futures_util::FutureExt as _;
 use serde::Deserialize;
 use tokio::{
     sync::{Mutex, OwnedSemaphorePermit},
@@ -28,7 +29,10 @@ use super::host::{
 use super::{GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor};
 use crate::{
     agent::agent::{Agent, build_session_model_provider},
-    agent::cost::{GoalOperationAccounting, GoalOperationRequest, GoalOperationSettlement},
+    agent::cost::{
+        GoalOperationAccounting, GoalOperationRequest, GoalOperationSettlement,
+        GoalToolExecutionFence,
+    },
     control_plane::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
         GoalTaskRegistry, GoalTransitionResult, TaskStatus,
@@ -193,18 +197,9 @@ impl GoalSessionLease for RpcGoalSessionLease {
             .await
     }
 
-    fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
+    fn append_verified_candidate(&mut self, candidate: &str) {
         self.agent
             .append_verified_goal_candidate(candidate.to_owned());
-        Ok(())
-    }
-
-    async fn deliver_verified_candidate(&mut self, _candidate: &str) -> anyhow::Result<()> {
-        // The private RPC adapter has no outbound presentation owner until the
-        // later ZeroCode command surface binds one. Completion remains durable
-        // before delivery, and the controller records any delivery failure
-        // separately rather than rolling the Goal lifecycle back.
-        anyhow::bail!("Goal RPC delivery is unavailable")
     }
 }
 
@@ -222,6 +217,49 @@ struct WorkerRegistration {
     epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
     _handle: JoinHandle<()>,
+}
+
+pub(super) async fn finish_goal_or_retain_execution(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+    status: TaskStatus,
+    error: Option<&str>,
+) -> bool {
+    loop {
+        match goals
+            .finish_session_goal(
+                &scope.task_id,
+                &scope.session_id,
+                scope.execution_epoch,
+                status,
+                error.map(str::to_owned),
+            )
+            .await
+        {
+            Ok(GoalTransitionResult::Applied) => return true,
+            Ok(GoalTransitionResult::Missing) => return false,
+            Ok(GoalTransitionResult::Stale) => {
+                match goals.current_goal_for_session(&scope.session_id).await {
+                    Ok(Some(task))
+                        if task.id == scope.task_id
+                            && task.execution_epoch == scope.execution_epoch
+                            && task.status == TaskStatus::Running => {}
+                    Ok(_) => return false,
+                    Err(_) => {}
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+async fn fail_goal_or_retain_worker(
+    goals: &Arc<dyn GoalTaskRegistry>,
+    scope: &GoalExecutionScope,
+    reason: &str,
+) {
+    let _ = finish_goal_or_retain_execution(goals, scope, TaskStatus::Failed, Some(reason)).await;
 }
 
 impl GoalExecutionHost {
@@ -285,13 +323,18 @@ impl GoalExecutor for GoalExecutionHost {
         let config = Arc::clone(&self.config);
         let worker_scope = scope.clone();
         let handle = zeroclaw_spawn::spawn!(async move {
-            let Some(task) = goals
+            let completed = AssertUnwindSafe(async {
+            let task = match goals
                 .current_goal_for_session(&worker_scope.session_id)
                 .await
-                .ok()
-                .flatten()
-            else {
-                return;
+            {
+                Ok(Some(task)) => task,
+                Ok(None) => return,
+                Err(_) => {
+                    fail_goal_or_retain_worker(&goals, &worker_scope, "goal_state_unavailable")
+                        .await;
+                    return;
+                }
             };
             if task.id != worker_scope.task_id
                 || task.execution_epoch != worker_scope.execution_epoch
@@ -300,45 +343,40 @@ impl GoalExecutor for GoalExecutionHost {
             {
                 return;
             }
-            let Some(goal) = goals.get_goal_task(&task.id).await.ok().flatten() else {
-                let _ = goals
-                    .finish_session_goal(
-                        &task.id,
-                        &worker_scope.session_id,
-                        worker_scope.execution_epoch,
-                        TaskStatus::Failed,
-                        Some("goal_extension_missing".to_string()),
-                    )
-                    .await;
-                return;
+            let goal = match goals.get_goal_task(&task.id).await {
+                Ok(Some(goal)) => goal,
+                Ok(None) => {
+                    fail_goal_or_retain_worker(&goals, &worker_scope, "goal_extension_missing")
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    fail_goal_or_retain_worker(&goals, &worker_scope, "goal_state_unavailable")
+                        .await;
+                    return;
+                }
             };
             let mut lease = match adapter.acquire(&worker_scope, &worker_scope.binding).await {
                 Ok(lease) => lease,
                 Err(_) => {
-                    let _ = goals
-                        .finish_session_goal(
-                            &task.id,
-                            &worker_scope.session_id,
-                            worker_scope.execution_epoch,
-                            TaskStatus::Failed,
-                            Some("goal_execution_host_unavailable".to_string()),
-                        )
-                        .await;
+                    fail_goal_or_retain_worker(
+                        &goals,
+                        &worker_scope,
+                        "goal_execution_host_unavailable",
+                    )
+                    .await;
                     return;
                 }
             };
             let mut transcript = match lease.working_history() {
                 Ok(history) => history,
                 Err(_) => {
-                    let _ = goals
-                        .finish_session_goal(
-                            &task.id,
-                            &worker_scope.session_id,
-                            worker_scope.execution_epoch,
-                            TaskStatus::Failed,
-                            Some("goal_transcript_initialization_failed".to_string()),
-                        )
-                        .await;
+                    fail_goal_or_retain_worker(
+                        &goals,
+                        &worker_scope,
+                        "goal_transcript_initialization_failed",
+                    )
+                    .await;
                     return;
                 }
             };
@@ -347,48 +385,39 @@ impl GoalExecutor for GoalExecutionHost {
                 goal.objective, goal.success_criteria, worker_scope.turn_kind
             )));
             let Some(accounting) = worker_scope.operation_accounting.clone() else {
-                let _ = goals
-                    .finish_session_goal(
-                        &task.id,
-                        &worker_scope.session_id,
-                        worker_scope.execution_epoch,
-                        TaskStatus::Failed,
-                        Some("goal_accounting_unavailable".to_string()),
-                    )
+                fail_goal_or_retain_worker(&goals, &worker_scope, "goal_accounting_unavailable")
                     .await;
                 return;
             };
+            let tool_execution_fence = Arc::new(GoalToolExecutionFence::new(
+                Arc::clone(&goals),
+                task.id.clone(),
+                worker_scope.session_id.clone(),
+                worker_scope.execution_epoch,
+            ));
             loop {
                 let result = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
                     .scope(
                         Some(Arc::clone(&accounting)),
-                        lease.run_parent_turn(transcript, worker_scope.cancellation.clone()),
+                        crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE.scope(
+                            Some(Arc::clone(&tool_execution_fence)),
+                            lease.run_parent_turn(transcript, worker_scope.cancellation.clone()),
+                        ),
                     )
                     .await;
                 let (candidate, next_transcript) = match result {
                     Ok(result) if !result.0.trim().is_empty() => result,
                     Ok(_) => {
-                        let _ = goals
-                            .finish_session_goal(
-                                &task.id,
-                                &worker_scope.session_id,
-                                worker_scope.execution_epoch,
-                                TaskStatus::Failed,
-                                Some("candidate_empty".to_string()),
-                            )
-                            .await;
+                        fail_goal_or_retain_worker(&goals, &worker_scope, "candidate_empty").await;
                         return;
                     }
                     Err(_) => {
-                        let _ = goals
-                            .finish_session_goal(
-                                &task.id,
-                                &worker_scope.session_id,
-                                worker_scope.execution_epoch,
-                                TaskStatus::Failed,
-                                Some("goal_parent_execution_failed".to_string()),
-                            )
-                            .await;
+                        fail_goal_or_retain_worker(
+                            &goals,
+                            &worker_scope,
+                            "goal_parent_execution_failed",
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -402,20 +431,19 @@ impl GoalExecutor for GoalExecutionHost {
                 .await
                 {
                     Ok(GoalVerifierOutcome::Complete) => {
-                        if matches!(
-                            goals
-                                .finish_session_goal(
-                                    &task.id,
-                                    &worker_scope.session_id,
-                                    worker_scope.execution_epoch,
-                                    TaskStatus::Completed,
-                                    None
-                                )
-                                .await,
-                            Ok(GoalTransitionResult::Applied)
-                        ) {
-                            let _ = lease.append_verified_candidate(&candidate);
-                            let _ = lease.deliver_verified_candidate(&candidate).await;
+                        if finish_goal_or_retain_execution(
+                            &goals,
+                            &worker_scope,
+                            TaskStatus::Completed,
+                            None,
+                        )
+                        .await
+                        {
+                            // The private host owns canonical history only.
+                            // A channel adapter supplies delivery in its later
+                            // exposure stage; this path has no silent failed
+                            // delivery attempt to misreport.
+                            lease.append_verified_candidate(&candidate);
                         }
                         return;
                     }
@@ -424,33 +452,53 @@ impl GoalExecutor for GoalExecutionHost {
                         transcript.push(ChatMessage::user(format!("[UNTRUSTED VERIFIER FEEDBACK]\n{reason}\n[END UNTRUSTED VERIFIER FEEDBACK]\n\nContinue working toward the exact objective.")));
                     }
                     Ok(GoalVerifierOutcome::Blocked(reason, blockers)) => {
-                        let _ = goals
-                            .pause_session_goal(
-                                &task.id,
-                                &worker_scope.session_id,
-                                worker_scope.execution_epoch,
-                                GoalPauseState {
-                                    reason: GoalPauseReason::VerifierBlocked,
-                                    description: Some(reason),
-                                    blockers,
+                        loop {
+                            match goals
+                                .pause_session_goal(
+                                    &task.id,
+                                    &worker_scope.session_id,
+                                    worker_scope.execution_epoch,
+                                    GoalPauseState {
+                                        reason: GoalPauseReason::VerifierBlocked,
+                                        description: Some(reason.clone()),
+                                        blockers: blockers.clone(),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(
+                                    GoalTransitionResult::Applied | GoalTransitionResult::Missing,
+                                ) => break,
+                                Ok(GoalTransitionResult::Stale) => match goals
+                                    .current_goal_for_session(&worker_scope.session_id)
+                                    .await
+                                {
+                                    Ok(Some(current))
+                                        if current.id == task.id
+                                            && current.execution_epoch
+                                                == worker_scope.execution_epoch
+                                            && current.status == TaskStatus::Running => {}
+                                    Ok(_) => break,
+                                    Err(_) => {}
                                 },
-                            )
-                            .await;
+                                Err(_) => {}
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
                         return;
                     }
                     Err(_) => {
-                        let _ = goals
-                            .finish_session_goal(
-                                &task.id,
-                                &worker_scope.session_id,
-                                worker_scope.execution_epoch,
-                                TaskStatus::Failed,
-                                Some("goal_verifier_failed".to_string()),
-                            )
+                        fail_goal_or_retain_worker(&goals, &worker_scope, "goal_verifier_failed")
                             .await;
                         return;
                     }
                 }
+            }
+            })
+            .catch_unwind()
+            .await;
+            if completed.is_err() {
+                fail_goal_or_retain_worker(&goals, &worker_scope, "goal_worker_panicked").await;
             }
         });
         workers.insert(
@@ -926,6 +974,324 @@ mod reservation_tests {
         assert!(reservation_fits_budget(80, Some(30), Some(100), 0.0, None, None).is_ok());
         assert!(reservation_fits_budget(100, Some(1), Some(100), 0.0, None, None).is_err());
         assert!(reservation_fits_budget(0, None, None, 2.0, Some(0.5), Some(3.0)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod host_worker_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use tokio::sync::Semaphore;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_config::schema::Config;
+
+    use super::{GoalExecutionHost, GoalHostModelBinding, GoalSessionAdapter};
+    use crate::{
+        control_plane::{
+            GoalTaskRecord, GoalTaskRegistry, TaskKind, TaskRecord, TaskStatus,
+            task_store_sqlite::SqliteTaskStore,
+        },
+        goal_mode::{GoalExecutionScope, GoalExecutor, GoalSessionBinding, GoalTurnKind},
+    };
+
+    struct UnavailableLeaseAdapter;
+
+    #[async_trait]
+    impl GoalSessionAdapter for UnavailableLeaseAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "rpc"
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "provider".to_owned(),
+                model: "model".to_owned(),
+            })
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn crate::goal_mode::GoalSessionLease>> {
+            anyhow::bail!("test lease is unavailable")
+        }
+    }
+
+    struct PanickingLeaseAdapter;
+
+    #[async_trait]
+    impl GoalSessionAdapter for PanickingLeaseAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "rpc"
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "provider".to_owned(),
+                model: "model".to_owned(),
+            })
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn crate::goal_mode::GoalSessionLease>> {
+            panic!("test Goal worker panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_durably_fails_a_running_goal_when_its_session_lease_is_unavailable() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal-host-lease-failure".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("rpc".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-a".to_owned()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "complete the test".to_owned(),
+            success_criteria: "return a result".to_owned(),
+            ..GoalTaskRecord::default()
+        };
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+        let host = GoalExecutionHost::new(
+            vec![Arc::new(UnavailableLeaseAdapter)],
+            goals,
+            Arc::new(Config::default()),
+        );
+        host.launch(GoalExecutionScope {
+            task_id: "goal-host-lease-failure".to_owned(),
+            session_id: "session-a".to_owned(),
+            binding: GoalSessionBinding::new(
+                "session-a".to_owned(),
+                "main".to_owned(),
+                "rpc".to_owned(),
+                None,
+            )
+            .unwrap(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: CancellationToken::new(),
+            operation_permit: Arc::new(Semaphore::new(1)),
+            operation_accounting: None,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .current_goal_for_session("session-a")
+                    .await
+                    .unwrap()
+                    .is_some_and(|current| current.status == TaskStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host worker must settle the durable failure");
+    }
+
+    #[tokio::test]
+    async fn host_durably_fails_a_running_goal_when_its_worker_panics() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal-host-panic".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("rpc".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-panic".to_owned()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store
+            .create_or_replace_session_goal(
+                task.clone(),
+                GoalTaskRecord {
+                    task_id: task.id.clone(),
+                    objective: "complete the test".to_owned(),
+                    success_criteria: "return a result".to_owned(),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .unwrap();
+        let host = GoalExecutionHost::new(
+            vec![Arc::new(PanickingLeaseAdapter)],
+            goals,
+            Arc::new(Config::default()),
+        );
+        host.launch(GoalExecutionScope {
+            task_id: task.id.clone(),
+            session_id: "session-panic".to_owned(),
+            binding: GoalSessionBinding::new(
+                "session-panic".to_owned(),
+                "main".to_owned(),
+                "rpc".to_owned(),
+                None,
+            )
+            .unwrap(),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: CancellationToken::new(),
+            operation_permit: Arc::new(Semaphore::new(1)),
+            operation_accounting: None,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .current_goal_for_session("session-panic")
+                    .await
+                    .unwrap()
+                    .is_some_and(|current| current.status == TaskStatus::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a panicking host worker must settle its exact durable Goal");
+    }
+
+    #[tokio::test]
+    async fn scoped_tool_fence_retains_in_flight_until_every_pinned_result_is_paired() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal-tool-fence".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("rpc".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session-fence".to_owned()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        store
+            .create_or_replace_session_goal(
+                task.clone(),
+                GoalTaskRecord {
+                    task_id: task.id.clone(),
+                    objective: "complete the test".to_owned(),
+                    success_criteria: "return a result".to_owned(),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .unwrap();
+        let fence = Arc::new(super::GoalToolExecutionFence::new(
+            goals,
+            task.id.clone(),
+            "session-fence".to_owned(),
+            1,
+        ));
+        crate::agent::cost::GOAL_TOOL_EXECUTION_FENCE
+            .scope(Some(fence), async {
+                crate::agent::cost::begin_goal_tool_execution_if_scoped(&[
+                    zeroclaw_tool_call_parser::ParsedToolCall {
+                        name: "tool".to_owned(),
+                        arguments: serde_json::Value::Null,
+                        tool_call_id: Some("call-1".to_owned()),
+                    },
+                ])
+                .await
+                .unwrap();
+                assert_eq!(
+                    store
+                        .get_goal_task(&task.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .tool_phase,
+                    crate::control_plane::GoalToolPhase::InFlight
+                );
+                assert!(
+                    crate::agent::cost::complete_goal_tool_execution_if_scoped(&[])
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    store
+                        .get_goal_task(&task.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .tool_phase,
+                    crate::control_plane::GoalToolPhase::InFlight
+                );
+                crate::agent::cost::complete_goal_tool_execution_if_scoped(&[(
+                    Some("call-1".to_owned()),
+                    "ok".to_owned(),
+                )])
+                .await
+                .unwrap();
+            })
+            .await;
+        assert_eq!(
+            store
+                .get_goal_task(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_phase,
+            crate::control_plane::GoalToolPhase::Clean
+        );
     }
 }
 

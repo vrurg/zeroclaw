@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::goal_task::GoalTaskRegistry;
 use super::reaper;
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
@@ -16,6 +17,9 @@ use super::task_store_sqlite::SqliteTaskStore;
 #[derive(Clone)]
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
+    /// Goal-specific view of the same SQLite store as [`Self::store`].
+    /// It exists so Goal execution does not create or reopen a second store.
+    pub goals: Arc<dyn GoalTaskRegistry>,
     pub boot_id: String,
 }
 
@@ -28,9 +32,10 @@ impl ControlPlaneHandle {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let sqlite_store = SqliteTaskStore::new(data_dir)?;
+        let sqlite_store = Arc::new(SqliteTaskStore::new(data_dir)?);
         let reconciled_goals = sqlite_store.reconcile_goal_boot_state(&boot_id)?;
-        let store: Arc<dyn TaskRegistry> = Arc::new(sqlite_store);
+        let store: Arc<dyn TaskRegistry> = sqlite_store.clone();
+        let goals: Arc<dyn GoalTaskRegistry> = sqlite_store;
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
         if reconciled_goals > 0 {
             ::zeroclaw_log::record!(
@@ -53,7 +58,11 @@ impl ControlPlaneHandle {
                 "control-plane: reclaimed prior-boot orphan tasks at startup"
             );
         }
-        Ok(Self { store, boot_id })
+        Ok(Self {
+            store,
+            goals,
+            boot_id,
+        })
     }
 
     pub fn spawn_reaper(&self, max_runtime_secs: i64, cancel: CancellationToken) -> JoinHandle<()> {

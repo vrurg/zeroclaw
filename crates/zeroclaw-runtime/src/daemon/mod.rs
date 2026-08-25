@@ -741,6 +741,41 @@ pub async fn run(
             None
         };
 
+        let cost_tracker =
+            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
+        let goal_runtime = crate::control_plane::control_plane().and_then(|control_plane| {
+            let tracker = crate::cost::CostTracker::get_or_init_global_for_goal(
+                config.cost.clone(),
+                &config.data_dir,
+            )?;
+            let executor = std::sync::Arc::new(
+                crate::goal_mode::GoalExecutionHost::from_existing_rpc_sessions(
+                    std::sync::Arc::clone(&sessions),
+                    std::sync::Arc::clone(&control_plane.goals),
+                    std::sync::Arc::new(config.clone()),
+                ),
+            ) as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
+            match crate::goal_mode::GoalRuntime::new(
+                std::sync::Arc::new(config.clone()),
+                std::sync::Arc::clone(&control_plane.goals),
+                tracker,
+                executor,
+                control_plane.boot_id.clone(),
+            ) {
+                Ok(runtime) => Some(std::sync::Arc::new(runtime)),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "Goal runtime controller is unavailable"
+                    );
+                    None
+                }
+            }
+        });
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -750,10 +785,7 @@ pub async fn run(
             // Process-global tracker shared with the gateway and channel
             // supervisor. Without this the RPC/zerocode-TUI turn path has no
             // tracker to record into and model cost is silently dropped
-            cost_tracker: crate::cost::CostTracker::get_or_init_global(
-                config.cost.clone(),
-                &config.data_dir,
-            ),
+            cost_tracker,
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
@@ -765,6 +797,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             hooks,
+            goal_runtime,
         }))
     } else {
         None
