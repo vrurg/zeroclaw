@@ -6320,6 +6320,11 @@ async fn process_channel_message_body(
     // Recognize Goal syntax anyway so it fails closed rather than becoming an
     // ordinary model prompt on an unwired execution surface.
     let unwired_matrix_goal_command = matrix_goal.is_none() && is_matrix_goal_command(&msg);
+    // The privacy boundary is the recognized command, not whether this
+    // particular entry point has a Goal runtime wired. An unwired command is
+    // still rejected below and must not leak its objective or raw principal
+    // on the way there.
+    let redact_goal_inbound = matrix_goal_command.is_some() || unwired_matrix_goal_command;
     // `/new` is a session-destruction command for Matrix. Capture it before
     // hooks for the same reason as Goal commands: a hook may cancel delivery,
     // but it cannot retarget the authenticated session that will be disposed.
@@ -6327,20 +6332,12 @@ async fn process_channel_message_body(
         .as_ref()
         .filter(|_| is_matrix_session_reset_command(&msg))
         .map(|_| msg.clone());
-    let inbound_content = if matrix_goal_command.is_some() {
-        "[goal command redacted]"
-    } else {
-        msg.content.as_str()
-    };
+    let (inbound_sender, inbound_content) = inbound_log_values(&msg, redact_goal_inbound);
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
             ::serde_json::json!({
-                "sender": if matrix_goal_command.is_some() {
-                    "[goal principal redacted]"
-                } else {
-                    msg.sender.as_str()
-                },
+                "sender": inbound_sender,
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
@@ -8277,6 +8274,39 @@ fn is_matrix_goal_command(message: &ChannelMessage) -> bool {
     command
         .strip_prefix("/goal")
         .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
+
+/// Return the privacy-safe values for the inbound log entry. Recognized Goal
+/// commands are redacted even on a standalone, unwired Matrix surface because
+/// they are still control-plane input rather than ordinary prompt content.
+fn inbound_log_values(message: &ChannelMessage, redact_goal: bool) -> (&str, &str) {
+    if redact_goal {
+        ("[goal principal redacted]", "[goal command redacted]")
+    } else {
+        (message.sender.as_str(), message.content.as_str())
+    }
+}
+
+#[cfg(test)]
+mod goal_inbound_log_tests {
+    use super::*;
+
+    #[test]
+    fn unwired_matrix_goal_input_is_redacted_before_logging() {
+        let message = ChannelMessage {
+            channel: "matrix".to_string(),
+            sender: "@private-user:example.invalid".to_string(),
+            content: "/goal status private objective".to_string(),
+            ..ChannelMessage::default()
+        };
+
+        let (sender, content) = inbound_log_values(&message, is_matrix_goal_command(&message));
+
+        assert_eq!(sender, "[goal principal redacted]");
+        assert_eq!(content, "[goal command redacted]");
+        assert!(!sender.contains("private-user"));
+        assert!(!content.contains("private objective"));
+    }
 }
 
 fn is_matrix_session_reset_command(message: &ChannelMessage) -> bool {

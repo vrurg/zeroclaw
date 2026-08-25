@@ -181,7 +181,10 @@ fn is_goal_command(input: &str) -> bool {
         })
 }
 
-fn render_goal_command_result(key: &str, status: Option<&serde_json::Value>) -> String {
+fn render_goal_command_result(
+    key: &str,
+    status: Option<&crate::client::GoalStatusProjection>,
+) -> String {
     let normalized_key = key
         .split('_')
         .map(|word| {
@@ -220,7 +223,35 @@ fn render_goal_command_result(key: &str, status: Option<&serde_json::Value>) -> 
     };
     let mut rendered = crate::i18n::t(fluent_key);
     if let Some(status) = status {
-        rendered.push_str(&format!("\n{status}"));
+        let status_key = match status.status {
+            crate::client::GoalTaskStatus::Running => "zc-goal-status-running",
+            crate::client::GoalTaskStatus::Paused => "zc-goal-status-paused",
+            crate::client::GoalTaskStatus::Completed => "zc-goal-status-completed",
+            crate::client::GoalTaskStatus::Failed => "zc-goal-status-failed",
+            crate::client::GoalTaskStatus::Cancelled => "zc-goal-status-cancelled",
+            crate::client::GoalTaskStatus::Lost => "zc-goal-status-lost",
+            crate::client::GoalTaskStatus::TimedOut => "zc-goal-status-timed-out",
+            crate::client::GoalTaskStatus::Unknown => "zc-goal-status-unknown",
+        };
+        let resumable_key = if status.resumable {
+            "zc-goal-resumable-yes"
+        } else {
+            "zc-goal-resumable-no"
+        };
+        let status_text = crate::i18n::t(status_key);
+        let resumable = crate::i18n::t(resumable_key);
+        let tokens = status.known_token_usage.to_string();
+        let cost = format!("{:.6}", status.known_cost_usd);
+        rendered.push('\n');
+        rendered.push_str(&crate::i18n::t_args(
+            "zc-goal-status-summary",
+            &[
+                ("status", &status_text),
+                ("resumable", &resumable),
+                ("tokens", &tokens),
+                ("cost", &cost),
+            ],
+        ));
     }
     rendered
 }
@@ -7742,6 +7773,42 @@ mod tests {
             command_action_from_initialize(response, "/new-session"),
             InputBarAction::RestartSession
         ));
+    }
+
+    #[test]
+    fn goal_status_response_renders_a_typed_localized_summary() {
+        let response: crate::client::SessionGoalResult =
+            serde_json::from_value(serde_json::json!({
+                "key": "status",
+                "status": {
+                    "task_id": "goal-task-id-must-not-be-rendered",
+                    "status": "paused",
+                    "resumable": true,
+                    "known_token_usage": 42,
+                    "known_cost_usd": 1.25,
+                    "terminal_error": "must-not-be-rendered"
+                }
+            }))
+            .expect("typed Goal status response");
+
+        let rendered = render_goal_command_result(&response.key, response.status.as_ref());
+        let expected_summary = crate::i18n::t_args(
+            "zc-goal-status-summary",
+            &[
+                ("status", &crate::i18n::t("zc-goal-status-paused")),
+                ("resumable", &crate::i18n::t("zc-goal-resumable-yes")),
+                ("tokens", "42"),
+                ("cost", "1.250000"),
+            ],
+        );
+
+        assert_eq!(
+            rendered,
+            format!("{}\n{expected_summary}", crate::i18n::t("zc-goal-status"))
+        );
+        assert!(!rendered.contains("goal-task-id-must-not-be-rendered"));
+        assert!(!rendered.contains("known_token_usage"));
+        assert!(!rendered.contains("terminal_error"));
     }
 
     #[test]

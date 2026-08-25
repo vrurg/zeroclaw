@@ -1955,14 +1955,40 @@ mod initialize_timeout_tests {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigDeleteResult {}
 
-/// Semantic reply from `session/goal`. The key is intentionally rendered by
-/// the TUI's Fluent catalogue; no Goal objective, principal, or usage payload
-/// is needed for command acknowledgement.
+/// Semantic reply from `session/goal`. The client keeps only the status fields
+/// it renders; the daemon remains the canonical owner of the full projection.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SessionGoalResult {
     pub key: String,
     #[serde(default)]
-    pub status: Option<serde_json::Value>,
+    pub status: Option<GoalStatusProjection>,
+}
+
+/// TUI view of a Goal status projection. This transport mirror intentionally
+/// avoids a runtime-crate dependency while keeping protocol payloads out of
+/// user-facing rendering.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GoalStatusProjection {
+    pub status: GoalTaskStatus,
+    pub resumable: bool,
+    pub known_token_usage: u64,
+    pub known_cost_usd: f64,
+}
+
+/// Goal lifecycle states understood by the TUI. An unknown future state stays
+/// renderable without exposing its wire representation to the user.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalTaskStatus {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+    Lost,
+    TimedOut,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, serde::Deserialize)]
