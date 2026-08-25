@@ -225,7 +225,7 @@ impl GoalChildTask {
 /// Shared execution owner for Goal Mode. It owns lifecycle workers and uses
 /// adapters solely for exclusive access to already-authoritative live sessions.
 pub struct GoalExecutionHost {
-    adapter: Arc<dyn GoalSessionAdapter>,
+    adapter: Arc<GoalSessionAdapterRouter>,
     goals: Arc<dyn GoalTaskRegistry>,
     child_lifecycle: Arc<GoalChildLifecycle>,
     config: Arc<Config>,
@@ -296,6 +296,16 @@ impl GoalExecutionHost {
             config,
             workers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Install one live-session adapter for this daemon generation.
+    ///
+    /// Channel crates call this during their own startup, after they have
+    /// constructed the transport-owned session state. The host retains only
+    /// the narrow adapter trait, so Goal control and execution remain free of
+    /// channel implementation details and can move to a separate crate.
+    pub async fn register_session_adapter(&self, adapter: Arc<dyn GoalSessionAdapter>) {
+        self.adapter.register(adapter).await;
     }
 }
 
@@ -460,11 +470,9 @@ impl GoalExecutor for GoalExecutionHost {
                         )
                         .await
                         {
-                            // The private host owns canonical history only.
-                            // A channel adapter supplies delivery in its later
-                            // exposure stage; this path has no silent failed
-                            // delivery attempt to misreport.
-                            lease.append_verified_candidate(&candidate);
+                            // Delivery is adapter-owned and intentionally
+                            // cannot reopen a verified lifecycle decision.
+                            let _ = lease.append_verified_candidate(&candidate).await;
                         }
                         return;
                     }

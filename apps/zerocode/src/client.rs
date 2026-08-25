@@ -93,6 +93,7 @@ pub mod method {
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
     pub const SESSION_KILL: &str = "session/kill";
+    pub const SESSION_GOAL: &str = "session/goal";
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
@@ -1602,6 +1603,16 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Submit a Goal command without sending it through the ordinary prompt
+    /// stream. The daemon derives all authority from the registered session.
+    pub async fn session_goal(&self, session_id: &str, command: &str) -> Result<SessionGoalResult> {
+        self.call(
+            method::SESSION_GOAL,
+            serde_json::json!({ "session_id": session_id, "command": command }),
+        )
+        .await
+    }
+
     // ── Dashboard helpers ────────────────────────────────────────
 
     pub async fn status(&self) -> Result<StatusResult> {
@@ -1943,6 +1954,14 @@ mod initialize_timeout_tests {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigDeleteResult {}
+
+/// Semantic reply from `session/goal`. The key is intentionally rendered by
+/// the TUI's Fluent catalogue; no Goal objective, principal, or usage payload
+/// is needed for command acknowledgement.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionGoalResult {
+    pub key: String,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

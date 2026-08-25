@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -96,19 +97,26 @@ pub trait GoalSessionAdapter: Send + Sync {
 
 /// Runtime-private exact-one router over the daemon generation's adapters.
 pub(super) struct GoalSessionAdapterRouter {
-    adapters: Vec<Arc<dyn GoalSessionAdapter>>,
+    adapters: RwLock<Vec<Arc<dyn GoalSessionAdapter>>>,
 }
 
 impl GoalSessionAdapterRouter {
     pub(super) fn new(adapters: Vec<Arc<dyn GoalSessionAdapter>>) -> Self {
-        Self { adapters }
+        Self {
+            adapters: RwLock::new(adapters),
+        }
     }
 
-    fn matching_adapter(
+    pub(super) async fn register(&self, adapter: Arc<dyn GoalSessionAdapter>) {
+        self.adapters.write().await.push(adapter);
+    }
+
+    async fn matching_adapter(
         &self,
         binding: &GoalSessionBinding,
     ) -> Result<Arc<dyn GoalSessionAdapter>> {
-        let mut adapters = self.adapters.iter().filter(|adapter| adapter.owns(binding));
+        let adapters = self.adapters.read().await;
+        let mut adapters = adapters.iter().filter(|adapter| adapter.owns(binding));
         let Some(adapter) = adapters.next() else {
             bail!("no Goal session adapter owns the trusted binding");
         };
@@ -122,11 +130,20 @@ impl GoalSessionAdapterRouter {
 #[async_trait]
 impl GoalSessionAdapter for GoalSessionAdapterRouter {
     fn owns(&self, binding: &GoalSessionBinding) -> bool {
-        self.matching_adapter(binding).is_ok()
+        self.adapters.try_read().is_ok_and(|adapters| {
+            adapters
+                .iter()
+                .filter(|adapter| adapter.owns(binding))
+                .count()
+                == 1
+        })
     }
 
     async fn model_binding(&self, binding: &GoalSessionBinding) -> Result<GoalHostModelBinding> {
-        self.matching_adapter(binding)?.model_binding(binding).await
+        self.matching_adapter(binding)
+            .await?
+            .model_binding(binding)
+            .await
     }
 
     async fn acquire(
@@ -134,7 +151,8 @@ impl GoalSessionAdapter for GoalSessionAdapterRouter {
         scope: &GoalExecutionScope,
         binding: &GoalSessionBinding,
     ) -> Result<Box<dyn GoalSessionLease>> {
-        self.matching_adapter(binding)?
+        self.matching_adapter(binding)
+            .await?
             .acquire(scope, binding)
             .await
     }
@@ -155,8 +173,11 @@ pub trait GoalSessionLease: Send {
         cancellation: CancellationToken,
     ) -> Result<(String, Vec<ChatMessage>)>;
 
-    /// Append only a controller-verified candidate to canonical history.
-    fn append_verified_candidate(&mut self, candidate: &str);
+    /// Append only a controller-verified candidate to canonical history and
+    /// attempt the adapter-owned delivery. Delivery is intentionally outside
+    /// the Goal lifecycle decision: a delivery failure cannot reopen a
+    /// verified completion.
+    async fn append_verified_candidate(&mut self, candidate: &str) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -238,5 +259,21 @@ mod tests {
         })]);
         assert!(unavailable.owns(&binding("rpc")));
         assert!(unavailable.model_binding(&binding("rpc")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn router_accepts_a_channel_adapter_after_host_construction() {
+        let router = GoalSessionAdapterRouter::new(Vec::new());
+        assert!(router.model_binding(&binding("matrix")).await.is_err());
+
+        router
+            .register(Arc::new(Adapter {
+                route: "matrix",
+                binding_error: false,
+            }))
+            .await;
+
+        assert!(router.owns(&binding("matrix")));
+        assert!(router.model_binding(&binding("matrix")).await.is_ok());
     }
 }

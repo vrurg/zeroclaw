@@ -553,6 +553,295 @@ struct ChannelRuntimeContext {
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+/// Matrix's thin binding to the transport-neutral Goal controller. Durable
+/// lifecycle and accounting remain in `zeroclaw-runtime`; this object holds
+/// only the live Matrix session facts needed to lease normal channel execution
+/// and send a verified completion back to its original room.
+#[derive(Clone)]
+struct MatrixGoalRuntime {
+    controller: Arc<zeroclaw_runtime::goal_mode::GoalRuntime>,
+    sessions: Arc<MatrixGoalSessionAdapter>,
+}
+
+struct MatrixGoalSessionAdapter {
+    sessions: Mutex<HashMap<String, MatrixGoalSession>>,
+}
+
+#[derive(Clone)]
+struct MatrixGoalSession {
+    ctx: Arc<ChannelRuntimeContext>,
+    message: ChannelMessage,
+    lease: Arc<tokio::sync::Mutex<()>>,
+    executing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MatrixGoalSessionAdapter {
+    fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Refresh the process-local delivery/session facts from a trusted Matrix
+    /// ingress snapshot. A hook never receives this value and cannot rewrite
+    /// its principal, session, route, or command text.
+    fn bind(
+        &self,
+        session_id: &str,
+        ctx: Arc<ChannelRuntimeContext>,
+        message: ChannelMessage,
+    ) -> anyhow::Result<()> {
+        if message.channel != "matrix" || message.sender.trim().is_empty() {
+            anyhow::bail!("Goal Matrix ingress binding is unavailable");
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match sessions.get_mut(session_id) {
+            Some(existing)
+                if existing.ctx.agent_alias.as_str() != ctx.agent_alias.as_str()
+                    || existing.message.sender != message.sender
+                    || existing.message.reply_target != message.reply_target =>
+            {
+                anyhow::bail!("Goal Matrix session binding changed");
+            }
+            Some(existing) => existing.message = message,
+            None => {
+                sessions.insert(
+                    session_id.to_owned(),
+                    MatrixGoalSession {
+                        ctx,
+                        message,
+                        lease: Arc::new(tokio::sync::Mutex::new(())),
+                        executing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn session(&self, session_id: &str) -> Option<MatrixGoalSession> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+
+    fn is_executing(&self, session_id: &str) -> bool {
+        self.session(session_id)
+            .is_some_and(|session| session.executing.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+struct MatrixGoalSessionLease {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    session: MatrixGoalSession,
+}
+
+impl Drop for MatrixGoalSessionLease {
+    fn drop(&mut self) {
+        self.session
+            .executing
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_runtime::goal_mode::GoalSessionAdapter for MatrixGoalSessionAdapter {
+    fn owns(&self, binding: &zeroclaw_runtime::goal_mode::GoalSessionBinding) -> bool {
+        binding.route() == "matrix"
+            && self.session(binding.session_id()).is_some_and(|session| {
+                session.ctx.agent_alias.as_str() == binding.agent()
+                    && session.message.sender == binding.principal_id().unwrap_or_default()
+            })
+    }
+
+    async fn model_binding(
+        &self,
+        binding: &zeroclaw_runtime::goal_mode::GoalSessionBinding,
+    ) -> anyhow::Result<zeroclaw_runtime::goal_mode::GoalHostModelBinding> {
+        let session = self
+            .session(binding.session_id())
+            .filter(|session| {
+                session.ctx.agent_alias.as_str() == binding.agent()
+                    && session.message.sender == binding.principal_id().unwrap_or_default()
+            })
+            .context("Goal Matrix session binding is unavailable")?;
+        let defaults = runtime_defaults_snapshot(session.ctx.as_ref());
+        let route = get_route_selection(
+            session.ctx.as_ref(),
+            &session.message,
+            binding.session_id(),
+            &defaults,
+        );
+        if route.model_provider.trim().is_empty() || route.model.trim().is_empty() {
+            anyhow::bail!("Goal Matrix model binding is unavailable");
+        }
+        Ok(zeroclaw_runtime::goal_mode::GoalHostModelBinding {
+            provider_ref: route.model_provider,
+            model: route.model,
+        })
+    }
+
+    async fn acquire(
+        &self,
+        scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
+        binding: &zeroclaw_runtime::goal_mode::GoalSessionBinding,
+    ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionLease>> {
+        if scope.session_id != binding.session_id() {
+            anyhow::bail!("Goal Matrix lease does not match its execution scope");
+        }
+        let session = self
+            .session(binding.session_id())
+            .filter(|session| {
+                session.ctx.agent_alias.as_str() == binding.agent()
+                    && session.message.sender == binding.principal_id().unwrap_or_default()
+            })
+            .context("Goal Matrix session disappeared")?;
+        let guard = Arc::clone(&session.lease).lock_owned().await;
+        session
+            .executing
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(Box::new(MatrixGoalSessionLease {
+            _guard: guard,
+            session,
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_runtime::goal_mode::GoalSessionLease for MatrixGoalSessionLease {
+    fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+        let mut history = vec![ChatMessage::system(self.session.ctx.system_prompt.as_str())];
+        let cached = self
+            .session
+            .ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .peek(&conversation_history_key(&self.session.message))
+            .cloned()
+            .unwrap_or_default();
+        history.extend(normalize_cached_channel_turns(cached));
+        Ok(history)
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        working_history: Vec<ChatMessage>,
+        cancellation: CancellationToken,
+    ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+        run_matrix_goal_parent_turn(&self.session, working_history, cancellation).await
+    }
+
+    async fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
+        let history_key = conversation_history_key(&self.session.message);
+        append_sender_turn(
+            self.session.ctx.as_ref(),
+            &history_key,
+            ChatMessage::assistant(candidate),
+        );
+        let channel =
+            find_channel_for_message(&self.session.ctx.channels_by_name, &self.session.message)
+                .cloned()
+                .context("Goal Matrix delivery channel is unavailable")?;
+        channel
+            .send_final(&SendMessage::reply_to(&self.session.message, candidate))
+            .await
+    }
+}
+
+async fn run_matrix_goal_parent_turn(
+    session: &MatrixGoalSession,
+    mut history: Vec<ChatMessage>,
+    cancellation: CancellationToken,
+) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+    let ctx = session.ctx.as_ref();
+    let defaults = runtime_defaults_snapshot(ctx);
+    let route = get_route_selection(
+        ctx,
+        &session.message,
+        &conversation_history_key(&session.message),
+        &defaults,
+    );
+    let provider = get_or_create_provider(
+        ctx,
+        &route.model_provider,
+        route.api_key.as_deref(),
+        &defaults,
+    )
+    .await
+    .context("Goal Matrix parent provider is unavailable")?;
+    let excluded_tools: &[String] = if ctx.autonomy_level == AutonomyLevel::Full {
+        &[]
+    } else {
+        ctx.non_cli_excluded_tools.as_ref()
+    };
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let loop_knobs = LoopKnobs::default();
+    let tool_loop = run_tool_call_loop(ToolLoop {
+        exec: ResolvedAgentExecution::resolve(
+            ResolvedModelAccess {
+                model_provider: provider.as_ref(),
+                provider_name: route.model_provider.as_str(),
+                model: route.model.as_str(),
+                temperature: defaults.defaults.temperature,
+            },
+            ResolvedIo {
+                tools_registry: ctx.tools_registry.as_ref(),
+                observer: ctx.observer.as_ref(),
+                silent: true,
+                approval: Some(ctx.approval_manager.as_ref()),
+                multimodal_config: &ctx.multimodal,
+                config: Some(ctx.prompt_config.as_ref()),
+                hooks: ctx.hooks.as_deref(),
+                activated_tools: ctx.activated_tools.as_ref(),
+                model_switch_callback: None,
+                receipt_generator: ctx.receipt_generator.as_ref(),
+            },
+            ResolvedRuntimeKnobs {
+                max_tool_iterations: ctx.max_tool_iterations,
+                excluded_tools,
+                dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                pacing: &ctx.pacing,
+                strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
+                parallel_tools: false,
+                max_tool_result_chars: ctx.max_tool_result_chars,
+                context_token_budget: ctx.context_token_budget,
+                knobs: &loop_knobs,
+            },
+        ),
+        history: &mut history,
+        channel_name: "matrix",
+        channel_reply_target: Some(session.message.reply_target.as_str()),
+        cancellation_token: Some(cancellation.clone()),
+        on_delta: None,
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        memory: None,
+        ingress: zeroclaw_api::ingress::IngressContext::channel(),
+        agent_alias: Some(ctx.agent_alias.as_str()),
+        parent_agent_alias: None,
+        turn_id: &turn_id,
+        sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
+            config: ctx.prompt_config.as_ref(),
+        }),
+    });
+    let result = tokio::select! {
+        () = cancellation.cancelled() => anyhow::bail!("Goal Matrix parent turn cancelled"),
+        result = tool_loop => result,
+    }?;
+    Ok((result, history))
+}
+
 /// Acquire the per-conversation-history-key persistence lock so that
 /// append/remove_last/delete_session operations for the same sender are
 /// serialized without blocking the full message-processing loop
@@ -5136,10 +5425,20 @@ impl Channel for ApprovalTypingChannel {
     }
 }
 
+#[cfg(test)]
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
+) {
+    process_channel_message_with_goal(ctx, msg, cancellation_token, None).await;
+}
+
+async fn process_channel_message_with_goal(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    cancellation_token: CancellationToken,
+    matrix_goal: Option<MatrixGoalRuntime>,
 ) {
     if cancellation_token.is_cancelled() {
         return;
@@ -5160,7 +5459,14 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            process_channel_message_body(
+                ctx,
+                msg,
+                cancellation_token,
+                composite_for_body,
+                matrix_goal,
+            )
+            .await;
         }
     )
     .await;
@@ -6001,16 +6307,40 @@ async fn process_channel_message_body(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
+    matrix_goal: Option<MatrixGoalRuntime>,
 ) {
+    // Capture the original Matrix command before any hook can rewrite message
+    // content or identity. A hook may still cancel processing below, but it
+    // can never manufacture or retarget Goal authority.
+    let matrix_goal_command = matrix_goal
+        .as_ref()
+        .filter(|_| is_matrix_goal_command(&msg))
+        .map(|_| msg.clone());
+    // `/new` is a session-destruction command for Matrix. Capture it before
+    // hooks for the same reason as Goal commands: a hook may cancel delivery,
+    // but it cannot retarget the authenticated session that will be disposed.
+    let matrix_session_reset = matrix_goal
+        .as_ref()
+        .filter(|_| is_matrix_session_reset_command(&msg))
+        .map(|_| msg.clone());
+    let inbound_content = if matrix_goal_command.is_some() {
+        "[goal command redacted]"
+    } else {
+        msg.content.as_str()
+    };
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
             ::serde_json::json!({
-                "sender": msg.sender,
+                "sender": if matrix_goal_command.is_some() {
+                    "[goal principal redacted]"
+                } else {
+                    msg.sender.as_str()
+                },
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content": inbound_content,
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -6035,6 +6365,95 @@ async fn process_channel_message_body(
     } else {
         msg
     };
+
+    if let (Some(goal), Some(original)) = (matrix_goal.as_ref(), matrix_goal_command) {
+        let session_id = conversation_history_key(&original);
+        let response = match goal
+            .sessions
+            .bind(&session_id, Arc::clone(&ctx), original.clone())
+        {
+            Ok(()) => match zeroclaw_runtime::goal_mode::GoalIngressContext::trusted(
+                session_id,
+                ctx.agent_alias.as_str(),
+                "matrix",
+                Some(original.sender.clone()),
+            ) {
+                Ok(ingress) => {
+                    match zeroclaw_runtime::goal_mode::parse_goal_command(&original.content) {
+                        Ok(command) => goal.controller.submit(ingress, command).await,
+                        Err(error) => Ok(zeroclaw_runtime::goal_mode::GoalResponse {
+                            key: matrix_goal_parse_error_key(error.key),
+                            status: None,
+                        }),
+                    }
+                }
+                Err(_) => Ok(zeroclaw_runtime::goal_mode::GoalResponse {
+                    key: zeroclaw_runtime::goal_mode::GoalMessageKey::Stale,
+                    status: None,
+                }),
+            },
+            Err(_) => Ok(zeroclaw_runtime::goal_mode::GoalResponse {
+                key: zeroclaw_runtime::goal_mode::GoalMessageKey::Stale,
+                status: None,
+            }),
+        };
+        let rendered = response
+            .map(|response| render_matrix_goal_response(&response))
+            .unwrap_or_else(|_| channel_runtime_cli_string("goal-response-controller-failed"));
+        if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original) {
+            let _ = channel
+                .send_final(&SendMessage::reply_to(&original, rendered))
+                .await;
+        }
+        return;
+    }
+
+    if let (Some(goal), Some(original)) = (matrix_goal.as_ref(), matrix_session_reset) {
+        let session_id = conversation_history_key(&original);
+        let disposed = match zeroclaw_runtime::goal_mode::GoalIngressContext::trusted(
+            session_id,
+            ctx.agent_alias.as_str(),
+            "matrix",
+            Some(original.sender.clone()),
+        ) {
+            Ok(ingress) => matches!(
+                goal.controller.dispose_session(&ingress).await,
+                Ok(zeroclaw_runtime::goal_mode::GoalTransitionResult::Applied
+                    | zeroclaw_runtime::goal_mode::GoalTransitionResult::Missing)
+            ),
+            Err(_) => false,
+        };
+        if !disposed {
+            if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original) {
+                let _ = channel
+                    .send_final(&SendMessage::reply_to(
+                        &original,
+                        channel_runtime_cli_string("goal-response-controller-failed"),
+                    ))
+                    .await;
+            }
+            return;
+        }
+        let target_channel = find_channel_for_message(&ctx.channels_by_name, &original).cloned();
+        let _ = handle_runtime_command_if_needed(ctx.as_ref(), &original, target_channel.as_ref())
+            .await;
+        return;
+    }
+
+    if let Some(goal) = matrix_goal.as_ref()
+        && msg.channel == "matrix"
+        && goal.sessions.is_executing(&conversation_history_key(&msg))
+    {
+        if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg) {
+            let _ = channel
+                .send_final(&SendMessage::reply_to(
+                    &msg,
+                    channel_runtime_cli_string("goal-response-session-busy"),
+                ))
+                .await;
+        }
+        return;
+    }
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
@@ -7834,6 +8253,89 @@ async fn process_channel_message_body(
     }
 }
 
+fn is_matrix_goal_command(message: &ChannelMessage) -> bool {
+    if message.channel != "matrix" {
+        return false;
+    }
+    let command = message.content.trim_start();
+    command
+        .strip_prefix("/goal")
+        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
+
+fn is_matrix_session_reset_command(message: &ChannelMessage) -> bool {
+    message.channel == "matrix"
+        && matches!(
+            parse_runtime_command(message.channel.as_str(), message.content.as_str()),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+}
+
+fn matrix_goal_parse_error_key(
+    key: zeroclaw_runtime::goal_mode::GoalCommandErrorKey,
+) -> zeroclaw_runtime::goal_mode::GoalMessageKey {
+    match key {
+        zeroclaw_runtime::goal_mode::GoalCommandErrorKey::InvalidBudget => {
+            zeroclaw_runtime::goal_mode::GoalMessageKey::InvalidBudget
+        }
+        zeroclaw_runtime::goal_mode::GoalCommandErrorKey::SuccessCriteriaRequired => {
+            zeroclaw_runtime::goal_mode::GoalMessageKey::SuccessCriteriaRequired
+        }
+        zeroclaw_runtime::goal_mode::GoalCommandErrorKey::InvalidGrammar
+        | zeroclaw_runtime::goal_mode::GoalCommandErrorKey::ObjectiveRequired
+        | zeroclaw_runtime::goal_mode::GoalCommandErrorKey::InvalidArguments => {
+            zeroclaw_runtime::goal_mode::GoalMessageKey::InvalidCommand
+        }
+    }
+}
+
+fn render_matrix_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
+    use zeroclaw_runtime::goal_mode::GoalMessageKey;
+
+    let key = match response.key {
+        GoalMessageKey::Help => "goal-response-help",
+        GoalMessageKey::Disabled => "goal-response-disabled",
+        GoalMessageKey::InvalidConfiguration => "goal-response-invalid-configuration",
+        GoalMessageKey::NoCurrentGoal => "goal-response-no-current-goal",
+        GoalMessageKey::AlreadyActive => "goal-response-already-active",
+        GoalMessageKey::BudgetRequired => "goal-response-budget-required",
+        GoalMessageKey::PricingUnavailable => "goal-response-pricing-unavailable",
+        GoalMessageKey::VerifierUnavailable => "goal-response-verifier-unavailable",
+        GoalMessageKey::Started => "goal-response-started",
+        GoalMessageKey::Status => "goal-response-status",
+        GoalMessageKey::Budget => "goal-response-budget",
+        GoalMessageKey::Paused => "goal-response-paused",
+        GoalMessageKey::AlreadyPaused => "goal-response-already-paused",
+        GoalMessageKey::Resumed => "goal-response-resumed",
+        GoalMessageKey::Cancelled => "goal-response-cancelled",
+        GoalMessageKey::AlreadyCancelled => "goal-response-already-cancelled",
+        GoalMessageKey::BudgetUpdated => "goal-response-budget-updated",
+        GoalMessageKey::InvalidCommand => "goal-response-invalid-command",
+        GoalMessageKey::InvalidBudget => "goal-response-invalid-budget",
+        GoalMessageKey::SuccessCriteriaRequired => "goal-response-success-criteria-required",
+        GoalMessageKey::ToolPhaseNonResumable => "goal-response-tool-phase-nonresumable",
+        GoalMessageKey::Terminal => "goal-response-terminal",
+        GoalMessageKey::ExecutorStartFailed => "goal-response-executor-start-failed",
+        GoalMessageKey::Stale => "goal-response-stale",
+    };
+    let mut result = channel_runtime_cli_string(key);
+    if let Some(status) = &response.status {
+        let status_text = format!("{:?}", status.status);
+        let resumable = if status.resumable { "yes" } else { "no" };
+        result.push('\n');
+        result.push_str(&channel_runtime_cli_string_with_args(
+            "goal-response-status-summary",
+            &[
+                ("status", status_text.as_str()),
+                ("resumable", resumable),
+                ("tokens", &status.known_token_usage.to_string()),
+                ("cost", &format!("{:.6}", status.known_cost_usd)),
+            ],
+        ));
+    }
+    result
+}
+
 /// Shared worker body extracted so both the normal path and the debounce path
 /// can reuse the same in-flight tracking / cancellation / process logic.
 async fn dispatch_worker(
@@ -7842,6 +8344,7 @@ async fn dispatch_worker(
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    matrix_goal: Option<MatrixGoalRuntime>,
 ) {
     let _permit = permit;
     let interrupt_enabled = ctx
@@ -7879,7 +8382,7 @@ async fn dispatch_worker(
         }
     }
 
-    process_channel_message(ctx, msg, cancellation_token).await;
+    process_channel_message_with_goal(ctx, msg, cancellation_token, matrix_goal).await;
 
     if register_in_flight {
         let mut active = in_flight.lock().await;
@@ -7901,6 +8404,7 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    matrix_goal: Option<MatrixGoalRuntime>,
 }
 
 impl AgentRouter {
@@ -7912,14 +8416,26 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            matrix_goal: None,
         }
     }
 
+    #[cfg(test)]
     fn multi(
         by_agent: HashMap<String, Arc<ChannelRuntimeContext>>,
         owner_by_channel_key: HashMap<String, String>,
         sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
         sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    ) -> Self {
+        Self::multi_with_goal(by_agent, owner_by_channel_key, sop_engine, sop_audit, None)
+    }
+
+    fn multi_with_goal(
+        by_agent: HashMap<String, Arc<ChannelRuntimeContext>>,
+        owner_by_channel_key: HashMap<String, String>,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+        matrix_goal: Option<MatrixGoalRuntime>,
     ) -> Self {
         Self {
             by_agent: Arc::new(by_agent),
@@ -7927,6 +8443,7 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            matrix_goal,
         }
     }
 
@@ -8536,6 +9053,7 @@ async fn run_message_dispatch_loop(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
+                    let debounce_matrix_goal = router.matrix_goal.clone();
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match rx.await {
@@ -8559,6 +9077,7 @@ async fn run_message_dispatch_loop(
                             debounce_in_flight,
                             debounce_task_seq,
                             permit,
+                            debounce_matrix_goal,
                         )
                         .await;
                     });
@@ -8582,8 +9101,17 @@ async fn run_message_dispatch_loop(
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
+        let matrix_goal = router.matrix_goal.clone();
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                task_sequence,
+                permit,
+                matrix_goal,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -12056,7 +12584,20 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    goal_runtime: Option<Arc<zeroclaw_runtime::goal_mode::GoalRuntime>>,
+    goal_execution_host: Option<Arc<zeroclaw_runtime::goal_mode::GoalExecutionHost>>,
 ) -> Result<()> {
+    let matrix_goal = match (goal_runtime, goal_execution_host) {
+        (Some(controller), Some(host)) => {
+            let sessions = Arc::new(MatrixGoalSessionAdapter::new());
+            host.register_session_adapter(sessions.clone()).await;
+            Some(MatrixGoalRuntime {
+                controller,
+                sessions,
+            })
+        }
+        _ => None,
+    };
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
     let any_agent_provider_resolves = config
@@ -12808,7 +13349,13 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi_with_goal(
+        agent_ctxs,
+        owner_by_channel_key,
+        sop_engine,
+        sop_audit,
+        matrix_goal,
+    );
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -33972,6 +34519,7 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            matrix_goal: None,
         }
     }
 
@@ -34075,6 +34623,7 @@ Done."#;
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
+            matrix_goal: None,
         };
         (router, engine, run_id)
     }

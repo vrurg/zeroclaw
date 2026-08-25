@@ -89,6 +89,7 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionGoal,
 
     // Memory
     MemoryList,
@@ -209,6 +210,7 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionGoal, "session/goal"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -789,6 +791,7 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
             Method::SessionKill => self.handle_session_kill(&req.params).await,
+            Method::SessionGoal => self.handle_session_goal(&req.params).await,
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -1475,6 +1478,39 @@ impl RpcDispatcher {
             None,
         )
         .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))
+    }
+
+    async fn handle_session_goal(&self, params: &Value) -> RpcResult {
+        let request: SessionGoalParams = parse_params(params)?;
+        let live = self
+            .ctx
+            .sessions
+            .live_session(&request.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let runtime = self.ctx.goal_runtime.as_ref().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "Goal lifecycle controller is unavailable for this session",
+            )
+        })?;
+        let command = crate::goal_mode::parse_goal_command(&request.command).map_err(|_| {
+            rpc_err(
+                INVALID_PARAMS,
+                "Invalid Goal command; use the shared /goal grammar",
+            )
+        })?;
+        let ingress = Self::goal_ingress_for_live_session(&live)?;
+        let response = runtime.submit(ingress, command).await.map_err(|error| {
+            rpc_err(
+                INTERNAL_ERROR,
+                format!("Goal command failed in the lifecycle controller: {error}"),
+            )
+        })?;
+        to_result(SessionGoalResult {
+            key: response.key,
+            status: response.status,
+        })
     }
 
     async fn reserve_session_disposal(
@@ -7486,6 +7522,32 @@ mod tests {
                 .unwrap(),
             crate::control_plane::GoalTransitionResult::Applied
         );
+    }
+
+    #[tokio::test]
+    async fn session_goal_uses_the_typed_runtime_path_and_never_becomes_a_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, _sessions, _store) = goal_bound_lifecycle_dispatcher(&tmp);
+        dispatcher.set_tui_id_for_test(Some("goal-command-owner".into()));
+        new_chat_session_for_eviction_test(&dispatcher, "goal-command", Some(true)).await;
+
+        let result = dispatcher
+            .handle_session_goal(&json!({
+                "session_id": "goal-command",
+                "command": "/goal status",
+            }))
+            .await
+            .expect("typed session/goal must reach GoalRuntime");
+        assert_eq!(result["key"], "disabled");
+
+        let invalid = dispatcher
+            .handle_session_goal(&json!({
+                "session_id": "goal-command",
+                "command": "/goal objective rewrite this",
+            }))
+            .await
+            .expect_err("obsolete Goal syntax must be rejected by session/goal");
+        assert_eq!(invalid.code, INVALID_PARAMS);
     }
 
     /// Create a Chat-mode session through the real `session/new` handler,

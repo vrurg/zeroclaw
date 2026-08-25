@@ -194,9 +194,9 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Goal,
         name: "goal",
         aliases: &[],
-        usage: "/goal <start <objective>|objective <objective>|status|budget|pause|resume [reason]|cancel|help> ...",
+        usage: "/goal start [--tokens N] [--cost-usd D] --success-criteria CRITERIA -- OBJECTIVE | /goal start --unlimited --success-criteria CRITERIA -- OBJECTIVE | /goal status | /goal budget | /goal budget set [--tokens N] [--cost-usd D] | /goal budget set --unlimited | /goal pause | /goal resume | /goal cancel | /goal help",
         description_key: "command-goal-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::GoalAdmission,
     },
 ];
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_surface_advertises_help_model_and_new_only() {
+    fn tui_surface_advertises_goal_after_its_typed_handler_exists() {
         let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
             .map(|spec| spec.id)
             .collect();
@@ -323,6 +323,7 @@ mod tests {
                 BuiltinCommandId::Help,
                 BuiltinCommandId::New,
                 BuiltinCommandId::Model,
+                BuiltinCommandId::Goal,
             ]
         );
         assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
@@ -335,16 +336,16 @@ mod tests {
     #[test]
     fn goal_is_advertised_only_where_admission_is_implemented() {
         assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
+        assert!(parse_command_token("/goal", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
         let goal = command_by_name("/goal").expect("goal command should be registered");
         assert!(
-            goal.usage.contains("start <objective>"),
-            "goal command usage must advertise the required start objective"
+            goal.usage.contains("--success-criteria CRITERIA"),
+            "goal command usage must advertise the required success criteria"
         );
         assert!(
-            goal.usage.contains("objective <objective>"),
-            "goal command usage must advertise objective amendment syntax"
+            !goal.usage.contains("objective <objective>"),
+            "Goal command usage must not advertise retired objective amendment syntax"
         );
     }
 }

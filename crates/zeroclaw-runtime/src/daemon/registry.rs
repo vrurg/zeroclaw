@@ -14,6 +14,18 @@ use crate::rpc::tui_identity::TuiRegistry;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
+/// One Goal command surface supplied by a transport registration.
+///
+/// The transport declares both its stable route name and how to determine
+/// whether that route is enabled in the prospective configuration. This keeps
+/// Goal policy classification transport-neutral: the daemon does not import
+/// channel configuration details or infer availability from persisted tasks.
+#[derive(Clone, Copy)]
+pub struct GoalRouteCapability {
+    pub route: &'static str,
+    pub is_configured: fn(&Config) -> bool,
+}
+
 #[derive(Clone)]
 pub struct GatewayReloadControls {
     pub shutdown_tx: watch::Sender<bool>,
@@ -35,7 +47,20 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+///
+/// Goal Mode supplies its transport-neutral controller and execution host here.
+/// The channel crate may register an adapter for a live channel session, but
+/// never receives control-plane ownership or an RPC-specific API.
+pub type ChannelsStarter = Box<
+    dyn Fn(
+            Config,
+            CancellationToken,
+            Option<Arc<crate::goal_mode::GoalRuntime>>,
+            Option<Arc<crate::goal_mode::GoalExecutionHost>>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
+>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -61,6 +86,7 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
+    channel_goal_routes: &'static [GoalRouteCapability],
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
@@ -87,8 +113,16 @@ impl DaemonRegistry {
         self.gateway_start.is_some()
     }
 
-    pub fn register_channels(&mut self, starter: ChannelsStarter) -> &mut Self {
+    /// Register the channel supervisor and the Goal routes compiled into its
+    /// transport implementation. The daemon combines these capabilities with
+    /// loaded configuration before it evaluates Goal policy revocation.
+    pub fn register_channels(
+        &mut self,
+        starter: ChannelsStarter,
+        goal_routes: &'static [GoalRouteCapability],
+    ) -> &mut Self {
         self.channels_start = Some(starter);
+        self.channel_goal_routes = goal_routes;
         self
     }
 
@@ -133,6 +167,10 @@ impl DaemonRegistry {
         self.channels_start.take()
     }
 
+    pub(crate) fn channel_goal_routes(&self) -> &'static [GoalRouteCapability] {
+        self.channel_goal_routes
+    }
+
     pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {
         self.socket_start.take()
     }
@@ -175,7 +213,7 @@ mod tests {
     }
 
     fn channels_starter() -> ChannelsStarter {
-        Box::new(|_, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn socket_starter() -> SocketStarter {
@@ -206,7 +244,7 @@ mod tests {
         let mut registry = DaemonRegistry::new();
         registry
             .register_gateway(gateway_starter())
-            .register_channels(channels_starter())
+            .register_channels(channels_starter(), &[])
             .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());
@@ -223,7 +261,7 @@ mod tests {
         let mut registry = DaemonRegistry::new();
         registry
             .register_gateway(gateway_starter())
-            .register_channels(channels_starter())
+            .register_channels(channels_starter(), &[])
             .register_socket(socket_starter())
             .register_wss(rpc_starter())
             .register_mqtt(mqtt_starter());

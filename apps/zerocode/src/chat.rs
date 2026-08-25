@@ -96,6 +96,8 @@ pub(crate) struct Chat {
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
+    goal_result_tx: mpsc::Sender<GoalCommandUpdate>,
+    goal_result_rx: mpsc::Receiver<GoalCommandUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
     /// Background model-catalog fetch result, routed back so the Loading
@@ -165,6 +167,51 @@ struct GitStatusUpdate {
     hash: Option<String>,
 }
 
+struct GoalCommandUpdate {
+    session_id: String,
+    result: Result<crate::client::SessionGoalResult, String>,
+}
+
+fn is_goal_command(input: &str) -> bool {
+    input
+        .trim_start()
+        .strip_prefix("/goal")
+        .is_some_and(|suffix| {
+            suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
+        })
+}
+
+fn render_goal_command_result(key: &str) -> String {
+    let fluent_key = match key {
+        "Help" => "zc-goal-help",
+        "Disabled" => "zc-goal-disabled",
+        "InvalidConfiguration" => "zc-goal-invalid-configuration",
+        "NoCurrentGoal" => "zc-goal-no-current",
+        "AlreadyActive" => "zc-goal-already-active",
+        "BudgetRequired" => "zc-goal-budget-required",
+        "PricingUnavailable" => "zc-goal-pricing-unavailable",
+        "VerifierUnavailable" => "zc-goal-verifier-unavailable",
+        "Started" => "zc-goal-started",
+        "Status" => "zc-goal-status",
+        "Budget" => "zc-goal-budget",
+        "Paused" => "zc-goal-paused",
+        "AlreadyPaused" => "zc-goal-already-paused",
+        "Resumed" => "zc-goal-resumed",
+        "Cancelled" => "zc-goal-cancelled",
+        "AlreadyCancelled" => "zc-goal-already-cancelled",
+        "BudgetUpdated" => "zc-goal-budget-updated",
+        "InvalidCommand" => "zc-goal-invalid-command",
+        "InvalidBudget" => "zc-goal-invalid-budget",
+        "SuccessCriteriaRequired" => "zc-goal-success-criteria-required",
+        "ToolPhaseNonResumable" => "zc-goal-tool-phase-nonresumable",
+        "Terminal" => "zc-goal-terminal",
+        "ExecutorStartFailed" => "zc-goal-executor-start-failed",
+        "Stale" => "zc-goal-stale",
+        _ => "zc-goal-controller-unavailable",
+    };
+    crate::i18n::t(fluent_key)
+}
+
 /// Result of a background model-catalog fetch, routed back so the Loading
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
@@ -182,6 +229,7 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
+        let (goal_result_tx, goal_result_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
@@ -190,6 +238,8 @@ impl Chat {
             inbound_rx: rpc.subscribe_inbound_requests(),
             git_branch_tx,
             git_branch_rx,
+            goal_result_tx,
+            goal_result_rx,
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
@@ -927,6 +977,14 @@ impl Chat {
             _ => return,
         };
 
+        // Goal commands are control-plane requests, never ordinary model
+        // prompts. Keep attachments out of this path: the shared Goal grammar
+        // is text-only and the daemon rejects malformed forms semantically.
+        if msg.attachments.is_empty() && is_goal_command(&msg.text) {
+            self.spawn_goal_command(sid, msg.text);
+            return;
+        }
+
         let transport = self.rpc.transport();
         let attachments_json = if msg.attachments.is_empty() {
             Vec::new()
@@ -975,6 +1033,41 @@ impl Chat {
             }
             rpc_arc.notify(method::SESSION_PROMPT, params).await;
         });
+    }
+
+    fn spawn_goal_command(&self, session_id: String, command: String) {
+        let rpc = Arc::clone(&self.rpc);
+        let result_tx = self.goal_result_tx.clone();
+        tokio::spawn(async move {
+            let result = rpc
+                .session_goal(&session_id, &command)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = result_tx
+                .send(GoalCommandUpdate { session_id, result })
+                .await;
+        });
+    }
+
+    fn drain_goal_command_results(&mut self) {
+        while let Ok(update) = self.goal_result_rx.try_recv() {
+            let ChatPhase::Active(state) = &mut self.phase else {
+                continue;
+            };
+            if state.session_id != update.session_id {
+                continue;
+            }
+            let text = match update.result {
+                Ok(result) => render_goal_command_result(&result.key),
+                Err(error) => {
+                    crate::i18n::t_args("zc-goal-controller-failed", &[("error", &error)])
+                }
+            };
+            state
+                .entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(text)));
+            state.mark_dirty_append();
+        }
     }
 
     fn drain_git_branch_results(&mut self) {
@@ -1044,6 +1137,7 @@ impl Chat {
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
+        self.drain_goal_command_results();
         self.maybe_refresh_git_branch();
 
         match &mut self.phase {
@@ -13016,6 +13110,15 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(rpc));
         (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    #[test]
+    fn goal_commands_are_identified_without_capturing_ordinary_prompts() {
+        assert!(is_goal_command("/goal status"));
+        assert!(is_goal_command("  /goal help"));
+        assert!(is_goal_command("/goal"));
+        assert!(!is_goal_command("/goals status"));
+        assert!(!is_goal_command("please /goal status"));
     }
 
     fn chat_with_active_input(kind: PaneKind) -> Chat {

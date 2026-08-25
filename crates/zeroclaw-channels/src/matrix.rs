@@ -2275,8 +2275,17 @@ mod inbound {
         }
 
         let thread_id = extract_thread_id(&raw);
-        let mut content = body.clone();
-        if let Some(tid) = thread_id.as_ref()
+        // A Goal command must be identified from the authenticated event body
+        // before a thread-root preamble can prepend untrusted text. Keep the
+        // normalized command as the entire forwarded content so the generic
+        // orchestrator can snapshot it before hooks run.
+        let bot_display_name = ctx.bot_display_name.read().await.clone();
+        let goal_command =
+            normalize_goal_command(&body, &ctx.bot_user_id, bot_display_name.as_deref());
+        let is_goal_command = goal_command.is_some();
+        let mut content = goal_command.unwrap_or_else(|| body.clone());
+        if !is_goal_command
+            && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
         {
             match room.event(tid, None).await {
@@ -2427,6 +2436,58 @@ mod inbound {
         raw: RawEvent,
     ) -> anyhow::Result<()> {
         handle_message(ctx, ev, room, raw).await
+    }
+
+    /// Normalize a direct or addressed Matrix Goal command before it crosses
+    /// into generic channel processing. The sender remains the raw Matrix
+    /// MXID; this only removes Matrix's presentation-level bot mention.
+    pub(super) fn normalize_goal_command(
+        body: &str,
+        bot_user_id: &matrix_sdk::ruma::UserId,
+        display_name: Option<&str>,
+    ) -> Option<String> {
+        let command = body.trim_start();
+        if is_goal_command(command) {
+            return Some(command.to_string());
+        }
+
+        // Matrix clients may address a slash command as `/goal@bot`. The
+        // suffix is presentation syntax, not part of Goal's shared grammar.
+        let localpart = bot_user_id.localpart();
+        let bare_mxid = bot_user_id.as_str().trim_start_matches('@');
+        if let Some(suffix) = command.strip_prefix("/goal@")
+            && let Some(index) = suffix.find(char::is_whitespace)
+            && matches!(&suffix[..index], target if target == localpart || target == bare_mxid)
+        {
+            return Some(format!("/goal{}", &suffix[index..]));
+        }
+
+        let candidates = [
+            format!("@{localpart}"),
+            bot_user_id.to_string(),
+            display_name
+                .map(|name| format!("@{name}"))
+                .unwrap_or_default(),
+            display_name.unwrap_or_default().to_string(),
+        ];
+        for mention in candidates.into_iter().filter(|mention| !mention.is_empty()) {
+            let Some(rest) = command.strip_prefix(&mention) else {
+                continue;
+            };
+            if rest.chars().next().is_none_or(char::is_whitespace) {
+                let rest = rest.trim_start();
+                if is_goal_command(rest) {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn is_goal_command(value: &str) -> bool {
+        value.strip_prefix("/goal").is_some_and(|rest| {
+            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
+        })
     }
 
     async fn is_group_room(room: &Room) -> bool {
@@ -4928,6 +4989,38 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    mod goal_command_normalization {
+        use matrix_sdk::ruma::user_id;
+
+        use super::super::inbound::normalize_goal_command;
+
+        #[test]
+        fn preserves_direct_goal_commands_and_strips_only_presentation_mentions() {
+            let bot = user_id!("@goalbot:example.org");
+            let command = "/goal status";
+            assert_eq!(
+                normalize_goal_command(command, bot, Some("Goal Bot")),
+                Some(command.into())
+            );
+            assert_eq!(
+                normalize_goal_command("@goalbot /goal status", bot, Some("Goal Bot")),
+                Some(command.into())
+            );
+            assert_eq!(
+                normalize_goal_command("Goal Bot /goal status", bot, Some("Goal Bot")),
+                Some(command.into())
+            );
+            assert_eq!(
+                normalize_goal_command("/goal@goalbot:example.org status", bot, Some("Goal Bot")),
+                Some(command.into())
+            );
+            assert_eq!(
+                normalize_goal_command("/goals status", bot, Some("Goal Bot")),
+                None
+            );
+        }
+    }
+
     mod transcription_provider_resolution {
         use super::super::inbound::build_transcription_manager;
         use zeroclaw_config::schema::TranscriptionConfig;

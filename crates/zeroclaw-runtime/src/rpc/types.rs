@@ -182,6 +182,24 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// Typed Goal command submission. The daemon derives authority and
+    /// session facts; the client supplies only its session ID and command.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Transport-neutral Goal result rendered by the client through Fluent.
+    pub struct SessionGoalResult {
+        pub key: crate::goal_mode::GoalMessageKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<crate::goal_mode::GoalStatusProjection>,
+    }
+}
+
+rpc_type! {
     pub struct SessionNewParams {
         pub agent_alias: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

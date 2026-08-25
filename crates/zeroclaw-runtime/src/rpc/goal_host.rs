@@ -120,8 +120,9 @@ impl GoalSessionLease for RpcGoalSessionLease {
             .await
     }
 
-    fn append_verified_candidate(&mut self, candidate: &str) {
+    async fn append_verified_candidate(&mut self, candidate: &str) -> anyhow::Result<()> {
         self.agent
             .append_verified_goal_candidate(candidate.to_owned());
+        Ok(())
     }
 }

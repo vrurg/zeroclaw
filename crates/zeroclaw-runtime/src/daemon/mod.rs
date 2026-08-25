@@ -192,7 +192,7 @@ impl Drop for StartupReadinessAttempt {
 }
 
 mod registry;
-pub use registry::{DaemonRegistry, GatewayReloadControls};
+pub use registry::{DaemonRegistry, GatewayReloadControls, GoalRouteCapability};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -612,39 +612,11 @@ pub async fn run(
         crate::health::mark_component_ok("control-plane");
     }
 
-    if let Some(channels_start) = registry.take_channels_start() {
-        if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
-            let channels_start = std::sync::Arc::new(channels_start);
-            let cancel_for_supervisor = channels_cancel.clone();
-            handles.push(spawn_component_supervisor(
-                "channels",
-                initial_backoff,
-                max_backoff,
-                channels_cancel.clone(),
-                move || {
-                    let cfg = channels_cfg.clone();
-                    let start = channels_start.clone();
-                    let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
-                },
-            ));
-        } else {
-            crate::health::mark_component_ok("channels");
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "No channels configured; channel supervisor disabled"
-            );
-        }
-    } else {
-        crate::health::mark_component_ok("channels");
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Channels subsystem not wired; channel supervisor disabled"
-        );
-    }
+    // Build Goal's shared execution host before starting channel listeners.
+    // A channel registers only its narrow session adapter through this host;
+    // it never owns a second Goal controller or an RPC implementation detail.
+    let channel_goal_routes = registry.channel_goal_routes();
+    let channels_start = registry.take_channels_start();
 
     // RPC transports: Unix socket and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
@@ -654,7 +626,7 @@ pub async fn run(
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
 
-    let rpc_ctx = if need_rpc_ctx {
+    let (rpc_ctx, rpc_goal_execution_host) = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
         use crate::rpc::session::SessionStore;
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -751,28 +723,32 @@ pub async fn run(
 
         let cost_tracker =
             crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
-        let goal_runtime = if let Some(control_plane) = crate::control_plane::control_plane() {
+        let (goal_runtime, goal_execution_host) = if let Some(control_plane) =
+            crate::control_plane::control_plane()
+        {
             let tracker = crate::cost::CostTracker::get_or_init_global_for_goal(
                 config.cost.clone(),
                 &config.data_dir,
             );
             match tracker {
                 Some(tracker) => {
-                    let executor = std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
-                        vec![std::sync::Arc::new(
-                            crate::rpc::goal_host::RpcGoalSessionAdapter::new(
-                                std::sync::Arc::clone(&sessions),
-                            ),
-                        )],
-                        std::sync::Arc::clone(&control_plane.goals),
-                        std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
-                            std::sync::Arc::clone(&control_plane.store),
-                            control_plane.boot_id.clone(),
-                        )),
-                        std::sync::Arc::new(config.clone()),
-                    ))
+                    let goal_execution_host =
+                        std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                            vec![std::sync::Arc::new(
+                                crate::rpc::goal_host::RpcGoalSessionAdapter::new(
+                                    std::sync::Arc::clone(&sessions),
+                                ),
+                            )],
+                            std::sync::Arc::clone(&control_plane.goals),
+                            std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
+                                std::sync::Arc::clone(&control_plane.store),
+                                control_plane.boot_id.clone(),
+                            )),
+                            std::sync::Arc::new(config.clone()),
+                        ));
+                    let executor = std::sync::Arc::clone(&goal_execution_host)
                         as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
-                    Some(std::sync::Arc::new(
+                    let goal_runtime = std::sync::Arc::new(
                         crate::goal_mode::GoalRuntime::new(
                             std::sync::Arc::new(config.clone()),
                             std::sync::Arc::clone(&control_plane.goals),
@@ -782,7 +758,8 @@ pub async fn run(
                         )
                         .map_err(anyhow::Error::new)
                         .context("construct RPC Goal lifecycle controller")?,
-                    ))
+                    );
+                    (Some(goal_runtime), Some(goal_execution_host))
                 }
                 None => {
                     if !control_plane
@@ -796,14 +773,14 @@ pub async fn run(
                             "Goal lifecycle controller is unavailable while nonterminal Goals exist"
                         );
                     }
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
-        Some(std::sync::Arc::new(RpcContext {
+        let rpc_context = std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sessions,
@@ -825,9 +802,10 @@ pub async fn run(
             sop_audit,
             hooks,
             goal_runtime,
-        }))
+        });
+        (Some(rpc_context), goal_execution_host)
     } else {
-        None
+        (None, None)
     };
 
     // A generation with no RPC listener still has to revoke Goals previously
@@ -835,29 +813,31 @@ pub async fn run(
     // adapter: every retained route is consequently revoked before any worker
     // could be admitted, while direct child cleanup continues through the
     // canonical task registry.
-    let lifecycle_goal_runtime = if let Some(runtime) = rpc_ctx
+    let (lifecycle_goal_runtime, lifecycle_goal_execution_host) = if let Some(runtime) = rpc_ctx
         .as_ref()
         .and_then(|context| context.goal_runtime.as_ref())
         .cloned()
     {
-        Some(runtime)
+        (Some(runtime), rpc_goal_execution_host)
     } else if let Some(control_plane) = crate::control_plane::control_plane() {
         match crate::cost::CostTracker::get_or_init_global_for_goal(
             config.cost.clone(),
             &config.data_dir,
         ) {
             Some(tracker) => {
-                let executor = std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
-                    Vec::<std::sync::Arc<dyn crate::goal_mode::GoalSessionAdapter>>::new(),
-                    std::sync::Arc::clone(&control_plane.goals),
-                    std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
-                        std::sync::Arc::clone(&control_plane.store),
-                        control_plane.boot_id.clone(),
-                    )),
-                    std::sync::Arc::new(config.clone()),
-                ))
+                let goal_execution_host =
+                    std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                        Vec::<std::sync::Arc<dyn crate::goal_mode::GoalSessionAdapter>>::new(),
+                        std::sync::Arc::clone(&control_plane.goals),
+                        std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
+                            std::sync::Arc::clone(&control_plane.store),
+                            control_plane.boot_id.clone(),
+                        )),
+                        std::sync::Arc::new(config.clone()),
+                    ));
+                let executor = std::sync::Arc::clone(&goal_execution_host)
                     as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
-                Some(std::sync::Arc::new(
+                let goal_runtime = std::sync::Arc::new(
                     crate::goal_mode::GoalRuntime::new(
                         std::sync::Arc::new(config.clone()),
                         std::sync::Arc::clone(&control_plane.goals),
@@ -867,7 +847,8 @@ pub async fn run(
                     )
                     .map_err(anyhow::Error::new)
                     .context("construct Goal lifecycle controller without an RPC adapter")?,
-                ))
+                );
+                (Some(goal_runtime), Some(goal_execution_host))
             }
             None => {
                 if !control_plane
@@ -881,13 +862,24 @@ pub async fn run(
                         "Goal lifecycle controller is unavailable while nonterminal Goals exist"
                     );
                 }
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
-    let available_goal_routes: &[&str] = if rpc_ctx.is_some() { &["rpc"] } else { &[] };
+    let mut available_goal_routes = Vec::new();
+    if rpc_ctx.is_some() {
+        available_goal_routes.push("rpc");
+    }
+    if channels_start.is_some() {
+        available_goal_routes.extend(
+            channel_goal_routes
+                .iter()
+                .filter(|capability| (capability.is_configured)(&config))
+                .map(|capability| capability.route),
+        );
+    }
 
     // Cost-ledger construction is required even while ordinary cost tracking
     // is disabled. Do not install a policy generation that could revoke a
@@ -911,12 +903,54 @@ pub async fn run(
     if let Some(goal_runtime) = lifecycle_goal_runtime.as_ref()
         && let Err(error) = goal_runtime
             .cancel_nonterminal_goals_for_policy_revocation(|task| {
-                crate::goal_mode::goal_policy_revokes_task(&config, task, available_goal_routes)
+                crate::goal_mode::goal_policy_revokes_task(
+                    &config,
+                    task,
+                    available_goal_routes.as_slice(),
+                )
             })
             .await
     {
         return Err(anyhow::Error::new(error)
             .context("Goal policy revocation failed before runtime admission"));
+    }
+
+    if let Some(channels_start) = channels_start {
+        if has_supervised_channels(&config) {
+            let channels_cfg = config.clone();
+            let channels_start = std::sync::Arc::new(channels_start);
+            let cancel_for_supervisor = channels_cancel.clone();
+            let goal_runtime = lifecycle_goal_runtime.clone();
+            let goal_execution_host = lifecycle_goal_execution_host.clone();
+            handles.push(spawn_component_supervisor(
+                "channels",
+                initial_backoff,
+                max_backoff,
+                channels_cancel.clone(),
+                move || {
+                    let cfg = channels_cfg.clone();
+                    let start = channels_start.clone();
+                    let cancel = cancel_for_supervisor.clone();
+                    let goal_runtime = goal_runtime.clone();
+                    let goal_execution_host = goal_execution_host.clone();
+                    async move { start(cfg, cancel, goal_runtime, goal_execution_host).await }
+                },
+            ));
+        } else {
+            crate::health::mark_component_ok("channels");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "No channels configured; channel supervisor disabled"
+            );
+        }
+    } else {
+        crate::health::mark_component_ok("channels");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Channels subsystem not wired; channel supervisor disabled"
+        );
     }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).

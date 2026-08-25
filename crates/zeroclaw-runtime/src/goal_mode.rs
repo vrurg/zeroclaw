@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -14,12 +15,13 @@ use zeroclaw_config::{cost::CostTracker, schema::Config};
 
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
+    GoalTaskRegistry, GoalToolPhase, TaskKind, TaskRecord, TaskStatus,
 };
 
 mod execution;
 mod host;
 
+pub use crate::control_plane::GoalTransitionResult;
 pub use execution::GoalExecutionHost;
 pub(crate) use execution::{GoalChildLifecycle, GoalChildTask};
 pub use host::{GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease};
@@ -363,7 +365,8 @@ fn required(value: String) -> Result<String, GoalIngressError> {
 
 /// Semantic response keys. Concrete transports render these through Fluent
 /// only when they are wired in a later stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GoalMessageKey {
     Help,
     Disabled,
@@ -392,7 +395,7 @@ pub enum GoalMessageKey {
 }
 
 /// A transport-neutral semantic result with no rendered text.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct GoalResponse {
     pub key: GoalMessageKey,
     pub status: Option<GoalStatusProjection>,
@@ -411,7 +414,7 @@ impl GoalResponse {
 }
 
 /// Current Goal status derived from the canonical task rows and usage ledger.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct GoalStatusProjection {
     pub task_id: String,
     pub status: TaskStatus,
@@ -607,7 +610,7 @@ impl GoalRuntime {
     /// available after Goal Mode has been disabled or the session's former
     /// policy has been revoked. The caller must not remove the live session
     /// unless this returns `Applied` or `Missing`.
-    pub(crate) async fn dispose_session(
+    pub async fn dispose_session(
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<GoalTransitionResult, GoalRuntimeError> {

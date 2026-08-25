@@ -4818,25 +4818,44 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_channels(Box::new({
-                    let sop_e = sop_engine.clone();
-                    let sop_a = sop_audit.clone();
-                    move |config, cancel| {
-                        let canvas_store = canvas_store_for_channels.clone();
-                        let sop_engine = sop_e.clone();
-                        let sop_audit = sop_a.clone();
-                        Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                                config,
-                                Some(canvas_store),
-                                cancel,
-                                sop_engine,
-                                sop_audit,
-                            ))
-                            .await
-                        })
-                    }
-                }));
+                #[cfg(feature = "channel-matrix")]
+                fn matrix_goal_route_configured(config: &zeroclaw_config::schema::Config) -> bool {
+                    !config.channels.matrix.is_empty()
+                }
+                #[cfg(feature = "channel-matrix")]
+                let channel_goal_routes: &'static [zeroclaw_runtime::daemon::GoalRouteCapability] =
+                    &[zeroclaw_runtime::daemon::GoalRouteCapability {
+                    route: "matrix",
+                    is_configured: matrix_goal_route_configured,
+                }];
+                #[cfg(not(feature = "channel-matrix"))]
+                let channel_goal_routes: &'static [zeroclaw_runtime::daemon::GoalRouteCapability] =
+                    &[];
+
+                registry.register_channels(
+                    Box::new({
+                        let sop_e = sop_engine.clone();
+                        let sop_a = sop_audit.clone();
+                        move |config, cancel, goal_runtime, goal_execution_host| {
+                            let canvas_store = canvas_store_for_channels.clone();
+                            let sop_engine = sop_e.clone();
+                            let sop_audit = sop_a.clone();
+                            Box::pin(async move {
+                                Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                    config,
+                                    Some(canvas_store),
+                                    cancel,
+                                    sop_engine,
+                                    sop_audit,
+                                    goal_runtime,
+                                    goal_execution_host,
+                                ))
+                                .await
+                            })
+                        }
+                    }),
+                    channel_goal_routes,
+                );
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
@@ -5565,7 +5584,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     config.sop.maintenance_interval_secs,
                 );
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config, None, cancel, sop_engine, sop_audit, None, None,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
