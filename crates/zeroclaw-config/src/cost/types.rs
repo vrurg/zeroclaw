@@ -149,6 +149,10 @@ pub struct CostRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_id: Option<String>,
+    /// Exact provider reference that served this usage event when the caller
+    /// has immutable actual-route attribution. Existing records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<String>,
 }
 
 impl CostRecord {
@@ -160,6 +164,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias: None,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -175,6 +180,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -191,6 +197,25 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id,
+            provider_ref: None,
+        }
+    }
+
+    /// Create a task-attributed record with an actual provider route.
+    pub fn with_attribution_and_provider(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        task_id: Option<String>,
+        provider_ref: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
+            task_id,
+            provider_ref,
         }
     }
 }
@@ -240,6 +265,15 @@ pub struct CostSummary {
     /// false` or when no records carry an agent_alias.
     #[serde(default)]
     pub by_agent: std::collections::HashMap<String, AgentCostStats>,
+}
+
+/// Checked canonical-ledger totals for one task. Goal admission uses this
+/// fail-closed view rather than the tolerant reporting projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrictTaskUsageTotals {
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub pricing_available: bool,
 }
 
 /// Statistics for a specific agent alias.

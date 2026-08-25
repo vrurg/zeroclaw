@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -16,7 +17,8 @@ use crate::control_plane::{
     GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
 
-mod host;
+pub mod execution;
+pub mod host;
 
 /// Bound durable, user-supplied Goal text before it can reach SQLite or a
 /// future verifier prompt. This is the same 20k-character envelope used for
@@ -451,9 +453,16 @@ pub enum GoalTurnKind {
 pub struct GoalExecutionScope {
     pub task_id: String,
     pub session_id: String,
+    /// Immutable server-derived binding. Goal execution never derives
+    /// authority from model output or mutable transport state.
+    pub binding: host::GoalSessionBinding,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
+    /// Shared by all Goal-owned logical model operations in this execution
+    /// epoch. Child propagation later clones this permit rather than creating
+    /// another admission domain.
+    pub operation_permit: Arc<Semaphore>,
 }
 
 /// Read-only facts an execution host uses to plan one exact Goal turn.
@@ -466,6 +475,8 @@ pub struct GoalExecutionPreflight {
     /// The task and epoch that the prospective execution scope must own.
     pub task_id: String,
     pub session_id: String,
+    /// Immutable transport binding that the execution host must recognize.
+    pub binding: host::GoalSessionBinding,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub agent: String,
@@ -935,9 +946,17 @@ impl GoalRuntime {
         let scope = GoalExecutionScope {
             task_id: task_id.to_owned(),
             session_id: ingress.session_id.clone(),
+            binding: host::GoalSessionBinding::new(
+                ingress.session_id.clone(),
+                ingress.agent.clone(),
+                ingress.route.clone(),
+                ingress.principal_id.clone(),
+            )
+            .map_err(GoalRuntimeError::control_plane)?,
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
+            operation_permit: Arc::new(Semaphore::new(1)),
         };
         if self.executor.launch(scope).await.is_ok() {
             return Ok(GoalResponse::message(if turn_kind == GoalTurnKind::Start {
@@ -975,10 +994,20 @@ impl GoalRuntime {
         cost_limit_usd: Option<f64>,
         totals: (u64, f64, bool),
     ) -> GoalExecutionReadiness {
+        let binding = match host::GoalSessionBinding::new(
+            ingress.session_id.clone(),
+            ingress.agent.clone(),
+            ingress.route.clone(),
+            ingress.principal_id.clone(),
+        ) {
+            Ok(binding) => binding,
+            Err(_) => return GoalExecutionReadiness::VerifierUnavailable,
+        };
         self.executor
             .preflight(&GoalExecutionPreflight {
                 task_id: task_id.to_owned(),
                 session_id: ingress.session_id.clone(),
+                binding,
                 execution_epoch,
                 turn_kind,
                 agent: ingress.agent.clone(),
@@ -1405,6 +1434,13 @@ mod tests {
         GoalExecutionPreflight {
             task_id: "task".into(),
             session_id: "session".into(),
+            binding: host::GoalSessionBinding::new(
+                "session".into(),
+                "main".into(),
+                "route".into(),
+                None,
+            )
+            .unwrap(),
             execution_epoch: 1,
             turn_kind,
             agent: "main".into(),
