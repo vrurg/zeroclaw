@@ -1028,6 +1028,19 @@ impl CostStorage {
                 anyhow::bail!("cost record cost is not finite or is negative");
             }
             if record.task_id.as_deref() == Some(task_id) {
+                if usage.total_tokens == 0 {
+                    anyhow::bail!("task-attributed cost record has all-zero token usage");
+                }
+                if usage.model.trim().is_empty() {
+                    anyhow::bail!("task-attributed cost record has no actual model attribution");
+                }
+                if record
+                    .provider_ref
+                    .as_deref()
+                    .is_none_or(|provider| provider.trim().is_empty())
+                {
+                    anyhow::bail!("task-attributed cost record has no actual provider attribution");
+                }
                 totals.total_tokens = totals
                     .total_tokens
                     .checked_add(usage.total_tokens)
@@ -1130,10 +1143,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         tracker
-            .record_scoped_usage_with_owned_task_attribution(
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
                 TokenUsage::new("test/free", 1_000, 500, 0, 0.0, 0.0, 0.0),
                 Some("agent-a"),
                 Some("goal-a".into()),
+                "test-provider".to_owned(),
             )
             .unwrap();
 
@@ -1150,6 +1164,56 @@ mod tests {
     }
 
     #[test]
+    fn strict_task_totals_reject_zero_usage_and_missing_actual_route() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                TokenUsage::new("test/zero", 0, 0, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-zero".into()),
+                "test-provider".to_owned(),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task("goal-zero")
+                .is_err(),
+            "a Goal row with all-zero usage cannot become known-zero progress"
+        );
+
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/missing-provider", 10, 5, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-no-route".into()),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task("goal-no-route")
+                .is_err(),
+            "a Goal row without its actual provider route cannot be complete"
+        );
+
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                TokenUsage::new("", 10, 5, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-no-model".into()),
+                "test-provider".to_owned(),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task("goal-no-model")
+                .is_err(),
+            "a Goal row without its actual model route cannot be complete"
+        );
+    }
+
+    #[test]
     fn forced_goal_tracker_records_to_canonical_ledger_while_ordinary_cost_is_disabled() {
         let tmp = TempDir::new().unwrap();
         let slot = RwLock::new(None);
@@ -1161,10 +1225,11 @@ mod tests {
             .expect("Goal scope opens the canonical tracker");
         assert!(!tracker.is_enabled());
         tracker
-            .record_scoped_usage_with_owned_task_attribution(
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
                 TokenUsage::new("test/model", 10, 5, 0, 1.0, 1.0, 1.0),
                 Some("agent-a"),
                 Some("goal-a".into()),
+                "test-provider".to_owned(),
             )
             .unwrap();
         assert_eq!(

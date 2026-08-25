@@ -156,11 +156,7 @@ pub trait GoalSessionLease: Send {
     ) -> Result<(String, Vec<ChatMessage>)>;
 
     /// Append only a controller-verified candidate to canonical history.
-    fn append_verified_candidate(&mut self, candidate: &str) -> Result<()>;
-
-    /// Deliver only a controller-verified candidate through the session's
-    /// existing delivery owner.
-    async fn deliver_verified_candidate(&mut self, candidate: &str) -> Result<()>;
+    fn append_verified_candidate(&mut self, candidate: &str);
 }
 
 #[cfg(test)]

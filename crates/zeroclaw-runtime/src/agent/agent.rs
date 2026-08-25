@@ -1108,23 +1108,58 @@ impl Agent {
     /// candidate may later enter canonical history.
     pub(crate) async fn run_goal_parent_turn(
         &mut self,
-        working_history: Vec<ChatMessage>,
+        mut working_history: Vec<ChatMessage>,
         cancellation: CancellationToken,
     ) -> Result<(String, Vec<ChatMessage>)> {
         let last_user = working_history
             .iter()
             .rev()
             .find(|message| message.role == "user")
-            .context("Goal parent transcript has no user directive")?;
-        if last_user.content.trim().is_empty() {
+            .context("Goal parent transcript has no user directive")?
+            .content
+            .clone();
+        if last_user.trim().is_empty() {
             anyhow::bail!("Goal parent transcript has a blank user directive");
         }
 
-        let effective_model = self.model_name.clone();
+        let effective_model = self.classify_model(&last_user);
+        let (vision_provider_box, _degrade_strip_images) =
+            crate::agent::turn::resolve_vision_provider(
+                self.full_config(),
+                self.model_provider.as_ref(),
+                &working_history,
+                &self.multimodal_config,
+                &self.model_provider_name,
+                &effective_model,
+            )?;
+        let (active_provider, active_provider_name, active_model): (
+            &dyn ModelProvider,
+            &str,
+            &str,
+        ) = vision_provider_box.as_ref().map_or(
+            (
+                self.model_provider.as_ref(),
+                self.model_provider_name.as_str(),
+                effective_model.as_str(),
+            ),
+            |resolved| {
+                (
+                    resolved.provider.as_ref(),
+                    resolved.provider_name.as_str(),
+                    resolved.model.as_str(),
+                )
+            },
+        );
+        let active_dispatcher =
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model);
+        if let Some(system) = working_history
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            system.content =
+                self.build_system_prompt_with_dispatcher(active_dispatcher.as_ref())?;
+        }
         let tool_protocol_prompts = self.tool_protocol_prompts()?;
-        // `goal_working_history` already returns the dispatcher-normalized
-        // provider representation. Vision selection remains inside the shared
-        // loop, exactly as for an ordinary tool-loop iteration.
         let split_idx = working_history
             .iter()
             .rposition(|message| message.role == "user")
@@ -1150,67 +1185,86 @@ impl Agent {
         let cost_context = self.tool_loop_cost_tracking_context();
         let agent_alias = self.observer_agent_alias();
         let turn_id = Self::new_turn_id();
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
 
         let run = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
             Some(cost_context),
-            crate::agent::turn::scope_tool_protocol_prompts(
-                tool_protocol_prompts,
-                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                        crate::agent::loop_::ResolvedModelAccess {
-                            model_provider: self.model_provider.as_ref(),
-                            provider_name: &self.model_provider_name,
-                            model: &effective_model,
-                            temperature: self.temperature,
-                        },
-                        crate::agent::loop_::ResolvedIo {
-                            tools_registry: &self.tools,
-                            observer: self.observer.as_ref(),
-                            silent: false,
-                            approval: self.approval_manager.as_deref(),
-                            multimodal_config: &self.multimodal_config,
-                            // Keep this field borrow separate from the mutable
-                            // image cache borrowed below.
-                            config: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|config| config.config.as_deref()),
-                            hooks: self.hook_runner.as_deref(),
-                            activated_tools: self.activated_tools.as_ref(),
-                            model_switch_callback: None,
-                            receipt_generator: None,
-                        },
-                        crate::agent::loop_::ResolvedRuntimeKnobs {
-                            max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            excluded_tools: &goal_excluded_tools,
-                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                            pacing: &pacing,
-                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                            parallel_tools: self.config.resolved.parallel_tools,
-                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_token_budget: self.config.resolved.effective_context_budget(),
-                            knobs: &knobs,
-                        },
-                    ),
-                    history: &mut loop_history,
-                    channel_name: &self.channel_name,
-                    channel_reply_target: None,
-                    cancellation_token: Some(cancellation),
-                    on_delta: None,
-                    shared_budget: None,
-                    channel: None,
-                    collected_receipts: None,
-                    event_tx: None,
-                    steering: None,
-                    new_messages_out: Some(&mut loop_new_messages),
-                    image_cache: Some(&mut self.image_cache),
-                    memory: None,
-                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                    agent_alias: agent_alias.as_deref(),
-                    parent_agent_alias: None,
-                    turn_id: &turn_id,
-                    sop_reassembly: None,
-                }),
+            crate::agent::tool_receipts::scope_receipts(
+                receipt_scope.clone(),
+                crate::agent::turn::scope_tool_protocol_prompts(
+                    tool_protocol_prompts,
+                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: active_provider,
+                                provider_name: active_provider_name,
+                                model: active_model,
+                                temperature: self.temperature,
+                            },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: false,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                // Keep this field borrow separate from the mutable
+                                // image cache borrowed below.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|config| config.config.as_deref()),
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &goal_excluded_tools,
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_token_budget: self
+                                    .config
+                                    .resolved
+                                    .effective_context_budget(),
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut loop_history,
+                        channel_name: &self.channel_name,
+                        channel_reply_target: None,
+                        cancellation_token: Some(cancellation),
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: Some(&mut loop_new_messages),
+                        image_cache: Some(&mut self.image_cache),
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: last_user.clone(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                        agent_alias: agent_alias.as_deref(),
+                        parent_agent_alias: None,
+                        turn_id: &turn_id,
+                        sop_reassembly: None,
+                    }),
+                ),
             ),
         );
         let response = zeroclaw_providers::reliable::scope_provider_fallback(run).await?;

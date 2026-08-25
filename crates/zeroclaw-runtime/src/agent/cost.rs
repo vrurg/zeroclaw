@@ -1,11 +1,17 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::pricing::ModelRates;
+
+use crate::control_plane::{GoalTaskRegistry, GoalTransitionResult};
 
 // ── Cost tracking via task-local ──
 
@@ -231,6 +237,153 @@ pub(crate) trait GoalOperationAccounting: Send + Sync {
 
 tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
+}
+
+/// Durable pairing fence for tool work performed inside one exact Goal epoch.
+///
+/// The ordinary tool loop owns the transient transcript. This helper only
+/// brackets that loop's existing prepare-before-poll and append-result seams:
+/// a process interruption after the first boundary leaves the Goal in
+/// `InFlight`, so restart cannot claim the tool batch was safely paired.
+pub(crate) struct GoalToolExecutionFence {
+    goals: Arc<dyn GoalTaskRegistry>,
+    task_id: String,
+    session_id: String,
+    epoch: i64,
+    in_flight: AtomicBool,
+    /// IDs pinned by the ordinary preparation path before it polls a tool.
+    /// They are process-local because the durable phase only needs to answer
+    /// whether an interrupted batch may be resumed safely.
+    expected_result_ids: Mutex<Option<HashSet<String>>>,
+}
+
+impl GoalToolExecutionFence {
+    pub(crate) fn new(
+        goals: Arc<dyn GoalTaskRegistry>,
+        task_id: String,
+        session_id: String,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            goals,
+            task_id,
+            session_id,
+            epoch,
+            in_flight: AtomicBool::new(false),
+            expected_result_ids: Mutex::new(None),
+        }
+    }
+
+    async fn begin_before_poll(&self, executable_call_ids: Vec<String>) -> anyhow::Result<()> {
+        if executable_call_ids.is_empty()
+            || executable_call_ids.iter().any(|id| id.trim().is_empty())
+            || executable_call_ids.iter().collect::<HashSet<_>>().len() != executable_call_ids.len()
+        {
+            anyhow::bail!("Goal tool batch does not have unique stable call IDs");
+        }
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            anyhow::bail!("Goal tool execution fence is already in flight");
+        }
+        match self
+            .goals
+            .begin_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            GoalTransitionResult::Applied => {
+                *self.expected_result_ids.lock() = Some(executable_call_ids.into_iter().collect());
+                Ok(())
+            }
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                self.in_flight.store(false, Ordering::Release);
+                anyhow::bail!("goal tool execution fence is stale")
+            }
+        }
+    }
+
+    async fn complete_after_pairing(
+        &self,
+        individual_results: &[(Option<String>, String)],
+    ) -> anyhow::Result<()> {
+        if !self.in_flight.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let expected = self
+            .expected_result_ids
+            .lock()
+            .clone()
+            .context("Goal tool execution fence has no pinned result IDs")?;
+        let mut observed = HashSet::new();
+        for (id, _) in individual_results {
+            if let Some(id) = id
+                && expected.contains(id)
+                && !observed.insert(id.clone())
+            {
+                anyhow::bail!("Goal tool batch has a duplicate terminal result ID");
+            }
+        }
+        if observed != expected {
+            anyhow::bail!("Goal tool batch did not produce one result for every executed call");
+        }
+        match self
+            .goals
+            .complete_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            GoalTransitionResult::Applied => {
+                self.in_flight.store(false, Ordering::Release);
+                *self.expected_result_ids.lock() = None;
+                Ok(())
+            }
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                anyhow::bail!("goal tool execution fence is stale")
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_TOOL_EXECUTION_FENCE: Option<Arc<GoalToolExecutionFence>>;
+}
+
+/// Mark the durable Goal tool phase immediately before a prepared tool batch
+/// may be polled. This is a no-op for every ordinary turn.
+pub(crate) async fn begin_goal_tool_execution_if_scoped(
+    executable_calls: &[zeroclaw_tool_call_parser::ParsedToolCall],
+) -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_EXECUTION_FENCE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        fence
+            .begin_before_poll(
+                executable_calls
+                    .iter()
+                    .map(|call| {
+                        call.tool_call_id
+                            .clone()
+                            .context("Goal executable tool call has no stable ID")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Clear the durable Goal tool phase only after the ordinary loop appended the
+/// complete paired result batch to its caller-owned transcript.
+pub(crate) async fn complete_goal_tool_execution_if_scoped(
+    individual_results: &[(Option<String>, String)],
+) -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_EXECUTION_FENCE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        fence.complete_after_pairing(individual_results).await?;
+    }
+    Ok(())
 }
 
 /// Admit the next Goal logical operation when a Goal execution owner scoped

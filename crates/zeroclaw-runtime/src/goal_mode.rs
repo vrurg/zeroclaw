@@ -902,6 +902,7 @@ impl GoalRuntime {
                 current.task.agent.clone(),
             ));
         let scope = scope.with_operation_accounting(accounting);
+        let failure_scope = scope.clone();
         if self.executor.launch(scope).await.is_ok() {
             return Ok(GoalResponse::message(if turn_kind == GoalTurnKind::Start {
                 GoalMessageKey::Started
@@ -909,21 +910,18 @@ impl GoalRuntime {
                 GoalMessageKey::Resumed
             }));
         }
-        let result = self
-            .goals
-            .finish_session_goal(
-                task_id,
-                ingress.session_id(),
-                epoch,
-                TaskStatus::Failed,
-                Some("executor_start_failed".into()),
-            )
-            .await
-            .map_err(GoalRuntimeError::control_plane)?;
-        Ok(GoalResponse::message(transition_message(
-            result,
-            GoalMessageKey::ExecutorStartFailed,
-        )))
+        let applied = execution::finish_goal_or_retain_execution(
+            &self.goals,
+            &failure_scope,
+            TaskStatus::Failed,
+            Some("executor_start_failed"),
+        )
+        .await;
+        Ok(GoalResponse::message(if applied {
+            GoalMessageKey::ExecutorStartFailed
+        } else {
+            GoalMessageKey::Stale
+        }))
     }
 
     async fn preflight(
