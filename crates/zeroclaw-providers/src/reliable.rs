@@ -1105,14 +1105,23 @@ fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>())
 }
 
-/// Extract billing metadata a Reliable terminal error preserves alongside its
-/// actual cause. The caller still returns the original error unchanged.
+/// Extract billable typed terminal usage at the dispatch boundary.
+///
+/// Reliable aggregates rejected attempts in its sidecar; direct providers
+/// preserve their terminal failure instead. The caller still returns the
+/// original error unchanged.
 pub(crate) fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
-    error.chain().find_map(|cause| {
-        cause
-            .downcast_ref::<ReliableRejectedCompletionUsage>()
-            .map(|rejected| rejected.usage.clone())
-    })
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ReliableRejectedCompletionUsage>()
+                .map(|rejected| rejected.usage.clone())
+        })
+        // Direct providers have no Reliable aggregate. Preserve their typed
+        // terminal usage through the same dispatch boundary, while respecting
+        // a contextual policy that marks an outcome informational.
+        .or_else(|| crate::terminal::billable_terminal_usage(error).cloned())
 }
 
 /// A Reliable chat request exhausted its candidates after receiving rejected
@@ -4823,6 +4832,38 @@ mod tests {
             outcome.result.map(|response| response.response),
             outcome.accounting,
         );
+    }
+
+    #[test]
+    fn direct_terminal_usage_respects_contextual_chargeability() {
+        use crate::terminal::{
+            TerminalCompletionPolicy, TerminalRecoveryDisposition, TerminalUsageChargeability,
+            terminal_completion_context_error,
+        };
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+        };
+        let billable = anyhow::Error::new(TerminalCompletionFailure::new(
+            TerminalCompletionError::OutputTokenLimit,
+            Some(usage.clone()),
+        ));
+        let observed = terminal_error_usage(&billable).expect("direct usage must be preserved");
+        assert_eq!(observed.input_tokens, usage.input_tokens);
+        assert_eq!(observed.output_tokens, usage.output_tokens);
+        assert_eq!(observed.cached_input_tokens, usage.cached_input_tokens);
+
+        let informational = terminal_completion_context_error(
+            TerminalCompletionFailure::new(TerminalCompletionError::Refusal, Some(usage)),
+            TerminalCompletionPolicy::new(
+                TerminalRecoveryDisposition::NextCandidate,
+                TerminalUsageChargeability::Informational,
+            ),
+        );
+        assert!(terminal_error_usage(&informational).is_none());
     }
 
     #[tokio::test]
