@@ -149,6 +149,11 @@ pub struct CostRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_id: Option<String>,
+    /// Exact provider reference that served this usage event, when the caller
+    /// has an immutable actual-route attribution. Legacy and ordinary records
+    /// remain readable without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<String>,
 }
 
 impl CostRecord {
@@ -160,6 +165,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias: None,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -175,6 +181,7 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -191,6 +198,26 @@ impl CostRecord {
             session_id: session_id.into(),
             agent_alias,
             task_id,
+            provider_ref: None,
+        }
+    }
+
+    /// Create a record with durable task attribution and an actual provider
+    /// route supplied by a caller that can prove the served route.
+    pub fn with_attribution_and_provider(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        task_id: Option<String>,
+        provider_ref: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            agent_alias,
+            task_id,
+            provider_ref,
         }
     }
 }
@@ -240,6 +267,20 @@ pub struct CostSummary {
     /// false` or when no records carry an agent_alias.
     #[serde(default)]
     pub by_agent: std::collections::HashMap<String, AgentCostStats>,
+}
+
+/// Checked usage totals derived from the canonical ledger for one durable task.
+///
+/// Unlike ordinary reporting summaries, this projection rejects malformed
+/// ledger input and internally inconsistent usage before returning a value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrictTaskUsageTotals {
+    /// Sum of every persisted input and output token count for the task.
+    pub total_tokens: u64,
+    /// Sum of every persisted cost value for the task.
+    pub cost_usd: f64,
+    /// Whether every persisted task row had a resolved price.
+    pub pricing_available: bool,
 }
 
 /// Statistics for a specific agent alias.
@@ -372,6 +413,7 @@ mod tests {
 
         assert_eq!(record.session_id, "session-123");
         assert!(record.task_id.is_none());
+        assert!(record.provider_ref.is_none());
         assert!(!record.id.is_empty());
         assert_eq!(record.usage.model, "test/model");
     }
@@ -394,6 +436,7 @@ mod tests {
 
         assert_eq!(parsed.agent_alias.as_deref(), Some("agent-a"));
         assert_eq!(parsed.task_id.as_deref(), Some("goal-123"));
+        assert!(parsed.provider_ref.is_none());
     }
 
     #[test]
@@ -415,6 +458,7 @@ mod tests {
         let parsed: CostRecord = serde_json::from_str(json).unwrap();
 
         assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
+        assert!(parsed.provider_ref.is_none());
         assert!(parsed.usage.pricing_available);
     }
 }

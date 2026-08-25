@@ -292,9 +292,17 @@ pub(crate) async fn record_accepted_chat_response(
         turn_id: Some(ctx.turn_id.to_string()),
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
-    let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    // A scoped Goal operation has already settled every surfaced #10144
+    // attempt, including the accepted leaf, through its strict canonical
+    // ledger owner. Ordinary turns retain the established accepted-response
+    // recording path.
+    let cost_usd = (!accepted_response_cost_is_goal_owned())
+        .then(|| {
+            usage
+                .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+                .map(|(_total_tokens, cost_usd)| cost_usd)
+        })
+        .flatten();
     if let Some(tx) = ctx.event_tx
         && let Some(usage) = usage
     {
@@ -328,10 +336,55 @@ pub(crate) async fn record_accepted_chat_response(
     );
 }
 
+fn accepted_response_cost_is_goal_owned() -> bool {
+    crate::agent::cost::goal_operation_accounting_is_scoped()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_native_assistant_history, unforwarded_narration};
+    use super::{
+        accepted_response_cost_is_goal_owned, build_native_assistant_history, unforwarded_narration,
+    };
+    use crate::agent::cost::{
+        GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
+        GoalOperationSettlement,
+    };
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use zeroclaw_config::schema::Config;
     use zeroclaw_providers::ToolCall;
+
+    struct NoopGoalAccounting(Config);
+
+    #[async_trait]
+    impl GoalOperationAccounting for NoopGoalAccounting {
+        fn config(&self) -> &Config {
+            &self.0
+        }
+
+        async fn admit(&self, _: GoalOperationRequest) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn settle(&self, _: GoalOperationSettlement) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_accepted_response_never_uses_ordinary_cost_recording() {
+        assert!(!accepted_response_cost_is_goal_owned());
+        let accounting = Arc::new(NoopGoalAccounting(Config::default()));
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(accounting as Arc<dyn GoalOperationAccounting>),
+                async {
+                    assert!(accepted_response_cost_is_goal_owned());
+                },
+            )
+            .await;
+        assert!(!accepted_response_cost_is_goal_owned());
+    }
 
     #[test]
     fn native_assistant_history_preserves_tool_call_extra_content() {

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -15,6 +16,8 @@ use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
+
+mod execution;
 
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
@@ -413,13 +416,40 @@ pub enum GoalTurnKind {
 }
 
 /// Exact durable identity submitted to the dormant execution seam.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GoalExecutionScope {
     pub task_id: String,
     pub session_id: String,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
+    /// One permit shared by every Goal-owned logical provider operation for
+    /// this exact executor scope. Child propagation retains this same permit
+    /// in GM-05; session ownership is supplied by the generic host in GM-06.
+    pub operation_permit: Arc<Semaphore>,
+    operation_accounting: Option<Arc<dyn crate::agent::cost::GoalOperationAccounting>>,
+}
+
+impl std::fmt::Debug for GoalExecutionScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalExecutionScope")
+            .field("task_id", &self.task_id)
+            .field("session_id", &self.session_id)
+            .field("execution_epoch", &self.execution_epoch)
+            .field("turn_kind", &self.turn_kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoalExecutionScope {
+    fn with_operation_accounting(
+        mut self,
+        accounting: Arc<dyn crate::agent::cost::GoalOperationAccounting>,
+    ) -> Self {
+        self.operation_accounting = Some(accounting);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -602,12 +632,11 @@ impl GoalRuntime {
         };
         let task_id = current.task.id.clone();
         let tracker = Arc::clone(&self.cost_tracker);
-        let totals = tokio::task::spawn_blocking(move || {
-            tracker.get_usage_totals_for_task_with_pricing(&task_id)
-        })
-        .await
-        .map_err(GoalRuntimeError::accounting)?
-        .map_err(GoalRuntimeError::accounting)?;
+        let totals =
+            tokio::task::spawn_blocking(move || tracker.get_strict_usage_totals_for_task(&task_id))
+                .await
+                .map_err(GoalRuntimeError::accounting)?
+                .map_err(GoalRuntimeError::accounting)?;
         let terminal_reason = if current.task.status.is_terminal() {
             self.goals
                 .terminal_reason_for_session_goal(&current.task.id, ingress.session_id())
@@ -620,7 +649,15 @@ impl GoalRuntime {
         };
         Ok(GoalResponse::status(
             key,
-            status_projection(current, totals, terminal_reason),
+            status_projection(
+                current,
+                (
+                    totals.total_tokens,
+                    totals.cost_usd,
+                    totals.pricing_available,
+                ),
+                terminal_reason,
+            ),
         ))
     }
 
@@ -813,7 +850,18 @@ impl GoalRuntime {
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
+            operation_permit: Arc::new(Semaphore::new(1)),
+            operation_accounting: None,
         };
+        let accounting: Arc<dyn crate::agent::cost::GoalOperationAccounting> =
+            Arc::new(execution::GoalOperationAccountant::new(
+                Arc::clone(&self.goals),
+                Arc::clone(&self.config),
+                Arc::clone(&self.cost_tracker),
+                scope.clone(),
+                current.task.agent.clone(),
+            ));
+        let scope = scope.with_operation_accounting(accounting);
         if self.executor.launch(scope).await.is_ok() {
             return Ok(GoalResponse::message(if turn_kind == GoalTurnKind::Start {
                 GoalMessageKey::Started
@@ -1055,6 +1103,18 @@ mod tests {
         Arc<FakeExecutor>,
         tempfile::TempDir,
     ) {
+        controller_with_config(enabled_config(), readiness)
+    }
+
+    fn controller_with_config(
+        config: Arc<Config>,
+        readiness: GoalExecutionReadiness,
+    ) -> (
+        GoalRuntime,
+        Arc<SqliteTaskStore>,
+        Arc<FakeExecutor>,
+        tempfile::TempDir,
+    ) {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let directory = tempfile::tempdir().unwrap();
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
@@ -1064,7 +1124,7 @@ mod tests {
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
         (
-            GoalRuntime::new(enabled_config(), goals, tracker, executor.clone(), "boot").unwrap(),
+            GoalRuntime::new(config, goals, tracker, executor.clone(), "boot").unwrap(),
             store,
             executor,
             directory,
@@ -1081,6 +1141,249 @@ mod tests {
             parse_goal_command(" /goal start --tokens 8 --cost-usd 1.5 --success-criteria  done safely  --  ship it  ").unwrap(),
             GoalCommand::Start { budget: GoalBudgetRequest::Limits { token_limit: Some(8), cost_limit_usd: Some(1.5) }, success_criteria: "  done safely  ".into(), objective: "  ship it  ".into() }
         );
+    }
+
+    #[tokio::test]
+    async fn launched_scope_settles_one_task_attributed_provider_operation() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        let response = runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "deliver the result".into(),
+                    objective: "complete the scoped operation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.key, GoalMessageKey::Started);
+        let scope = executor.launches.lock().pop().unwrap();
+        let accountant = scope.operation_accounting.clone().unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::agent::cost::GoalOperationAccounting::settle(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                pricing_complete: true,
+                usage_events: vec![crate::agent::cost::GoalUsageEvent {
+                    model_provider: "openai".into(),
+                    model: "verifier".into(),
+                    usage: zeroclaw_config::cost::TokenUsage::new(
+                        "verifier", 3, 2, 0, 0.0, 0.0, 0.0,
+                    ),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+        let status = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.known_token_usage, 5);
+    }
+
+    #[tokio::test]
+    async fn first_budgeted_operation_is_admitted_even_when_its_reservation_overshoots() {
+        let mut config = (*enabled_config()).clone();
+        config.goal.default_token_limit = Some(1);
+        let (runtime, _store, executor, _directory) =
+            controller_with_config(Arc::new(config), GoalExecutionReadiness::Ready);
+        let response = runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Defaults,
+                    success_criteria: "deliver the result".into(),
+                    objective: "complete the scoped operation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.key, GoalMessageKey::Started);
+        let scope = executor.launches.lock().pop().unwrap();
+        let accountant = scope.operation_accounting.clone().unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .expect("one operation may overshoot a finite admission limit");
+        crate::agent::cost::GoalOperationAccounting::settle(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                pricing_complete: true,
+                usage_events: vec![crate::agent::cost::GoalUsageEvent {
+                    model_provider: "openai".into(),
+                    model: "verifier".into(),
+                    usage: zeroclaw_config::cost::TokenUsage::new(
+                        "verifier", 1, 1, 0, 0.0, 0.0, 0.0,
+                    ),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let second = crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await;
+        assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn complete_settlement_without_usage_is_durably_classified_missing() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "deliver the result".into(),
+                    objective: "complete the scoped operation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = executor.launches.lock().pop().unwrap();
+        let accountant = scope.operation_accounting.clone().unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::agent::cost::GoalOperationAccounting::settle(
+                accountant.as_ref(),
+                crate::agent::cost::GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Complete,
+                    pricing_complete: true,
+                    usage_events: Vec::new(),
+                },
+            )
+            .await
+            .is_err()
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Missing);
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_usage_is_durably_classified_invalid_without_a_ledger_row() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "deliver the result".into(),
+                    objective: "complete the scoped operation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = executor.launches.lock().pop().unwrap();
+        let accountant = scope.operation_accounting.clone().unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut usage = zeroclaw_config::cost::TokenUsage::new("verifier", 3, 2, 0, 0.0, 0.0, 0.0);
+        usage.total_tokens = 0;
+        assert!(
+            crate::agent::cost::GoalOperationAccounting::settle(
+                accountant.as_ref(),
+                crate::agent::cost::GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Complete,
+                    pricing_complete: true,
+                    usage_events: vec![crate::agent::cost::GoalUsageEvent {
+                        model_provider: "openai".into(),
+                        model: "verifier".into(),
+                        usage,
+                    }],
+                },
+            )
+            .await
+            .is_err()
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        let status = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(status.known_token_usage, 0);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::types::{
-    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod,
+    AgentCostStats, BudgetCheck, CostRecord, CostSummary, ModelStats, StrictTaskUsageTotals,
+    TokenUsage, UsagePeriod,
 };
 use crate::schema::CostConfig;
 use anyhow::{Context, Result};
@@ -198,7 +199,7 @@ impl CostTracker {
         agent_alias: Option<&str>,
         task_id: Option<String>,
     ) -> Result<()> {
-        self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, true)
+        self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, None, true)
     }
 
     pub fn record_scoped_usage_with_owned_task_attribution(
@@ -207,7 +208,34 @@ impl CostTracker {
         agent_alias: Option<&str>,
         task_id: Option<String>,
     ) -> Result<()> {
-        self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, false)
+        self.record_usage_with_owned_task_attribution_inner(
+            usage,
+            agent_alias,
+            task_id,
+            None,
+            false,
+        )
+    }
+
+    /// Persist one guarded task-attributed usage event with its exact actual
+    /// provider route, even when ordinary cost tracking is disabled.
+    pub fn record_scoped_usage_with_owned_task_and_provider_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: String,
+    ) -> Result<()> {
+        if provider_ref.trim().is_empty() {
+            anyhow::bail!("Task-attributed usage requires a nonblank provider route");
+        }
+        self.record_usage_with_owned_task_attribution_inner(
+            usage,
+            agent_alias,
+            task_id,
+            Some(provider_ref),
+            false,
+        )
     }
 
     fn record_usage_with_owned_task_attribution_inner(
@@ -215,6 +243,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
+        provider_ref: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
         let (enabled, track_per_agent) = {
@@ -243,8 +272,13 @@ impl CostTracker {
         };
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
-        let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
+        let record = CostRecord::with_attribution_and_provider(
+            &self.session_id,
+            effective_alias.clone(),
+            task_id,
+            provider_ref,
+            usage,
+        );
 
         {
             let mut storage = self.lock_storage();
@@ -329,6 +363,16 @@ impl CostTracker {
     ) -> Result<(u64, f64, bool)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task_with_pricing(task_id)
+    }
+
+    /// Derive task totals through the strict canonical-ledger path.
+    ///
+    /// Ordinary reporting keeps its tolerant parser so historical dashboards
+    /// remain available. Guarded Goal admission uses this projection so a
+    /// damaged ledger cannot silently become known-zero consumption.
+    pub fn get_strict_usage_totals_for_task(&self, task_id: &str) -> Result<StrictTaskUsageTotals> {
+        let storage = self.lock_storage();
+        storage.strict_usage_totals_for_task(task_id)
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -428,13 +472,28 @@ impl CostTracker {
     /// later reload flipping `enabled` to `true` constructs it on demand.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
         let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
-        Self::resolve_global(slot, config, workspace_dir)
+        Self::resolve_global(slot, config, workspace_dir, false)
+    }
+
+    /// Open the existing canonical tracker for a Goal-owned operation without
+    /// changing ordinary `[cost].enabled` behavior.
+    ///
+    /// Goal Mode persists task-attributed records even when ordinary cost
+    /// reporting is disabled. The resulting tracker retains that disabled
+    /// policy; only Goal's scoped record API bypasses the policy gate.
+    pub fn get_or_init_global_for_goal(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::resolve_global(slot, config, workspace_dir, true)
     }
 
     fn resolve_global(
         slot: &RwLock<Option<Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
+        force_initialize: bool,
     ) -> Option<Arc<Self>> {
         let storage_path = match resolve_storage_path(workspace_dir) {
             Ok(path) => path,
@@ -451,19 +510,19 @@ impl CostTracker {
         };
 
         if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !force_initialize))
         {
             ct.update_config(config);
             return Some(ct);
         }
 
-        if !config.enabled {
+        if !config.enabled && !force_initialize {
             return None;
         }
 
         let mut guard = slot.write();
         if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
+            && (ct.storage_path() == storage_path || (!config.enabled && !force_initialize))
         {
             ct.update_config(config);
             return Some(ct);
@@ -910,6 +969,80 @@ impl CostStorage {
         Ok((total_tokens, cost_usd, pricing_available))
     }
 
+    /// Visit canonical records without legacy recovery. Consumers that make
+    /// lifecycle or admission decisions must fail closed on malformed JSONL.
+    fn try_for_each_record_strict<F>(&self, mut on_record: F) -> Result<()>
+    where
+        F: FnMut(CostRecord) -> Result<()>,
+    {
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+        let reader = BufReader::new(file);
+        for (line_number, line) in reader.lines().enumerate() {
+            let raw_line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from cost storage {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let record = serde_json::from_str::<CostRecord>(trimmed).with_context(|| {
+                format!(
+                    "malformed cost record at line {} in {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            on_record(record)?;
+        }
+        Ok(())
+    }
+
+    fn strict_usage_totals_for_task(&self, task_id: &str) -> Result<StrictTaskUsageTotals> {
+        let mut totals = StrictTaskUsageTotals {
+            total_tokens: 0,
+            cost_usd: 0.0,
+            pricing_available: true,
+        };
+        self.try_for_each_record_strict(|record| {
+            let usage = &record.usage;
+            let expected_total = usage
+                .input_tokens
+                .checked_add(usage.output_tokens)
+                .context("cost record total token overflow")?;
+            if usage.total_tokens != expected_total {
+                anyhow::bail!("cost record total_tokens does not match input plus output");
+            }
+            if usage.cached_input_tokens > usage.input_tokens {
+                anyhow::bail!("cost record cached input tokens exceed input tokens");
+            }
+            if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
+                anyhow::bail!("cost record cost is not finite or is negative");
+            }
+            if record.task_id.as_deref() == Some(task_id) {
+                totals.total_tokens = totals
+                    .total_tokens
+                    .checked_add(usage.total_tokens)
+                    .context("task usage total token overflow")?;
+                totals.cost_usd += usage.cost_usd;
+                if !totals.cost_usd.is_finite() {
+                    anyhow::bail!("task usage total cost is not finite");
+                }
+                totals.pricing_available &= usage.pricing_available;
+            }
+            Ok(())
+        })?;
+        Ok(totals)
+    }
+
     /// Get cost for a specific date.
     fn get_cost_for_date(&self, date: NaiveDate) -> Result<f64> {
         let mut cost = 0.0;
@@ -990,6 +1123,82 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
         assert!(!tracker.session_id().is_empty());
+    }
+
+    #[test]
+    fn strict_task_totals_fail_closed_on_malformed_ledger_and_keep_free_usage_priced() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/free", 1_000, 500, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+
+        let totals = tracker.get_strict_usage_totals_for_task("goal-a").unwrap();
+        assert_eq!(totals.total_tokens, 1_500);
+        assert_eq!(totals.cost_usd, 0.0);
+        assert!(totals.pricing_available);
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "not-a-json-line").unwrap();
+        file.sync_all().unwrap();
+        assert!(tracker.get_strict_usage_totals_for_task("goal-a").is_err());
+    }
+
+    #[test]
+    fn forced_goal_tracker_records_to_canonical_ledger_while_ordinary_cost_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let slot = RwLock::new(None);
+        let disabled = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let tracker = CostTracker::resolve_global(&slot, disabled, tmp.path(), true)
+            .expect("Goal scope opens the canonical tracker");
+        assert!(!tracker.is_enabled());
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 10, 5, 0, 1.0, 1.0, 1.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task("goal-a")
+                .unwrap()
+                .total_tokens,
+            15
+        );
+        assert!(resolve_storage_path(tmp.path()).unwrap().exists());
+    }
+
+    #[test]
+    fn scoped_task_record_retains_actual_provider_route() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                TokenUsage::new("served-model", 10, 5, 0, 1.0, 1.0, 1.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+                "served.fallback".into(),
+            )
+            .unwrap();
+
+        let record = std::fs::read_to_string(resolve_storage_path(tmp.path()).unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CostRecord>(line).unwrap())
+            .next()
+            .unwrap();
+        assert_eq!(record.task_id.as_deref(), Some("goal-a"));
+        assert_eq!(record.provider_ref.as_deref(), Some("served.fallback"));
+        assert_eq!(record.usage.model, "served-model");
     }
 
     #[test]
@@ -1466,7 +1675,7 @@ mod tests {
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first = CostTracker::resolve_global(&slot, boot, tmp.path())
+        let first = CostTracker::resolve_global(&slot, boot, tmp.path(), false)
             .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
@@ -1474,7 +1683,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path())
+        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path(), false)
             .expect("reload yields a tracker");
 
         assert_eq!(
@@ -1494,9 +1703,9 @@ mod tests {
         let second_tmp = TempDir::new().unwrap();
         let slot = RwLock::new(None);
 
-        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path())
+        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path(), false)
             .expect("first init yields a tracker");
-        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path())
+        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path(), false)
             .expect("data-dir change yields a tracker");
 
         assert!(
@@ -1524,7 +1733,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&slot, disabled_boot, tmp.path()).is_none(),
+            CostTracker::resolve_global(&slot, disabled_boot, tmp.path(), false).is_none(),
             "disabled boot must not construct a tracker"
         );
 
@@ -1533,7 +1742,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path())
+        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path(), false)
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
@@ -1549,6 +1758,7 @@ mod tests {
                 ..Default::default()
             },
             tmp.path(),
+            false,
         )
         .expect("subsequent call yields a tracker");
         assert!(
@@ -1567,7 +1777,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path())
+        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path(), false)
             .expect("enabled boot yields a tracker");
 
         let disable = CostConfig {
@@ -1575,7 +1785,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, disable, tmp.path())
+        let after = CostTracker::resolve_global(&slot, disable, tmp.path(), false)
             .expect("disable reload leaves the tracker resident");
         assert!(
             Arc::ptr_eq(&tracker, &after),
