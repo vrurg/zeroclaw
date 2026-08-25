@@ -24,6 +24,12 @@ use zeroclaw_providers::{
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
+/// Child creation stays unavailable to a Goal parent until the foreground
+/// propagation stage can carry exact Goal scope into the child runtime.
+pub(crate) fn goal_parent_excluded_tools() -> &'static [&'static str] {
+    &["delegate", "spawn_subagent"]
+}
+
 pub fn build_session_model_provider(
     config: &Config,
     model_provider_ref: &str,
@@ -1135,6 +1141,12 @@ impl Agent {
             loop_detection_enabled: false,
             ..zeroclaw_config::schema::PacingConfig::default()
         };
+        // GM05 supplies foreground child inheritance. Until then, a Goal
+        // parent must not initiate work that could outlive this exact scope.
+        let goal_excluded_tools = goal_parent_excluded_tools()
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .collect::<Vec<_>>();
         let cost_context = self.tool_loop_cost_tracking_context();
         let agent_alias = self.observer_agent_alias();
         let turn_id = Self::new_turn_id();
@@ -1170,7 +1182,7 @@ impl Agent {
                         },
                         crate::agent::loop_::ResolvedRuntimeKnobs {
                             max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            excluded_tools: &[],
+                            excluded_tools: &goal_excluded_tools,
                             dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
                             pacing: &pacing,
                             strict_tool_parsing: self.config.resolved.strict_tool_parsing,
@@ -3668,6 +3680,14 @@ mod tests {
                 .iter()
                 .zip(&canonical_before)
                 .all(|(actual, expected)| format!("{actual:?}") == format!("{expected:?}"))
+        );
+    }
+
+    #[test]
+    fn goal_parent_excludes_child_creation_until_scope_propagation_exists() {
+        assert_eq!(
+            goal_parent_excluded_tools(),
+            &["delegate", "spawn_subagent"]
         );
     }
 
