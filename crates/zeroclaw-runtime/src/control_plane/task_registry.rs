@@ -94,6 +94,14 @@ pub struct TaskRecord {
     pub idem_key: Option<String>,
     #[serde(default)]
     pub principal_id: Option<String>,
+    /// Canonical session binding for a Goal. Unrelated tasks and legacy rows
+    /// may omit it, but new Goal tasks must bind exactly one nonblank session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Durable executor fence for a Goal. A resumed executor must own a newer
+    /// epoch before it can mutate canonical task state.
+    #[serde(default)]
+    pub execution_epoch: i64,
     /// Task registration/start timestamp in RFC3339 form.
     pub started_at: String,
     /// Terminal transition timestamp in RFC3339 form.
@@ -193,5 +201,20 @@ mod tests {
         assert!(rec.parent_id.is_none());
         assert!(rec.originator_route.is_none());
         assert!(rec.principal_id.is_none()); // EPIC-D attribution not yet stamped; absent
+    }
+
+    #[test]
+    fn legacy_task_record_defaults_to_unbound_session_and_epoch_zero() {
+        let legacy = r#"{
+            "id": "11111111-1111-1111-1111-111111111111",
+            "kind": "goal",
+            "agent": "main",
+            "status": "running",
+            "started_at": "2026-06-18T00:00:00Z"
+        }"#;
+        let rec: TaskRecord = serde_json::from_str(legacy).unwrap();
+
+        assert!(rec.session_id.is_none());
+        assert_eq!(rec.execution_epoch, 0);
     }
 }

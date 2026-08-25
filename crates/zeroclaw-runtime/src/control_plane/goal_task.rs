@@ -30,6 +30,80 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
+    /// Durable fence for one admitted logical model operation.
+    #[serde(default)]
+    pub pending_call_id: Option<String>,
+    /// Epoch that admitted `pending_call_id`; it is always paired with the id.
+    #[serde(default)]
+    pub pending_call_epoch: Option<i64>,
+    /// Conservative token reservation for the pending logical operation.
+    #[serde(default)]
+    pub pending_reserved_tokens: Option<u64>,
+    /// Conservative cost reservation for the pending logical operation.
+    #[serde(default)]
+    pub pending_reserved_cost_usd: Option<f64>,
+    /// Whether Goal accounting is safe for another logical operation.
+    #[serde(default)]
+    pub accounting_state: GoalAccountingState,
+    /// Durable, reversible phase around a Goal-owned tool batch.
+    ///
+    /// This is intentionally not a transcript, receipt, or checkpoint. The
+    /// executor may return it to `Clean` only after it validates and appends
+    /// its process-local tool-result pairing.
+    #[serde(default)]
+    pub tool_phase: GoalToolPhase,
+    /// Immutable declared success criteria for the mandatory verifier.
+    #[serde(default)]
+    pub success_criteria: String,
+}
+
+impl Default for GoalTaskRecord {
+    fn default() -> Self {
+        Self {
+            task_id: String::new(),
+            objective: String::new(),
+            effective_token_limit: None,
+            effective_cost_limit_usd: None,
+            pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
+            pending_call_id: None,
+            pending_call_epoch: None,
+            pending_reserved_tokens: None,
+            pending_reserved_cost_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            tool_phase: GoalToolPhase::Clean,
+            success_criteria: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalAccountingState {
+    #[default]
+    Complete,
+    Missing,
+    Invalid,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalToolPhase {
+    #[default]
+    Clean,
+    InFlight,
+}
+
+/// Result of a guarded Goal control-plane mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalTransitionResult {
+    Applied,
+    /// The row still exists, but no longer has the exact session/epoch/state
+    /// binding the caller proved before attempting the mutation.
+    Stale,
+    Missing,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +365,101 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         task_id: &str,
     ) -> anyhow::Result<Option<TaskContinuationContext>>;
+
+    /// Return the one current Goal for this canonical session. Terminal rows
+    /// remain current until replacement or disposal.
+    async fn current_goal_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// Atomically create a session-bound Goal, or replace a fully settled
+    /// terminal predecessor for the same session.
+    async fn create_or_replace_session_goal(
+        &self,
+        task: TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn pause_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pause: GoalPauseState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn resume_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn finish_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn admit_pending_call_with_reservation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pending_call_id: &str,
+        reserved_tokens: Option<u64>,
+        reserved_cost_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn settle_pending_call(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+        accounting_state: GoalAccountingState,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Enter the durable in-flight phase before a prepared Goal tool batch is
+    /// polled. The runtime owns pairing and is the sole caller allowed to
+    /// complete it after appending paired results to its working transcript.
+    async fn begin_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn complete_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    async fn update_session_goal_limits(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Delete session-owned Goal control state after its executor is fenced
+    /// and quiesced. Ledger records are deliberately outside this operation.
+    async fn delete_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
 }
 
 #[cfg(test)]
