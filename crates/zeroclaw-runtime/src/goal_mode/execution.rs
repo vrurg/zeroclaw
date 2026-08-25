@@ -22,13 +22,10 @@ use zeroclaw_config::{
     schema::Config,
 };
 
-use super::host::{
-    GoalHostModelBinding, GoalSessionAdapter, GoalSessionAdapterRouter, GoalSessionBinding,
-    GoalSessionLease,
-};
+use super::host::{GoalSessionAdapter, GoalSessionAdapterRouter};
 use super::{GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor};
 use crate::{
-    agent::agent::{Agent, build_session_model_provider},
+    agent::agent::build_session_model_provider,
     agent::cost::{
         GoalOperationAccounting, GoalOperationRequest, GoalOperationSettlement,
         GoalToolExecutionFence,
@@ -37,7 +34,6 @@ use crate::{
         GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
         GoalTaskRegistry, GoalTransitionResult, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     },
-    rpc::session::SessionStore,
 };
 
 const VERIFIER_REASON_MAX_BYTES: usize = 2_048;
@@ -94,115 +90,6 @@ struct ActiveGoalOperation {
     _permit: OwnedSemaphorePermit,
 }
 
-/// Private adapter that leases the existing RPC session actor. It owns no
-/// Goal lifecycle state and does not expose a new RPC method; public ZeroCode
-/// exposure remains a later Goal Mode stage.
-pub(crate) struct RpcGoalSessionAdapter {
-    sessions: Arc<SessionStore>,
-}
-
-impl RpcGoalSessionAdapter {
-    pub(crate) fn new(sessions: Arc<SessionStore>) -> Self {
-        Self { sessions }
-    }
-}
-
-struct RpcGoalSessionLease {
-    _queue_guard: zeroclaw_infra::session_queue::SessionGuard,
-    agent: tokio::sync::OwnedMutexGuard<Agent>,
-}
-
-#[async_trait]
-impl GoalSessionAdapter for RpcGoalSessionAdapter {
-    fn owns(&self, binding: &GoalSessionBinding) -> bool {
-        binding.route() == "rpc"
-    }
-
-    async fn model_binding(
-        &self,
-        binding: &GoalSessionBinding,
-    ) -> anyhow::Result<GoalHostModelBinding> {
-        if self
-            .sessions
-            .get_agent_alias(binding.session_id())
-            .await
-            .as_deref()
-            != Some(binding.agent())
-        {
-            anyhow::bail!("Goal RPC session agent binding is unavailable");
-        }
-        let agent = self
-            .sessions
-            .get_agent(binding.session_id())
-            .await
-            .context("Goal RPC session is unavailable")?;
-        let (provider_ref, model) = agent.lock().await.goal_model_binding();
-        if provider_ref.trim().is_empty() || model.trim().is_empty() {
-            anyhow::bail!("Goal RPC session model binding is unavailable");
-        }
-        Ok(GoalHostModelBinding {
-            provider_ref,
-            model,
-        })
-    }
-
-    async fn acquire(
-        &self,
-        scope: &GoalExecutionScope,
-        binding: &GoalSessionBinding,
-    ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
-        if binding.session_id() != scope.session_id || binding.agent().trim().is_empty() {
-            anyhow::bail!("Goal RPC lease binding does not match the execution scope");
-        }
-        let queue_guard = self
-            .sessions
-            .session_queue
-            .acquire(&scope.session_id)
-            .await
-            .context("Goal RPC foreground lease is unavailable")?;
-        if self
-            .sessions
-            .get_agent_alias(&scope.session_id)
-            .await
-            .as_deref()
-            != Some(binding.agent())
-        {
-            anyhow::bail!("Goal RPC session agent binding changed while waiting for lease");
-        }
-        let agent = self
-            .sessions
-            .get_agent(&scope.session_id)
-            .await
-            .context("Goal RPC session disappeared while waiting for lease")?;
-        Ok(Box::new(RpcGoalSessionLease {
-            _queue_guard: queue_guard,
-            agent: agent.lock_owned().await,
-        }))
-    }
-}
-
-#[async_trait]
-impl GoalSessionLease for RpcGoalSessionLease {
-    fn working_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
-        self.agent.goal_working_history()
-    }
-
-    async fn run_parent_turn(
-        &mut self,
-        working_history: Vec<zeroclaw_api::model_provider::ChatMessage>,
-        cancellation: tokio_util::sync::CancellationToken,
-    ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
-        self.agent
-            .run_goal_parent_turn(working_history, cancellation)
-            .await
-    }
-
-    fn append_verified_candidate(&mut self, candidate: &str) {
-        self.agent
-            .append_verified_goal_candidate(candidate.to_owned());
-    }
-}
-
 /// Goal-owned durable child lifecycle. This is a concrete, private seam over
 /// the same task registry and boot identity that compose the execution host;
 /// child tools never consult process-global control-plane state.
@@ -214,6 +101,25 @@ pub(crate) struct GoalChildLifecycle {
 impl GoalChildLifecycle {
     pub(crate) fn new(tasks: Arc<dyn TaskRegistry>, boot_id: String) -> Self {
         Self { tasks, boot_id }
+    }
+
+    /// Repair any foreground child that survived a forced parent-worker
+    /// quiesce. Children are direct, synchronously owned Goal work; this is
+    /// terminal accounting cleanup, not asynchronous supervision.
+    async fn cancel_running_children(&self, parent_task_id: &str) -> anyhow::Result<()> {
+        for child in self.tasks.list_running().await? {
+            if child.parent_id.as_deref() == Some(parent_task_id) {
+                self.tasks
+                    .update_status(
+                        &child.id,
+                        TaskStatus::Cancelled,
+                        None,
+                        Some("goal_parent_quiesced".to_owned()),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -390,24 +296,6 @@ impl GoalExecutionHost {
             config,
             workers: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Build the generic host over the daemon's existing RPC session owner.
-    ///
-    /// This is construction plumbing only. It does not register a public RPC
-    /// Goal command; transport exposure remains a later adapter stage.
-    pub(crate) fn from_existing_rpc_sessions(
-        sessions: Arc<SessionStore>,
-        goals: Arc<dyn GoalTaskRegistry>,
-        child_lifecycle: Arc<GoalChildLifecycle>,
-        config: Arc<Config>,
-    ) -> Self {
-        Self::new(
-            vec![Arc::new(RpcGoalSessionAdapter::new(sessions))],
-            goals,
-            child_lifecycle,
-            config,
-        )
     }
 }
 
@@ -647,19 +535,32 @@ impl GoalExecutor for GoalExecutionHost {
     }
 
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
-        let mut worker = {
+        let worker = {
             let mut workers = self.workers.lock().await;
-            let Some(worker) = workers.remove(task_id) else {
-                return Ok(());
-            };
-            if worker.session_id != session_id || worker.epoch != epoch {
-                workers.insert(task_id.to_owned(), worker);
-                return Err(());
+            match workers.remove(task_id) {
+                Some(worker) if worker.session_id == session_id && worker.epoch == epoch => {
+                    Some(worker)
+                }
+                Some(worker) => {
+                    workers.insert(task_id.to_owned(), worker);
+                    return Err(());
+                }
+                None => None,
             }
-            worker
+        };
+        let Some(mut worker) = worker else {
+            // A prior lifecycle attempt may have joined the worker but failed
+            // while durably settling direct children. Retry that phase even
+            // though no worker registration remains.
+            return self
+                .child_lifecycle
+                .cancel_running_children(task_id)
+                .await
+                .map_err(|_| ());
         };
         worker.cancellation.cancel();
-        match tokio::time::timeout(GOAL_WORKER_JOIN_TIMEOUT, &mut worker._handle).await {
+        let joined = match tokio::time::timeout(GOAL_WORKER_JOIN_TIMEOUT, &mut worker._handle).await
+        {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(()),
             Err(_) => {
@@ -667,7 +568,12 @@ impl GoalExecutor for GoalExecutionHost {
                 let _ = worker._handle.await;
                 Ok(())
             }
-        }
+        };
+        joined?;
+        self.child_lifecycle
+            .cancel_running_children(task_id)
+            .await
+            .map_err(|_| ())
     }
 }
 
@@ -1112,7 +1018,10 @@ mod reservation_tests {
 
 #[cfg(test)]
 mod host_worker_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
     use chrono::Utc;
@@ -1120,21 +1029,78 @@ mod host_worker_tests {
     use tokio_util::sync::CancellationToken;
     use zeroclaw_config::schema::Config;
 
-    use super::{
-        GoalChildLifecycle, GoalChildTask, GoalExecutionHost, GoalHostModelBinding,
-        GoalSessionAdapter,
-    };
+    use super::{GoalChildLifecycle, GoalChildTask, GoalExecutionHost, GoalSessionAdapter};
     use crate::{
         control_plane::{
             GoalTaskRecord, GoalTaskRegistry, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
             task_store_sqlite::SqliteTaskStore,
         },
-        goal_mode::{GoalExecutionScope, GoalExecutor, GoalSessionBinding, GoalTurnKind},
+        goal_mode::{
+            GoalExecutionScope, GoalExecutor, GoalHostModelBinding, GoalSessionBinding,
+            GoalTurnKind,
+        },
     };
 
     fn child_lifecycle(store: Arc<SqliteTaskStore>) -> Arc<GoalChildLifecycle> {
         let tasks: Arc<dyn TaskRegistry> = store;
         Arc::new(GoalChildLifecycle::new(tasks, "test-boot".to_owned()))
+    }
+
+    /// Inject just the persistence failure needed to prove the host's retry
+    /// path. The production lifecycle continues to use the canonical task
+    /// registry rather than carrying a test-only retry state.
+    struct FailOnceTaskRegistry {
+        inner: Arc<SqliteTaskStore>,
+        fail_next_status_update: AtomicBool,
+    }
+
+    #[async_trait]
+    impl TaskRegistry for FailOnceTaskRegistry {
+        async fn create(&self, record: TaskRecord) -> anyhow::Result<()> {
+            self.inner.create(record).await
+        }
+
+        async fn heartbeat(&self, id: &str, boot_id: &str) -> anyhow::Result<()> {
+            self.inner.heartbeat(id, boot_id).await
+        }
+
+        async fn update_status(
+            &self,
+            id: &str,
+            status: TaskStatus,
+            output: Option<String>,
+            error: Option<String>,
+        ) -> anyhow::Result<()> {
+            if self.fail_next_status_update.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("injected child-status persistence failure");
+            }
+            self.inner.update_status(id, status, output, error).await
+        }
+
+        async fn claim_owner(
+            &self,
+            id: &str,
+            owner_pid: u32,
+            owner_boot_id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.claim_owner(id, owner_pid, owner_boot_id).await
+        }
+
+        async fn get(&self, id: &str) -> anyhow::Result<Option<TaskRecord>> {
+            self.inner.get(id).await
+        }
+
+        async fn list_running(&self) -> anyhow::Result<Vec<TaskRecord>> {
+            self.inner.list_running().await
+        }
+
+        async fn list_by_agent(&self, agent: &str) -> anyhow::Result<Vec<TaskRecord>> {
+            self.inner.list_by_agent(agent).await
+        }
+
+        async fn reconcile_lost(&self, id: &str, boot_id: &str) -> anyhow::Result<bool> {
+            self.inner.reconcile_lost(id, boot_id).await
+        }
     }
 
     #[tokio::test]
@@ -1177,6 +1143,95 @@ mod host_worker_tests {
         assert_eq!(task.originator_route.as_deref(), Some("route-parent"));
         assert_eq!(task.principal_id.as_deref(), Some("principal-parent"));
         assert_eq!(task.owner_boot_id, "test-boot");
+    }
+
+    #[tokio::test]
+    async fn forced_parent_quiesce_terminally_settles_direct_running_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let lifecycle = child_lifecycle(Arc::clone(&store));
+        let child_id = crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(
+                Some(crate::agent::cost::GoalChildScope {
+                    task_id: "goal-parent".to_owned(),
+                    session_id: "session-parent".to_owned(),
+                    execution_epoch: 7,
+                    originator_route: None,
+                    principal_id: None,
+                    cancellation: CancellationToken::new(),
+                    lifecycle: Some(Arc::clone(&lifecycle)),
+                }),
+                async {
+                    GoalChildTask::create(TaskKind::Delegate, "child".to_owned(), 2)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task_id
+                },
+            )
+            .await;
+
+        lifecycle
+            .cancel_running_children("goal-parent")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&child_id).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_parent_quiesce_repairs_child_after_initial_persistence_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let tasks: Arc<dyn TaskRegistry> = Arc::new(FailOnceTaskRegistry {
+            inner: Arc::clone(&store),
+            fail_next_status_update: AtomicBool::new(true),
+        });
+        let lifecycle = Arc::new(GoalChildLifecycle::new(tasks, "test-boot".to_owned()));
+        let child_id = crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(
+                Some(crate::agent::cost::GoalChildScope {
+                    task_id: "goal-parent".to_owned(),
+                    session_id: "session-parent".to_owned(),
+                    execution_epoch: 7,
+                    originator_route: None,
+                    principal_id: None,
+                    cancellation: CancellationToken::new(),
+                    lifecycle: Some(Arc::clone(&lifecycle)),
+                }),
+                async {
+                    GoalChildTask::create(TaskKind::Delegate, "child".to_owned(), 2)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .task_id
+                },
+            )
+            .await;
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let host =
+            GoalExecutionHost::new(Vec::new(), goals, lifecycle, Arc::new(Config::default()));
+
+        // The worker was already removed after the parent fence. A later
+        // disposal retry must still reach the direct child cleanup path.
+        assert!(
+            host.cancel("goal-parent", "session-parent", 7)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.get(&child_id).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        host.cancel("goal-parent", "session-parent", 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&child_id).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
     }
 
     struct UnavailableLeaseAdapter;

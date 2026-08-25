@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
-    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskContinuationContext,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalSessionFence,
+    GoalTaskRecord, GoalTaskRegistry, GoalTaskStatus, GoalToolPhase, GoalTransitionResult,
+    TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -537,6 +538,30 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
     })
 }
 
+impl SqliteTaskStore {
+    fn list_goal_statuses(&self, status_predicate: &str) -> Result<Vec<GoalTaskStatus>> {
+        let conn = self.conn.lock();
+        let query = format!(
+            "SELECT tasks.*, goal_tasks.*
+               FROM tasks JOIN goal_tasks ON goal_tasks.task_id = tasks.id
+              WHERE tasks.kind = 'goal' AND {status_predicate}"
+        );
+        let mut statement = conn
+            .prepare(&query)
+            .context("prepare Goal lifecycle status query")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(GoalTaskStatus {
+                    task: row_to_record(row)?,
+                    goal: row_to_goal_task(row)?,
+                })
+            })
+            .context("query Goal lifecycle statuses")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("collect Goal lifecycle statuses")
+    }
+}
+
 fn accounting_state_to_db(state: GoalAccountingState) -> &'static str {
     match state {
         GoalAccountingState::Complete => "complete",
@@ -678,6 +703,14 @@ fn upsert_continuation_context(
 
 #[async_trait::async_trait]
 impl GoalTaskRegistry for SqliteTaskStore {
+    async fn list_running_goal_statuses(&self) -> Result<Vec<GoalTaskStatus>> {
+        self.list_goal_statuses("tasks.status = 'running'")
+    }
+
+    async fn list_nonterminal_goal_statuses(&self) -> Result<Vec<GoalTaskStatus>> {
+        self.list_goal_statuses("tasks.status IN ('running', 'paused')")
+    }
+
     async fn create_goal(
         &self,
         task: TaskRecord,
@@ -1131,6 +1164,60 @@ impl GoalTaskRegistry for SqliteTaskStore {
             return transition_failure(&tx, task_id, session_id);
         }
         tx.commit().context("commit guarded goal finish")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn cancel_session_goals(
+        &self,
+        fences: &[GoalSessionFence],
+        error: &str,
+    ) -> Result<GoalTransitionResult> {
+        if fences.is_empty() {
+            return Ok(GoalTransitionResult::Applied);
+        }
+        if error.trim().is_empty() {
+            anyhow::bail!("Goal policy revocation requires a nonempty terminal error");
+        }
+        let mut seen = std::collections::HashSet::with_capacity(fences.len());
+        if fences.iter().any(|fence| !seen.insert(&fence.task_id)) {
+            anyhow::bail!("Goal policy revocation contains a duplicate task fence");
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic Goal policy revocation")?;
+        for fence in fences {
+            let changed = tx.execute(
+                "UPDATE tasks
+                    SET status = 'cancelled', error = COALESCE(?4, error),
+                        finished_at = COALESCE(finished_at, ?5),
+                        execution_epoch = execution_epoch + 1
+                  WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                    AND execution_epoch = ?3 AND execution_epoch < 9223372036854775807
+                    AND status IN ('running', 'paused')
+                    AND EXISTS (SELECT 1 FROM goal_tasks WHERE task_id = tasks.id)",
+                params![
+                    &fence.task_id,
+                    &fence.session_id,
+                    fence.execution_epoch,
+                    error,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            if changed != 1 {
+                return transition_failure(&tx, &fence.task_id, &fence.session_id);
+            }
+            #[cfg(test)]
+            if self
+                .cancel_goal_policy_revocation_after_first_fence
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("injected Goal policy revocation persistence failure");
+            }
+        }
+        tx.commit()
+            .context("commit atomic Goal policy revocation")?;
         Ok(GoalTransitionResult::Applied)
     }
 

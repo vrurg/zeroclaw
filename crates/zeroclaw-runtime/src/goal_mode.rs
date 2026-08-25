@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -23,6 +23,45 @@ mod host;
 pub use execution::GoalExecutionHost;
 pub(crate) use execution::{GoalChildLifecycle, GoalChildTask};
 pub use host::{GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease};
+
+/// Determine whether a durable Goal has lost a fact required by the
+/// prospective runtime generation. This is deliberately a narrow projection
+/// of Goal's own control surface, rather than a proxy for `Config::validate()`:
+/// an unrelated daemon configuration defect must not permanently cancel a
+/// Goal that remains eligible under the new policy.
+///
+/// `available_routes` comes from the adapters installed in this runtime
+/// generation. It is an ephemeral installation fact, not another durable
+/// policy store.
+pub(crate) fn goal_policy_revokes_task(
+    config: &Config,
+    task: &TaskRecord,
+    available_routes: &[&str],
+) -> bool {
+    if !config.goal.enabled
+        || !available_routes.contains(&task.originator_route.as_deref().unwrap_or_default())
+    {
+        return true;
+    }
+
+    let Some(agent) = config.agent(&task.agent) else {
+        return true;
+    };
+    if !agent.is_dispatchable() {
+        return true;
+    }
+
+    let provider_ref = config.goal.verifier.provider.trim();
+    if provider_ref.is_empty() || config.providers.models.find_by_name(provider_ref).is_none() {
+        return true;
+    }
+    config
+        .goal
+        .verifier
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+}
 
 /// Parsed Goal Mode commands accepted by the V1 grammar.
 #[derive(Debug, Clone, PartialEq)]
@@ -497,6 +536,10 @@ pub struct GoalRuntime {
     cost_tracker: Arc<CostTracker>,
     executor: Arc<dyn GoalExecutor>,
     boot_id: String,
+    /// Process-local admission gate used while this runtime generation fences
+    /// durable work. It deliberately contains no channel or session state, so
+    /// the controller can move behind a future crate boundary unchanged.
+    admission_cutover: RwLock<bool>,
 }
 
 impl GoalRuntime {
@@ -513,6 +556,7 @@ impl GoalRuntime {
             cost_tracker,
             executor,
             boot_id: required(boot_id.into())?,
+            admission_cutover: RwLock::new(false),
         })
     }
 
@@ -524,6 +568,13 @@ impl GoalRuntime {
     ) -> Result<GoalResponse, GoalRuntimeError> {
         if command == GoalCommand::Help {
             return Ok(GoalResponse::message(GoalMessageKey::Help));
+        }
+        // Keep the read lease until command admission completes. A cutover
+        // takes the write lease before it enumerates/fences durable Goals, so
+        // an already-entered command cannot create a successor behind it.
+        let admission = self.admission_cutover.read().await;
+        if *admission {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
         }
         if !self.config.goal.enabled {
             return Ok(GoalResponse::message(GoalMessageKey::Disabled));
@@ -548,6 +599,411 @@ impl GoalRuntime {
             GoalCommand::Cancel => self.cancel(ingress).await,
             GoalCommand::Help => unreachable!("handled before configuration admission"),
         }
+    }
+
+    /// Dispose the exact Goal bound to a session that is being destroyed.
+    ///
+    /// This is a lifecycle operation, not command admission: it remains
+    /// available after Goal Mode has been disabled or the session's former
+    /// policy has been revoked. The caller must not remove the live session
+    /// unless this returns `Applied` or `Missing`.
+    pub(crate) async fn dispose_session(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(mut current) = self.current_goal(ingress).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+
+        // A prior disposal may have committed the terminal fence and then
+        // failed while settling direct children. Retrying a terminal Goal must
+        // still ask the host for idempotent child cleanup before hard delete.
+        if current.task.status.is_terminal() {
+            self.quiesce_exact_goal(&current.task, ingress.session_id())
+                .await?;
+        }
+
+        if !current.task.status.is_terminal() {
+            let result = self
+                .goals
+                .finish_session_goal(
+                    &current.task.id,
+                    ingress.session_id(),
+                    current.task.execution_epoch,
+                    TaskStatus::Cancelled,
+                    Some("session_disposed".to_owned()),
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane)?;
+            if result != GoalTransitionResult::Applied {
+                return Ok(result);
+            }
+            self.quiesce_exact_goal(&current.task, ingress.session_id())
+                .await?;
+            let Some(reloaded) = self.current_goal(ingress).await? else {
+                return Ok(GoalTransitionResult::Missing);
+            };
+            if reloaded.task.id != current.task.id {
+                return Ok(GoalTransitionResult::Stale);
+            }
+            current = reloaded;
+        }
+
+        self.classify_pending_operation_for_disposal(&current, ingress)
+            .await?;
+        let Some(reloaded) = self.current_goal(ingress).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if reloaded.task.id != current.task.id || !reloaded.task.status.is_terminal() {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        self.goals
+            .delete_session_goal(
+                &reloaded.task.id,
+                ingress.session_id(),
+                reloaded.task.execution_epoch,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)
+    }
+
+    /// Interrupt a Goal while retaining its live session and durable audit.
+    ///
+    /// A clean executor is paused for explicit resume. An operation still
+    /// pending after quiescence cannot be replayed, so it is classified as an
+    /// unknown outcome and the Goal becomes terminal.
+    pub(crate) async fn interrupt_session(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(current) = self.current_goal(ingress).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if current.task.status != TaskStatus::Running {
+            return Ok(if current.task.status == TaskStatus::Paused {
+                GoalTransitionResult::Applied
+            } else {
+                GoalTransitionResult::Stale
+            });
+        }
+        let result = self
+            .goals
+            .pause_session_goal(
+                &current.task.id,
+                ingress.session_id(),
+                current.task.execution_epoch,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        if result != GoalTransitionResult::Applied {
+            return Ok(result);
+        }
+        self.quiesce_exact_goal(&current.task, ingress.session_id())
+            .await?;
+        let Some(paused) = self.current_goal(ingress).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        self.classify_pending_operation_for_disposal(&paused, ingress)
+            .await?;
+        let Some(reloaded) = self.current_goal(ingress).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if reloaded.goal.accounting_state == GoalAccountingState::OutcomeUnknown {
+            return self
+                .goals
+                .finish_session_goal(
+                    &reloaded.task.id,
+                    ingress.session_id(),
+                    reloaded.task.execution_epoch,
+                    TaskStatus::Failed,
+                    Some("accounting_outcome_unknown".to_owned()),
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    /// Fence and quiesce every running Goal before the daemon stops its
+    /// generic workers. The canonical task plane supplies the enumeration;
+    /// no channel-owned session map is treated as lifecycle authority.
+    pub(crate) async fn pause_running_goals_for_runtime_cutover(
+        &self,
+    ) -> Result<usize, GoalRuntimeError> {
+        *self.admission_cutover.write().await = true;
+        let running = self
+            .goals
+            .list_running_goal_statuses()
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        let mut paused = 0;
+        let mut failures = Vec::new();
+        for current in running {
+            match self.pause_running_goal_for_runtime_cutover(current).await {
+                Ok(true) => paused += 1,
+                Ok(false) => {}
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                format!("Goal runtime cutover failed: {}", failures.join("; ")),
+            )));
+        }
+        Ok(paused)
+    }
+
+    async fn pause_running_goal_for_runtime_cutover(
+        &self,
+        current: crate::control_plane::GoalTaskStatus,
+    ) -> Result<bool, GoalRuntimeError> {
+        let session_id = current.task.session_id.as_deref().ok_or_else(|| {
+            GoalRuntimeError::control_plane(anyhow::Error::msg(
+                "running Goal has no durable session binding during runtime cutover",
+            ))
+        })?;
+        if session_id.trim().is_empty() {
+            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                "running Goal has an empty durable session binding during runtime cutover",
+            )));
+        }
+        let pause = GoalPauseState {
+            reason: GoalPauseReason::DaemonRestart,
+            description: None,
+            blockers: Vec::new(),
+        };
+        match self
+            .goals
+            .pause_session_goal(
+                &current.task.id,
+                session_id,
+                current.task.execution_epoch,
+                pause,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied => {
+                self.quiesce_exact_goal(&current.task, session_id).await?;
+                // Admission can win after the lifecycle enumeration but
+                // before the epoch fence. Inspect the post-quiescence
+                // extension row, not the stale enumeration snapshot.
+                let settled_goal = self
+                    .goals
+                    .get_goal_task(&current.task.id)
+                    .await
+                    .map_err(GoalRuntimeError::control_plane)?
+                    .ok_or_else(|| {
+                        GoalRuntimeError::control_plane(anyhow::Error::msg(
+                            "Goal extension disappeared during runtime cutover",
+                        ))
+                    })?;
+                let admitted = settled_goal
+                    .pending_call_id
+                    .as_deref()
+                    .zip(settled_goal.pending_call_epoch);
+                if let Some((call_id, epoch)) = admitted {
+                    self.classify_pending_operation(&current.task.id, session_id, epoch, call_id)
+                        .await?;
+                    let fenced_epoch =
+                        current.task.execution_epoch.checked_add(1).ok_or_else(|| {
+                            GoalRuntimeError::control_plane(anyhow::Error::msg(
+                                "Goal execution epoch exhausted during runtime cutover",
+                            ))
+                        })?;
+                    let terminal = self
+                        .goals
+                        .finish_session_goal(
+                            &current.task.id,
+                            session_id,
+                            fenced_epoch,
+                            TaskStatus::Failed,
+                            Some("accounting_outcome_unknown".to_owned()),
+                        )
+                        .await
+                        .map_err(GoalRuntimeError::control_plane)?;
+                    if terminal != GoalTransitionResult::Applied {
+                        return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                            "Goal pending operation changed during runtime cutover",
+                        )));
+                    }
+                }
+                Ok(true)
+            }
+            GoalTransitionResult::Missing => Ok(false),
+            GoalTransitionResult::Stale => Err(GoalRuntimeError::control_plane(
+                anyhow::Error::msg("running Goal changed while runtime cutover was fencing it"),
+            )),
+        }
+    }
+
+    /// Atomically retain terminal audit for every Goal invalidated by an
+    /// already-classified policy change, then quiesce their exact executors.
+    /// Policy interpretation remains outside this transport-neutral runtime.
+    pub(crate) async fn cancel_nonterminal_goals_for_policy_revocation<F>(
+        &self,
+        matches_revoked_policy: F,
+    ) -> Result<usize, GoalRuntimeError>
+    where
+        F: Fn(&TaskRecord) -> bool,
+    {
+        // Classify and fence under the same gate that guards command
+        // admission. A Start already holding the read lease completes before
+        // enumeration; a later Start cannot escape this exact batch.
+        let _admission = self.admission_cutover.write().await;
+        let affected: Vec<_> = self
+            .goals
+            .list_nonterminal_goal_statuses()
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+            .into_iter()
+            .filter(|current| matches_revoked_policy(&current.task))
+            .collect();
+        let fences = affected
+            .iter()
+            .map(|current| {
+                let session_id = current.task.session_id.as_deref().ok_or_else(|| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "nonterminal Goal has no durable session binding during policy revocation",
+                    ))
+                })?;
+                if session_id.trim().is_empty() {
+                    return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "nonterminal Goal has an empty durable session binding during policy revocation",
+                    )));
+                }
+                Ok(crate::control_plane::GoalSessionFence::new(
+                    &current.task.id,
+                    session_id,
+                    current.task.execution_epoch,
+                ))
+            })
+            .collect::<Result<Vec<_>, GoalRuntimeError>>()?;
+        if fences.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .goals
+            .cancel_session_goals(&fences, "goal_policy_revoked")
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+            != GoalTransitionResult::Applied
+        {
+            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                "Goal policy revocation did not commit atomically",
+            )));
+        }
+        let mut failures = Vec::new();
+        for (current, fence) in affected.iter().zip(&fences) {
+            if let Err(error) = self
+                .quiesce_exact_goal(&current.task, &fence.session_id)
+                .await
+            {
+                failures.push(error.to_string());
+                continue;
+            }
+            match self
+                .goals
+                .get_goal_task(&current.task.id)
+                .await
+                .map_err(GoalRuntimeError::control_plane)
+            {
+                Ok(Some(goal)) => {
+                    if let (Some(call_id), Some(epoch)) =
+                        (goal.pending_call_id.as_deref(), goal.pending_call_epoch)
+                        && let Err(error) = self
+                            .classify_pending_operation(
+                                &current.task.id,
+                                &fence.session_id,
+                                epoch,
+                                call_id,
+                            )
+                            .await
+                    {
+                        failures.push(error.to_string());
+                    }
+                }
+                Ok(None) => {
+                    failures.push("Goal extension disappeared during policy revocation".into())
+                }
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                format!(
+                    "Goal policy revocation quiescence failed: {}",
+                    failures.join("; ")
+                ),
+            )));
+        }
+        Ok(affected.len())
+    }
+
+    async fn classify_pending_operation_for_disposal(
+        &self,
+        current: &CurrentGoal,
+        ingress: &GoalIngressContext,
+    ) -> Result<(), GoalRuntimeError> {
+        let (Some(call_id), Some(admitted_epoch)) = (
+            current.goal.pending_call_id.as_deref(),
+            current.goal.pending_call_epoch,
+        ) else {
+            return Ok(());
+        };
+        self.classify_pending_operation(
+            &current.task.id,
+            ingress.session_id(),
+            admitted_epoch,
+            call_id,
+        )
+        .await
+    }
+
+    async fn classify_pending_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        call_id: &str,
+    ) -> Result<(), GoalRuntimeError> {
+        match self
+            .goals
+            .settle_pending_call(
+                task_id,
+                session_id,
+                admitted_epoch,
+                call_id,
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied | GoalTransitionResult::Missing => Ok(()),
+            GoalTransitionResult::Stale => Err(GoalRuntimeError::control_plane(
+                anyhow::Error::msg("goal pending operation changed while disposing its session"),
+            )),
+        }
+    }
+
+    async fn quiesce_exact_goal(
+        &self,
+        task: &TaskRecord,
+        session_id: &str,
+    ) -> Result<(), GoalRuntimeError> {
+        self.executor
+            .cancel(&task.id, session_id, task.execution_epoch)
+            .await
+            .map_err(|_| {
+                GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "goal executor did not quiesce after lifecycle fence",
+                ))
+            })
     }
 
     async fn start(
@@ -1098,6 +1554,7 @@ fn sanitize_terminal_reason(reason: &str) -> String {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use tokio::sync::oneshot;
     use zeroclaw_config::schema::{Config, CostConfig};
 
     use crate::control_plane::SqliteTaskStore;
@@ -1105,6 +1562,8 @@ mod tests {
     struct FakeExecutor {
         readiness: GoalExecutionReadiness,
         launches: Mutex<Vec<GoalExecutionScope>>,
+        cancellations: Mutex<Vec<(String, String, i64)>>,
+        cancellation_failures: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1115,6 +1574,21 @@ mod tests {
 
         async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
             self.launches.lock().push(scope);
+            Ok(())
+        }
+
+        async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+            if self
+                .cancellation_failures
+                .lock()
+                .iter()
+                .any(|failed_task_id| failed_task_id == task_id)
+            {
+                return Err(());
+            }
+            self.cancellations
+                .lock()
+                .push((task_id.to_owned(), session_id.to_owned(), epoch));
             Ok(())
         }
     }
@@ -1129,6 +1603,31 @@ mod tests {
 
         async fn launch(&self, _: GoalExecutionScope) -> Result<(), ()> {
             Err(())
+        }
+    }
+
+    struct BlockingPreflightExecutor {
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+        launches: Mutex<Vec<GoalExecutionScope>>,
+    }
+
+    #[async_trait]
+    impl GoalExecutor for BlockingPreflightExecutor {
+        async fn preflight(&self, _: &GoalExecutionPreflight) -> GoalExecutionReadiness {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            let release = { self.release.lock().take() };
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            GoalExecutionReadiness::Ready
+        }
+
+        async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
+            self.launches.lock().push(scope);
+            Ok(())
         }
     }
 
@@ -1167,6 +1666,8 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             readiness,
             launches: Mutex::new(Vec::new()),
+            cancellations: Mutex::new(Vec::new()),
+            cancellation_failures: Mutex::new(Vec::new()),
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
         (
@@ -1179,6 +1680,66 @@ mod tests {
 
     fn ingress() -> GoalIngressContext {
         GoalIngressContext::trusted("session", "main", "room", Some("principal".into())).unwrap()
+    }
+
+    fn ingress_for(session_id: &str) -> GoalIngressContext {
+        GoalIngressContext::trusted(session_id, "main", "room", Some("principal".into())).unwrap()
+    }
+
+    fn policy_task(route: &str) -> TaskRecord {
+        TaskRecord {
+            id: "goal-policy-task".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 0,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some(route.into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn policy_revocation_classifier_uses_only_goal_eligibility_facts() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        config.agents.insert(
+            "main".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.verifier".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        let task = policy_task("rpc");
+
+        assert!(!goal_policy_revokes_task(&config, &task, &["rpc"]));
+
+        // This deliberately invalid unrelated agent must not turn a Goal
+        // policy cutover into a permanent revocation of `main`'s Goal.
+        config.agents.insert("unrelated".into(), Default::default());
+        assert!(!goal_policy_revokes_task(&config, &task, &["rpc"]));
+
+        config.goal.enabled = false;
+        assert!(goal_policy_revokes_task(&config, &task, &["rpc"]));
+        config.goal.enabled = true;
+
+        assert!(goal_policy_revokes_task(&config, &task, &[]));
+        config.goal.verifier.model = Some(" ".into());
+        assert!(goal_policy_revokes_task(&config, &task, &["rpc"]));
     }
 
     #[test]
@@ -1252,6 +1813,469 @@ mod tests {
             .status
             .unwrap();
         assert_eq!(status.known_token_usage, 5);
+    }
+
+    #[tokio::test]
+    async fn session_disposal_fences_pending_goal_operation_before_hard_delete() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "finish safely".into(),
+                    objective: "dispose this goal".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = executor.launches.lock().pop().unwrap();
+        let accountant = scope.operation_accounting.clone().unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            accountant.as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime.dispose_session(&ingress()).await.unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            executor.cancellations.lock().as_slice(),
+            &[(scope.task_id, "session".to_owned(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_cutover_pauses_clean_goals_and_fails_unsettled_operations() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "finish safely".into(),
+                    objective: "exercise daemon cutover".into(),
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .submit(
+                ingress_for("pending-session"),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "finish safely".into(),
+                    objective: "exercise unsettled daemon cutover".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let (pending_scope, clean_scope) = {
+            let launches = executor.launches.lock();
+            let pending_scope = launches
+                .iter()
+                .find(|scope| scope.session_id == "pending-session")
+                .cloned()
+                .unwrap();
+            let clean_scope = launches
+                .iter()
+                .find(|scope| scope.session_id == "session")
+                .cloned()
+                .unwrap();
+            (pending_scope, clean_scope)
+        };
+        let task_id = pending_scope.task_id.clone();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            pending_scope
+                .operation_accounting
+                .as_ref()
+                .unwrap()
+                .as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .pause_running_goals_for_runtime_cutover()
+                .await
+                .unwrap(),
+            2
+        );
+        let current = store
+            .current_goal_for_session("pending-session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.id, task_id);
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .get_goal_task(&task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        let clean = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean.status, TaskStatus::Paused);
+        assert_eq!(
+            store
+                .get_goal_task(&clean.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .accounting_state,
+            GoalAccountingState::Complete
+        );
+        assert_eq!(
+            executor.cancellations.lock().as_slice(),
+            [
+                (clean_scope.task_id, "session".into(), 1),
+                (task_id, "pending-session".into(), 1),
+            ]
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Status)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_cutover_fences_every_goal_even_if_one_worker_will_not_quiesce() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        for session_id in ["first-session", "second-session"] {
+            runtime
+                .submit(
+                    ingress_for(session_id),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        success_criteria: "finish safely".into(),
+                        objective: "exercise cutover failure isolation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let first_task_id = executor
+            .launches
+            .lock()
+            .iter()
+            .find(|scope| scope.session_id == "first-session")
+            .unwrap()
+            .task_id
+            .clone();
+        executor.cancellation_failures.lock().push(first_task_id);
+
+        assert!(
+            runtime
+                .pause_running_goals_for_runtime_cutover()
+                .await
+                .is_err()
+        );
+        for session_id in ["first-session", "second-session"] {
+            assert_eq!(
+                store
+                    .current_goal_for_session(session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskStatus::Paused
+            );
+        }
+        assert!(
+            executor
+                .cancellations
+                .lock()
+                .iter()
+                .any(|(_, session_id, _)| session_id == "second-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_cancels_matching_goals_atomically() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "finish safely".into(),
+                    objective: "exercise policy revocation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let task_id = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        assert_eq!(
+            runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|task| task.agent == "main")
+                .await
+                .unwrap(),
+            1
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Cancelled);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&task_id, "session")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("goal_policy_revoked")
+        );
+        assert_eq!(
+            executor.cancellations.lock().as_slice(),
+            [(task_id, "session".into(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_rolls_back_every_goal_when_storage_fails_mid_batch() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        for session_id in ["session", "second-session"] {
+            runtime
+                .submit(
+                    ingress_for(session_id),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        success_criteria: "finish safely".into(),
+                        objective: "exercise transactional policy revocation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        store.fail_next_goal_policy_revocation_after_first_fence();
+        let result = runtime
+            .cancel_nonterminal_goals_for_policy_revocation(|task| task.agent == "main")
+            .await;
+
+        assert!(result.is_err());
+        for session_id in ["session", "second-session"] {
+            assert_eq!(
+                store
+                    .current_goal_for_session(session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                TaskStatus::Running
+            );
+        }
+        assert!(executor.cancellations.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_waits_for_an_inflight_start_then_fences_it() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let executor = Arc::new(BlockingPreflightExecutor {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+            launches: Mutex::new(Vec::new()),
+        });
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let runtime = Arc::new(
+            GoalRuntime::new(enabled_config(), goals, tracker, executor.clone(), "boot").unwrap(),
+        );
+
+        let starter_runtime = Arc::clone(&runtime);
+        let starter = zeroclaw_spawn::spawn!(async move {
+            starter_runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        success_criteria: "finish safely".into(),
+                        objective: "exercise policy admission fencing".into(),
+                    },
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let revocation_runtime = Arc::clone(&runtime);
+        let revocation = zeroclaw_spawn::spawn!(async move {
+            revocation_runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|task| task.agent == "main")
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !revocation.is_finished(),
+            "policy revocation must wait for the already-admitted start"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(starter.await.unwrap().is_ok());
+        assert_eq!(revocation.await.unwrap().unwrap(), 1);
+        assert_eq!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_classifies_pending_operations_after_the_atomic_fence() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        for session_id in ["session", "pending-session"] {
+            runtime
+                .submit(
+                    ingress_for(session_id),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        success_criteria: "finish safely".into(),
+                        objective: "exercise policy revocation".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let pending_scope = executor
+            .launches
+            .lock()
+            .iter()
+            .find(|scope| scope.session_id == "pending-session")
+            .cloned()
+            .unwrap();
+        crate::agent::cost::GoalOperationAccounting::admit(
+            pending_scope
+                .operation_accounting
+                .as_ref()
+                .unwrap()
+                .as_ref(),
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "openai".into(),
+                model: "verifier".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("prompt")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .cancel_nonterminal_goals_for_policy_revocation(|task| task.agent == "main")
+                .await
+                .unwrap(),
+            2
+        );
+        let pending = store
+            .current_goal_for_session("pending-session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.status, TaskStatus::Cancelled);
+        assert_eq!(
+            store
+                .get_goal_task(&pending.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn external_session_interrupt_pauses_a_clean_goal_without_disposal() {
+        let (runtime, store, executor, _directory) = controller(GoalExecutionReadiness::Ready);
+        runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "finish safely".into(),
+                    objective: "pause this goal".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = executor.launches.lock().pop().unwrap();
+
+        assert_eq!(
+            runtime.interrupt_session(&ingress()).await.unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.execution_epoch, 2);
+        assert_eq!(
+            executor.cancellations.lock().as_slice(),
+            &[(scope.task_id, "session".to_owned(), 1)]
+        );
     }
 
     #[tokio::test]
@@ -1608,6 +2632,8 @@ mod tests {
             let executor = Arc::new(FakeExecutor {
                 readiness: GoalExecutionReadiness::Ready,
                 launches: Mutex::new(Vec::new()),
+                cancellations: Mutex::new(Vec::new()),
+                cancellation_failures: Mutex::new(Vec::new()),
             });
             (config, store, executor, directory)
         };
@@ -1755,6 +2781,8 @@ mod tests {
             let executor = Arc::new(FakeExecutor {
                 readiness: GoalExecutionReadiness::Ready,
                 launches: Mutex::new(Vec::new()),
+                cancellations: Mutex::new(Vec::new()),
+                cancellation_failures: Mutex::new(Vec::new()),
             });
             (config, store, executor, directory)
         };

@@ -67,6 +67,26 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    generation: u64,
+    lifecycle_reserved: bool,
+}
+
+/// Immutable identity snapshot used by session-lifecycle operations.
+///
+/// A session ID can be reused by a later reconnect. Callers must carry this
+/// generation through an operation that can destroy Goal-owned state, then
+/// remove only the captured generation.
+#[derive(Clone)]
+pub(crate) struct LiveRpcSession {
+    pub session_id: String,
+    pub agent_alias: String,
+    generation: u64,
+}
+
+impl LiveRpcSession {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl RpcSession {
@@ -88,6 +108,8 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
+            generation: 0,
+            lifecycle_reserved: false,
         }
     }
 
@@ -104,6 +126,7 @@ pub struct SessionStore {
     model_provider_update_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
+    session_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
@@ -117,19 +140,42 @@ impl SessionStore {
             model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
+            session_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
         }
     }
 
-    pub async fn insert(&self, id: String, session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&id)
+            .is_some_and(|existing| existing.lifecycle_reserved)
+        {
+            return Err("session lifecycle operation is in progress");
+        }
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
+        session.generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
         sessions.insert(id, session);
         Ok(())
+    }
+
+    /// Capture one exact live session generation for destructive lifecycle
+    /// work. The snapshot deliberately excludes mutable agent state.
+    pub(crate) async fn live_session(&self, id: &str) -> Option<LiveRpcSession> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        Some(LiveRpcSession {
+            session_id: id.to_owned(),
+            agent_alias: session.agent_alias.clone(),
+            generation: session.generation,
+        })
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -397,12 +443,61 @@ impl SessionStore {
         self.sessions.lock().await.remove(id).is_some()
     }
 
-    pub async fn evict_same_mode_sibling(
+    /// Remove only the captured session generation. A same-ID reconnect that
+    /// wins while lifecycle fencing is in progress remains live.
+    pub(crate) async fn remove_exact(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(id)
+            .is_none_or(|session| session.generation != generation || !session.lifecycle_reserved)
+        {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
+    }
+
+    /// Claim the captured session generation for destructive teardown. A
+    /// reconnect cannot replace a reserved session while Goal control state is
+    /// being fenced, so it cannot inherit a stale close operation.
+    pub(crate) async fn reserve_removal(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return false;
+        };
+        if session.generation != generation || session.lifecycle_reserved {
+            return false;
+        }
+        session.lifecycle_reserved = true;
+        true
+    }
+
+    /// Release a teardown reservation after a pre-removal Goal fence fails.
+    pub(crate) async fn release_removal(&self, id: &str, generation: u64) {
+        if let Some(session) = self.sessions.lock().await.get_mut(id)
+            && session.generation == generation
+        {
+            session.lifecycle_reserved = false;
+        }
+    }
+
+    /// Return idle same-mode sibling sessions for dispatcher-owned lifecycle
+    /// disposal. This store intentionally does not remove them itself: Goal
+    /// fencing must happen before their live session disappears.
+    pub(crate) async fn idle_same_mode_siblings(
         &self,
         tui_id: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         except_id: &str,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<LiveRpcSession> {
         let in_flight: std::collections::HashSet<String> = self
             .cancel_tokens
             .lock()
@@ -410,24 +505,22 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
+        let sessions = self.sessions.lock().await;
+        sessions
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
                     && s.owner_tui_id.as_deref() == Some(tui_id)
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
+                    && !s.lifecycle_reserved
             })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                evicted.push((key, s.agent_alias));
-            }
-        }
-        evicted
+            .map(|(session_id, session)| LiveRpcSession {
+                session_id: session_id.clone(),
+                agent_alias: session.agent_alias.clone(),
+                generation: session.generation,
+            })
+            .collect()
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -510,6 +603,27 @@ impl SessionStore {
             token.cancel();
         }
         self.sessions.lock().await.remove(id).is_some()
+    }
+
+    /// Admin-kill only the captured session generation.
+    pub(crate) async fn kill_session_exact(&self, id: &str, generation: u64) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(id)
+            .is_none_or(|session| session.generation != generation || !session.lifecycle_reserved)
+        {
+            return false;
+        }
+        if let Some((_, token)) = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
+            token.cancel();
+        }
+        sessions.remove(id).is_some()
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -632,6 +746,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_lifecycle_generation_cannot_remove_same_id_reconnect() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "old", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let old = store.live_session("s1").await.unwrap();
+        assert!(store.reserve_removal("s1", old.generation()).await);
+        assert!(
+            store
+                .insert(
+                    "s1".into(),
+                    RpcSession::new(make_agent(), "new", ".", crate::rpc::types::ChatMode::Chat),
+                )
+                .await
+                .is_err()
+        );
+
+        store.release_removal("s1", old.generation()).await;
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "new", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        assert!(!store.remove_exact("s1", old.generation()).await);
+        assert_eq!(store.get_agent_alias("s1").await.as_deref(), Some("new"));
     }
 
     #[tokio::test]
@@ -845,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_same_mode_sibling_drops_only_same_mode_owner() {
+    async fn idle_same_mode_siblings_selects_only_same_mode_owner() {
         use crate::rpc::types::ChatMode;
         let store = make_store(8);
         let mk = |mode: ChatMode, owner: &str| {
@@ -868,11 +1016,14 @@ mod tests {
             .await
             .unwrap();
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .idle_same_mode_siblings("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
-        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
         assert_eq!(ids, vec!["old_chat"]);
         assert!(
             store.get_agent("new_chat").await.is_some(),
@@ -887,13 +1038,13 @@ mod tests {
             "other TUI session preserved"
         );
         assert!(
-            store.get_agent("old_chat").await.is_none(),
-            "abandoned same-mode session evicted"
+            store.get_agent("old_chat").await.is_some(),
+            "selection must not remove before dispatcher-owned Goal fencing"
         );
     }
 
     #[tokio::test]
-    async fn evict_same_mode_sibling_skips_in_flight_turn() {
+    async fn idle_same_mode_siblings_skips_in_flight_turn() {
         use crate::rpc::types::ChatMode;
         let store = make_store(8);
         let mk = |mode: ChatMode, owner: &str| {
@@ -913,12 +1064,12 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         store.register_cancel_token("busy_chat", token.clone());
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .idle_same_mode_siblings("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         assert!(
-            evicted.is_empty(),
+            candidates.is_empty(),
             "in-flight same-mode session must be left to finish its turn"
         );
         assert!(

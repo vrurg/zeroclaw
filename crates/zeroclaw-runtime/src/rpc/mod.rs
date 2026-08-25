@@ -6,6 +6,7 @@ pub mod context;
 pub mod dispatch;
 pub mod fs;
 pub mod git;
+pub(crate) mod goal_host;
 pub mod local;
 pub mod locales;
 pub mod session;

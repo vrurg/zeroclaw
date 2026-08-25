@@ -1228,11 +1228,39 @@ impl RpcDispatcher {
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
         {
-            let evicted = self
+            let candidates = self
                 .ctx
                 .sessions
-                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .idle_same_mode_siblings(tui_id, &chat_mode, &session_id)
                 .await;
+            let mut evicted = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let candidate_id = candidate.session_id.clone();
+                let candidate_alias = candidate.agent_alias.clone();
+                let reserved = match self.reserve_live_session_disposal(candidate).await {
+                    Ok(reserved) => reserved,
+                    // A concurrent lifecycle owner may already be tearing the
+                    // sibling down. It cannot transfer the old Goal because
+                    // reservation is generation-bound, so this is a benign
+                    // stale candidate rather than a replacement failure.
+                    Err(error) if error.code == SESSION_BUSY => continue,
+                    Err(error) => {
+                        // The successor was inserted before sibling eviction.
+                        // It owns no Goal yet, so remove it rather than report
+                        // a successful replacement with an unfenced sibling.
+                        let _ = self.ctx.sessions.remove(&session_id).await;
+                        return Err(error);
+                    }
+                };
+                if self
+                    .ctx
+                    .sessions
+                    .remove_exact(&candidate_id, reserved.generation())
+                    .await
+                {
+                    evicted.push((candidate_id, candidate_alias));
+                }
+            }
             if !evicted.is_empty() {
                 if let Some(ref hooks) = self.ctx.hooks {
                     for (sid, _) in &evicted {
@@ -1435,8 +1463,137 @@ impl RpcDispatcher {
         })
     }
 
+    fn goal_ingress_for_live_session(
+        live: &crate::rpc::session::LiveRpcSession,
+    ) -> Result<crate::goal_mode::GoalIngressContext, JsonRpcError> {
+        // ZeroCode's connection identity is transient. It must not be copied
+        // into a durable Goal principal binding.
+        crate::goal_mode::GoalIngressContext::trusted(
+            &live.session_id,
+            &live.agent_alias,
+            "rpc",
+            None,
+        )
+        .map_err(|_| rpc_err(INTERNAL_ERROR, "Goal session binding is unavailable"))
+    }
+
+    async fn reserve_session_disposal(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::rpc::session::LiveRpcSession, JsonRpcError> {
+        let live = self
+            .ctx
+            .sessions
+            .live_session(session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let live = self.reserve_live_session(live).await?;
+        self.dispose_reserved_goal(&live).await?;
+        Ok(live)
+    }
+
+    async fn reserve_live_session(
+        &self,
+        live: crate::rpc::session::LiveRpcSession,
+    ) -> Result<crate::rpc::session::LiveRpcSession, JsonRpcError> {
+        if !self
+            .ctx
+            .sessions
+            .reserve_removal(&live.session_id, live.generation())
+            .await
+        {
+            return Err(rpc_err(
+                SESSION_BUSY,
+                "Session lifecycle operation is in progress",
+            ));
+        }
+        Ok(live)
+    }
+
+    async fn dispose_reserved_goal(
+        &self,
+        live: &crate::rpc::session::LiveRpcSession,
+    ) -> Result<(), JsonRpcError> {
+        let Some(goal_runtime) = &self.ctx.goal_runtime else {
+            // Test and compatibility contexts may intentionally omit a Goal
+            // controller. That is safe only when the canonical task plane
+            // confirms this session has no current Goal; otherwise removal
+            // must fail closed instead of orphaning durable control state.
+            if let Some(control_plane) = crate::control_plane::control_plane() {
+                let current = crate::control_plane::GoalTaskRegistry::current_goal_for_session(
+                    control_plane.goals.as_ref(),
+                    &live.session_id,
+                )
+                .await
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Goal session disposal lookup failed: {error}"),
+                    )
+                })?;
+                if current.is_some() {
+                    self.ctx
+                        .sessions
+                        .release_removal(&live.session_id, live.generation())
+                        .await;
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        "Goal lifecycle controller is unavailable",
+                    ));
+                }
+            }
+            return Ok(());
+        };
+        let ingress = match Self::goal_ingress_for_live_session(live) {
+            Ok(ingress) => ingress,
+            Err(error) => {
+                self.ctx
+                    .sessions
+                    .release_removal(&live.session_id, live.generation())
+                    .await;
+                return Err(error);
+            }
+        };
+        match goal_runtime.dispose_session(&ingress).await {
+            Ok(
+                crate::control_plane::GoalTransitionResult::Applied
+                | crate::control_plane::GoalTransitionResult::Missing,
+            ) => Ok(()),
+            Ok(crate::control_plane::GoalTransitionResult::Stale) => {
+                self.ctx
+                    .sessions
+                    .release_removal(&live.session_id, live.generation())
+                    .await;
+                Err(rpc_err(
+                    SESSION_BUSY,
+                    "Goal lifecycle changed while session disposal was fenced",
+                ))
+            }
+            Err(error) => {
+                self.ctx
+                    .sessions
+                    .release_removal(&live.session_id, live.generation())
+                    .await;
+                Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Goal session disposal failed: {error}"),
+                ))
+            }
+        }
+    }
+
+    async fn reserve_live_session_disposal(
+        &self,
+        live: crate::rpc::session::LiveRpcSession,
+    ) -> Result<crate::rpc::session::LiveRpcSession, JsonRpcError> {
+        let live = self.reserve_live_session(live).await?;
+        self.dispose_reserved_goal(&live).await?;
+        Ok(live)
+    }
+
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let live_session = self.reserve_session_disposal(&req.session_id).await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1473,7 +1630,12 @@ impl RpcDispatcher {
             // promptly.
             drop(agent);
         }
-        if !self.ctx.sessions.remove(&req.session_id).await {
+        if !self
+            .ctx
+            .sessions
+            .remove_exact(&req.session_id, live_session.generation())
+            .await
+        {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         if let Some(ref hooks) = self.ctx.hooks {
@@ -1506,12 +1668,21 @@ impl RpcDispatcher {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        let chat_mode = self
+        let live_session = self
             .ctx
             .sessions
-            .chat_mode(sid)
+            .live_session(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let live_session = self.reserve_live_session(live_session).await?;
+
+        let Some(chat_mode) = self.ctx.sessions.chat_mode(sid).await else {
+            self.ctx
+                .sessions
+                .release_removal(sid, live_session.generation())
+                .await;
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        };
 
         let agent_alias = self
             .ctx
@@ -1529,11 +1700,16 @@ impl RpcDispatcher {
         let _guard = span.enter();
 
         if matches!(chat_mode, ChatMode::Acp) {
-            let store = self
-                .ctx
-                .acp_session_store
-                .clone()
-                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let Some(store) = self.ctx.acp_session_store.clone() else {
+                self.ctx
+                    .sessions
+                    .release_removal(sid, live_session.generation())
+                    .await;
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "ACP session store is not available",
+                ));
+            };
             let sid_owned = sid.to_string();
             let marked =
                 tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
@@ -1549,12 +1725,20 @@ impl RpcDispatcher {
                     );
                 }
                 Ok(Err(e)) => {
+                    self.ctx
+                        .sessions
+                        .release_removal(sid, live_session.generation())
+                        .await;
                     return Err(rpc_err(
                         INTERNAL_ERROR,
                         format!("Failed to mark ACP session killed: {e}"),
                     ));
                 }
                 Err(e) => {
+                    self.ctx
+                        .sessions
+                        .release_removal(sid, live_session.generation())
+                        .await;
                     return Err(rpc_err(
                         INTERNAL_ERROR,
                         format!("Failed to mark ACP session killed: {e}"),
@@ -1563,7 +1747,13 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = self.ctx.sessions.kill_session(sid).await;
+        self.dispose_reserved_goal(&live_session).await?;
+
+        let killed = self
+            .ctx
+            .sessions
+            .kill_session_exact(sid, live_session.generation())
+            .await;
         if killed {
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
@@ -2276,7 +2466,28 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        if self.ctx.sessions.cancel_session(&req.session_id) {
+        let goal_cancelled = if let (Some(goal_runtime), Some(live_session)) = (
+            self.ctx.goal_runtime.as_ref(),
+            self.ctx.sessions.live_session(&req.session_id).await,
+        ) {
+            let ingress = Self::goal_ingress_for_live_session(&live_session)?;
+            match goal_runtime.interrupt_session(&ingress).await {
+                Ok(crate::control_plane::GoalTransitionResult::Applied) => true,
+                Ok(
+                    crate::control_plane::GoalTransitionResult::Missing
+                    | crate::control_plane::GoalTransitionResult::Stale,
+                ) => false,
+                Err(error) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Goal session interruption failed: {error}"),
+                    ));
+                }
+            }
+        } else {
+            false
+        };
+        if self.ctx.sessions.cancel_session(&req.session_id) || goal_cancelled {
             to_result(SessionCancelResult {
                 session_id: req.session_id,
                 cancelled: true,
@@ -2513,6 +2724,16 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let live_session = match self.reserve_session_disposal(&req.session_id).await {
+            Ok(session) => session,
+            Err(error) if error.code == SESSION_NOT_FOUND => {
+                return to_result(SessionDeleteResult {
+                    session_id: req.session_id,
+                    deleted: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2520,7 +2741,11 @@ impl RpcDispatcher {
                 .channel_handles()
                 .unregister_channel("rpc");
         }
-        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        let existed = self
+            .ctx
+            .sessions
+            .remove_exact(&req.session_id, live_session.generation())
+            .await;
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -7165,6 +7390,104 @@ mod tests {
         (dispatcher, sessions)
     }
 
+    struct LifecycleGoalExecutor;
+
+    #[async_trait]
+    impl crate::goal_mode::GoalExecutor for LifecycleGoalExecutor {
+        async fn preflight(
+            &self,
+            _: &crate::goal_mode::GoalExecutionPreflight,
+        ) -> crate::goal_mode::GoalExecutionReadiness {
+            crate::goal_mode::GoalExecutionReadiness::Ready
+        }
+
+        async fn launch(&self, _: crate::goal_mode::GoalExecutionScope) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    fn goal_bound_lifecycle_dispatcher(
+        tmp: &tempfile::TempDir,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<crate::control_plane::SqliteTaskStore>,
+    ) {
+        use zeroclaw_config::{cost::CostTracker, schema::CostConfig};
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let config = make_acp_test_config(tmp);
+        let queue = Arc::new(SessionActorQueue::new(16, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config.clone(), Arc::clone(&sessions));
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        let store = Arc::new(crate::control_plane::SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn crate::control_plane::GoalTaskRegistry> = store.clone();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), tmp.path()).unwrap());
+        ctx.goal_runtime = Some(Arc::new(
+            crate::goal_mode::GoalRuntime::new(
+                Arc::new(config),
+                goals,
+                tracker,
+                Arc::new(LifecycleGoalExecutor),
+                "rpc-lifecycle-test",
+            )
+            .unwrap(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        (
+            RpcDispatcher::new(Arc::new(ctx), tx, "goal-lifecycle-test-peer".into()),
+            sessions,
+            store,
+        )
+    }
+
+    async fn bind_running_goal_to_rpc_session(
+        store: &Arc<crate::control_plane::SqliteTaskStore>,
+        session_id: &str,
+    ) {
+        use crate::control_plane::{
+            GoalTaskRecord, GoalTaskRegistry, TaskKind, TaskRecord, TaskStatus,
+        };
+
+        let task_id = format!("goal-{session_id}");
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    TaskRecord {
+                        id: task_id.clone(),
+                        kind: TaskKind::Goal,
+                        agent: "test-agent".into(),
+                        status: TaskStatus::Running,
+                        owner_pid: std::process::id(),
+                        owner_boot_id: "rpc-lifecycle-test".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some("rpc".into()),
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        session_id: Some(session_id.into()),
+                        execution_epoch: 0,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id,
+                        objective: "finish safely".into(),
+                        success_criteria: "the task is complete".into(),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+    }
+
     /// Create a Chat-mode session through the real `session/new` handler,
     /// optionally sending the `keep_siblings` opt-out.
     async fn new_chat_session_for_eviction_test(
@@ -7185,6 +7508,92 @@ mod tests {
             result.is_ok(),
             "session/new for {session_id} should succeed; got: {:?}",
             result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_bound_rpc_close_hard_deletes_control_state_before_session_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, sessions, store) = goal_bound_lifecycle_dispatcher(&tmp);
+        dispatcher.set_tui_id_for_test(Some("goal-close-owner".into()));
+        new_chat_session_for_eviction_test(&dispatcher, "goal-close", Some(true)).await;
+        bind_running_goal_to_rpc_session(&store, "goal-close").await;
+
+        dispatcher
+            .handle_session_close(&json!({"session_id": "goal-close"}))
+            .await
+            .expect("Goal-bound session close must dispose control state first");
+
+        assert!(sessions.get_agent("goal-close").await.is_none());
+        assert!(
+            crate::control_plane::GoalTaskRegistry::current_goal_for_session(
+                store.as_ref(),
+                "goal-close"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "close must leave no Goal control record after removing its session"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_bound_rpc_delete_and_kill_hard_delete_control_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, sessions, store) = goal_bound_lifecycle_dispatcher(&tmp);
+        dispatcher.set_tui_id_for_test(Some("goal-dispose-owner".into()));
+
+        for (session_id, delete) in [("goal-delete", true), ("goal-kill", false)] {
+            new_chat_session_for_eviction_test(&dispatcher, session_id, Some(true)).await;
+            bind_running_goal_to_rpc_session(&store, session_id).await;
+            let result = if delete {
+                dispatcher
+                    .handle_session_delete(&json!({"session_id": session_id}))
+                    .await
+            } else {
+                dispatcher
+                    .handle_session_kill(&json!({"session_id": session_id}))
+                    .await
+            };
+            assert!(
+                result.is_ok(),
+                "Goal-bound lifecycle operation failed: {result:?}"
+            );
+            assert!(sessions.get_agent(session_id).await.is_none());
+            assert!(
+                crate::control_plane::GoalTaskRegistry::current_goal_for_session(
+                    store.as_ref(),
+                    session_id
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "{session_id} control state must be deleted with its session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_bound_rpc_replacement_disposes_the_predecessor_before_reporting_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut dispatcher, sessions, store) = goal_bound_lifecycle_dispatcher(&tmp);
+        dispatcher.set_tui_id_for_test(Some("goal-replace-owner".into()));
+        new_chat_session_for_eviction_test(&dispatcher, "goal-predecessor", None).await;
+        bind_running_goal_to_rpc_session(&store, "goal-predecessor").await;
+
+        new_chat_session_for_eviction_test(&dispatcher, "goal-successor", None).await;
+
+        assert!(sessions.get_agent("goal-predecessor").await.is_none());
+        assert!(sessions.get_agent("goal-successor").await.is_some());
+        assert!(
+            crate::control_plane::GoalTaskRegistry::current_goal_for_session(
+                store.as_ref(),
+                "goal-predecessor"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "replacement must not report success while predecessor Goal state remains"
         );
     }
 

@@ -106,6 +106,38 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// Exact durable Goal fence used by one atomic policy-revocation transition.
+///
+/// Keeping this small, transport-free value in the control plane lets a
+/// channel/runtime adapter classify policy without owning lifecycle mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalSessionFence {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+}
+
+impl GoalSessionFence {
+    pub fn new(
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        execution_epoch: i64,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            session_id: session_id.into(),
+            execution_epoch,
+        }
+    }
+}
+
+/// Canonical task-plus-extension projection used by Goal lifecycle owners.
+#[derive(Debug, Clone)]
+pub struct GoalTaskStatus {
+    pub task: TaskRecord,
+    pub goal: GoalTaskRecord,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -296,6 +328,11 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// Read every currently running Goal from the canonical control plane.
+    async fn list_running_goal_statuses(&self) -> anyhow::Result<Vec<GoalTaskStatus>>;
+
+    /// Read every nonterminal Goal, including retained paused records.
+    async fn list_nonterminal_goal_statuses(&self) -> anyhow::Result<Vec<GoalTaskStatus>>;
     async fn create_goal(
         &self,
         task: TaskRecord,
@@ -415,6 +452,14 @@ pub trait GoalTaskRegistry: Send + Sync {
         expected_epoch: i64,
         status: TaskStatus,
         error: Option<String>,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Atomically cancel exact nonterminal Goal fences during one policy
+    /// cutover. A stale or missing fence rolls back every earlier transition.
+    async fn cancel_session_goals(
+        &self,
+        fences: &[GoalSessionFence],
+        error: &str,
     ) -> anyhow::Result<GoalTransitionResult>;
 
     async fn admit_pending_call_with_reservation(

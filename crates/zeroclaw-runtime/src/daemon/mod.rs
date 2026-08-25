@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::Utc;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -586,6 +586,14 @@ pub async fn run(
             .await
             .map(crate::control_plane::init_control_plane)
     {
+        // An existing control-plane database may retain a session-bound Goal.
+        // Treat a failed reopen as unknown durable state, never as proof that
+        // session removal or policy installation is safe. A new deployment
+        // without the database retains the historical supervision-disabled
+        // fallback for unrelated runtime facilities.
+        if config.data_dir.join("control_plane.db").exists() {
+            return Err(e).context("reopen existing Goal lifecycle control plane");
+        }
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -743,42 +751,57 @@ pub async fn run(
 
         let cost_tracker =
             crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
-        let goal_runtime = crate::control_plane::control_plane().and_then(|control_plane| {
+        let goal_runtime = if let Some(control_plane) = crate::control_plane::control_plane() {
             let tracker = crate::cost::CostTracker::get_or_init_global_for_goal(
                 config.cost.clone(),
                 &config.data_dir,
-            )?;
-            let executor = std::sync::Arc::new(
-                crate::goal_mode::GoalExecutionHost::from_existing_rpc_sessions(
-                    std::sync::Arc::clone(&sessions),
-                    std::sync::Arc::clone(&control_plane.goals),
-                    std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
-                        std::sync::Arc::clone(&control_plane.store),
-                        control_plane.boot_id.clone(),
-                    )),
-                    std::sync::Arc::new(config.clone()),
-                ),
-            ) as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
-            match crate::goal_mode::GoalRuntime::new(
-                std::sync::Arc::new(config.clone()),
-                std::sync::Arc::clone(&control_plane.goals),
-                tracker,
-                executor,
-                control_plane.boot_id.clone(),
-            ) {
-                Ok(runtime) => Some(std::sync::Arc::new(runtime)),
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                        "Goal runtime controller is unavailable"
-                    );
+            );
+            match tracker {
+                Some(tracker) => {
+                    let executor = std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                        vec![std::sync::Arc::new(
+                            crate::rpc::goal_host::RpcGoalSessionAdapter::new(
+                                std::sync::Arc::clone(&sessions),
+                            ),
+                        )],
+                        std::sync::Arc::clone(&control_plane.goals),
+                        std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
+                            std::sync::Arc::clone(&control_plane.store),
+                            control_plane.boot_id.clone(),
+                        )),
+                        std::sync::Arc::new(config.clone()),
+                    ))
+                        as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
+                    Some(std::sync::Arc::new(
+                        crate::goal_mode::GoalRuntime::new(
+                            std::sync::Arc::new(config.clone()),
+                            std::sync::Arc::clone(&control_plane.goals),
+                            tracker,
+                            executor,
+                            control_plane.boot_id.clone(),
+                        )
+                        .map_err(anyhow::Error::new)
+                        .context("construct RPC Goal lifecycle controller")?,
+                    ))
+                }
+                None => {
+                    if !control_plane
+                        .goals
+                        .list_nonterminal_goal_statuses()
+                        .await
+                        .context("inspect Goals before constructing the RPC lifecycle controller")?
+                        .is_empty()
+                    {
+                        anyhow::bail!(
+                            "Goal lifecycle controller is unavailable while nonterminal Goals exist"
+                        );
+                    }
                     None
                 }
             }
-        });
+        } else {
+            None
+        };
 
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
@@ -806,6 +829,95 @@ pub async fn run(
     } else {
         None
     };
+
+    // A generation with no RPC listener still has to revoke Goals previously
+    // bound to that surface. Reuse the same controller with no live-session
+    // adapter: every retained route is consequently revoked before any worker
+    // could be admitted, while direct child cleanup continues through the
+    // canonical task registry.
+    let lifecycle_goal_runtime = if let Some(runtime) = rpc_ctx
+        .as_ref()
+        .and_then(|context| context.goal_runtime.as_ref())
+        .cloned()
+    {
+        Some(runtime)
+    } else if let Some(control_plane) = crate::control_plane::control_plane() {
+        match crate::cost::CostTracker::get_or_init_global_for_goal(
+            config.cost.clone(),
+            &config.data_dir,
+        ) {
+            Some(tracker) => {
+                let executor = std::sync::Arc::new(crate::goal_mode::GoalExecutionHost::new(
+                    Vec::<std::sync::Arc<dyn crate::goal_mode::GoalSessionAdapter>>::new(),
+                    std::sync::Arc::clone(&control_plane.goals),
+                    std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
+                        std::sync::Arc::clone(&control_plane.store),
+                        control_plane.boot_id.clone(),
+                    )),
+                    std::sync::Arc::new(config.clone()),
+                ))
+                    as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
+                Some(std::sync::Arc::new(
+                    crate::goal_mode::GoalRuntime::new(
+                        std::sync::Arc::new(config.clone()),
+                        std::sync::Arc::clone(&control_plane.goals),
+                        tracker,
+                        executor,
+                        control_plane.boot_id.clone(),
+                    )
+                    .map_err(anyhow::Error::new)
+                    .context("construct Goal lifecycle controller without an RPC adapter")?,
+                ))
+            }
+            None => {
+                if !control_plane
+                    .goals
+                    .list_nonterminal_goal_statuses()
+                    .await
+                    .context("inspect Goals before constructing the lifecycle controller")?
+                    .is_empty()
+                {
+                    anyhow::bail!(
+                        "Goal lifecycle controller is unavailable while nonterminal Goals exist"
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let available_goal_routes: &[&str] = if rpc_ctx.is_some() { &["rpc"] } else { &[] };
+
+    // Cost-ledger construction is required even while ordinary cost tracking
+    // is disabled. Do not install a policy generation that could revoke a
+    // durable Goal when the controller needed to fence it is unavailable.
+    if lifecycle_goal_runtime.is_none()
+        && let Some(control_plane) = crate::control_plane::control_plane()
+        && !control_plane
+            .goals
+            .list_nonterminal_goal_statuses()
+            .await
+            .context("inspect Goals before lifecycle controller cutover")?
+            .is_empty()
+    {
+        anyhow::bail!("Goal lifecycle controller is unavailable while nonterminal Goals exist");
+    }
+
+    // Classify the prospective Goal policy before it admits work. This must
+    // remain narrower than `Config::validate()`: an unrelated daemon config
+    // defect cannot permanently cancel a durable Goal. The installed RPC
+    // adapter contributes the only route this daemon generation can own.
+    if let Some(goal_runtime) = lifecycle_goal_runtime.as_ref()
+        && let Err(error) = goal_runtime
+            .cancel_nonterminal_goals_for_policy_revocation(|task| {
+                crate::goal_mode::goal_policy_revokes_task(&config, task, available_goal_routes)
+            })
+            .await
+    {
+        return Err(anyhow::Error::new(error)
+            .context("Goal policy revocation failed before runtime admission"));
+    }
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
     if let Some(socket_start) = registry.take_socket_start() {
@@ -998,6 +1110,17 @@ pub async fn run(
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
+    // Fence Goal work before generic channel cancellation. A reload cannot
+    // install its replacement generation if this durable cutover fails.
+    let goal_cutover_failure = if let Some(goal_runtime) = lifecycle_goal_runtime.as_ref() {
+        goal_runtime
+            .pause_running_goals_for_runtime_cutover()
+            .await
+            .err()
+    } else {
+        None
+    };
+
     channels_cancel.cancel();
 
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
@@ -1029,6 +1152,10 @@ pub async fn run(
     // retained across the call.
     unsafe {
         libc::malloc_trim(0);
+    }
+
+    if let Some(error) = goal_cutover_failure {
+        return Err(anyhow::Error::new(error).context("Goal runtime cutover fencing failed"));
     }
 
     exit_result
