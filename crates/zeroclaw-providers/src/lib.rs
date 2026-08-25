@@ -45,6 +45,7 @@ pub use traits::{
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
+use zeroclaw_api::model_provider::BASELINE_MAX_TOKENS;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -623,6 +624,59 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+}
+
+/// One provider/model leaf that Reliable can select while serving a logical
+/// operation. This configuration-derived planning data contains neither
+/// credentials nor provider handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationCandidate {
+    /// Configured provider reference used for route attribution.
+    pub provider_ref: String,
+    /// Model served after profile and route pinning.
+    pub model: String,
+    /// Configured output bound, normalized to the shared baseline when unset.
+    pub max_output_tokens: u32,
+    /// Maximum physical attempts Reliable may make for this candidate.
+    pub attempt_count: u32,
+}
+
+/// Read-only candidate plan for one routed model operation.
+///
+/// The plan shares configured alias and fallback traversal with provider
+/// construction, but never creates a provider or serializes a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelOperationPlan {
+    pub candidates: Vec<ResolvedModelOperationCandidate>,
+}
+
+impl ResolvedModelOperationPlan {
+    /// Return a checked conservative token reservation for every candidate and
+    /// retry that one logical operation may use.
+    pub fn conservative_token_reservation(&self, input_tokens: u64) -> anyhow::Result<u64> {
+        if self.candidates.is_empty() {
+            anyhow::bail!("model operation plan has no candidates");
+        }
+
+        self.candidates.iter().try_fold(0_u64, |total, candidate| {
+            if candidate.attempt_count == 0 {
+                anyhow::bail!(
+                    "model operation candidate {}/{} has zero attempts",
+                    candidate.provider_ref,
+                    candidate.model
+                );
+            }
+            let per_attempt = input_tokens
+                .checked_add(u64::from(candidate.max_output_tokens))
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
+            let candidate_total = per_attempt
+                .checked_mul(u64::from(candidate.attempt_count))
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))?;
+            total
+                .checked_add(candidate_total)
+                .ok_or_else(|| anyhow::Error::msg("model operation reservation overflows"))
+        })
+    }
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -1501,17 +1555,10 @@ fn push_pinned_entries(
     built: Box<dyn ModelProvider>,
     primary_model_override: Option<&str>,
 ) {
-    let entry = config.providers.models.find(family, alias);
-    let primary_model = primary_model_override
-        .and_then(|model| {
-            let trimmed = model.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .or_else(|| entry.and_then(|e| e.model.as_deref()));
-    let extra_models: &[String] = entry.map(|e| e.fallback_models.as_slice()).unwrap_or(&[]);
     let cooldown_key = format!("{family}.{alias}");
+    let models = configured_models_for_alias(config, family, alias, primary_model_override);
 
-    let Some(primary_model) = primary_model else {
+    let Some((primary_model, fallback_models)) = models.split_first() else {
         out.push(ReliableModelProviderEntry::new_with_candidate(
             family,
             cooldown_key.clone(),
@@ -1529,10 +1576,7 @@ fn push_pinned_entries(
         primary_model,
         Box::new(std::sync::Arc::clone(&built)),
     ));
-    for model in extra_models {
-        if model.trim().is_empty() || model == primary_model {
-            continue;
-        }
+    for model in fallback_models {
         out.push(ReliableModelProviderEntry::new_pinned(
             family,
             cooldown_key.clone(),
@@ -1543,13 +1587,45 @@ fn push_pinned_entries(
     }
 }
 
-fn append_fallback_chain(
-    out: &mut Vec<ReliableModelProviderEntry>,
+fn configured_models_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    primary_model_override: Option<&str>,
+) -> Vec<String> {
+    let entry = config.providers.models.find(family, alias);
+    let primary_model = primary_model_override
+        .and_then(|model| {
+            let trimmed = model.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .or_else(|| entry.and_then(|entry| entry.model.as_deref()));
+    let Some(primary_model) = primary_model else {
+        return Vec::new();
+    };
+
+    let mut models = vec![primary_model.to_string()];
+    if let Some(entry) = entry {
+        for model in &entry.fallback_models {
+            if model.trim().is_empty() || model == primary_model {
+                continue;
+            }
+            models.push(model.clone());
+        }
+    }
+    models
+}
+
+fn visit_fallback_chain<F>(
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
     depth: usize,
-) -> anyhow::Result<()> {
+    visit_alias: &mut F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str, &str, &str) -> anyhow::Result<()>,
+{
     if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
         ::zeroclaw_log::record!(
             WARN,
@@ -1578,7 +1654,7 @@ fn append_fallback_chain(
             continue;
         };
         let resolved = format!("{family}.{alias}");
-        if visited.iter().any(|v| v == &resolved) {
+        if visited.iter().any(|value| value == &resolved) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1589,11 +1665,31 @@ fn append_fallback_chain(
             continue;
         }
 
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        visit_alias(family, &alias, raw)?;
+        visited.push(resolved);
+        visit_fallback_chain(config, &entry.fallback, visited, depth + 1, visit_alias)?;
+        visited.pop();
+    }
+    Ok(())
+}
+
+fn append_fallback_chain(
+    out: &mut Vec<ReliableModelProviderEntry>,
+    config: &zeroclaw_config::schema::Config,
+    refs: &[zeroclaw_config::providers::ModelProviderRef],
+    visited: &mut Vec<String>,
+    depth: usize,
+) -> anyhow::Result<()> {
+    visit_fallback_chain(config, refs, visited, depth, &mut |family, alias, raw| {
+        let Some(entry) = config.providers.models.find(family, alias) else {
+            anyhow::bail!("fallback provider `{raw}` disappeared during resolution");
+        };
+        let resolved = format!("{family}.{alias}");
+        let opts = provider_runtime_options_for_alias(config, family, alias);
         if !factory::fallback_auth_ready_for_alias(
             config,
             family,
-            &alias,
+            alias,
             entry.api_key.as_deref(),
             &opts,
         ) {
@@ -1608,26 +1704,189 @@ fn append_fallback_chain(
         match create_model_provider_inner(
             Some(config),
             family,
-            &alias,
+            alias,
             entry.api_key.as_deref(),
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
+            Ok(built) => push_pinned_entries(out, config, family, alias, built, None),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
                     "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) failed to \
-                     build: {e}"
+                    build: {e}"
                 );
             }
         }
+        Ok(())
+    })
+}
 
-        visited.push(resolved.clone());
-        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1)?;
-        visited.pop();
+fn append_operation_candidates(
+    candidates: &mut Vec<ResolvedModelOperationCandidate>,
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    requested_model: &str,
+    primary_model_override: Option<&str>,
+    max_output_tokens: u32,
+    attempt_count: u32,
+) {
+    let provider_ref = format!("{family}.{alias}");
+    let models = configured_models_for_alias(config, family, alias, primary_model_override);
+
+    let Some((primary_model, fallback_models)) = models.split_first() else {
+        candidates.push(ResolvedModelOperationCandidate {
+            provider_ref,
+            model: requested_model.to_string(),
+            max_output_tokens,
+            attempt_count,
+        });
+        return;
+    };
+
+    candidates.push(ResolvedModelOperationCandidate {
+        provider_ref: provider_ref.clone(),
+        model: primary_model.clone(),
+        max_output_tokens,
+        attempt_count,
+    });
+    for model in fallback_models {
+        candidates.push(ResolvedModelOperationCandidate {
+            provider_ref: provider_ref.clone(),
+            model: model.clone(),
+            max_output_tokens,
+            attempt_count,
+        });
     }
-    Ok(())
+}
+
+fn operation_plan_for_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    requested_model: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+    primary_model_override: Option<&str>,
+) -> anyhow::Result<ResolvedModelOperationPlan> {
+    let Some(attempt_count) = reliability.provider_retries.checked_add(1) else {
+        anyhow::bail!("provider retry count overflows operation planning");
+    };
+    let max_output_tokens = options.provider_max_tokens.unwrap_or(BASELINE_MAX_TOKENS);
+
+    let Some((family, alias)) = provider_ref.split_once('.') else {
+        return Ok(ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: provider_ref.to_string(),
+                model: requested_model.to_string(),
+                max_output_tokens,
+                attempt_count,
+            }],
+        });
+    };
+
+    if config.providers.models.find(family, alias).is_none() {
+        return Ok(ResolvedModelOperationPlan {
+            candidates: vec![ResolvedModelOperationCandidate {
+                provider_ref: provider_ref.to_string(),
+                model: requested_model.to_string(),
+                max_output_tokens,
+                attempt_count,
+            }],
+        });
+    }
+
+    let mut candidates = Vec::new();
+    append_operation_candidates(
+        &mut candidates,
+        config,
+        family,
+        alias,
+        requested_model,
+        primary_model_override,
+        max_output_tokens,
+        attempt_count,
+    );
+    let mut visited = vec![format!("{family}.{alias}")];
+    let entry = config
+        .providers
+        .models
+        .find(family, alias)
+        .ok_or_else(|| anyhow::Error::msg("primary provider disappeared during resolution"))?;
+    visit_fallback_chain(
+        config,
+        &entry.fallback,
+        &mut visited,
+        1,
+        &mut |fallback_family, fallback_alias, _raw| {
+            let fallback_options =
+                provider_runtime_options_for_alias(config, fallback_family, fallback_alias);
+            append_operation_candidates(
+                &mut candidates,
+                config,
+                fallback_family,
+                fallback_alias,
+                requested_model,
+                None,
+                fallback_options
+                    .provider_max_tokens
+                    .unwrap_or(BASELINE_MAX_TOKENS),
+                attempt_count,
+            );
+            Ok(())
+        },
+    )?;
+
+    Ok(ResolvedModelOperationPlan { candidates })
+}
+
+/// Resolve the configured router target with the same duplicate and unknown-
+/// hint semantics as [`router::RouterModelProvider`].
+fn resolve_routed_operation_target<'a>(
+    primary_name: &'a str,
+    model_routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+    requested_model: &'a str,
+) -> (&'a str, &'a str) {
+    let Some(hint) = requested_model.strip_prefix("hint:") else {
+        return (primary_name, requested_model);
+    };
+
+    let Some(route) = model_routes.iter().rev().find(|route| route.hint == hint) else {
+        return (primary_name, requested_model);
+    };
+    (route.model_provider.as_str(), route.model.as_str())
+}
+
+/// Resolve the Reliable candidate chain for one configured routed operation.
+///
+/// This is a configuration-only planning view. It uses the same alias and
+/// fallback traversal as provider construction, but does not construct a
+/// provider, resolve credentials, or serialize a provider request.
+pub fn resolve_routed_model_operation_plan_with_options(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+    requested_model: &str,
+) -> anyhow::Result<ResolvedModelOperationPlan> {
+    let (provider_ref, operation_model) =
+        resolve_routed_operation_target(primary_name, model_routes, requested_model);
+    let is_primary = provider_ref == primary_name;
+    let provider_options = if is_primary {
+        options.clone()
+    } else {
+        options_for_provider_ref(config, provider_ref, options)
+    };
+    operation_plan_for_ref(
+        config,
+        provider_ref,
+        operation_model,
+        reliability,
+        &provider_options,
+        is_primary.then_some(default_model),
+    )
 }
 
 pub fn create_resilient_model_provider_from_ref(
@@ -4282,6 +4541,309 @@ mod tests {
             "config-entry key should succeed: {}",
             result.err().unwrap()
         );
+    }
+
+    #[test]
+    fn routed_operation_plan_is_provider_agnostic() {
+        use zeroclaw_api::model_provider::BASELINE_MAX_TOKENS;
+
+        let config = zeroclaw_config::schema::Config::default();
+        let plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai",
+            &config.reliability,
+            &[],
+            "gpt-test",
+            &ModelProviderRuntimeOptions::default(),
+            "gpt-test",
+        )
+        .expect("bare provider references have one candidate");
+
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].provider_ref, "openai");
+        assert_eq!(plan.candidates[0].model, "gpt-test");
+        assert_eq!(plan.candidates[0].max_output_tokens, BASELINE_MAX_TOKENS);
+        assert_eq!(plan.candidates[0].attempt_count, 3);
+        assert_eq!(
+            plan.conservative_token_reservation(100).unwrap(),
+            3 * (100 + u64::from(BASELINE_MAX_TOKENS))
+        );
+    }
+
+    #[test]
+    fn operation_plan_matches_pinned_models_and_recursive_fallbacks() {
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, OpenAIModelProviderConfig, ReliabilityConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("ignored-by-primary-route".to_string()),
+                    fallback_models: vec!["primary-small".to_string()],
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    max_tokens: Some(40),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("backup-default".to_string()),
+                    fallback_models: vec!["backup-small".to_string()],
+                    fallback: vec![ModelProviderRef::new("openai.last")],
+                    max_tokens: Some(30),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "last".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("last-model".to_string()),
+                    max_tokens: Some(20),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let reliability = ReliabilityConfig {
+            provider_retries: 2,
+            ..ReliabilityConfig::default()
+        };
+        let options = provider_runtime_options_for_alias(&config, "openai", "primary");
+
+        let plan = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &reliability,
+            &[],
+            "primary-route-model",
+            &options,
+            "primary-route-model",
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.candidates,
+            vec![
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.primary".to_string(),
+                    model: "primary-route-model".to_string(),
+                    max_output_tokens: 40,
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.primary".to_string(),
+                    model: "primary-small".to_string(),
+                    max_output_tokens: 40,
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.backup".to_string(),
+                    model: "backup-default".to_string(),
+                    max_output_tokens: 30,
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.backup".to_string(),
+                    model: "backup-small".to_string(),
+                    max_output_tokens: 30,
+                    attempt_count: 3,
+                },
+                ResolvedModelOperationCandidate {
+                    provider_ref: "openai.last".to_string(),
+                    model: "last-model".to_string(),
+                    max_output_tokens: 20,
+                    attempt_count: 3,
+                },
+            ]
+        );
+        assert_eq!(plan.conservative_token_reservation(100).unwrap(), 1_980);
+    }
+
+    #[test]
+    fn operation_plan_reservation_rejects_invalid_or_overflowing_input() {
+        use zeroclaw_api::model_provider::BASELINE_MAX_TOKENS;
+        use zeroclaw_config::schema::ReliabilityConfig;
+
+        let candidate = ResolvedModelOperationCandidate {
+            provider_ref: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            max_output_tokens: BASELINE_MAX_TOKENS,
+            attempt_count: 1,
+        };
+        assert!(
+            ResolvedModelOperationPlan {
+                candidates: vec![candidate.clone()],
+            }
+            .conservative_token_reservation(u64::MAX)
+            .is_err()
+        );
+        assert!(
+            ResolvedModelOperationPlan {
+                candidates: vec![ResolvedModelOperationCandidate {
+                    max_output_tokens: 1,
+                    attempt_count: u32::MAX,
+                    ..candidate.clone()
+                }],
+            }
+            .conservative_token_reservation(u64::MAX / u64::from(u32::MAX))
+            .is_err()
+        );
+        assert!(
+            ResolvedModelOperationPlan {
+                candidates: vec![
+                    ResolvedModelOperationCandidate {
+                        max_output_tokens: 1,
+                        ..candidate.clone()
+                    },
+                    ResolvedModelOperationCandidate {
+                        max_output_tokens: 1,
+                        ..candidate.clone()
+                    },
+                ],
+            }
+            .conservative_token_reservation(u64::MAX / 2)
+            .is_err()
+        );
+        assert!(
+            ResolvedModelOperationPlan {
+                candidates: vec![ResolvedModelOperationCandidate {
+                    attempt_count: 0,
+                    ..candidate
+                }],
+            }
+            .conservative_token_reservation(1)
+            .is_err()
+        );
+        assert!(
+            ResolvedModelOperationPlan { candidates: vec![] }
+                .conservative_token_reservation(1)
+                .is_err()
+        );
+
+        let config = zeroclaw_config::schema::Config::default();
+        let retries_overflow = ReliabilityConfig {
+            provider_retries: u32::MAX,
+            ..ReliabilityConfig::default()
+        };
+        assert!(
+            resolve_routed_model_operation_plan_with_options(
+                &config,
+                "openai",
+                &retries_overflow,
+                &[],
+                "gpt-test",
+                &ModelProviderRuntimeOptions::default(),
+                "gpt-test",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn operation_plan_uses_selected_router_semantics() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        for alias in ["primary", "first", "last"] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(format!("{alias}-profile")),
+                        max_tokens: Some(12),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+        let routes = [
+            ModelRouteConfig {
+                hint: "duplicate".to_string(),
+                model_provider: "openai.first".to_string(),
+                model: "first-route".to_string(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "duplicate".to_string(),
+                model_provider: "openai.last".to_string(),
+                model: "last-route".to_string(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "self".to_string(),
+                model_provider: "openai.primary".to_string(),
+                model: "self-route".to_string(),
+                api_key: None,
+            },
+        ];
+        let options = ModelProviderRuntimeOptions {
+            provider_max_tokens: Some(77),
+            ..ModelProviderRuntimeOptions::default()
+        };
+
+        let duplicate = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &config.reliability,
+            &routes,
+            "default-model",
+            &options,
+            "hint:duplicate",
+        )
+        .unwrap();
+        assert_eq!(duplicate.candidates[0].provider_ref, "openai.last");
+        assert_eq!(duplicate.candidates[0].model, "last-profile");
+        assert_eq!(duplicate.candidates[0].max_output_tokens, 12);
+
+        let self_route = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &config.reliability,
+            &routes,
+            "default-model",
+            &options,
+            "hint:self",
+        )
+        .unwrap();
+        assert_eq!(self_route.candidates[0].provider_ref, "openai.primary");
+        assert_eq!(self_route.candidates[0].model, "default-model");
+        assert_eq!(self_route.candidates[0].max_output_tokens, 77);
+
+        let unknown = resolve_routed_model_operation_plan_with_options(
+            &config,
+            "openai.primary",
+            &config.reliability,
+            &routes,
+            "default-model",
+            &options,
+            "hint:unknown",
+        )
+        .unwrap();
+        assert_eq!(unknown.candidates[0].provider_ref, "openai.primary");
+        assert_eq!(unknown.candidates[0].model, "default-model");
+
+        let bare_config = Config::default();
+        let bare_unknown = resolve_routed_model_operation_plan_with_options(
+            &bare_config,
+            "openai",
+            &bare_config.reliability,
+            &routes,
+            "default-model",
+            &ModelProviderRuntimeOptions::default(),
+            "hint:unknown",
+        )
+        .unwrap();
+        assert_eq!(bare_unknown.candidates[0].model, "hint:unknown");
     }
 
     #[test]
