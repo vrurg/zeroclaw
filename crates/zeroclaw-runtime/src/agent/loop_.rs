@@ -1413,7 +1413,11 @@ pub async fn run(
             mcp_tool_names,
             ..
         } = assembled;
-        let tools_registry = registry.into_inner();
+        let mut tools_registry = registry.into_inner();
+        if is_subagent_caller && crate::agent::cost::current_goal_child_scope().is_some() {
+            tools_registry
+                .retain(|tool| !crate::agent::agent::is_goal_child_excluded_tool(tool.name()));
+        }
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -1971,7 +1975,8 @@ pub async fn run(
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
-                                cancellation_token: None,
+                                cancellation_token: crate::agent::cost::current_goal_child_scope()
+                                    .map(|scope| scope.cancellation.child_token()),
                                 on_delta: None,
                                 shared_budget: None,
                                 channel: None,

@@ -273,14 +273,29 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
+    let goal_child_supervision = crate::agent::cost::current_goal_child_scope().is_some()
+        && matches!(
+            call_name,
+            crate::tools::DelegateTool::NAME | crate::tools::SpawnSubagentTool::NAME
+        );
+    if goal_child_supervision && cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolLoopCancelled.into());
+    }
     let tool_future = tool
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+            if goal_child_supervision {
+                // The child inherits the Goal cancellation token and owns a
+                // durable task row. Await its cleanup instead of dropping the
+                // future from the ordinary outer cancellation select.
+                Ok(tool_future.await)
+            } else {
+                tokio::select! {
+                    () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                    result = tool_future => Ok(result),
+                }
             }
         } else {
             Ok(tool_future.await)
@@ -473,6 +488,21 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // Goal-owned foreground children are joined by the parent, but creating
+    // them still has durable and non-model side effects. Keep a batch that
+    // contains either child entry point in source order while the Goal scope
+    // is active; ordinary turns retain their existing parallel behavior.
+    if crate::agent::cost::current_goal_child_scope().is_some()
+        && tool_calls.iter().any(|call| {
+            matches!(
+                call.name.as_str(),
+                crate::tools::DelegateTool::NAME | crate::tools::SpawnSubagentTool::NAME
+            )
+        })
+    {
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -581,6 +611,49 @@ mod tests {
     struct CountingTool {
         name: String,
         invocations: Arc<AtomicUsize>,
+    }
+
+    struct GoalChildGateTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GoalChildGateTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-goal-child-gate"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for GoalChildGateTool {
+        fn name(&self) -> &str {
+            crate::tools::SpawnSubagentTool::NAME
+        }
+
+        fn description(&self) -> &str {
+            "Goal child cancellation gate"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "child cleanup complete".into(),
+                error: None,
+            })
+        }
     }
 
     impl CountingTool {
@@ -829,6 +902,72 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_child_entry_point_in_batch_forces_serial() {
+        let calls = vec![parsed_tool_call("file_read"), parsed_tool_call("delegate")];
+        let scope = crate::agent::cost::GoalChildScope::for_test();
+
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                assert!(!should_execute_tools_in_parallel(&calls, None));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn goal_child_cancellation_joins_admitted_tool_cleanup() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(GoalChildGateTool {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        })];
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-child-cancellation",
+            channel_name: "test",
+        };
+        let run = crate::agent::cost::GOAL_CHILD_SCOPE.scope(
+            Some(crate::agent::cost::GoalChildScope::for_test()),
+            execute_one_tool(
+                crate::tools::SpawnSubagentTool::NAME,
+                serde_json::json!({}),
+                None,
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                Some(&cancellation),
+                None,
+                None,
+            ),
+        );
+        tokio::pin!(run);
+
+        tokio::select! {
+            _ = started.notified() => {}
+            _ = &mut run => panic!("child gate completed before cancellation"),
+        }
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut run)
+                .await
+                .is_err(),
+            "outer cancellation must await the admitted Goal child cleanup"
+        );
+        release.notify_one();
+        assert!(
+            run.await.expect("joined child cleanup succeeds").success,
+            "the admitted Goal child completes after its cleanup gate releases"
         );
     }
 

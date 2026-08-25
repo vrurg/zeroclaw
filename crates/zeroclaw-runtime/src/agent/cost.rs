@@ -239,6 +239,43 @@ tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
+/// Process-local binding for a synchronous foreground child. Durable task and
+/// Goal state remain in the control plane; this only transports the already
+/// validated parent identity and cancellation boundary through existing tools.
+#[derive(Clone)]
+pub(crate) struct GoalChildScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+    pub originator_route: Option<String>,
+    pub principal_id: Option<String>,
+    pub cancellation: tokio_util::sync::CancellationToken,
+    pub lifecycle: Option<Arc<crate::goal_mode::GoalChildLifecycle>>,
+}
+
+#[cfg(test)]
+impl GoalChildScope {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            task_id: "goal-test".to_owned(),
+            session_id: "session-test".to_owned(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            lifecycle: None,
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_CHILD_SCOPE: Option<GoalChildScope>;
+}
+
+pub(crate) fn current_goal_child_scope() -> Option<GoalChildScope> {
+    GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten()
+}
+
 /// Durable pairing fence for tool work performed inside one exact Goal epoch.
 ///
 /// The ordinary tool loop owns the transient transcript. This helper only

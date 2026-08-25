@@ -21,6 +21,7 @@ mod execution;
 mod host;
 
 pub use execution::GoalExecutionHost;
+pub(crate) use execution::{GoalChildLifecycle, GoalChildTask};
 pub use host::{GoalHostModelBinding, GoalSessionAdapter, GoalSessionBinding, GoalSessionLease};
 
 /// Parsed Goal Mode commands accepted by the V1 grammar.

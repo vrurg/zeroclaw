@@ -752,6 +752,10 @@ pub async fn run(
                 crate::goal_mode::GoalExecutionHost::from_existing_rpc_sessions(
                     std::sync::Arc::clone(&sessions),
                     std::sync::Arc::clone(&control_plane.goals),
+                    std::sync::Arc::new(crate::goal_mode::GoalChildLifecycle::new(
+                        std::sync::Arc::clone(&control_plane.store),
+                        control_plane.boot_id.clone(),
+                    )),
                     std::sync::Arc::new(config.clone()),
                 ),
             ) as std::sync::Arc<dyn crate::goal_mode::GoalExecutor>;
