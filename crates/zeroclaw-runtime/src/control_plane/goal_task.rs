@@ -373,6 +373,16 @@ pub trait GoalTaskRegistry: Send + Sync {
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>>;
 
+    /// Return the raw internal terminal error from the canonical task row for
+    /// one exact session-bound Goal. Presentation code must sanitize it before
+    /// exposing it to a user. This is a read-only projection; it does not add
+    /// error state to `TaskRecord` or a second Goal store.
+    async fn terminal_reason_for_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Option<String>>;
+
     /// Atomically create a session-bound Goal, or replace a fully settled
     /// terminal predecessor for the same session.
     async fn create_or_replace_session_goal(
