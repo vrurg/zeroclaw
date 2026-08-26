@@ -1216,6 +1216,25 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn acknowledge_session_goal_delivery(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        completed_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE tasks SET delivered = 1
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'completed' AND execution_epoch = ?3",
+            params![task_id, session_id, completed_epoch],
+        )?;
+        if updated != 0 {
+            return Ok(GoalTransitionResult::Applied);
+        }
+        transition_failure(&conn, task_id, session_id)
+    }
+
     async fn create_foreground_goal_child(
         &self,
         parent_task_id: &str,
@@ -1691,6 +1710,50 @@ mod tests {
                 .map(|task| task.id.as_str()),
             Some("second")
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_acknowledgement_requires_the_exact_completed_goal_epoch() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    session_goal_task("delivered", "session-1"),
+                    goal_record("delivered", "objective"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal("delivered", "session-1", 1, TaskStatus::Completed, None)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .acknowledge_session_goal_delivery("delivered", "session-1", 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert_eq!(
+            store
+                .acknowledge_session_goal_delivery("delivered", "other-session", 2)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert_eq!(
+            store
+                .acknowledge_session_goal_delivery("delivered", "session-1", 2)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(store.get("delivered").await.unwrap().unwrap().delivered);
     }
 
     #[tokio::test]

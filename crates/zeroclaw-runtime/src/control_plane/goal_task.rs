@@ -417,6 +417,16 @@ pub trait GoalTaskRegistry: Send + Sync {
         error: Option<String>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Record successful external delivery only for the exact already-complete
+    /// Goal epoch. Delivery failure deliberately leaves lifecycle completion
+    /// intact and `delivered` false.
+    async fn acknowledge_session_goal_delivery(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        completed_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     /// Insert one joined foreground child only while the exact parent Goal is
     /// still the current running epoch and owns an in-flight tool phase. This
     /// is intentionally Goal-specific: generic task insertion cannot fence a
