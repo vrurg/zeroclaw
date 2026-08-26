@@ -1916,47 +1916,67 @@ mod tests {
     }
 
     fn forbidden_goal_runtime_import(source: &str) -> Option<String> {
-        let forbidden_imports = [
-            ["crate", "matrix"].join("::"),
-            ["crate", "rpc"].join("::"),
-            ["crate", "channels"].join("::"),
-            ["crate", "gateway"].join("::"),
-            ["matrix", "::"].join(""),
-            ["rpc", "::"].join(""),
-            ["channels", "::"].join(""),
-            ["gateway", "::"].join(""),
-            ["matrix", "_sdk"].join(""),
-            ["zeroclaw", "channels"].join("_"),
-            ["zeroclaw", "gateway"].join("_"),
-            ["zerocode"].join(""),
-            ["Acp", "SessionStore"].join(""),
-            ["Session", "Store"].join(""),
-            ["Channel", "RuntimeContext"].join(""),
-        ];
-        let mut import = String::new();
-        for line in source.lines().map(str::trim_start) {
-            if import.is_empty() {
-                if line.starts_with("use ") {
-                    import.push_str(line);
-                } else {
-                    continue;
-                }
-            } else {
-                import.push('\n');
-                import.push_str(line);
-            }
-            if !line.ends_with(';') {
-                continue;
-            }
-            if forbidden_imports
-                .iter()
-                .any(|forbidden| import.contains(forbidden))
-            {
-                return Some(import);
-            }
-            import.clear();
+        struct ImportVisitor {
+            forbidden: Option<String>,
         }
-        None
+
+        impl<'ast> syn::visit::Visit<'ast> for ImportVisitor {
+            fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+                if self.forbidden.is_none() && use_tree_is_forbidden(&item.tree, &[]) {
+                    self.forbidden = Some("forbidden Goal runtime import".into());
+                }
+                syn::visit::visit_item_use(self, item);
+            }
+        }
+
+        let file = syn::parse_file(source).expect("generic Goal runtime source must parse");
+        let mut visitor = ImportVisitor { forbidden: None };
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+        visitor.forbidden
+    }
+
+    fn use_tree_is_forbidden(tree: &syn::UseTree, prefix: &[String]) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => {
+                let mut path_prefix = prefix.to_vec();
+                path_prefix.push(path.ident.to_string());
+                use_tree_is_forbidden(&path.tree, &path_prefix)
+            }
+            syn::UseTree::Name(name) => {
+                is_forbidden_goal_runtime_path(prefix, &name.ident.to_string())
+            }
+            syn::UseTree::Rename(rename) => {
+                is_forbidden_goal_runtime_path(prefix, &rename.ident.to_string())
+            }
+            syn::UseTree::Glob(_) => is_forbidden_goal_runtime_path(prefix, "*"),
+            syn::UseTree::Group(group) => group
+                .items
+                .iter()
+                .any(|item| use_tree_is_forbidden(item, prefix)),
+        }
+    }
+
+    fn is_forbidden_goal_runtime_path(prefix: &[String], leaf: &str) -> bool {
+        let mut path = prefix.to_vec();
+        path.push(leaf.into());
+        let identifiers = path.iter().map(String::as_str).collect::<Vec<_>>();
+        identifiers.windows(2).any(|segments| {
+            matches!(
+                segments,
+                ["crate", "matrix" | "rpc" | "channels" | "gateway"]
+            )
+        }) || identifiers.iter().any(|identifier| {
+            matches!(
+                *identifier,
+                "matrix_sdk"
+                    | "zeroclaw_channels"
+                    | "zeroclaw_gateway"
+                    | "zerocode"
+                    | "AcpSessionStore"
+                    | "SessionStore"
+                    | "ChannelRuntimeContext"
+            )
+        })
     }
 
     #[test]
@@ -1978,6 +1998,15 @@ mod tests {
     fn generic_goal_runtime_boundary_guard_rejects_grouped_imports() {
         let grouped_import = "use crate::{\n    goal_mode::GoalCommand,\n    rpc::RpcServer,\n};";
         assert!(forbidden_goal_runtime_import(grouped_import).is_some());
+    }
+
+    #[test]
+    fn generic_goal_runtime_boundary_guard_rejects_visibility_and_comment_imports() {
+        let visibility_qualified_import = "pub(crate) use crate::rpc::RpcServer;";
+        assert!(forbidden_goal_runtime_import(visibility_qualified_import).is_some());
+
+        let trailing_comment_import = "use crate::gateway::Gateway; // transport coupling";
+        assert!(forbidden_goal_runtime_import(trailing_comment_import).is_some());
     }
 
     #[tokio::test]
