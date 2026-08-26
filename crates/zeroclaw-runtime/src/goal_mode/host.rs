@@ -14,6 +14,11 @@ use zeroclaw_api::model_provider::ChatMessage;
 
 use super::{GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind};
 
+/// Fixed protocol instruction for the isolated verifier operation. The core
+/// owns this schema so adapters cannot silently substitute session context,
+/// tools, or transport authority for the declared Goal contract.
+pub const GOAL_VERIFIER_SYSTEM_SCHEMA: &str = "Return strict JSON only: {\\\"decision\\\": \\\"complete|continue|blocked\\\", \\\"reason\\\": \\\"bounded nonempty text\\\", \\\"blockers\\\": [{\\\"kind\\\": \\\"needs_user_input|human_escalation|external_dependency\\\", \\\"message\\\": \\\"bounded nonempty text\\\"}]}. blockers is required only for blocked and forbidden otherwise.";
+
 /// Canonical facts binding a Goal to adapter-owned live session state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalSessionBinding {
@@ -83,8 +88,30 @@ pub struct GoalParentTurn {
 /// fixed verifier schema; session history and transport authority are absent.
 #[derive(Debug, Clone)]
 pub struct GoalVerifierTurn {
+    pub system_schema: &'static str,
     pub objective: String,
     pub success_criteria: String,
+    pub candidate: String,
+}
+
+impl GoalVerifierTurn {
+    pub fn isolated(objective: String, success_criteria: String, candidate: String) -> Self {
+        Self {
+            system_schema: GOAL_VERIFIER_SYSTEM_SCHEMA,
+            objective,
+            success_criteria,
+            candidate,
+        }
+    }
+}
+
+/// Idempotency key and exact text for a verifier-approved candidate. Delivery
+/// happens after the lifecycle is completed and cannot rewrite that decision.
+#[derive(Debug, Clone)]
+pub struct GoalVerifiedCandidate {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
     pub candidate: String,
 }
 
@@ -104,6 +131,10 @@ pub trait GoalSessionAdapter: Send + Sync {
     ) -> Result<GoalOperationReservation>;
 
     async fn model_binding(&self, binding: &GoalSessionBinding) -> Result<GoalHostModelBinding>;
+
+    /// Return the immutable absolute deadline inherited from the live session
+    /// policy, if that session is deadline-bound.
+    async fn deadline(&self, binding: &GoalSessionBinding) -> Result<Option<tokio::time::Instant>>;
 
     async fn acquire(
         &self,
@@ -131,7 +162,7 @@ pub trait GoalSessionLease: Send {
         cancellation: CancellationToken,
     ) -> Result<String>;
 
-    fn append_verified_candidate(&mut self, candidate: &str);
+    async fn append_verified_candidate(&mut self, candidate: GoalVerifiedCandidate) -> Result<()>;
 }
 
 /// Generic owner of adapter selection and foreground lease acquisition.
@@ -166,6 +197,13 @@ impl GoalExecutionHost {
         self.adapter(binding)?.model_binding(binding).await
     }
 
+    pub async fn deadline(
+        &self,
+        binding: &GoalSessionBinding,
+    ) -> Result<Option<tokio::time::Instant>> {
+        self.adapter(binding)?.deadline(binding).await
+    }
+
     pub async fn preflight(
         &self,
         binding: &GoalSessionBinding,
@@ -195,7 +233,7 @@ mod tests {
 
     use super::{
         GoalExecutionHost, GoalHostModelBinding, GoalParentTurn, GoalSessionAdapter,
-        GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
+        GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate, GoalVerifierTurn,
     };
     use crate::goal_mode::{
         GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind,
@@ -240,6 +278,13 @@ mod tests {
             })
         }
 
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
         async fn acquire(
             &self,
             _scope: &GoalExecutionScope,
@@ -273,8 +318,12 @@ mod tests {
             Ok(r#"{"decision":"complete","reason":"accepted"}"#.into())
         }
 
-        fn append_verified_candidate(&mut self, _candidate: &str) {
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
             self.appended = true;
+            Ok(())
         }
     }
 
@@ -312,6 +361,19 @@ mod tests {
         assert!(unavailable.model_binding(&binding("rpc")).await.is_err());
     }
 
+    #[test]
+    fn verifier_turn_is_constructed_from_the_closed_core_protocol() {
+        let turn = GoalVerifierTurn::isolated(
+            "objective".into(),
+            "success criteria".into(),
+            "candidate".into(),
+        );
+        assert_eq!(turn.system_schema, super::GOAL_VERIFIER_SYSTEM_SCHEMA);
+        assert_eq!(turn.objective, "objective");
+        assert_eq!(turn.success_criteria, "success criteria");
+        assert_eq!(turn.candidate, "candidate");
+    }
+
     #[tokio::test]
     async fn host_rejects_a_scope_from_another_session_before_adapter_acquisition() {
         let host = GoalExecutionHost::new(vec![Arc::new(Adapter {
@@ -325,6 +387,7 @@ mod tests {
             execution_epoch: 1,
             turn_kind: GoalTurnKind::Start,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         assert!(host.acquire(&scope, &binding("rpc")).await.is_err());
@@ -346,6 +409,7 @@ mod tests {
             execution_epoch: 1,
             turn_kind: GoalTurnKind::Start,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
 
@@ -395,6 +459,7 @@ mod tests {
             lease
                 .run_verifier(
                     GoalVerifierTurn {
+                        system_schema: super::GOAL_VERIFIER_SYSTEM_SCHEMA,
                         objective: "objective".into(),
                         success_criteria: "criteria".into(),
                         candidate: candidate.clone(),
@@ -405,6 +470,14 @@ mod tests {
                 .unwrap(),
             r#"{"decision":"complete","reason":"accepted"}"#,
         );
-        lease.append_verified_candidate(&candidate);
+        lease
+            .append_verified_candidate(GoalVerifiedCandidate {
+                task_id: scope.task_id,
+                session_id: scope.session_id,
+                execution_epoch: scope.execution_epoch,
+                candidate,
+            })
+            .await
+            .unwrap();
     }
 }

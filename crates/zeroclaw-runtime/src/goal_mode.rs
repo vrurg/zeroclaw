@@ -459,6 +459,9 @@ pub struct GoalExecutionScope {
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
+    /// Absolute supervisor deadline inherited from the owning session. It is
+    /// process-local by design: pause/restart discard the execution scope.
+    pub deadline: Option<tokio::time::Instant>,
     /// Shared by all Goal-owned logical model operations in this execution
     /// epoch. Child propagation later clones this permit rather than creating
     /// another admission domain.
@@ -956,6 +959,7 @@ impl GoalRuntime {
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
+            deadline: None,
             operation_permit: Arc::new(Semaphore::new(1)),
         };
         if self.executor.launch(scope).await.is_ok() {

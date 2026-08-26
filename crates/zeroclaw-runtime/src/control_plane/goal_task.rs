@@ -422,6 +422,8 @@ pub trait GoalTaskRegistry: Send + Sync {
         task_id: &str,
         session_id: &str,
         expected_epoch: i64,
+        expected_token_limit: Option<u64>,
+        expected_cost_limit_usd: Option<f64>,
         pending_call_id: &str,
         reserved_tokens: Option<u64>,
         reserved_cost_usd: Option<f64>,
