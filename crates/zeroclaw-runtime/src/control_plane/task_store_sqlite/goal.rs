@@ -1214,6 +1214,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         task_id: &str,
         session_id: &str,
         expected_epoch: i64,
+        expected_token_limit: Option<u64>,
+        expected_cost_limit_usd: Option<f64>,
         pending_call_id: &str,
         reserved_tokens: Option<u64>,
         reserved_cost_usd: Option<f64>,
@@ -1221,6 +1223,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if pending_call_id.trim().is_empty() {
             anyhow::bail!("goal pending call id must be nonblank");
         }
+        let expected_tokens = expected_token_limit.map(token_limit_to_db).transpose()?;
+        let expected_cost = expected_cost_limit_usd.map(cost_limit_to_db).transpose()?;
         let tokens = reserved_tokens.map(token_limit_to_db).transpose()?;
         let cost = reserved_cost_usd.map(cost_limit_to_db).transpose()?;
         let conn = self.conn.lock();
@@ -1230,6 +1234,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     pending_reserved_tokens = ?5, pending_reserved_cost_usd = ?6
               WHERE task_id = ?1 AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                 AND accounting_state = 'complete'
+                AND effective_token_limit IS ?7 AND effective_cost_limit_usd IS ?8
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
@@ -1241,7 +1246,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 expected_epoch,
                 pending_call_id,
                 tokens,
-                cost
+                cost,
+                expected_tokens,
+                expected_cost,
             ],
         )?;
         if updated == 0 {
@@ -1531,6 +1538,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_admission_rejects_limits_replaced_after_reservation() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = session_goal_task("goal-1", "session-1");
+        let mut goal = goal_record("goal-1", "ship it");
+        goal.effective_token_limit = Some(100);
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(
+            store
+                .update_session_goal_limits("goal-1", "session-1", 1, Some(1), None)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    "goal-1",
+                    "session-1",
+                    1,
+                    Some(100),
+                    None,
+                    "stale-reservation",
+                    Some(10),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale,
+        );
+        assert!(
+            store
+                .get_goal_task("goal-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_call_id
+                .is_none(),
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_session_goal_remains_current_until_explicit_replacement() {
         let store = SqliteTaskStore::new_in_memory().unwrap();
         assert_eq!(
@@ -1730,6 +1785,8 @@ mod tests {
                     "pending",
                     "pending-session",
                     1,
+                    None,
+                    None,
                     "pending-operation",
                     None,
                     None,

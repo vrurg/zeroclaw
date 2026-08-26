@@ -4,7 +4,7 @@
 //! runtime turn through a private task-local seam and owns only Goal admission,
 //! ledger persistence, and exact pending-operation settlement.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -78,6 +78,49 @@ impl std::fmt::Display for GoalBudgetExhausted {
 }
 
 impl std::error::Error for GoalBudgetExhausted {}
+
+#[derive(Debug)]
+struct GoalDeadlineExceeded;
+
+impl std::fmt::Display for GoalDeadlineExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("goal supervisory deadline elapsed")
+    }
+}
+
+impl std::error::Error for GoalDeadlineExceeded {}
+
+#[derive(Debug)]
+enum GoalAccountingFailure {
+    MissingOrInvalid,
+    OutcomeUnknown,
+    PricingUnavailable,
+}
+
+impl std::fmt::Display for GoalAccountingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingOrInvalid => "goal accounting is missing or invalid",
+            Self::OutcomeUnknown => "goal accounting outcome is unknown",
+            Self::PricingUnavailable => "goal pricing is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for GoalAccountingFailure {}
+
+async fn run_with_goal_deadline<T>(
+    scope: &GoalExecutionScope,
+    operation: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let Some(deadline) = scope.deadline else {
+        return operation.await;
+    };
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(GoalDeadlineExceeded.into()),
+    }
+}
 
 struct ActiveGoalOperation {
     call_id: String,
@@ -257,7 +300,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
         let totals = self.strict_totals().await?;
         if goal.effective_cost_limit_usd.is_some() && !totals.pricing_available {
-            anyhow::bail!("goal cost pricing is unavailable");
+            return Err(GoalAccountingFailure::PricingUnavailable.into());
         }
         let (reserved_tokens, reserved_cost_usd) = self.reservation(&task, &goal, &request)?;
         if let Some(limit) = goal.effective_token_limit {
@@ -287,6 +330,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 &self.scope.task_id,
                 &self.scope.session_id,
                 self.scope.execution_epoch,
+                goal.effective_token_limit,
+                goal.effective_cost_limit_usd,
                 &call_id,
                 reserved_tokens,
                 reserved_cost_usd,
@@ -341,12 +386,14 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             }
         }
         drop(operation);
-        recorded?;
+        if recorded.is_err() || state == GoalAccountingState::OutcomeUnknown {
+            return Err(GoalAccountingFailure::OutcomeUnknown.into());
+        }
         if state != GoalAccountingState::Complete {
-            anyhow::bail!("goal accounting is incomplete");
+            return Err(GoalAccountingFailure::MissingOrInvalid.into());
         }
         if cost_limit_required && !pricing_complete {
-            anyhow::bail!("goal pricing is unavailable")
+            return Err(GoalAccountingFailure::PricingUnavailable.into());
         }
         Ok(())
     }
@@ -382,36 +429,112 @@ impl GoalExecutionDriver {
         }
     }
 
+    fn terminal_reason_for_operation_error(
+        error: &anyhow::Error,
+        fallback: &'static str,
+    ) -> &'static str {
+        match error.downcast_ref::<GoalAccountingFailure>() {
+            Some(GoalAccountingFailure::MissingOrInvalid) => "accounting_missing_or_invalid",
+            Some(GoalAccountingFailure::OutcomeUnknown) => "accounting_outcome_unknown",
+            Some(GoalAccountingFailure::PricingUnavailable) => "pricing_unavailable",
+            None => fallback,
+        }
+    }
+
+    async fn scope_still_running(&self, scope: &GoalExecutionScope) -> bool {
+        match self.goals.current_goal_for_session(&scope.session_id).await {
+            Ok(Some(task)) => {
+                task.id == scope.task_id
+                    && task.execution_epoch == scope.execution_epoch
+                    && task.status == TaskStatus::Running
+            }
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// A worker may exit only after its exact durable scope has transitioned or
+    /// a newer owner has made that scope stale. Retrying storage failures keeps
+    /// a failed operation from leaving an ownerless `Running` Goal behind.
+    async fn finish_terminal(
+        &self,
+        scope: &GoalExecutionScope,
+        status: TaskStatus,
+        reason: Option<String>,
+    ) -> bool {
+        loop {
+            match self
+                .goals
+                .finish_session_goal(
+                    &scope.task_id,
+                    &scope.session_id,
+                    scope.execution_epoch,
+                    status,
+                    reason.clone(),
+                )
+                .await
+            {
+                Ok(GoalTransitionResult::Applied) => return true,
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
+                    if !self.scope_still_running(scope).await =>
+                {
+                    return false;
+                }
+                Ok(_) | Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    }
+
     async fn finish_failed(&self, scope: &GoalExecutionScope, reason: &'static str) {
-        let _ = self
-            .goals
-            .finish_session_goal(
-                &scope.task_id,
-                &scope.session_id,
-                scope.execution_epoch,
-                TaskStatus::Failed,
-                Some(reason.into()),
-            )
+        self.finish_terminal(scope, TaskStatus::Failed, Some(reason.into()))
             .await;
+    }
+
+    async fn finish_timed_out(&self, scope: &GoalExecutionScope) {
+        self.finish_terminal(
+            scope,
+            TaskStatus::TimedOut,
+            Some("goal_supervisory_deadline_elapsed".into()),
+        )
+        .await;
+    }
+
+    async fn pause_exact(&self, scope: &GoalExecutionScope, pause: GoalPauseState) -> bool {
+        loop {
+            match self
+                .goals
+                .pause_session_goal(
+                    &scope.task_id,
+                    &scope.session_id,
+                    scope.execution_epoch,
+                    pause.clone(),
+                )
+                .await
+            {
+                Ok(GoalTransitionResult::Applied) => return true,
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing)
+                    if !self.scope_still_running(scope).await =>
+                {
+                    return false;
+                }
+                Ok(_) | Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
     }
 
     async fn pause_budget_exhausted(&self, scope: &GoalExecutionScope) {
-        let _ = self
-            .goals
-            .pause_session_goal(
-                &scope.task_id,
-                &scope.session_id,
-                scope.execution_epoch,
-                GoalPauseState {
-                    reason: GoalPauseReason::BudgetExhausted,
-                    description: None,
-                    blockers: Vec::new(),
-                },
-            )
-            .await;
+        self.pause_exact(
+            scope,
+            GoalPauseState {
+                reason: GoalPauseReason::BudgetExhausted,
+                description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await;
     }
 
-    async fn run_scope(&self, scope: GoalExecutionScope) {
+    async fn run_scope(&self, mut scope: GoalExecutionScope) {
         let (task, goal) = match GoalOperationAccountant::new(
             Arc::clone(&self.goals),
             Arc::clone(&self.config),
@@ -430,6 +553,14 @@ impl GoalExecutionDriver {
                 .await;
             return;
         }
+        scope.deadline = match self.host.deadline(&scope.binding).await {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                self.finish_failed(&scope, "goal_executor_binding_failed")
+                    .await;
+                return;
+            }
+        };
         let mut lease = match self.host.acquire(&scope, &scope.binding).await {
             Ok(lease) => lease,
             Err(_) => {
@@ -459,12 +590,14 @@ impl GoalExecutionDriver {
             scope.session_id.clone(),
             scope.execution_epoch,
         ));
+        let mut turn_kind = scope.turn_kind;
         loop {
             if scope.cancellation.is_cancelled() {
                 return;
             }
-            let parent = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
-                .scope(
+            let parent = run_with_goal_deadline(
+                &scope,
+                crate::agent::cost::GOAL_OPERATION_ACCOUNTING.scope(
                     Some(Arc::clone(&accountant)),
                     crate::agent::cost::GOAL_TOOL_PHASE_FENCE.scope(
                         Some(Arc::clone(&tool_phase_fence)),
@@ -472,23 +605,34 @@ impl GoalExecutionDriver {
                             GoalParentTurn {
                                 objective: goal.objective.clone(),
                                 success_criteria: goal.success_criteria.clone(),
-                                turn_kind: scope.turn_kind,
+                                turn_kind,
                                 working_history,
                             },
                             scope.cancellation.child_token(),
                         ),
                     ),
-                )
-                .await;
+                ),
+            )
+            .await;
             let (candidate, next_history) = match parent {
                 Ok(value) => value,
                 Err(error) if error.downcast_ref::<GoalBudgetExhausted>().is_some() => {
                     self.pause_budget_exhausted(&scope).await;
                     return;
                 }
-                Err(_) => {
-                    self.finish_failed(&scope, "goal_parent_execution_failed")
-                        .await;
+                Err(error) if error.downcast_ref::<GoalDeadlineExceeded>().is_some() => {
+                    self.finish_timed_out(&scope).await;
+                    return;
+                }
+                Err(error) => {
+                    self.finish_failed(
+                        &scope,
+                        Self::terminal_reason_for_operation_error(
+                            &error,
+                            "goal_parent_execution_failed",
+                        ),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -496,35 +640,49 @@ impl GoalExecutionDriver {
                 self.finish_failed(&scope, "candidate_empty").await;
                 return;
             }
-            let verifier = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
-                .scope(
+            let verifier = run_with_goal_deadline(
+                &scope,
+                crate::agent::cost::GOAL_OPERATION_ACCOUNTING.scope(
                     Some(Arc::clone(&accountant)),
                     lease.run_verifier(
-                        GoalVerifierTurn {
-                            objective: goal.objective.clone(),
-                            success_criteria: goal.success_criteria.clone(),
-                            candidate: candidate.clone(),
-                        },
+                        GoalVerifierTurn::isolated(
+                            goal.objective.clone(),
+                            goal.success_criteria.clone(),
+                            candidate.clone(),
+                        ),
                         scope.cancellation.child_token(),
                     ),
-                )
-                .await
-                .and_then(|response| parse_verifier_response(&response));
+                ),
+            )
+            .await
+            .and_then(|response| parse_verifier_response(&response));
             match verifier {
                 Ok(VerifierOutcome::Complete) => {
-                    if matches!(
-                        self.goals
-                            .finish_session_goal(
-                                &scope.task_id,
-                                &scope.session_id,
-                                scope.execution_epoch,
-                                TaskStatus::Completed,
-                                None,
-                            )
-                            .await,
-                        Ok(GoalTransitionResult::Applied)
-                    ) {
-                        lease.append_verified_candidate(&candidate);
+                    if self
+                        .finish_terminal(&scope, TaskStatus::Completed, None)
+                        .await
+                    {
+                        if lease
+                            .append_verified_candidate(super::host::GoalVerifiedCandidate {
+                                task_id: scope.task_id.clone(),
+                                session_id: scope.session_id.clone(),
+                                execution_epoch: scope.execution_epoch,
+                                candidate,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail,
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                "verified Goal candidate delivery failed after completion"
+                            );
+                        }
                     }
                     return;
                 }
@@ -533,29 +691,34 @@ impl GoalExecutionDriver {
                     working_history.push(zeroclaw_api::model_provider::ChatMessage::user(format!(
                         "[UNTRUSTED VERIFIER FEEDBACK]\n{feedback}\n[END UNTRUSTED VERIFIER FEEDBACK]"
                     )));
+                    turn_kind = super::GoalTurnKind::Continue;
                 }
                 Ok(VerifierOutcome::Blocked(reason, blockers)) => {
-                    let _ = self
-                        .goals
-                        .pause_session_goal(
-                            &scope.task_id,
-                            &scope.session_id,
-                            scope.execution_epoch,
-                            GoalPauseState {
-                                reason: GoalPauseReason::VerifierBlocked,
-                                description: Some(reason),
-                                blockers,
-                            },
-                        )
-                        .await;
+                    self.pause_exact(
+                        &scope,
+                        GoalPauseState {
+                            reason: GoalPauseReason::VerifierBlocked,
+                            description: Some(reason),
+                            blockers,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 Err(error) if error.downcast_ref::<GoalBudgetExhausted>().is_some() => {
                     self.pause_budget_exhausted(&scope).await;
                     return;
                 }
-                Err(_) => {
-                    self.finish_failed(&scope, "goal_verifier_failed").await;
+                Err(error) if error.downcast_ref::<GoalDeadlineExceeded>().is_some() => {
+                    self.finish_timed_out(&scope).await;
+                    return;
+                }
+                Err(error) => {
+                    self.finish_failed(
+                        &scope,
+                        Self::terminal_reason_for_operation_error(&error, "goal_verifier_failed"),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -699,7 +862,7 @@ fn conservative_cost_reservation(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use super::{
         GoalExecutionDriver, GoalOperationAccountant, GoalOperationAccounting, VerifierOutcome,
@@ -731,6 +894,16 @@ mod tests {
         leave_tool_phase_in_flight: bool,
     }
 
+    struct ContinueAdapter {
+        parent_turn_kinds: Arc<StdMutex<Vec<crate::goal_mode::GoalTurnKind>>>,
+        verifier_calls: Arc<StdMutex<usize>>,
+    }
+
+    struct ContinueLease {
+        parent_turn_kinds: Arc<StdMutex<Vec<crate::goal_mode::GoalTurnKind>>>,
+        verifier_calls: Arc<StdMutex<usize>>,
+    }
+
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
         fn owns(&self, binding: &GoalSessionBinding) -> bool {
@@ -758,6 +931,13 @@ mod tests {
             })
         }
 
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
         async fn acquire(
             &self,
             _scope: &GoalExecutionScope,
@@ -765,6 +945,49 @@ mod tests {
         ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
             Ok(Box::new(Lease {
                 leave_tool_phase_in_flight: self.leave_tool_phase_in_flight,
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for ContinueAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "continue-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> anyhow::Result<GoalOperationReservation> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(ContinueLease {
+                parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
+                verifier_calls: Arc::clone(&self.verifier_calls),
             }))
         }
     }
@@ -798,7 +1021,51 @@ mod tests {
             Ok(r#"{"decision":"complete","reason":"meets criteria"}"#.into())
         }
 
-        fn append_verified_candidate(&mut self, _candidate: &str) {}
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: super::super::host::GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionLease for ContinueLease {
+        fn working_history(
+            &self,
+        ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            turn: GoalParentTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
+            self.parent_turn_kinds.lock().unwrap().push(turn.turn_kind);
+            Ok(("verified candidate".into(), turn.working_history))
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _turn: GoalVerifierTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<String> {
+            let mut calls = self.verifier_calls.lock().unwrap();
+            *calls += 1;
+            Ok(if *calls == 1 {
+                r#"{"decision":"continue","reason":"add detail"}"#.into()
+            } else {
+                r#"{"decision":"complete","reason":"accepted"}"#.into()
+            })
+        }
+
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: super::super::host::GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -827,6 +1094,32 @@ mod tests {
             r#"{"decision":"blocked","reason":"needs input","blockers":[{"kind":"needs_user_input","message":"provide value","payload":{"bad":true}}]}"#
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn supervisory_deadline_stops_a_goal_operation_before_completion() {
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: Some(tokio::time::Instant::now()),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let error = super::run_with_goal_deadline(&scope, async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<super::GoalDeadlineExceeded>()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -888,6 +1181,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verifier_continue_runs_the_next_parent_turn_as_continue() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let parent_turn_kinds = Arc::new(StdMutex::new(Vec::new()));
+        let host = Arc::new(GoalExecutionHost::new(vec![Arc::new(ContinueAdapter {
+            parent_turn_kinds: Arc::clone(&parent_turn_kinds),
+            verifier_calls: Arc::new(StdMutex::new(0)),
+        })]));
+        let driver = Arc::new(GoalExecutionDriver::new(
+            host,
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        let ingress = crate::goal_mode::GoalIngressContext::trusted(
+            "session",
+            "main",
+            "continue-route",
+            None,
+        )
+        .unwrap();
+
+        runtime
+            .submit(
+                ingress,
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    objective: "objective".into(),
+                    success_criteria: "criteria".into(),
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_some_and(|task| task.status == TaskStatus::Completed)
+            {
+                assert_eq!(
+                    *parent_turn_kinds.lock().unwrap(),
+                    vec![
+                        crate::goal_mode::GoalTurnKind::Start,
+                        crate::goal_mode::GoalTurnKind::Continue,
+                    ],
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("Goal did not complete after verifier continue");
+    }
+
+    #[tokio::test]
     async fn ledger_write_failure_settles_the_exact_pending_operation_as_unknown() {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -925,7 +1281,16 @@ mod tests {
         );
         assert_eq!(
             store
-                .admit_pending_call_with_reservation("goal-task", "session", 1, "call", None, None)
+                .admit_pending_call_with_reservation(
+                    "goal-task",
+                    "session",
+                    1,
+                    None,
+                    None,
+                    "call",
+                    None,
+                    None,
+                )
                 .await
                 .unwrap(),
             crate::control_plane::GoalTransitionResult::Applied,
@@ -945,6 +1310,7 @@ mod tests {
             execution_epoch: 1,
             turn_kind: crate::goal_mode::GoalTurnKind::Start,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         let accountant = GoalOperationAccountant::new(
