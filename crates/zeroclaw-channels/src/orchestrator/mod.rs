@@ -4,6 +4,7 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod foreground;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -130,6 +131,10 @@ use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
+
+use self::foreground::{
+    ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
+};
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
@@ -545,22 +550,29 @@ struct ChannelRuntimeContext {
     show_receipts_in_response: bool,
     last_applied_config_stamp: Arc<Mutex<Option<ConfigFileStamp>>>,
     runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
-    /// Per-conversation-history-key locks that serialize persistence mutations
-    /// (append / remove_last / delete_session) for the same sender without
-    /// serializing the full message-processing loop.
-    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+    /// Per-conversation-history-key process-local locks. These serialize
+    /// persistence mutations and foreground Matrix model work without creating
+    /// a second session, identity, or authorization store.
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, ConversationLocks>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
-/// Acquire the per-conversation-history-key persistence lock so that
-/// append/remove_last/delete_session operations for the same sender are
-/// serialized without blocking the full message-processing loop
 fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync::Mutex<()>> {
-    let mut map = ctx.persist_locks.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(key.to_string())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-        .clone()
+    persist_lock(&ctx.persist_locks, key)
+}
+
+async fn acquire_matrix_foreground_lease(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    history_key: &str,
+    cancellation: &CancellationToken,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    if !is_matrix_channel_name(&msg.channel) {
+        return None;
+    }
+    let lock = foreground_lock(&ctx.persist_locks, history_key);
+    wait_for_foreground_lease(lock, cancellation.clone()).await
 }
 
 #[derive(Clone)]
@@ -6920,6 +6932,12 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
+    // Matrix ordinary turns and Goal leases share this exact canonical-key
+    // foreground domain. Acquire after ingress-only work, immediately before
+    // model execution; cancellation while queued never holds a lease.
+    let _matrix_foreground_lease =
+        acquire_matrix_foreground_lease(ctx.as_ref(), &msg, &history_key, &cancellation_token)
+            .await;
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
