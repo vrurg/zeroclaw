@@ -661,8 +661,7 @@ impl GoalExecutionDriver {
                     if self
                         .finish_terminal(&scope, TaskStatus::Completed, None)
                         .await
-                    {
-                        if lease
+                        && lease
                             .append_verified_candidate(super::host::GoalVerifiedCandidate {
                                 task_id: scope.task_id.clone(),
                                 session_id: scope.session_id.clone(),
@@ -671,18 +670,17 @@ impl GoalExecutionDriver {
                             })
                             .await
                             .is_err()
-                        {
-                            ::zeroclaw_log::record!(
-                                ERROR,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail,
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                "verified Goal candidate delivery failed after completion"
-                            );
-                        }
+                    {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            "verified Goal candidate delivery failed after completion"
+                        );
                     }
                     return;
                 }
