@@ -1,6 +1,8 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
 
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -15,6 +17,8 @@ const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
+    #[cfg(test)]
+    fail_next_current_goal_read: AtomicBool,
 }
 
 impl SqliteTaskStore {
@@ -74,7 +78,15 @@ impl SqliteTaskStore {
         migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            fail_next_current_goal_read: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_current_goal_read_for_test(&self) {
+        self.fail_next_current_goal_read
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Admin enumeration — count this agent's records (mirrors AcpSessionStore's
