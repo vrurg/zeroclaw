@@ -14079,6 +14079,7 @@ dependencies = [
  "shellexpand",
  "strum 0.28.0",
  "strum_macros 0.28.0",
+ "syn 2.0.117",
  "sys-locale",
  "sysinfo",
  "tar",
