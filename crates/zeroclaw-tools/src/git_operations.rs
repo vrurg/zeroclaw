@@ -55,12 +55,44 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str, args: &serde_json::Value) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert"
-        ) || (operation == "worktree"
-            && matches!(
-                args.get("subcommand").and_then(|value| value.as_str()),
-                Some("add" | "remove" | "prune")
+            "commit" | "add" | "checkout" | "reset" | "revert"
+        ) || (operation == "stash"
+            && !matches!(
+                args.get("action").and_then(|value| value.as_str()),
+                Some("list")
             ))
+            || (operation == "worktree"
+                && matches!(
+                    args.get("subcommand").and_then(|value| value.as_str()),
+                    Some("add" | "remove" | "prune")
+                ))
+    }
+
+    /// Return whether a repository's `.git` directory is within the authorized root.
+    ///
+    /// Git normally discovers repositories by walking to parent directories. That
+    /// would let an approved child path operate on an unapproved parent repository,
+    /// so discovery must stop at the root that authorized the requested path.
+    fn has_repository_within_authorized_root(
+        &self,
+        working_dir: &Path,
+        authorized_root: Option<&Path>,
+    ) -> bool {
+        let mut current_dir = working_dir;
+        loop {
+            if std::fs::symlink_metadata(current_dir.join(".git"))
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+            {
+                return true;
+            }
+            if authorized_root.is_some_and(|root| current_dir == root) {
+                return false;
+            }
+            let Some(parent) = current_dir.parent() else {
+                return false;
+            };
+            current_dir = parent;
+        }
     }
 
     /// Resolve a user-provided path authorized for the requested Git operation.
@@ -673,7 +705,10 @@ impl GitOperationsTool {
                 self.run_git_command(&cmd_refs, working_dir).await
             }
             "pop" => self.run_git_command(&["stash", "pop"], working_dir).await,
-            "list" => self.run_git_command(&["stash", "list"], working_dir).await,
+            "list" => {
+                self.run_git_command(&["--no-optional-locks", "stash", "list"], working_dir)
+                    .await
+            }
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let index = i32::try_from(index_raw).map_err(|_| {
@@ -964,34 +999,21 @@ impl Tool for GitOperationsTool {
             }
         };
 
-        // Check if we're in a git repository
-        if !working_dir.join(".git").exists() {
-            // Try to find .git in parent directories
-            let mut current_dir = working_dir.as_path();
-            let mut found_git = false;
-            loop {
-                if current_dir.join(".git").exists() {
-                    found_git = true;
-                    break;
-                }
-                let Some(parent) = current_dir.parent() else {
-                    break;
-                };
-                current_dir = parent;
-            }
-
-            if !found_git {
-                let path_display = working_dir.display().to_string();
-                let error_msg = crate::i18n::get_required_tool_string_with_args(
-                    "tool-git-operations-error-not-in-repo",
-                    &[("path", &path_display)],
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(error_msg),
-                });
-            }
+        // Repository discovery must not escape the root that authorized this path.
+        if !self.has_repository_within_authorized_root(
+            &working_dir,
+            self.security.approved_read_root(&working_dir).as_deref(),
+        ) {
+            let path_display = working_dir.display().to_string();
+            let error_msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-git-operations-error-not-in-repo",
+                &[("path", &path_display)],
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error_msg),
+            });
         }
 
         // Check autonomy level for write operations
@@ -1256,6 +1278,7 @@ mod tests {
         assert!(tool.requires_write_access("add", &json!({})));
         assert!(tool.requires_write_access("checkout", &json!({})));
         assert!(tool.requires_write_access("stash", &json!({})));
+        assert!(tool.requires_write_access("stash", &json!({"action": "push"})));
         assert!(tool.requires_write_access("worktree", &json!({"subcommand": "add"})));
         assert!(tool.requires_write_access("worktree", &json!({"subcommand": "remove"})));
         assert!(tool.requires_write_access("worktree", &json!({"subcommand": "prune"})));
@@ -1264,6 +1287,7 @@ mod tests {
         assert!(!tool.requires_write_access("diff", &json!({})));
         assert!(!tool.requires_write_access("log", &json!({})));
         assert!(!tool.requires_write_access("branch", &json!({})));
+        assert!(!tool.requires_write_access("stash", &json!({"action": "list"})));
         assert!(!tool.requires_write_access("worktree", &json!({"subcommand": "list"})));
         assert!(!tool.requires_write_access("status", &json!({"subcommand": "add"})));
     }
@@ -1610,6 +1634,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_operations_rejects_parent_repository_above_allowed_root() {
+        let workspace = TempDir::new().unwrap();
+        let parent_repository = TempDir::new().unwrap();
+        git_init_no_sign(parent_repository.path(), &[]);
+        let allowed_child = parent_repository.path().join("allowed-child");
+        std::fs::create_dir(&allowed_child).unwrap();
+        std::fs::write(allowed_child.join("tracked.txt"), "content").unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_child.clone());
+
+        for args in [
+            json!({"operation": "status", "path": &allowed_child}),
+            json!({
+                "operation": "add",
+                "path": &allowed_child,
+                "paths": "tracked.txt"
+            }),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(
+                !result.success,
+                "parent repository must not be usable through an allowed child: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_operations_rejects_git_symlink_to_parent_repository() {
+        let workspace = TempDir::new().unwrap();
+        let parent_repository = TempDir::new().unwrap();
+        git_init_no_sign(parent_repository.path(), &[]);
+        let allowed_child = parent_repository.path().join("allowed-child");
+        std::fs::create_dir(&allowed_child).unwrap();
+        std::fs::write(allowed_child.join("tracked.txt"), "content").unwrap();
+        std::os::unix::fs::symlink(
+            parent_repository.path().join(".git"),
+            allowed_child.join(".git"),
+        )
+        .unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_child.clone());
+
+        for args in [
+            json!({"operation": "status", "path": &allowed_child}),
+            json!({
+                "operation": "add",
+                "path": &allowed_child,
+                "paths": "tracked.txt"
+            }),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(
+                !result.success,
+                "Git metadata outside the allowed root must be denied: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn git_status_does_not_refresh_index_in_read_only_root() {
         let workspace = TempDir::new().unwrap();
         let read_only_root = TempDir::new().unwrap();
@@ -1650,6 +1732,30 @@ mod tests {
             .execute(json!({
                 "operation": "worktree",
                 "subcommand": "list",
+                "path": read_only_root.path()
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn git_stash_list_reads_from_configured_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &[]).await;
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({
+                "operation": "stash",
+                "action": "list",
                 "path": read_only_root.path()
             }))
             .await
