@@ -4,13 +4,13 @@
 //! runtime turn through a private task-local seam and owns only Goal admission,
 //! ledger persistence, and exact pending-operation settlement.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit},
+    sync::{Mutex, OwnedSemaphorePermit, oneshot},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -562,7 +562,22 @@ pub struct GoalExecutionDriver {
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
-    workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    workers: Arc<Mutex<HashMap<GoalWorkerKey, Arc<GoalWorker>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GoalWorkerKey {
+    task_id: String,
+    execution_epoch: i64,
+}
+
+struct GoalWorker {
+    cancellation: tokio_util::sync::CancellationToken,
+    /// This per-worker mutex keeps the join handle runtime-owned even if a
+    /// control request is dropped while awaiting termination. It deliberately
+    /// does not serialize unrelated Goal epochs: their cancellation tokens can
+    /// be signalled immediately through the worker map.
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GoalExecutionDriver {
@@ -642,6 +657,19 @@ impl GoalExecutionDriver {
             .await;
     }
 
+    async fn fail_launch_initialization(
+        &self,
+        scope: &GoalExecutionScope,
+        ready: &mut Option<oneshot::Sender<Result<(), ()>>>,
+    ) {
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(()));
+        }
+        // The spawned worker, not the request awaiting launch readiness, owns
+        // this durable outcome. The waiter may be dropped at any await point.
+        self.finish_failed(scope, "executor_start_failed").await;
+    }
+
     async fn finish_timed_out(&self, scope: &GoalExecutionScope) {
         self.finish_terminal(
             scope,
@@ -686,7 +714,11 @@ impl GoalExecutionDriver {
         .await;
     }
 
-    async fn run_scope(&self, mut scope: GoalExecutionScope) {
+    async fn run_scope(
+        &self,
+        mut scope: GoalExecutionScope,
+        mut ready: Option<oneshot::Sender<Result<(), ()>>>,
+    ) {
         let (task, goal) = match GoalOperationAccountant::new(
             Arc::clone(&self.goals),
             Arc::clone(&self.config),
@@ -699,32 +731,45 @@ impl GoalExecutionDriver {
         {
             Ok(current) => current,
             Err(_) => {
-                self.finish_failed(&scope, "goal_executor_initialization_failed")
-                    .await;
+                self.fail_launch_initialization(&scope, &mut ready).await;
                 return;
             }
         };
         if task.agent != scope.binding.agent() {
-            self.finish_failed(&scope, "goal_executor_binding_failed")
-                .await;
+            self.fail_launch_initialization(&scope, &mut ready).await;
             return;
         }
         scope.deadline = match self.host.deadline(&scope.binding).await {
             Ok(deadline) => deadline,
             Err(_) => {
-                self.finish_failed(&scope, "goal_executor_binding_failed")
-                    .await;
+                self.fail_launch_initialization(&scope, &mut ready).await;
                 return;
             }
         };
         let mut lease = match self.host.acquire(&scope, &scope.binding).await {
             Ok(lease) => lease,
             Err(_) => {
-                self.finish_failed(&scope, "goal_executor_binding_failed")
-                    .await;
+                self.fail_launch_initialization(&scope, &mut ready).await;
                 return;
             }
         };
+        if GoalOperationAccountant::new(
+            Arc::clone(&self.goals),
+            Arc::clone(&self.config),
+            Arc::clone(&self.cost_tracker),
+            scope.clone(),
+            task.agent.clone(),
+        )
+        .current_goal()
+        .await
+        .is_err()
+        {
+            self.fail_launch_initialization(&scope, &mut ready).await;
+            return;
+        }
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Ok(()));
+        }
         let mut working_history = match lease.working_history() {
             Ok(history) => history,
             Err(_) => {
@@ -854,9 +899,10 @@ impl GoalExecutionDriver {
             .and_then(|response| parse_verifier_response(&response));
             match verifier {
                 Ok(VerifierOutcome::Complete) => {
-                    if self
+                    let completed = self
                         .finish_terminal(&scope, TaskStatus::Completed, None)
-                        .await
+                        .await;
+                    let delivered = completed
                         && lease
                             .append_verified_candidate(super::host::GoalVerifiedCandidate {
                                 task_id: scope.task_id.clone(),
@@ -865,8 +911,28 @@ impl GoalExecutionDriver {
                                 candidate,
                             })
                             .await
-                            .is_err()
-                    {
+                            .is_ok();
+                    let acknowledged = if delivered {
+                        match scope.execution_epoch.checked_add(1) {
+                            Some(completed_epoch) => matches!(
+                                self.goals
+                                    .acknowledge_session_goal_delivery(
+                                        &scope.task_id,
+                                        &scope.session_id,
+                                        completed_epoch,
+                                    )
+                                    .await,
+                                Ok(GoalTransitionResult::Applied)
+                            ),
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+                    if acknowledged {
+                        return;
+                    }
+                    if completed {
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -875,7 +941,7 @@ impl GoalExecutionDriver {
                             )
                             .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                            "verified Goal candidate delivery failed after completion"
+                            "verified Goal candidate delivery acknowledgement failed after completion"
                         );
                     }
                     return;
@@ -957,8 +1023,12 @@ impl GoalExecutor for GoalExecutionDriver {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let mut workers = self.workers.lock().await;
-        workers.retain(|_, handle| !handle.is_finished());
-        if workers.contains_key(&scope.task_id) {
+        workers.retain(|_, worker| {
+            worker.handle.try_lock().map_or(true, |handle| {
+                handle.as_ref().is_some_and(|handle| !handle.is_finished())
+            })
+        });
+        if workers.keys().any(|key| key.task_id == scope.task_id) {
             return Err(());
         }
         let driver = Self {
@@ -968,10 +1038,97 @@ impl GoalExecutor for GoalExecutionDriver {
             cost_tracker: Arc::clone(&self.cost_tracker),
             workers: Arc::clone(&self.workers),
         };
-        let key = scope.task_id.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
-        workers.insert(key, handle);
+        let key = GoalWorkerKey {
+            task_id: scope.task_id.clone(),
+            execution_epoch: scope.execution_epoch,
+        };
+        let cancellation = scope.cancellation.clone();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let handle =
+            zeroclaw_spawn::spawn!(async move { driver.run_scope(scope, Some(ready_tx)).await });
+        workers.insert(
+            key.clone(),
+            Arc::new(GoalWorker {
+                cancellation,
+                handle: Mutex::new(Some(handle)),
+            }),
+        );
+        drop(workers);
+        match ready_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) | Err(_) => {
+                let _ = self
+                    .cancel_and_quiesce(&key.task_id, key.execution_epoch)
+                    .await;
+                Err(())
+            }
+        }
+    }
+
+    async fn cancel_and_quiesce(&self, task_id: &str, execution_epoch: i64) -> Result<(), ()> {
+        let key = GoalWorkerKey {
+            task_id: task_id.to_owned(),
+            execution_epoch,
+        };
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(&key).cloned()
+        };
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        worker.cancellation.cancel();
+        // The worker remains in the runtime map while its own bounded join is
+        // in progress. If this caller is cancelled, the handle guard drops but
+        // both the token and handle remain available to a later quiescer. Once
+        // the join has completed, `None` makes concurrent/idempotent callers
+        // succeed without polling a completed JoinHandle again.
+        let mut handle = worker.handle.lock().await;
+        if let Some(join_handle) = handle.as_mut() {
+            let graceful = tokio::time::timeout(Duration::from_secs(5), &mut *join_handle)
+                .await
+                .is_ok();
+            if !graceful {
+                join_handle.abort();
+                let _ = join_handle.await;
+            }
+            *handle = None;
+        }
+        drop(handle);
+        let mut workers = self.workers.lock().await;
+        if workers
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &worker))
+        {
+            workers.remove(&key);
+        }
         Ok(())
+    }
+
+    async fn cancel_task_and_quiesce(&self, task_id: &str) -> Result<(), ()> {
+        let workers = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .filter(|(key, _)| key.task_id == task_id)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        for worker in workers {
+            self.cancel_and_quiesce(&worker.task_id, worker.execution_epoch)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn task_is_quiescent(&self, task_id: &str) -> bool {
+        let mut workers = self.workers.lock().await;
+        workers.retain(|_, worker| {
+            worker.handle.try_lock().map_or(true, |handle| {
+                handle.as_ref().is_some_and(|handle| !handle.is_finished())
+            })
+        });
+        !workers.keys().any(|key| key.task_id == task_id)
     }
 }
 
@@ -1086,12 +1243,14 @@ mod tests {
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
 
     use super::{
-        GoalExecutionDriver, GoalOperationAccountant, GoalOperationAccounting, VerifierOutcome,
-        parse_verifier_response,
+        GoalExecutionDriver, GoalOperationAccountant, GoalOperationAccounting, GoalWorker,
+        GoalWorkerKey, VerifierOutcome, parse_verifier_response,
     };
     use async_trait::async_trait;
+    use tokio::sync::Mutex;
     use zeroclaw_config::{
         cost::CostTracker,
         schema::{Config, CostConfig},
@@ -1101,7 +1260,7 @@ mod tests {
         control_plane::{GoalTaskRegistry, SqliteTaskStore, TaskStatus},
         goal_mode::{
             GoalBudgetRequest, GoalCommand, GoalExecutionPreflight, GoalExecutionScope,
-            GoalOperationReservation, GoalRuntime,
+            GoalExecutor, GoalOperationReservation, GoalRuntime,
             host::{
                 GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
                 GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
@@ -1125,6 +1284,220 @@ mod tests {
         parent_waits_for_cancellation: bool,
         verifier_waits_for_cancellation: bool,
         verifier_started: Option<Arc<AtomicBool>>,
+    }
+
+    #[tokio::test]
+    async fn cancelled_quiescer_keeps_worker_owned_for_a_later_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        ));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_cancellation = cancellation.clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_release = Arc::clone(&release);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            worker_cancellation.cancelled().await;
+            worker_cancelled.notify_one();
+            worker_release.notified().await;
+        });
+        let key = GoalWorkerKey {
+            task_id: "goal-task".into(),
+            execution_epoch: 7,
+        };
+        driver.workers.lock().await.insert(
+            key,
+            Arc::new(GoalWorker {
+                cancellation,
+                handle: Mutex::new(Some(handle)),
+            }),
+        );
+
+        let quiescer = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.cancel_and_quiesce("goal-task", 7).await })
+        };
+        cancelled.notified().await;
+        quiescer.abort();
+        assert!(quiescer.await.unwrap_err().is_cancelled());
+        assert!(
+            !driver.task_is_quiescent("goal-task").await,
+            "a cancelled quiescer must leave the worker owned for a later join"
+        );
+        let replacement_quiescer = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.cancel_and_quiesce("goal-task", 7).await })
+        };
+        tokio::task::yield_now().await;
+        release.notify_one();
+        assert!(replacement_quiescer.await.unwrap().is_ok());
+        assert!(driver.task_is_quiescent("goal-task").await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_quiescers_do_not_repoll_a_completed_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        ));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_cancellation = cancellation.clone();
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_release = Arc::clone(&release);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            worker_cancellation.cancelled().await;
+            worker_cancelled.notify_one();
+            worker_release.notified().await;
+        });
+        driver.workers.lock().await.insert(
+            GoalWorkerKey {
+                task_id: "goal-task".into(),
+                execution_epoch: 7,
+            },
+            Arc::new(GoalWorker {
+                cancellation,
+                handle: Mutex::new(Some(handle)),
+            }),
+        );
+
+        let first = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.cancel_and_quiesce("goal-task", 7).await })
+        };
+        cancelled.notified().await;
+        let second = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.cancel_and_quiesce("goal-task", 7).await })
+        };
+        tokio::task::yield_now().await;
+        release.notify_one();
+        assert!(first.await.unwrap().is_ok());
+        assert!(second.await.unwrap().is_ok());
+        assert!(driver.task_is_quiescent("goal-task").await);
+    }
+
+    #[tokio::test]
+    async fn completed_worker_marker_is_pruned_after_a_quiescer_is_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        );
+        driver.workers.lock().await.insert(
+            GoalWorkerKey {
+                task_id: "goal-task".into(),
+                execution_epoch: 7,
+            },
+            Arc::new(GoalWorker {
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                // This is the state left if cancellation lands after a join
+                // but before the original quiescer reacquires the map.
+                handle: Mutex::new(None),
+            }),
+        );
+
+        assert!(driver.task_is_quiescent("goal-task").await);
+        assert!(driver.workers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_quiescence_does_not_delay_an_exact_worker_signal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        ));
+
+        let blocking_cancellation = tokio_util::sync::CancellationToken::new();
+        let blocking_cancelled = Arc::new(tokio::sync::Notify::new());
+        let blocking_release = Arc::new(tokio::sync::Notify::new());
+        let worker_cancellation = blocking_cancellation.clone();
+        let worker_cancelled = Arc::clone(&blocking_cancelled);
+        let worker_release = Arc::clone(&blocking_release);
+        let blocking_handle = zeroclaw_spawn::spawn!(async move {
+            worker_cancellation.cancelled().await;
+            worker_cancelled.notify_one();
+            worker_release.notified().await;
+        });
+
+        let target_cancellation = tokio_util::sync::CancellationToken::new();
+        let target_cancelled = Arc::new(tokio::sync::Notify::new());
+        let worker_cancellation = target_cancellation.clone();
+        let worker_cancelled = Arc::clone(&target_cancelled);
+        let target_handle = zeroclaw_spawn::spawn!(async move {
+            worker_cancellation.cancelled().await;
+            worker_cancelled.notify_one();
+        });
+
+        let mut workers = driver.workers.lock().await;
+        workers.insert(
+            GoalWorkerKey {
+                task_id: "blocking-task".into(),
+                execution_epoch: 3,
+            },
+            Arc::new(GoalWorker {
+                cancellation: blocking_cancellation,
+                handle: Mutex::new(Some(blocking_handle)),
+            }),
+        );
+        workers.insert(
+            GoalWorkerKey {
+                task_id: "target-task".into(),
+                execution_epoch: 9,
+            },
+            Arc::new(GoalWorker {
+                cancellation: target_cancellation,
+                handle: Mutex::new(Some(target_handle)),
+            }),
+        );
+        drop(workers);
+
+        let blocking_quiescer = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(
+                async move { driver.cancel_and_quiesce("blocking-task", 3).await }
+            )
+        };
+        blocking_cancelled.notified().await;
+
+        let target_quiescer = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.cancel_and_quiesce("target-task", 9).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target_cancelled.notified())
+                .await
+                .is_ok(),
+            "an unrelated bounded join must not delay this worker's cancellation signal"
+        );
+
+        blocking_release.notify_one();
+        assert!(blocking_quiescer.await.unwrap().is_ok());
+        assert!(target_quiescer.await.unwrap().is_ok());
+        assert!(driver.task_is_quiescent("blocking-task").await);
+        assert!(driver.task_is_quiescent("target-task").await);
     }
 
     struct ContinueAdapter {
@@ -1194,6 +1567,53 @@ mod tests {
                 verifier_waits_for_cancellation: self.verifier_waits_for_cancellation,
                 verifier_started: self.verifier_started.clone(),
             }))
+        }
+    }
+
+    struct DelayedFailingAcquireAdapter {
+        acquire_started: Arc<tokio::sync::Notify>,
+        release_failure: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for DelayedFailingAcquireAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "delayed-failure-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            self.acquire_started.notify_one();
+            self.release_failure.notified().await;
+            anyhow::bail!("deliberate delayed launch failure")
         }
     }
 
@@ -1602,6 +2022,7 @@ mod tests {
             if let Some(task) = store.current_goal_for_session("session").await.unwrap()
                 && task.status == TaskStatus::Completed
             {
+                assert!(task.delivered);
                 assert_eq!(
                     store
                         .get_goal_task(&task.id)
@@ -1798,7 +2219,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope, None).await });
         tokio::task::yield_now().await;
         cancellation.cancel();
         task.await.unwrap();
@@ -1889,7 +2310,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope, None).await });
         for _ in 0..100 {
             if verifier_started.load(Ordering::Acquire) {
                 break;
@@ -1988,7 +2409,7 @@ mod tests {
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         store.fail_next_current_goal_read_for_test();
-        driver.run_scope(scope).await;
+        driver.run_scope(scope, None).await;
         let current = store
             .current_goal_for_session("session")
             .await
@@ -2000,8 +2421,109 @@ mod tests {
                 .terminal_reason_for_session_goal(&current.id, "session")
                 .await
                 .unwrap(),
-            Some("goal_executor_initialization_failed".into())
+            Some("executor_start_failed".into())
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_launch_waiter_cannot_strand_a_running_goal() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let acquire_started = Arc::new(tokio::sync::Notify::new());
+        let release_failure = Arc::new(tokio::sync::Notify::new());
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                DelayedFailingAcquireAdapter {
+                    acquire_started: Arc::clone(&acquire_started),
+                    release_failure: Arc::clone(&release_failure),
+                },
+            )])),
+            goals,
+            Arc::clone(&config),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        ));
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("delayed-failure-route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 1,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new(
+                "session".into(),
+                "main".into(),
+                "delayed-failure-route".into(),
+                None,
+            )
+            .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let launcher = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move { driver.launch(scope).await })
+        };
+        acquire_started.notified().await;
+        launcher.abort();
+        assert!(launcher.await.unwrap_err().is_cancelled());
+        release_failure.notify_one();
+
+        for _ in 0..100 {
+            let current = store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status == TaskStatus::Failed {
+                assert_eq!(
+                    store
+                        .terminal_reason_for_session_goal(&current.id, "session")
+                        .await
+                        .unwrap(),
+                    Some("executor_start_failed".into())
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("dropped launch waiter left the Goal running");
     }
 
     fn forbidden_goal_runtime_import(source: &str) -> Option<String> {
@@ -2161,7 +2683,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope, None).await });
         tokio::task::yield_now().await;
         cancellation.cancel();
         task.await.unwrap();

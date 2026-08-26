@@ -374,6 +374,7 @@ pub enum GoalMessageKey {
     ToolPhaseNonResumable,
     Terminal,
     ExecutorStartFailed,
+    ExecutorQuiescing,
     Stale,
 }
 
@@ -522,7 +523,25 @@ pub enum GoalExecutionReadiness {
 #[async_trait]
 pub trait GoalExecutor: Send + Sync {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
+
+    /// Start one exact durable Goal epoch. A successful return means the
+    /// executor has acquired its session foreground lease and revalidated the
+    /// exact running scope; spawning alone is not launch success.
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
+
+    /// Stop and join the exact fenced epoch. The controller calls this only
+    /// after a durable pause or terminal transition has prevented fresh work.
+    async fn cancel_and_quiesce(&self, task_id: &str, execution_epoch: i64) -> Result<(), ()>;
+
+    /// Reclaim every runtime-owned epoch for a durably fenced Goal. This is
+    /// used by idempotent lifecycle commands because a prior caller may have
+    /// committed the fence and then been dropped before it reached the exact
+    /// worker cancellation path.
+    async fn cancel_task_and_quiesce(&self, task_id: &str) -> Result<(), ()>;
+
+    /// Whether no owned worker remains for this task. Resume uses this after
+    /// durable fencing so a new epoch cannot overlap a prior executor.
+    async fn task_is_quiescent(&self, task_id: &str) -> bool;
 }
 
 struct CurrentGoal {
@@ -817,6 +836,14 @@ impl GoalRuntime {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
         if current.task.status == TaskStatus::Paused {
+            if self
+                .executor
+                .cancel_task_and_quiesce(&current.task.id)
+                .await
+                .is_err()
+            {
+                return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
+            }
             return Ok(GoalResponse::message(GoalMessageKey::AlreadyPaused));
         }
         if current.task.status != TaskStatus::Running {
@@ -836,6 +863,15 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied
+            && self
+                .executor
+                .cancel_and_quiesce(&current.task.id, current.task.execution_epoch)
+                .await
+                .is_err()
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Paused,
@@ -854,6 +890,9 @@ impl GoalRuntime {
                     GoalMessageKey::Stale
                 },
             ));
+        }
+        if !self.executor.task_is_quiescent(&current.task.id).await {
+            return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
         }
         let totals = self.usage_totals(&current.task.id).await?;
         match self.resume_readiness(&ingress, &current, totals).await {
@@ -923,6 +962,14 @@ impl GoalRuntime {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
         if current.task.status == TaskStatus::Cancelled {
+            if self
+                .executor
+                .cancel_task_and_quiesce(&current.task.id)
+                .await
+                .is_err()
+            {
+                return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
+            }
             return Ok(GoalResponse::message(GoalMessageKey::AlreadyCancelled));
         }
         if current.task.status.is_terminal() {
@@ -939,6 +986,15 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied
+            && self
+                .executor
+                .cancel_task_and_quiesce(&current.task.id)
+                .await
+                .is_err()
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::Cancelled,
@@ -995,6 +1051,20 @@ impl GoalRuntime {
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Stale
+            && let Some(current) = self.current_goal(&ingress).await?
+            && current.task.id == task_id
+            && current.task.status == TaskStatus::Failed
+            && self
+                .goals
+                .terminal_reason_for_session_goal(task_id, ingress.session_id())
+                .await
+                .map_err(GoalRuntimeError::control_plane)?
+                .as_deref()
+                == Some("executor_start_failed")
+        {
+            return Ok(GoalResponse::message(GoalMessageKey::ExecutorStartFailed));
+        }
         Ok(GoalResponse::message(transition_message(
             result,
             GoalMessageKey::ExecutorStartFailed,
@@ -1347,6 +1417,8 @@ mod tests {
         readiness: Mutex<GoalExecutionReadiness>,
         preflights: Mutex<Vec<GoalExecutionPreflight>>,
         launches: Mutex<Vec<GoalExecutionScope>>,
+        cancelled: Mutex<Vec<(String, i64)>>,
+        quiescent: Mutex<bool>,
         fail_launch: bool,
     }
 
@@ -1363,6 +1435,24 @@ mod tests {
             }
             self.launches.lock().push(scope);
             Ok(())
+        }
+
+        async fn cancel_and_quiesce(&self, task_id: &str, execution_epoch: i64) -> Result<(), ()> {
+            self.cancelled
+                .lock()
+                .push((task_id.to_owned(), execution_epoch));
+            *self.quiescent.lock() = true;
+            Ok(())
+        }
+
+        async fn cancel_task_and_quiesce(&self, task_id: &str) -> Result<(), ()> {
+            self.cancelled.lock().push((task_id.to_owned(), -1));
+            *self.quiescent.lock() = true;
+            Ok(())
+        }
+
+        async fn task_is_quiescent(&self, _: &str) -> bool {
+            *self.quiescent.lock()
         }
     }
 
@@ -1391,6 +1481,8 @@ mod tests {
             readiness: Mutex::new(readiness),
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
+            cancelled: Mutex::new(Vec::new()),
+            quiescent: Mutex::new(true),
             fail_launch,
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -1439,6 +1531,18 @@ mod tests {
 
         async fn launch(&self, _scope: GoalExecutionScope) -> Result<(), ()> {
             Ok(())
+        }
+
+        async fn cancel_and_quiesce(&self, _: &str, _: i64) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn cancel_task_and_quiesce(&self, _: &str) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn task_is_quiescent(&self, _: &str) -> bool {
+            true
         }
     }
 
@@ -1827,6 +1931,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pause_fences_then_quiesces_the_exact_running_epoch() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let running = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Pause)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Paused
+        );
+        let paused = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+        assert_eq!(paused.execution_epoch, running.execution_epoch + 1);
+        assert_eq!(
+            executor.cancelled.lock().as_slice(),
+            &[(running.id, running.execution_epoch)]
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_pause_reclaims_a_worker_left_by_a_dropped_prior_request() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        runtime.submit(ingress(), GoalCommand::Pause).await.unwrap();
+        let paused = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Pause)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::AlreadyPaused
+        );
+        assert_eq!(
+            executor.cancelled.lock().last(),
+            Some(&(paused.id, -1)),
+            "a retry must reclaim every epoch after an earlier caller fenced persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_overlap_an_unquiesced_executor() {
+        let (runtime, _store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        runtime.submit(ingress(), GoalCommand::Pause).await.unwrap();
+        *executor.quiescent.lock() = false;
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::ExecutorQuiescing
+        );
+        assert_eq!(executor.launches.lock().len(), 1);
+    }
+
+    #[tokio::test]
     async fn status_and_resume_reject_an_exhausted_budget_before_launch() {
         let (runtime, store, executor, directory) = controller(ready(), false);
         runtime.submit(ingress(), start_command()).await.unwrap();
@@ -2083,6 +2262,8 @@ mod tests {
             readiness: Mutex::new(ready()),
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
+            cancelled: Mutex::new(Vec::new()),
+            quiescent: Mutex::new(true),
             fail_launch: false,
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -2384,6 +2565,8 @@ mod tests {
             readiness: Mutex::new(ready()),
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
+            cancelled: Mutex::new(Vec::new()),
+            quiescent: Mutex::new(true),
             fail_launch: false,
         });
         let mut config = Config::default();
