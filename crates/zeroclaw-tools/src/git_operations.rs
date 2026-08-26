@@ -68,11 +68,14 @@ impl GitOperationsTool {
                 ))
     }
 
-    /// Return whether a repository's `.git` directory is within the authorized root.
+    /// Return whether a repository's physical `.git` directory is within the authorized root.
     ///
     /// Git normally discovers repositories by walking to parent directories. That
     /// would let an approved child path operate on an unapproved parent repository,
     /// so discovery must stop at the root that authorized the requested path.
+    /// `.git` files used by linked worktrees are intentionally rejected: their
+    /// indirection cannot be validated against this boundary without widening
+    /// the authorization contract.
     fn has_repository_within_authorized_root(
         &self,
         working_dir: &Path,
@@ -1689,6 +1692,43 @@ mod tests {
                 "Git metadata outside the allowed root must be denied: {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_authorized_linked_worktree() {
+        let workspace = TempDir::new().unwrap();
+        let parent_repository = TempDir::new().unwrap();
+        let linked_worktree_parent = TempDir::new().unwrap();
+        bootstrap_repo(parent_repository.path(), &[]).await;
+        let linked_worktree = linked_worktree_parent.path().join("linked-worktree");
+
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked_worktree)
+            .current_dir(parent_repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "linked worktree setup must succeed");
+        assert!(linked_worktree.join(".git").is_file());
+
+        let tool = test_tool_with_allowed_root(workspace.path(), linked_worktree.clone());
+        let result = tool
+            .execute(json!({"operation": "status", "path": &linked_worktree}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "linked worktree metadata indirection must fail closed: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Not in a Git repository")),
+            "linked worktree must fail as not-in-repository: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
