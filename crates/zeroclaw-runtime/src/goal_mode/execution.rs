@@ -1915,6 +1915,50 @@ mod tests {
         );
     }
 
+    fn forbidden_goal_runtime_import(source: &str) -> Option<String> {
+        let forbidden_imports = [
+            ["crate", "matrix"].join("::"),
+            ["crate", "rpc"].join("::"),
+            ["crate", "channels"].join("::"),
+            ["crate", "gateway"].join("::"),
+            ["matrix", "::"].join(""),
+            ["rpc", "::"].join(""),
+            ["channels", "::"].join(""),
+            ["gateway", "::"].join(""),
+            ["matrix", "_sdk"].join(""),
+            ["zeroclaw", "channels"].join("_"),
+            ["zeroclaw", "gateway"].join("_"),
+            ["zerocode"].join(""),
+            ["Acp", "SessionStore"].join(""),
+            ["Session", "Store"].join(""),
+            ["Channel", "RuntimeContext"].join(""),
+        ];
+        let mut import = String::new();
+        for line in source.lines().map(str::trim_start) {
+            if import.is_empty() {
+                if line.starts_with("use ") {
+                    import.push_str(line);
+                } else {
+                    continue;
+                }
+            } else {
+                import.push('\n');
+                import.push_str(line);
+            }
+            if !line.ends_with(';') {
+                continue;
+            }
+            if forbidden_imports
+                .iter()
+                .any(|forbidden| import.contains(forbidden))
+            {
+                return Some(import);
+            }
+            import.clear();
+        }
+        None
+    }
+
     #[test]
     fn generic_goal_runtime_modules_do_not_import_transport_or_session_store_code() {
         let sources = [
@@ -1922,28 +1966,18 @@ mod tests {
             include_str!("execution.rs"),
             include_str!("host.rs"),
         ];
-        let forbidden_imports = [
-            ["crate", "matrix"].join("::"),
-            ["crate", "rpc"].join("::"),
-            ["zeroclaw", "channels"].join("_"),
-            ["zeroclaw", "gateway"].join("_"),
-            ["zerocode"].join("_"),
-            ["Acp", "SessionStore"].join(""),
-        ];
         for source in sources {
-            for import in source
-                .lines()
-                .map(str::trim_start)
-                .filter(|line| line.starts_with("use "))
-            {
-                assert!(
-                    forbidden_imports
-                        .iter()
-                        .all(|forbidden| !import.contains(forbidden)),
-                    "generic Goal runtime module imported transport/session code: {import}"
-                );
-            }
+            assert!(
+                forbidden_goal_runtime_import(source).is_none(),
+                "generic Goal runtime module imported transport/session code"
+            );
         }
+    }
+
+    #[test]
+    fn generic_goal_runtime_boundary_guard_rejects_grouped_imports() {
+        let grouped_import = "use crate::{\n    goal_mode::GoalCommand,\n    rpc::RpcServer,\n};";
+        assert!(forbidden_goal_runtime_import(grouped_import).is_some());
     }
 
     #[tokio::test]
