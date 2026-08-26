@@ -14,6 +14,31 @@ use zeroclaw_api::model_provider::ChatMessage;
 
 use super::{GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind};
 
+/// Classified failure while planning a Goal operation before any provider work
+/// starts. The generic host owns this narrow contract so the controller can
+/// preserve pricing, verifier, session-binding, and capacity semantics without
+/// knowing which transport supplied the live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalHostPreflightError {
+    BindingUnavailable,
+    VerifierUnavailable,
+    PricingUnavailable,
+    ReservationUnavailable,
+}
+
+impl std::fmt::Display for GoalHostPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BindingUnavailable => "goal session binding is unavailable",
+            Self::VerifierUnavailable => "goal verifier is unavailable",
+            Self::PricingUnavailable => "goal pricing is unavailable",
+            Self::ReservationUnavailable => "goal operation reservation is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for GoalHostPreflightError {}
+
 /// Fixed protocol instruction for the isolated verifier operation. The core
 /// owns this schema so adapters cannot silently substitute session context,
 /// tools, or transport authority for the declared Goal contract.
@@ -128,7 +153,7 @@ pub trait GoalSessionAdapter: Send + Sync {
         &self,
         binding: &GoalSessionBinding,
         request: &GoalExecutionPreflight,
-    ) -> Result<GoalOperationReservation>;
+    ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError>;
 
     async fn model_binding(&self, binding: &GoalSessionBinding) -> Result<GoalHostModelBinding>;
 
@@ -208,8 +233,11 @@ impl GoalExecutionHost {
         &self,
         binding: &GoalSessionBinding,
         request: &GoalExecutionPreflight,
-    ) -> Result<GoalOperationReservation> {
-        self.adapter(binding)?.preflight(binding, request).await
+    ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+        self.adapter(binding)
+            .map_err(|_| GoalHostPreflightError::BindingUnavailable)?
+            .preflight(binding, request)
+            .await
     }
 
     pub async fn acquire(
@@ -232,8 +260,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{
-        GoalExecutionHost, GoalHostModelBinding, GoalParentTurn, GoalSessionAdapter,
-        GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate, GoalVerifierTurn,
+        GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
+        GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate,
+        GoalVerifierTurn,
     };
     use crate::goal_mode::{
         GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind,
@@ -258,7 +287,7 @@ mod tests {
             &self,
             _binding: &GoalSessionBinding,
             _request: &GoalExecutionPreflight,
-        ) -> anyhow::Result<GoalOperationReservation> {
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
             Ok(GoalOperationReservation {
                 token_count: Some(1),
                 cost_usd: Some(0.0),
