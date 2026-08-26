@@ -1121,6 +1121,42 @@ impl GoalExecutor for GoalExecutionDriver {
         Ok(())
     }
 
+    async fn wait_task_quiescent(&self, task_id: &str) -> Result<(), ()> {
+        let workers = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .filter(|(key, _)| key.task_id == task_id)
+                .map(|(key, worker)| (key.clone(), Arc::clone(worker)))
+                .collect::<Vec<_>>()
+        };
+        for (key, worker) in workers {
+            // Unlike cancellation, terminal replacement must let a completed
+            // worker finish its already-verified delivery. Keeping ownership
+            // under the worker mutex closes the replacement-to-send race while
+            // preserving cancellation's independent ability to reclaim it.
+            let mut handle = worker.handle.lock().await;
+            if let Some(join_handle) = handle.as_mut() {
+                if tokio::time::timeout(Duration::from_secs(5), &mut *join_handle)
+                    .await
+                    .is_err()
+                {
+                    return Err(());
+                }
+                *handle = None;
+            }
+            drop(handle);
+            let mut workers = self.workers.lock().await;
+            if workers
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &worker))
+            {
+                workers.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
     async fn task_is_quiescent(&self, task_id: &str) -> bool {
         let mut workers = self.workers.lock().await;
         workers.retain(|_, worker| {
@@ -1388,6 +1424,50 @@ mod tests {
         assert!(first.await.unwrap().is_ok());
         assert!(second.await.unwrap().is_ok());
         assert!(driver.task_is_quiescent("goal-task").await);
+    }
+
+    #[tokio::test]
+    async fn terminal_replacement_waits_for_delivery_without_cancelling_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap()),
+        ));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_release = Arc::clone(&release);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            worker_release.notified().await;
+        });
+        driver.workers.lock().await.insert(
+            GoalWorkerKey {
+                task_id: "completed-goal".into(),
+                execution_epoch: 2,
+            },
+            Arc::new(GoalWorker {
+                cancellation: cancellation.clone(),
+                handle: Mutex::new(Some(handle)),
+            }),
+        );
+
+        let waiter = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move {
+                driver.wait_task_quiescent("completed-goal").await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !cancellation.is_cancelled(),
+            "terminal replacement must not cancel verified delivery"
+        );
+        release.notify_one();
+        assert!(waiter.await.unwrap().is_ok());
+        assert!(driver.task_is_quiescent("completed-goal").await);
     }
 
     #[tokio::test]

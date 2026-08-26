@@ -4054,6 +4054,22 @@ fn sanitize_channel_response_for_format_with_leak_detection(
     redact_channel_outbound_leaks(&sanitized, leak_detection, content_format)
 }
 
+/// Apply the same final outbound guard used by ordinary channel turns to a
+/// verifier-approved Goal candidate. Verification decides whether a candidate
+/// is semantically complete; it is not a security bypass for transport output.
+pub(super) fn sanitize_verified_goal_delivery(
+    candidate: &str,
+    tools: &[Box<dyn Tool>],
+    config: &zeroclaw_config::schema::Config,
+) -> String {
+    sanitize_channel_response_for_format_with_leak_detection(
+        candidate,
+        tools,
+        &config.security.leak_detection,
+        OutboundContentFormat::Markdown,
+    )
+}
+
 fn redact_channel_outbound_leaks(
     content: &str,
     leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
