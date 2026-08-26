@@ -3,7 +3,9 @@
 //! focused prompt, and returns the response. Cron's `JobType::Agent`
 //! dispatch is the other SubAgent spawn site; both funnel through
 
+use crate::agent::cost::current_goal_child_scope;
 use crate::agent::loop_::AgentRunOverrides;
+use crate::control_plane::GoalTransitionResult;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
@@ -26,6 +28,29 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+}
+
+fn goal_empty_completion_is_failure(is_goal_child: bool, response: &str) -> bool {
+    is_goal_child && response.trim().is_empty()
+}
+
+fn subagent_completion_result(is_goal_child: bool, response: String) -> ToolResult {
+    if goal_empty_completion_is_failure(is_goal_child, &response) {
+        return ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some("subagent completed with empty output".into()),
+        };
+    }
+    ToolResult {
+        success: true,
+        output: if response.trim().is_empty() {
+            "subagent completed without output".to_string().into()
+        } else {
+            response.into()
+        },
+        error: None,
+    }
 }
 
 impl SpawnSubagentTool {
@@ -174,9 +199,14 @@ impl Tool for SpawnSubagentTool {
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
+        let goal_parent = current_goal_child_scope();
+        let is_goal_child = goal_parent.is_some();
         let run_overrides = AgentRunOverrides {
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
+            cancellation_token: goal_parent
+                .as_ref()
+                .map(|scope| scope.cancellation.child_token()),
             is_subagent: true,
             // Sub-turn origin already skips memory injection; explicit for
             // the same future-proofing reason as `is_subagent` above.
@@ -194,31 +224,66 @@ impl Tool for SpawnSubagentTool {
 
         let cp_task_id = run_id.clone();
         if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .create(crate::control_plane::TaskRecord {
-                    id: cp_task_id.clone(),
-                    kind: crate::control_plane::TaskKind::Subagent,
-                    agent: self.parent_alias.clone(),
-                    status: crate::control_plane::TaskStatus::Running,
-                    owner_pid: std::process::id(),
-                    owner_boot_id: cp.boot_id.clone(),
-                    heartbeat_at: None,
-                    depth: u32::from(self.is_subagent_caller),
-                    parent_id: None,
-                    originator_route: None,
-                    delivered: false,
-                    idem_key: None,
-                    principal_id: None,
-                    session_id: None,
-                    execution_epoch: 0,
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    finished_at: None,
-                })
-                .await;
+            let child = crate::control_plane::TaskRecord {
+                id: cp_task_id.clone(),
+                kind: crate::control_plane::TaskKind::Subagent,
+                agent: self.parent_alias.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: cp.boot_id.clone(),
+                heartbeat_at: None,
+                depth: u32::from(self.is_subagent_caller),
+                parent_id: goal_parent.as_ref().map(|scope| scope.task_id.clone()),
+                originator_route: goal_parent
+                    .as_ref()
+                    .and_then(|scope| scope.originator_route.clone()),
+                delivered: false,
+                idem_key: None,
+                principal_id: goal_parent
+                    .as_ref()
+                    .and_then(|scope| scope.principal_id.clone()),
+                session_id: goal_parent.as_ref().map(|scope| scope.session_id.clone()),
+                execution_epoch: goal_parent
+                    .as_ref()
+                    .map_or(0, |scope| scope.execution_epoch),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            };
+            let create = if let Some(parent) = goal_parent.as_ref() {
+                cp.goal_store
+                    .create_foreground_goal_child(
+                        &parent.task_id,
+                        &parent.session_id,
+                        parent.execution_epoch,
+                        child,
+                    )
+                    .await
+                    .and_then(|result| {
+                        (result == GoalTransitionResult::Applied)
+                            .then_some(())
+                            .ok_or_else(|| {
+                                anyhow::Error::msg("goal subagent parent is no longer current")
+                            })
+                    })
+            } else {
+                cp.store.create(child).await
+            };
+            if is_goal_child && let Err(error) = create {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("goal subagent task creation failed: {error}")),
+                });
+            }
+        } else if is_goal_child {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some("goal subagent requires the control plane".into()),
+            });
         }
 
-        let run_result = Box::pin(scope!(
+        let run = scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
@@ -236,12 +301,26 @@ impl Tool for SpawnSubagentTool {
                 zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
-        ))
-        .await;
+        );
+        let run_result = if let Some(scope) = goal_parent {
+            crate::agent::cost::GOAL_CHILD_SCOPE
+                .scope(Some(scope), run)
+                .await
+        } else {
+            run.await
+        };
 
-        // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
+        let blank_response = matches!(
+            &run_result,
+            Ok(response) if goal_empty_completion_is_failure(is_goal_child, response)
+        );
         if let Some(cp) = crate::control_plane::control_plane() {
             let (status, output, error) = match &run_result {
+                Ok(_) if blank_response => (
+                    crate::control_plane::TaskStatus::Failed,
+                    None,
+                    Some("subagent completed with empty output".into()),
+                ),
                 Ok(resp) => (
                     crate::control_plane::TaskStatus::Completed,
                     Some(resp.clone()),
@@ -253,22 +332,17 @@ impl Tool for SpawnSubagentTool {
                     Some(format!("subagent run failed: {e}")),
                 ),
             };
-            let _ = cp
+            let settlement = cp
                 .store
                 .update_status(&cp_task_id, status, output, error)
                 .await;
+            if is_goal_child && let Err(error) = settlement {
+                anyhow::bail!("goal subagent task settlement failed: {error}");
+            }
         }
 
         match run_result {
-            Ok(response) => Ok(ToolResult {
-                success: true,
-                output: if response.trim().is_empty() {
-                    "subagent completed without output".to_string().into()
-                } else {
-                    response.into()
-                },
-                error: None,
-            }),
+            Ok(response) => Ok(subagent_completion_result(is_goal_child, response)),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -553,6 +627,50 @@ mod tests {
         assert!(
             !overrides.is_subagent,
             "AgentRunOverrides::default().is_subagent must be false so cron paths inherit a top-level shape"
+        );
+        assert!(overrides.cancellation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn goal_child_cancellation_is_derived_from_parent_scope() {
+        let parent = tokio_util::sync::CancellationToken::new();
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: parent.clone(),
+        };
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                let child = current_goal_child_scope()
+                    .expect("Goal child setup must receive its parent scope")
+                    .cancellation
+                    .child_token();
+                child.cancel();
+                assert!(!parent.is_cancelled());
+                parent.cancel();
+                child.cancelled().await;
+            })
+            .await;
+    }
+
+    #[test]
+    fn empty_completion_remains_ordinary_success_outside_goal_scope() {
+        assert!(!goal_empty_completion_is_failure(false, "  "));
+        assert!(goal_empty_completion_is_failure(true, "  "));
+        assert!(!goal_empty_completion_is_failure(true, "answer"));
+
+        let ordinary = subagent_completion_result(false, " ".into());
+        assert!(ordinary.success);
+        assert_eq!(ordinary.output, "subagent completed without output");
+
+        let goal = subagent_completion_result(true, " ".into());
+        assert!(!goal.success);
+        assert_eq!(
+            goal.error.as_deref(),
+            Some("subagent completed with empty output")
         );
     }
 
