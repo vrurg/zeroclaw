@@ -392,6 +392,103 @@ pub(crate) async fn call_provider(
 }
 
 #[cfg(test)]
+mod goal_accounting_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use zeroclaw_config::schema::{Config, PacingConfig};
+    use zeroclaw_providers::ChatMessage;
+
+    use super::{super::context::TurnCtx, call_provider};
+    use crate::{
+        agent::cost::{
+            GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
+            GoalOperationSettlement,
+        },
+        observability::NoopObserver,
+    };
+
+    struct RecordingGoalAccounting {
+        config: Config,
+        requests: Mutex<Vec<GoalOperationRequest>>,
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for RecordingGoalAccounting {
+        fn config(&self) -> &Config {
+            &self.config
+        }
+
+        async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()> {
+            self.requests.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(&self, _settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_admission_uses_the_active_provider_not_the_base_turn_provider() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "base-provider",
+            model: "base-model",
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
+            turn_id: "goal-active-provider",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+        let accounting = Arc::new(RecordingGoalAccounting {
+            config: Config::default(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let provider = super::payload_capture_tests::StubProvider;
+
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "vision-provider",
+                        "vision-model",
+                        &[ChatMessage::user("describe image")],
+                        None,
+                        false,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                },
+            )
+            .await;
+
+        let requests = accounting.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_provider, "vision-provider");
+        assert_eq!(requests[0].model, "vision-model");
+    }
+}
+
+#[cfg(test)]
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
@@ -406,7 +503,7 @@ mod payload_capture_tests {
     /// Minimal provider stub. Only `chat_with_system` is required by
     /// `ModelProvider`; `announce_llm_request` never calls it (it only opens
     /// `attribution_span!` over the provider), so a trivial reply is fine.
-    struct StubProvider;
+    pub(super) struct StubProvider;
 
     #[async_trait]
     impl ModelProvider for StubProvider {
