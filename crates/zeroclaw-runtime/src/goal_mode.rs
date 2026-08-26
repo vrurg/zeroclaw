@@ -353,6 +353,7 @@ pub enum GoalMessageKey {
     BudgetRequired,
     PricingUnavailable,
     VerifierUnavailable,
+    BindingUnavailable,
     Started,
     Status,
     Budget,
@@ -513,6 +514,8 @@ pub enum GoalExecutionReadiness {
     Ready(GoalOperationReservation),
     PricingUnavailable,
     VerifierUnavailable,
+    ReservationUnavailable,
+    BindingUnavailable,
 }
 
 /// Dormant execution seam. This stage performs no provider work.
@@ -541,6 +544,7 @@ enum GoalResumeReadiness {
     ReservationExceedsBudget,
     PricingUnavailable,
     VerifierUnavailable,
+    BindingUnavailable,
 }
 
 /// The sole transport-neutral Goal controller facade.
@@ -680,6 +684,14 @@ impl GoalRuntime {
             GoalExecutionReadiness::PricingUnavailable => {}
             GoalExecutionReadiness::VerifierUnavailable => {
                 return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
+            }
+            GoalExecutionReadiness::ReservationUnavailable => {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationUnavailable,
+                ));
+            }
+            GoalExecutionReadiness::BindingUnavailable => {
+                return Ok(GoalResponse::message(GoalMessageKey::BindingUnavailable));
             }
         }
         let task = TaskRecord {
@@ -870,6 +882,9 @@ impl GoalRuntime {
             }
             GoalResumeReadiness::VerifierUnavailable => {
                 return Ok(GoalResponse::message(GoalMessageKey::VerifierUnavailable));
+            }
+            GoalResumeReadiness::BindingUnavailable => {
+                return Ok(GoalResponse::message(GoalMessageKey::BindingUnavailable));
             }
             GoalResumeReadiness::NotPaused => {
                 return Ok(GoalResponse::message(GoalMessageKey::Stale));
@@ -1111,6 +1126,10 @@ impl GoalRuntime {
             }
             GoalExecutionReadiness::PricingUnavailable => GoalResumeReadiness::Ready,
             GoalExecutionReadiness::VerifierUnavailable => GoalResumeReadiness::VerifierUnavailable,
+            GoalExecutionReadiness::ReservationUnavailable => {
+                GoalResumeReadiness::ReservationUnavailable
+            }
+            GoalExecutionReadiness::BindingUnavailable => GoalResumeReadiness::BindingUnavailable,
         }
     }
 
@@ -1428,6 +1447,65 @@ mod tests {
             token_count: Some(1),
             cost_usd: Some(0.0),
         })
+    }
+
+    #[tokio::test]
+    async fn start_preserves_each_typed_preflight_failure() {
+        let cases = [
+            (
+                GoalExecutionReadiness::BindingUnavailable,
+                GoalBudgetRequest::Defaults,
+                GoalMessageKey::BindingUnavailable,
+            ),
+            (
+                GoalExecutionReadiness::VerifierUnavailable,
+                GoalBudgetRequest::Defaults,
+                GoalMessageKey::VerifierUnavailable,
+            ),
+            (
+                GoalExecutionReadiness::ReservationUnavailable,
+                GoalBudgetRequest::Defaults,
+                GoalMessageKey::ReservationUnavailable,
+            ),
+            (
+                GoalExecutionReadiness::PricingUnavailable,
+                GoalBudgetRequest::Limits {
+                    token_limit: None,
+                    cost_limit_usd: Some(1.0),
+                },
+                GoalMessageKey::PricingUnavailable,
+            ),
+        ];
+        for (readiness, budget, expected) in cases {
+            let (runtime, store, _executor, _directory) = controller(readiness, false);
+            let GoalCommand::Start {
+                success_criteria,
+                objective,
+                ..
+            } = start_command()
+            else {
+                unreachable!();
+            };
+            let response = runtime
+                .submit(
+                    ingress(),
+                    GoalCommand::Start {
+                        budget,
+                        success_criteria,
+                        objective,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.key, expected);
+            assert!(
+                store
+                    .current_goal_for_session("session")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     fn preflight_for(

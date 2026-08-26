@@ -21,7 +21,7 @@ use zeroclaw_config::{
 
 use super::{
     GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor,
-    host::{GoalExecutionHost, GoalParentTurn, GoalVerifierTurn},
+    host::{GoalExecutionHost, GoalHostPreflightError, GoalParentTurn, GoalVerifierTurn},
 };
 use crate::{
     agent::cost::{
@@ -274,6 +274,73 @@ impl GoalOperationAccountant {
         }
         Ok((state, pricing_complete))
     }
+
+    /// Resolve an admitted operation whose normal completion future was
+    /// cancelled or dropped. A deadline must not convert an in-flight remote
+    /// operation into a cleanly settled terminal Goal merely because the
+    /// supervisor stopped awaiting it.
+    async fn classify_unsettled_operation(&self) -> bool {
+        let Some(call_id) = self
+            .active
+            .lock()
+            .await
+            .as_ref()
+            .map(|operation| operation.call_id.clone())
+        else {
+            return false;
+        };
+        loop {
+            match self
+                .goals
+                .settle_pending_call(
+                    &self.scope.task_id,
+                    &self.scope.session_id,
+                    self.scope.execution_epoch,
+                    &call_id,
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await
+            {
+                Ok(GoalTransitionResult::Applied) => {
+                    self.active.lock().await.take();
+                    return true;
+                }
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
+                    match self
+                        .goals
+                        .current_goal_for_session(&self.scope.session_id)
+                        .await
+                    {
+                        Ok(Some(task))
+                            if task.id == self.scope.task_id
+                                && task.execution_epoch == self.scope.execution_epoch
+                                && task.status == TaskStatus::Running =>
+                        {
+                            match self.goals.get_goal_task(&task.id).await {
+                                Ok(Some(goal))
+                                    if goal.pending_call_id.is_none()
+                                        && goal.pending_call_epoch.is_none() =>
+                                {
+                                    // The normal settlement committed before
+                                    // its future was dropped.
+                                    self.active.lock().await.take();
+                                    return false;
+                                }
+                                Ok(_) | Err(_) => {}
+                            }
+                        }
+                        Ok(Some(_)) | Ok(None) => {
+                            self.active.lock().await.take();
+                            return false;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -353,13 +420,13 @@ impl GoalOperationAccounting for GoalOperationAccountant {
     }
 
     async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
-        let operation = self
-            .active
-            .lock()
-            .await
-            .take()
-            .context("goal logical operation has no pending admission")?;
-        let cost_limit_required = operation.cost_limit_required;
+        let (call_id, cost_limit_required) = {
+            let active = self.active.lock().await;
+            let operation = active
+                .as_ref()
+                .context("goal logical operation has no pending admission")?;
+            (operation.call_id.clone(), operation.cost_limit_required)
+        };
         // A response has already crossed the provider boundary. If canonical
         // persistence cannot prove every event reached JSONL, settle the exact
         // pending operation as outcome-unknown before surfacing the error; the
@@ -375,7 +442,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 &self.scope.task_id,
                 &self.scope.session_id,
                 self.scope.execution_epoch,
-                &operation.call_id,
+                &call_id,
                 state,
             )
             .await?
@@ -385,7 +452,13 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 anyhow::bail!("goal logical operation settlement is stale")
             }
         }
-        drop(operation);
+        let cleared = self.active.lock().await.take();
+        if cleared
+            .as_ref()
+            .is_none_or(|operation| operation.call_id != call_id)
+        {
+            anyhow::bail!("goal logical operation changed during settlement");
+        }
         if recorded.is_err() || state == GoalAccountingState::OutcomeUnknown {
             return Err(GoalAccountingFailure::OutcomeUnknown.into());
         }
@@ -546,7 +619,11 @@ impl GoalExecutionDriver {
         .await
         {
             Ok(current) => current,
-            Err(_) => return,
+            Err(_) => {
+                self.finish_failed(&scope, "goal_executor_initialization_failed")
+                    .await;
+                return;
+            }
         };
         if task.agent != scope.binding.agent() {
             self.finish_failed(&scope, "goal_executor_binding_failed")
@@ -577,13 +654,14 @@ impl GoalExecutionDriver {
                 return;
             }
         };
-        let accountant: Arc<dyn GoalOperationAccounting> = Arc::new(GoalOperationAccountant::new(
+        let accountant = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.goals),
             Arc::clone(&self.config),
             Arc::clone(&self.cost_tracker),
             scope.clone(),
             task.agent,
         ));
+        let accounting: Arc<dyn GoalOperationAccounting> = accountant.clone();
         let tool_phase_fence = Arc::new(crate::agent::cost::GoalToolPhaseFence::new(
             Arc::clone(&self.goals),
             scope.task_id.clone(),
@@ -593,12 +671,26 @@ impl GoalExecutionDriver {
         let mut turn_kind = scope.turn_kind;
         loop {
             if scope.cancellation.is_cancelled() {
+                if accountant.classify_unsettled_operation().await {
+                    self.finish_failed(&scope, "accounting_outcome_unknown")
+                        .await;
+                } else {
+                    self.pause_exact(
+                        &scope,
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await;
+                }
                 return;
             }
             let parent = run_with_goal_deadline(
                 &scope,
                 crate::agent::cost::GOAL_OPERATION_ACCOUNTING.scope(
-                    Some(Arc::clone(&accountant)),
+                    Some(Arc::clone(&accounting)),
                     crate::agent::cost::GOAL_TOOL_PHASE_FENCE.scope(
                         Some(Arc::clone(&tool_phase_fence)),
                         lease.run_parent_turn(
@@ -621,18 +713,33 @@ impl GoalExecutionDriver {
                     return;
                 }
                 Err(error) if error.downcast_ref::<GoalDeadlineExceeded>().is_some() => {
+                    accountant.classify_unsettled_operation().await;
                     self.finish_timed_out(&scope).await;
                     return;
                 }
                 Err(error) => {
-                    self.finish_failed(
-                        &scope,
+                    let outcome_unknown = accountant.classify_unsettled_operation().await;
+                    if scope.cancellation.is_cancelled() && !outcome_unknown {
+                        self.pause_exact(
+                            &scope,
+                            GoalPauseState {
+                                reason: GoalPauseReason::OperatorPaused,
+                                description: None,
+                                blockers: Vec::new(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    let reason = if outcome_unknown {
+                        "accounting_outcome_unknown"
+                    } else {
                         Self::terminal_reason_for_operation_error(
                             &error,
                             "goal_parent_execution_failed",
-                        ),
-                    )
-                    .await;
+                        )
+                    };
+                    self.finish_failed(&scope, reason).await;
                     return;
                 }
             };
@@ -643,7 +750,7 @@ impl GoalExecutionDriver {
             let verifier = run_with_goal_deadline(
                 &scope,
                 crate::agent::cost::GOAL_OPERATION_ACCOUNTING.scope(
-                    Some(Arc::clone(&accountant)),
+                    Some(Arc::clone(&accounting)),
                     lease.run_verifier(
                         GoalVerifierTurn::isolated(
                             goal.objective.clone(),
@@ -708,15 +815,30 @@ impl GoalExecutionDriver {
                     return;
                 }
                 Err(error) if error.downcast_ref::<GoalDeadlineExceeded>().is_some() => {
+                    accountant.classify_unsettled_operation().await;
                     self.finish_timed_out(&scope).await;
                     return;
                 }
                 Err(error) => {
-                    self.finish_failed(
-                        &scope,
-                        Self::terminal_reason_for_operation_error(&error, "goal_verifier_failed"),
-                    )
-                    .await;
+                    let outcome_unknown = accountant.classify_unsettled_operation().await;
+                    if scope.cancellation.is_cancelled() && !outcome_unknown {
+                        self.pause_exact(
+                            &scope,
+                            GoalPauseState {
+                                reason: GoalPauseReason::OperatorPaused,
+                                description: None,
+                                blockers: Vec::new(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    let reason = if outcome_unknown {
+                        "accounting_outcome_unknown"
+                    } else {
+                        Self::terminal_reason_for_operation_error(&error, "goal_verifier_failed")
+                    };
+                    self.finish_failed(&scope, reason).await;
                     return;
                 }
             }
@@ -729,7 +851,18 @@ impl GoalExecutor for GoalExecutionDriver {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
         match self.host.preflight(&request.binding, request).await {
             Ok(reservation) => GoalExecutionReadiness::Ready(reservation),
-            Err(_) => GoalExecutionReadiness::VerifierUnavailable,
+            Err(GoalHostPreflightError::PricingUnavailable) => {
+                GoalExecutionReadiness::PricingUnavailable
+            }
+            Err(GoalHostPreflightError::VerifierUnavailable) => {
+                GoalExecutionReadiness::VerifierUnavailable
+            }
+            Err(GoalHostPreflightError::ReservationUnavailable) => {
+                GoalExecutionReadiness::ReservationUnavailable
+            }
+            Err(GoalHostPreflightError::BindingUnavailable) => {
+                GoalExecutionReadiness::BindingUnavailable
+            }
         }
     }
 
@@ -878,8 +1011,8 @@ mod tests {
             GoalBudgetRequest, GoalCommand, GoalExecutionPreflight, GoalExecutionScope,
             GoalOperationReservation, GoalRuntime,
             host::{
-                GoalExecutionHost, GoalHostModelBinding, GoalParentTurn, GoalSessionAdapter,
-                GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
+                GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
+                GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
             },
         },
     };
@@ -905,6 +1038,10 @@ mod tests {
         verifier_calls: Arc<StdMutex<usize>>,
     }
 
+    struct AdmittingDeadlineAdapter;
+
+    struct AdmittingDeadlineLease;
+
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
         fn owns(&self, binding: &GoalSessionBinding) -> bool {
@@ -915,7 +1052,7 @@ mod tests {
             &self,
             _binding: &GoalSessionBinding,
             _request: &GoalExecutionPreflight,
-        ) -> anyhow::Result<GoalOperationReservation> {
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
             Ok(GoalOperationReservation {
                 token_count: Some(1),
                 cost_usd: None,
@@ -961,7 +1098,7 @@ mod tests {
             &self,
             _binding: &GoalSessionBinding,
             _request: &GoalExecutionPreflight,
-        ) -> anyhow::Result<GoalOperationReservation> {
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
             Ok(GoalOperationReservation::default())
         }
 
@@ -991,6 +1128,48 @@ mod tests {
                 parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
                 verifier_calls: Arc::clone(&self.verifier_calls),
             }))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for AdmittingDeadlineAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "admitting-deadline-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(Some(
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            ))
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(AdmittingDeadlineLease))
         }
     }
 
@@ -1070,6 +1249,50 @@ mod tests {
             _candidate: super::super::host::GoalVerifiedCandidate,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionLease for AdmittingDeadlineLease {
+        fn working_history(
+            &self,
+        ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _turn: GoalParentTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
+            crate::agent::cost::admit_goal_operation_if_scoped(
+                crate::agent::cost::GoalOperationRequest {
+                    model_provider: "test.provider".into(),
+                    model: "test-model".into(),
+                    temperature: None,
+                    thinking: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                },
+            )
+            .await?;
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _turn: GoalVerifierTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: super::super::host::GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            unreachable!()
         }
     }
 
@@ -1182,7 +1405,7 @@ mod tests {
                 );
                 return;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("generic Goal driver did not complete the exact session task");
     }
@@ -1237,6 +1460,61 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("Goal did not transition to timed out after its inherited deadline");
+    }
+
+    #[tokio::test]
+    async fn deadline_after_admission_marks_the_pending_operation_outcome_unknown() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                AdmittingDeadlineAdapter,
+            )])),
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        runtime
+            .submit(
+                crate::goal_mode::GoalIngressContext::trusted(
+                    "session",
+                    "main",
+                    "admitting-deadline-route",
+                    None,
+                )
+                .unwrap(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    objective: "objective".into(),
+                    success_criteria: "criteria".into(),
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let Some(task) = store.current_goal_for_session("session").await.unwrap() else {
+                panic!("Goal disappeared");
+            };
+            if task.status == TaskStatus::TimedOut {
+                let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+                assert_eq!(
+                    goal.accounting_state,
+                    crate::control_plane::GoalAccountingState::OutcomeUnknown
+                );
+                assert!(goal.pending_call_id.is_none());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("admitted Goal did not time out");
     }
 
     #[tokio::test]
