@@ -999,6 +999,13 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if session_id.trim().is_empty() {
             return Ok(None);
         }
+        #[cfg(test)]
+        if self
+            .fail_next_current_goal_read
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!("injected current Goal read failure");
+        }
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT * FROM tasks WHERE kind = 'goal' AND session_id = ?1",

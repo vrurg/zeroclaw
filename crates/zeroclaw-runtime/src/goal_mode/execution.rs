@@ -993,7 +993,10 @@ fn conservative_cost_reservation(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use super::{
         GoalExecutionDriver, GoalOperationAccountant, GoalOperationAccounting, VerifierOutcome,
@@ -1022,6 +1025,8 @@ mod tests {
         deadline: Option<tokio::time::Instant>,
         parent_never_returns: bool,
         parent_waits_for_cancellation: bool,
+        verifier_waits_for_cancellation: bool,
+        verifier_started: Option<Arc<AtomicBool>>,
         preflight_error: Option<GoalHostPreflightError>,
     }
 
@@ -1029,6 +1034,8 @@ mod tests {
         leave_tool_phase_in_flight: bool,
         parent_never_returns: bool,
         parent_waits_for_cancellation: bool,
+        verifier_waits_for_cancellation: bool,
+        verifier_started: Option<Arc<AtomicBool>>,
     }
 
     struct ContinueAdapter {
@@ -1095,6 +1102,8 @@ mod tests {
                 leave_tool_phase_in_flight: self.leave_tool_phase_in_flight,
                 parent_never_returns: self.parent_never_returns,
                 parent_waits_for_cancellation: self.parent_waits_for_cancellation,
+                verifier_waits_for_cancellation: self.verifier_waits_for_cancellation,
+                verifier_started: self.verifier_started.clone(),
             }))
         }
     }
@@ -1255,8 +1264,15 @@ mod tests {
         async fn run_verifier(
             &mut self,
             _turn: GoalVerifierTurn,
-            _cancellation: tokio_util::sync::CancellationToken,
+            cancellation: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<String> {
+            if let Some(started) = &self.verifier_started {
+                started.store(true, Ordering::Release);
+            }
+            if self.verifier_waits_for_cancellation {
+                cancellation.cancelled().await;
+                anyhow::bail!("simulated verifier cancellation");
+            }
             Ok(r#"{"decision":"complete","reason":"meets criteria"}"#.into())
         }
 
@@ -1466,6 +1482,8 @@ mod tests {
             deadline: None,
             parent_never_returns: false,
             parent_waits_for_cancellation: false,
+            verifier_waits_for_cancellation: false,
+            verifier_started: None,
             preflight_error: None,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
@@ -1527,6 +1545,8 @@ mod tests {
             deadline: Some(tokio::time::Instant::now()),
             parent_never_returns: true,
             parent_waits_for_cancellation: false,
+            verifier_waits_for_cancellation: false,
+            verifier_started: None,
             preflight_error: None,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
@@ -1637,6 +1657,8 @@ mod tests {
                 deadline: None,
                 parent_never_returns: false,
                 parent_waits_for_cancellation: true,
+                verifier_waits_for_cancellation: false,
+                verifier_started: None,
                 preflight_error: None,
             })])),
             goals.clone(),
@@ -1705,6 +1727,191 @@ mod tests {
                 .unwrap()
                 .pause_reason,
             Some(crate::control_plane::GoalPauseReason::OperatorPaused)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_clean_verifier_turn_pauses_the_exact_goal() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let verifier_started = Arc::new(AtomicBool::new(false));
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
+                leave_tool_phase_in_flight: false,
+                deadline: None,
+                parent_never_returns: false,
+                parent_waits_for_cancellation: false,
+                verifier_waits_for_cancellation: true,
+                verifier_started: Some(Arc::clone(&verifier_started)),
+                preflight_error: None,
+            })])),
+            goals.clone(),
+            Arc::clone(&config),
+            tracker,
+        );
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: cancellation.clone(),
+            deadline: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        for _ in 0..100 {
+            if verifier_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            verifier_started.load(Ordering::Acquire),
+            "verifier did not begin before cancellation"
+        );
+        cancellation.cancel();
+        task.await.unwrap();
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Paused);
+        assert_eq!(
+            store
+                .get_goal_task(&current.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(crate::control_plane::GoalPauseReason::OperatorPaused)
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_current_goal_read_failure_fences_the_running_goal() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
+                leave_tool_phase_in_flight: false,
+                deadline: None,
+                parent_never_returns: false,
+                parent_waits_for_cancellation: false,
+                verifier_waits_for_cancellation: false,
+                verifier_started: None,
+                preflight_error: None,
+            })])),
+            goals.clone(),
+            Arc::clone(&config),
+            tracker,
+        );
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        store.fail_next_current_goal_read_for_test();
+        driver.run_scope(scope).await;
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(&current.id, "session")
+                .await
+                .unwrap(),
+            Some("goal_executor_initialization_failed".into())
         );
     }
 
@@ -1826,6 +2033,8 @@ mod tests {
                     deadline: None,
                     parent_never_returns: false,
                     parent_waits_for_cancellation: false,
+                    verifier_waits_for_cancellation: false,
+                    verifier_started: None,
                     preflight_error: Some(preflight_error),
                 })])),
                 goals.clone(),
