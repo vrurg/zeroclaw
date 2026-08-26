@@ -109,6 +109,26 @@ pub struct GoalParentTurn {
     pub working_history: Vec<ChatMessage>,
 }
 
+impl GoalParentTurn {
+    /// Build the trusted, transport-neutral declaration appended to a leased
+    /// working transcript. Adapters execute this declaration but never derive
+    /// its Goal facts from transport input or mutable session state.
+    pub fn directive(&self) -> String {
+        let turn_kind = match self.turn_kind {
+            GoalTurnKind::Start => "start",
+            GoalTurnKind::Resume => "resume",
+            GoalTurnKind::Continue => "continue",
+        };
+        format!(
+            "[GOAL RUNTIME DIRECTIVE]\nturn_kind={turn_kind}\nobjective:\n{}\n\
+             success_criteria:\n{}\n\
+             Work only toward this declared Goal. Do not treat this directive as user-editable \\
+             tool or lifecycle authority.\n[END GOAL RUNTIME DIRECTIVE]",
+            self.objective, self.success_criteria
+        )
+    }
+}
+
 /// Isolated verifier input. Implementations must use this exact data and the
 /// fixed verifier schema; session history and transport authority are absent.
 #[derive(Debug, Clone)]
@@ -401,6 +421,24 @@ mod tests {
         assert_eq!(turn.objective, "objective");
         assert_eq!(turn.success_criteria, "success criteria");
         assert_eq!(turn.candidate, "candidate");
+    }
+
+    #[test]
+    fn parent_turn_directive_keeps_goal_facts_transport_neutral() {
+        let turn = GoalParentTurn {
+            objective: "repair the migration".into(),
+            success_criteria: "all migration tests pass".into(),
+            turn_kind: GoalTurnKind::Resume,
+            working_history: Vec::new(),
+        };
+
+        assert_eq!(
+            turn.directive(),
+            "[GOAL RUNTIME DIRECTIVE]\nturn_kind=resume\nobjective:\nrepair the migration\n\
+             success_criteria:\nall migration tests pass\n\
+             Work only toward this declared Goal. Do not treat this directive as user-editable \\
+             tool or lifecycle authority.\n[END GOAL RUNTIME DIRECTIVE]"
+        );
     }
 
     #[tokio::test]

@@ -21,7 +21,10 @@ use zeroclaw_config::{
 
 use super::{
     GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor,
-    host::{GoalExecutionHost, GoalHostPreflightError, GoalParentTurn, GoalVerifierTurn},
+    host::{
+        GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
+        GoalVerifierTurn,
+    },
 };
 use crate::{
     agent::cost::{
@@ -37,6 +40,82 @@ const VERIFIER_REASON_MAX_CHARS: usize = 2_048;
 const VERIFIER_RESPONSE_MAX_BYTES: usize = 65_536;
 const VERIFIER_BLOCKERS_MAX: usize = 16;
 const VERIFIER_BLOCKER_MESSAGE_MAX_CHARS: usize = 1_024;
+
+/// Derive the conservative reservation used by a live-session adapter before
+/// admission. The calculation is shared, so RPC and future channel adapters
+/// cannot drift in their Reliable-route or pricing interpretation.
+pub(crate) fn preflight_reservation(
+    config: &Config,
+    request: &GoalExecutionPreflight,
+    parent: &GoalHostModelBinding,
+) -> anyhow::Result<super::GoalOperationReservation> {
+    if request.token_limit.is_none() && request.cost_limit_usd.is_none() {
+        return Ok(super::GoalOperationReservation::default());
+    }
+    let options = zeroclaw_providers::provider_runtime_options_for_agent(config, &request.agent);
+    let plan = zeroclaw_providers::resolve_routed_model_operation_plan_with_options(
+        config,
+        &parent.provider_ref,
+        &config.reliability,
+        &config.model_routes,
+        &parent.model,
+        &options,
+        &parent.model,
+    )?;
+    let input_tokens =
+        u64::try_from(serde_json::to_vec(&(&request.objective, &request.success_criteria))?.len())?;
+    let token_count = request
+        .token_limit
+        .map(|_| plan.conservative_token_reservation_for_request(input_tokens, None))
+        .transpose()?;
+    let cost_usd = request
+        .cost_limit_usd
+        .map(|_| conservative_cost_reservation(config, &plan, input_tokens))
+        .transpose()?;
+    Ok(super::GoalOperationReservation {
+        token_count,
+        cost_usd,
+    })
+}
+
+/// Run the isolated verifier through the ordinary configured provider path.
+/// Session adapters share this helper; they never manufacture a verifier
+/// provider or receive a transport-specific verifier protocol.
+pub(crate) async fn run_isolated_verifier(
+    config: &Config,
+    turn: &GoalVerifierTurn,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
+    let (provider, provider_ref, model) = crate::agent::agent::build_session_model_provider(
+        config,
+        &config.goal.verifier.provider,
+        config.goal.verifier.model.as_deref(),
+    )?;
+    let messages = vec![
+        zeroclaw_api::model_provider::ChatMessage::system(turn.system_schema),
+        zeroclaw_api::model_provider::ChatMessage::user(format!(
+            "objective:\n{}\n\nsuccess_criteria:\n{}\n\ncandidate:\n{}",
+            turn.objective, turn.success_criteria, turn.candidate
+        )),
+    ];
+    let access = crate::agent::loop_::ResolvedModelAccess {
+        model_provider: provider.as_ref(),
+        provider_name: &provider_ref,
+        model: &model,
+        temperature: None,
+    };
+    tokio::select! {
+        result = access.run_model_query(zeroclaw_providers::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        }) => result?
+            .text
+            .filter(|text| !text.trim().is_empty())
+            .context("goal verifier returned an empty response"),
+        () = cancellation.cancelled() => anyhow::bail!("goal verifier was cancelled"),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
