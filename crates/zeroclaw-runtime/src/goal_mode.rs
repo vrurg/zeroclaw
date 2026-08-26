@@ -539,6 +539,12 @@ pub trait GoalExecutor: Send + Sync {
     /// worker cancellation path.
     async fn cancel_task_and_quiesce(&self, task_id: &str) -> Result<(), ()>;
 
+    /// Wait for a terminal worker's last controller-owned action to finish
+    /// without cancelling it. In particular, a completed Goal may still be
+    /// delivering its verified candidate; replacement must not let that
+    /// delivery cross into the successor session.
+    async fn wait_task_quiescent(&self, task_id: &str) -> Result<(), ()>;
+
     /// Whether no owned worker remains for this task. Resume uses this after
     /// durable fencing so a new epoch cannot overlap a prior executor.
     async fn task_is_quiescent(&self, task_id: &str) -> bool;
@@ -646,10 +652,23 @@ impl GoalRuntime {
         {
             return Ok(GoalResponse::message(GoalMessageKey::InputTooLong));
         }
-        if let Some(current) = self.current_goal(&ingress).await?
-            && !current.task.status.is_terminal()
-        {
-            return Ok(GoalResponse::message(GoalMessageKey::AlreadyActive));
+        if let Some(current) = self.current_goal(&ingress).await? {
+            if !current.task.status.is_terminal() {
+                return Ok(GoalResponse::message(GoalMessageKey::AlreadyActive));
+            }
+            // A completed task remains the current durable Goal until this
+            // start replaces it, but its executor may still be sending the
+            // verifier-approved response. Let that exact worker settle before
+            // removal so it cannot append an old response to the successor's
+            // canonical history.
+            if self
+                .executor
+                .wait_task_quiescent(&current.task.id)
+                .await
+                .is_err()
+            {
+                return Ok(GoalResponse::message(GoalMessageKey::ExecutorQuiescing));
+            }
         }
         let (token_limit, cost_limit_usd) = match self.resolve_limits(request) {
             Ok(limits) => limits,
@@ -1418,6 +1437,7 @@ mod tests {
         preflights: Mutex<Vec<GoalExecutionPreflight>>,
         launches: Mutex<Vec<GoalExecutionScope>>,
         cancelled: Mutex<Vec<(String, i64)>>,
+        waited: Mutex<Vec<String>>,
         quiescent: Mutex<bool>,
         fail_launch: bool,
     }
@@ -1447,6 +1467,12 @@ mod tests {
 
         async fn cancel_task_and_quiesce(&self, task_id: &str) -> Result<(), ()> {
             self.cancelled.lock().push((task_id.to_owned(), -1));
+            *self.quiescent.lock() = true;
+            Ok(())
+        }
+
+        async fn wait_task_quiescent(&self, task_id: &str) -> Result<(), ()> {
+            self.waited.lock().push(task_id.to_owned());
             *self.quiescent.lock() = true;
             Ok(())
         }
@@ -1482,6 +1508,7 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancelled: Mutex::new(Vec::new()),
+            waited: Mutex::new(Vec::new()),
             quiescent: Mutex::new(true),
             fail_launch,
         });
@@ -1538,6 +1565,10 @@ mod tests {
         }
 
         async fn cancel_task_and_quiesce(&self, _: &str) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn wait_task_quiescent(&self, _: &str) -> Result<(), ()> {
             Ok(())
         }
 
@@ -1610,6 +1641,59 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_replacement_waits_for_predecessor_delivery_to_quiesce() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Started
+        );
+        let predecessor = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &predecessor.id,
+                    "session",
+                    predecessor.execution_epoch,
+                    TaskStatus::Completed,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Started
+        );
+        assert_eq!(
+            executor.waited.lock().as_slice(),
+            std::slice::from_ref(&predecessor.id)
+        );
+        assert_ne!(
+            store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            predecessor.id
+        );
     }
 
     fn preflight_for(
@@ -2263,6 +2347,7 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancelled: Mutex::new(Vec::new()),
+            waited: Mutex::new(Vec::new()),
             quiescent: Mutex::new(true),
             fail_launch: false,
         });
@@ -2566,6 +2651,7 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancelled: Mutex::new(Vec::new()),
+            waited: Mutex::new(Vec::new()),
             quiescent: Mutex::new(true),
             fail_launch: false,
         });

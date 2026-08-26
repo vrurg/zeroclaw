@@ -30,7 +30,7 @@ use super::{
     ChannelRuntimeDefaultsSnapshot, channel_message_timeout_budget_secs_with_cap,
     composite_channel_key, foreground_lock, get_or_create_provider, get_route_selection,
     normalize_cached_channel_turns, resolve_channel_thinking, runtime_defaults_snapshot,
-    system_prompt_for_channel_turn, wait_for_foreground_lease,
+    sanitize_verified_goal_delivery, system_prompt_for_channel_turn, wait_for_foreground_lease,
 };
 
 const MATRIX_ROUTE_PREFIX: &str = "matrix:";
@@ -419,6 +419,11 @@ impl GoalSessionLease for MatrixGoalSessionLease {
         if candidate.session_id != self.binding.session_id() {
             bail!("Matrix Goal delivery session does not match its lease");
         }
+        let candidate = sanitize_verified_goal_delivery(
+            &candidate.candidate,
+            self.context.tools_registry.as_ref(),
+            self.context.prompt_config.as_ref(),
+        );
         let channel_key = composite_channel_key("matrix", Some(self.route.alias.as_str()));
         let channel = self
             .context
@@ -427,14 +432,14 @@ impl GoalSessionLease for MatrixGoalSessionLease {
             .context("Matrix Goal channel alias disappeared before delivery")?;
         channel
             .send(&zeroclaw_api::channel::SendMessage::new(
-                &candidate.candidate,
+                &candidate,
                 &self.route.room_id,
             ))
             .await?;
         super::append_sender_turn(
             self.context.as_ref(),
             self.binding.session_id(),
-            zeroclaw_api::model_provider::ChatMessage::assistant(candidate.candidate),
+            zeroclaw_api::model_provider::ChatMessage::assistant(candidate),
         );
         Ok(())
     }
@@ -456,6 +461,17 @@ mod tests {
             route.canonical_session_id("@user:example.org").unwrap(),
             "matrix_primary__room_example_org__user_example_org"
         );
+    }
+
+    #[test]
+    fn verified_goal_delivery_uses_the_standard_leak_guard() {
+        let candidate = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let delivered = super::sanitize_verified_goal_delivery(
+            candidate,
+            &[],
+            &zeroclaw_config::schema::Config::default(),
+        );
+        assert!(!delivered.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
     }
 
     #[test]
