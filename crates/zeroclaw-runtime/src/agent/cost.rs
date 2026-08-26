@@ -235,6 +235,27 @@ tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
+/// Transient binding inherited by a joined foreground child of one Goal.
+/// Durable ownership remains in the task registry; this merely carries the
+/// exact parent facts across the ordinary tool boundary.
+#[derive(Clone)]
+pub(crate) struct GoalChildScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+    pub originator_route: Option<String>,
+    pub principal_id: Option<String>,
+    pub cancellation: tokio_util::sync::CancellationToken,
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_CHILD_SCOPE: Option<GoalChildScope>;
+}
+
+pub(crate) fn current_goal_child_scope() -> Option<GoalChildScope> {
+    GOAL_CHILD_SCOPE.try_with(Clone::clone).ok().flatten()
+}
+
 /// Durable tool-result pairing fence for one Goal execution scope. It is
 /// installed only by the Goal driver; ordinary turns do not observe it.
 pub(crate) struct GoalToolPhaseFence {

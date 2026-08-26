@@ -417,6 +417,18 @@ pub trait GoalTaskRegistry: Send + Sync {
         error: Option<String>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Insert one joined foreground child only while the exact parent Goal is
+    /// still the current running epoch and owns an in-flight tool phase. This
+    /// is intentionally Goal-specific: generic task insertion cannot fence a
+    /// stale Goal executor.
+    async fn create_foreground_goal_child(
+        &self,
+        parent_task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        child: TaskRecord,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     async fn admit_pending_call_with_reservation(
         &self,
         task_id: &str,

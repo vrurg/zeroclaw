@@ -797,6 +797,11 @@ pub fn all_tools_with_runtime(
     // model out from under the parent (the switch signal is process-wide).
     if is_subagent_caller {
         tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
+        if crate::agent::cost::current_goal_child_scope().is_some() {
+            tool_arcs.retain(|tool| {
+                tool.name() != SpawnSubagentTool::NAME && tool.name() != DelegateTool::NAME
+            });
+        }
     }
 
     // Register discord_search if any configured Discord alias has
@@ -3941,6 +3946,25 @@ const = true
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_subagent_registry_strips_child_creation_tools() {
+        let tmp = TempDir::new().unwrap();
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let names = crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async { registry_names(&tmp, true) })
+            .await;
+
+        assert!(!names.iter().any(|name| name == SpawnSubagentTool::NAME));
+        assert!(!names.iter().any(|name| name == DelegateTool::NAME));
     }
 
     #[test]
