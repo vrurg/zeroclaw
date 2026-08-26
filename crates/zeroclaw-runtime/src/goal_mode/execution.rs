@@ -1709,7 +1709,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
         tokio::task::yield_now().await;
         cancellation.cancel();
         task.await.unwrap();
@@ -1800,7 +1800,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
         for _ in 0..100 {
             if verifier_started.load(Ordering::Acquire) {
                 break;
@@ -1915,6 +1915,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generic_goal_runtime_modules_do_not_import_transport_or_session_store_code() {
+        let sources = [
+            include_str!("../goal_mode.rs"),
+            include_str!("execution.rs"),
+            include_str!("host.rs"),
+        ];
+        let forbidden_imports = [
+            ["crate", "matrix"].join("::"),
+            ["crate", "rpc"].join("::"),
+            ["zeroclaw", "channels"].join("_"),
+            ["zeroclaw", "gateway"].join("_"),
+            ["zerocode"].join("_"),
+            ["Acp", "SessionStore"].join(""),
+        ];
+        for source in sources {
+            for import in source
+                .lines()
+                .map(str::trim_start)
+                .filter(|line| line.starts_with("use "))
+            {
+                assert!(
+                    forbidden_imports
+                        .iter()
+                        .all(|forbidden| !import.contains(forbidden)),
+                    "generic Goal runtime module imported transport/session code: {import}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cancellation_during_an_admitted_operation_fails_outcome_unknown() {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
@@ -1978,7 +2009,7 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
         tokio::task::yield_now().await;
         cancellation.cancel();
         task.await.unwrap();
