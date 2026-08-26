@@ -4,7 +4,7 @@
 //! runtime turn through a private task-local seam and owns only Goal admission,
 //! ledger persistence, and exact pending-operation settlement.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -37,6 +37,10 @@ const VERIFIER_REASON_MAX_CHARS: usize = 2_048;
 const VERIFIER_RESPONSE_MAX_BYTES: usize = 65_536;
 const VERIFIER_BLOCKERS_MAX: usize = 16;
 const VERIFIER_BLOCKER_MESSAGE_MAX_CHARS: usize = 1_024;
+/// A lifecycle fence first asks a Goal worker to settle through its
+/// cancellation path. The bounded fallback prevents an uncooperative session
+/// adapter from retaining foreground ownership indefinitely.
+const EXECUTOR_QUIESCE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -483,7 +487,14 @@ pub struct GoalExecutionDriver {
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
-    workers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    workers: Arc<Mutex<HashMap<String, ActiveGoalWorker>>>,
+}
+
+struct ActiveGoalWorker {
+    session_id: String,
+    execution_epoch: i64,
+    cancellation: tokio_util::sync::CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 impl GoalExecutionDriver {
@@ -868,7 +879,7 @@ impl GoalExecutor for GoalExecutionDriver {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let mut workers = self.workers.lock().await;
-        workers.retain(|_, handle| !handle.is_finished());
+        workers.retain(|_, worker| !worker.handle.is_finished());
         if workers.contains_key(&scope.task_id) {
             return Err(());
         }
@@ -880,9 +891,52 @@ impl GoalExecutor for GoalExecutionDriver {
             workers: Arc::clone(&self.workers),
         };
         let key = scope.task_id.clone();
+        let session_id = scope.session_id.clone();
+        let execution_epoch = scope.execution_epoch;
+        let cancellation = scope.cancellation.clone();
         let handle = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
-        workers.insert(key, handle);
+        workers.insert(
+            key,
+            ActiveGoalWorker {
+                session_id,
+                execution_epoch,
+                cancellation,
+                handle,
+            },
+        );
         Ok(())
+    }
+
+    async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+        let worker = {
+            let mut workers = self.workers.lock().await;
+            workers.retain(|_, worker| !worker.handle.is_finished());
+            let Some(worker) = workers.get(task_id) else {
+                return Ok(());
+            };
+            if worker.session_id != session_id || worker.execution_epoch != epoch {
+                return Ok(());
+            }
+            workers.remove(task_id)
+        };
+        let Some(mut worker) = worker else {
+            return Ok(());
+        };
+        worker.cancellation.cancel();
+        let completed = tokio::time::timeout(EXECUTOR_QUIESCE_GRACE, &mut worker.handle).await;
+        match completed {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.is_cancelled() => Ok(()),
+            Ok(Err(_)) => Err(()),
+            Err(_) => {
+                worker.handle.abort();
+                match worker.handle.await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Err(_) => Err(()),
+                }
+            }
+        }
     }
 }
 
@@ -1012,7 +1066,7 @@ mod tests {
         control_plane::{GoalTaskRegistry, SqliteTaskStore, TaskStatus},
         goal_mode::{
             GoalBudgetRequest, GoalCommand, GoalExecutionPreflight, GoalExecutionScope,
-            GoalOperationReservation, GoalRuntime,
+            GoalExecutor, GoalOperationReservation, GoalRuntime,
             host::{
                 GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
                 GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
@@ -1641,7 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_a_clean_parent_turn_pauses_the_exact_goal() {
+    async fn executor_cancellation_gracefully_settles_a_clean_parent_turn() {
         let mut config = Config::default();
         config.goal.enabled = true;
         config.goal.verifier.provider = "openai.verifier".into();
@@ -1697,7 +1751,6 @@ mod tests {
                 .unwrap(),
             crate::control_plane::GoalTransitionResult::Applied
         );
-        let cancellation = tokio_util::sync::CancellationToken::new();
         let scope = GoalExecutionScope {
             task_id: "goal-task".into(),
             session_id: "session".into(),
@@ -1705,14 +1758,13 @@ mod tests {
                 .unwrap(),
             execution_epoch: 1,
             turn_kind: crate::goal_mode::GoalTurnKind::Start,
-            cancellation: cancellation.clone(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        driver.launch(scope).await.unwrap();
         tokio::task::yield_now().await;
-        cancellation.cancel();
-        task.await.unwrap();
+        driver.cancel("goal-task", "session", 1).await.unwrap();
         let current = store
             .current_goal_for_session("session")
             .await
