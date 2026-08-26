@@ -1022,6 +1022,7 @@ mod tests {
         deadline: Option<tokio::time::Instant>,
         parent_never_returns: bool,
         parent_waits_for_cancellation: bool,
+        preflight_error: Option<GoalHostPreflightError>,
     }
 
     struct Lease {
@@ -1055,6 +1056,9 @@ mod tests {
             _binding: &GoalSessionBinding,
             _request: &GoalExecutionPreflight,
         ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            if let Some(error) = self.preflight_error {
+                return Err(error);
+            }
             Ok(GoalOperationReservation {
                 token_count: Some(1),
                 cost_usd: None,
@@ -1374,6 +1378,7 @@ mod tests {
             deadline: None,
             parent_never_returns: false,
             parent_waits_for_cancellation: false,
+            preflight_error: None,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
             host,
@@ -1434,6 +1439,7 @@ mod tests {
             deadline: Some(tokio::time::Instant::now()),
             parent_never_returns: true,
             parent_waits_for_cancellation: false,
+            preflight_error: None,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
             host,
@@ -1543,6 +1549,7 @@ mod tests {
                 deadline: None,
                 parent_never_returns: false,
                 parent_waits_for_cancellation: true,
+                preflight_error: None,
             })])),
             goals.clone(),
             Arc::clone(&config),
@@ -1611,6 +1618,81 @@ mod tests {
                 .pause_reason,
             Some(crate::control_plane::GoalPauseReason::OperatorPaused)
         );
+    }
+
+    #[tokio::test]
+    async fn execution_driver_preserves_host_preflight_classes() {
+        let cases = [
+            (
+                GoalHostPreflightError::BindingUnavailable,
+                crate::goal_mode::GoalMessageKey::BindingUnavailable,
+            ),
+            (
+                GoalHostPreflightError::VerifierUnavailable,
+                crate::goal_mode::GoalMessageKey::VerifierUnavailable,
+            ),
+            (
+                GoalHostPreflightError::ReservationUnavailable,
+                crate::goal_mode::GoalMessageKey::ReservationUnavailable,
+            ),
+            (
+                GoalHostPreflightError::PricingUnavailable,
+                crate::goal_mode::GoalMessageKey::PricingUnavailable,
+            ),
+        ];
+        for (preflight_error, expected) in cases {
+            let mut config = Config::default();
+            config.goal.enabled = true;
+            config.goal.verifier.provider = "openai.verifier".into();
+            let _ = config.providers.models.ensure("openai", "verifier");
+            let config = Arc::new(config);
+            let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+            let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+            let directory = tempfile::tempdir().unwrap();
+            let tracker =
+                Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+            let driver = Arc::new(GoalExecutionDriver::new(
+                Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
+                    leave_tool_phase_in_flight: false,
+                    deadline: None,
+                    parent_never_returns: false,
+                    parent_waits_for_cancellation: false,
+                    preflight_error: Some(preflight_error),
+                })])),
+                goals.clone(),
+                Arc::clone(&config),
+                Arc::clone(&tracker),
+            ));
+            let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+            let budget = if preflight_error == GoalHostPreflightError::PricingUnavailable {
+                GoalBudgetRequest::Limits {
+                    token_limit: None,
+                    cost_limit_usd: Some(1.0),
+                }
+            } else {
+                GoalBudgetRequest::Unlimited
+            };
+            let response = runtime
+                .submit(
+                    crate::goal_mode::GoalIngressContext::trusted("session", "main", "route", None)
+                        .unwrap(),
+                    GoalCommand::Start {
+                        budget,
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.key, expected);
+            assert!(
+                store
+                    .current_goal_for_session("session")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
