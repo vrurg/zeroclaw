@@ -1538,8 +1538,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_admission_rejects_limits_replaced_after_reservation() {
-        let store = SqliteTaskStore::new_in_memory().unwrap();
+    async fn pending_admission_rejects_limits_replaced_by_another_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        let updater = SqliteTaskStore::new(directory.path()).unwrap();
         let task = session_goal_task("goal-1", "session-1");
         let mut goal = goal_record("goal-1", "ship it");
         goal.effective_token_limit = Some(100);
@@ -1552,7 +1554,7 @@ mod tests {
         );
 
         assert_eq!(
-            store
+            updater
                 .update_session_goal_limits("goal-1", "session-1", 1, Some(1), None)
                 .await
                 .unwrap(),
