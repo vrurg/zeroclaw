@@ -1021,11 +1021,13 @@ mod tests {
         leave_tool_phase_in_flight: bool,
         deadline: Option<tokio::time::Instant>,
         parent_never_returns: bool,
+        parent_waits_for_cancellation: bool,
     }
 
     struct Lease {
         leave_tool_phase_in_flight: bool,
         parent_never_returns: bool,
+        parent_waits_for_cancellation: bool,
     }
 
     struct ContinueAdapter {
@@ -1084,6 +1086,7 @@ mod tests {
             Ok(Box::new(Lease {
                 leave_tool_phase_in_flight: self.leave_tool_phase_in_flight,
                 parent_never_returns: self.parent_never_returns,
+                parent_waits_for_cancellation: self.parent_waits_for_cancellation,
             }))
         }
     }
@@ -1188,6 +1191,10 @@ mod tests {
         ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
             if self.parent_never_returns {
                 std::future::pending::<()>().await;
+            }
+            if self.parent_waits_for_cancellation {
+                _cancellation.cancelled().await;
+                anyhow::bail!("simulated clean operation cancellation");
             }
             crate::agent::cost::begin_goal_tool_phase_if_scoped().await?;
             if self.leave_tool_phase_in_flight {
@@ -1366,6 +1373,7 @@ mod tests {
             leave_tool_phase_in_flight: false,
             deadline: None,
             parent_never_returns: false,
+            parent_waits_for_cancellation: false,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
             host,
@@ -1425,6 +1433,7 @@ mod tests {
             leave_tool_phase_in_flight: false,
             deadline: Some(tokio::time::Instant::now()),
             parent_never_returns: true,
+            parent_waits_for_cancellation: false,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
             host,
@@ -1515,6 +1524,93 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("admitted Goal did not time out");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_a_clean_parent_turn_pauses_the_exact_goal() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
+                leave_tool_phase_in_flight: false,
+                deadline: None,
+                parent_never_returns: false,
+                parent_waits_for_cancellation: true,
+            })])),
+            goals.clone(),
+            Arc::clone(&config),
+            tracker,
+        );
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: cancellation.clone(),
+            deadline: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        task.await.unwrap();
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Paused);
+        assert_eq!(
+            store
+                .get_goal_task(&current.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(crate::control_plane::GoalPauseReason::OperatorPaused)
+        );
     }
 
     #[tokio::test]
