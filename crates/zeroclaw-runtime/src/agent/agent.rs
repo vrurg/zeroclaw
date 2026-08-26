@@ -12,6 +12,7 @@ use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 #[cfg(test)]
@@ -1063,6 +1064,134 @@ impl Agent {
 
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
+    }
+
+    /// Build a detached provider-visible history prefix for a Goal lease.
+    ///
+    /// Goal execution may extend this copy with directives, tool calls, and
+    /// verifier feedback, but it must not mutate canonical session history
+    /// until a verifier-approved completion is committed by the controller.
+    pub(crate) fn goal_working_history(&self) -> Result<Vec<ChatMessage>> {
+        if self.history.is_empty() {
+            return Ok(vec![ChatMessage::system(self.build_system_prompt()?)]);
+        }
+        Ok(self.tool_dispatcher.to_provider_messages(&self.history))
+    }
+
+    /// Return the current session-owned parent model binding for Goal
+    /// preflight. This is not provider construction: the ordinary configured
+    /// provider path remains the execution authority.
+    pub(crate) fn goal_model_binding(&self) -> (String, String) {
+        (self.model_provider_name.clone(), self.model_name.clone())
+    }
+
+    /// Append the only verifier-approved Goal completion to canonical history.
+    ///
+    /// The Goal controller calls this after its guarded `Completed`
+    /// transition; rejected candidates and working transcripts never reach
+    /// canonical history.
+    pub(crate) fn append_verified_goal_candidate(&mut self, candidate: String) {
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::assistant(candidate)));
+    }
+
+    /// Run a Goal-owned parent tool turn over its caller-owned working
+    /// transcript. This intentionally omits normal user-ingress side effects
+    /// (history replay, autosave, cache, steering, and transport delivery).
+    pub(crate) async fn run_goal_parent_turn(
+        &mut self,
+        working_history: &mut Vec<ChatMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<String> {
+        let tool_protocol_prompts = self.tool_protocol_prompts()?;
+        let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
+            self.channel_handles.ask_user.as_ref().map(|handles| {
+                Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
+                    Arc::clone(handles),
+                    self.approval_route.clone(),
+                )) as Box<dyn zeroclaw_api::channel::Channel>
+            });
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+        };
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+        let agent_alias = self.observer_agent_alias();
+        let turn_id = Self::new_turn_id();
+
+        crate::agent::turn::scope_tool_protocol_prompts(
+            tool_protocol_prompts,
+            crate::agent::tool_receipts::scope_receipts(
+                receipt_scope.clone(),
+                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                        crate::agent::loop_::ResolvedModelAccess {
+                            model_provider: self.model_provider.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &self.model_name,
+                            temperature: self.temperature,
+                        },
+                        crate::agent::loop_::ResolvedIo {
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            silent: false,
+                            approval: self.approval_manager.as_deref(),
+                            multimodal_config: &self.multimodal_config,
+                            config: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|config| config.config.as_deref()),
+                            hooks: self.hook_runner.as_deref(),
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            receipt_generator: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                        },
+                        crate::agent::loop_::ResolvedRuntimeKnobs {
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.effective_context_budget(),
+                            knobs: &knobs,
+                        },
+                    ),
+                    history: working_history,
+                    channel_name: &self.channel_name,
+                    channel_reply_target: None,
+                    cancellation_token: Some(cancellation),
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: approval_bridge.as_deref(),
+                    collected_receipts: receipt_scope
+                        .as_ref()
+                        .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: Some(&mut self.image_cache),
+                    memory: None,
+                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                    agent_alias: agent_alias.as_deref(),
+                    parent_agent_alias: None,
+                    turn_id: &turn_id,
+                    sop_reassembly: None,
+                }),
+            ),
+        )
+        .await
     }
 
     pub fn channel_handles(&self) -> &AgentChannelHandles {
