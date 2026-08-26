@@ -888,10 +888,13 @@ mod tests {
 
     struct Adapter {
         leave_tool_phase_in_flight: bool,
+        deadline: Option<tokio::time::Instant>,
+        parent_never_returns: bool,
     }
 
     struct Lease {
         leave_tool_phase_in_flight: bool,
+        parent_never_returns: bool,
     }
 
     struct ContinueAdapter {
@@ -935,7 +938,7 @@ mod tests {
             &self,
             _binding: &GoalSessionBinding,
         ) -> anyhow::Result<Option<tokio::time::Instant>> {
-            Ok(None)
+            Ok(self.deadline)
         }
 
         async fn acquire(
@@ -945,6 +948,7 @@ mod tests {
         ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
             Ok(Box::new(Lease {
                 leave_tool_phase_in_flight: self.leave_tool_phase_in_flight,
+                parent_never_returns: self.parent_never_returns,
             }))
         }
     }
@@ -1005,6 +1009,9 @@ mod tests {
             _turn: GoalParentTurn,
             _cancellation: tokio_util::sync::CancellationToken,
         ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
+            if self.parent_never_returns {
+                std::future::pending::<()>().await;
+            }
             crate::agent::cost::begin_goal_tool_phase_if_scoped().await?;
             if self.leave_tool_phase_in_flight {
                 anyhow::bail!("simulated tool-result pairing failure");
@@ -1136,6 +1143,8 @@ mod tests {
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
         let host = Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
             leave_tool_phase_in_flight: false,
+            deadline: None,
+            parent_never_returns: false,
         })]));
         let driver = Arc::new(GoalExecutionDriver::new(
             host,
@@ -1178,6 +1187,58 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("generic Goal driver did not complete the exact session task");
+    }
+
+    #[tokio::test]
+    async fn inherited_host_deadline_transitions_the_running_goal_to_timed_out() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let host = Arc::new(GoalExecutionHost::new(vec![Arc::new(Adapter {
+            leave_tool_phase_in_flight: false,
+            deadline: Some(tokio::time::Instant::now()),
+            parent_never_returns: true,
+        })]));
+        let driver = Arc::new(GoalExecutionDriver::new(
+            host,
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        let ingress =
+            crate::goal_mode::GoalIngressContext::trusted("session", "main", "route", None)
+                .unwrap();
+
+        runtime
+            .submit(
+                ingress,
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    objective: "objective".into(),
+                    success_criteria: "criteria".into(),
+                },
+            )
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_some_and(|task| task.status == TaskStatus::TimedOut)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("Goal did not transition to timed out after its inherited deadline");
     }
 
     #[tokio::test]
