@@ -1045,6 +1045,10 @@ mod tests {
 
     struct AdmittingDeadlineLease;
 
+    struct AdmittingCancellationAdapter;
+
+    struct AdmittingCancellationLease;
+
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
         fn owns(&self, binding: &GoalSessionBinding) -> bool {
@@ -1181,6 +1185,46 @@ mod tests {
     }
 
     #[async_trait]
+    impl GoalSessionAdapter for AdmittingCancellationAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "admitting-cancellation-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(AdmittingCancellationLease))
+        }
+    }
+
+    #[async_trait]
     impl GoalSessionLease for Lease {
         fn working_history(
             &self,
@@ -1289,6 +1333,50 @@ mod tests {
             .await?;
             std::future::pending::<()>().await;
             unreachable!()
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _turn: GoalVerifierTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: super::super::host::GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionLease for AdmittingCancellationLease {
+        fn working_history(
+            &self,
+        ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _turn: GoalParentTurn,
+            cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
+            crate::agent::cost::admit_goal_operation_if_scoped(
+                crate::agent::cost::GoalOperationRequest {
+                    model_provider: "test.provider".into(),
+                    model: "test-model".into(),
+                    temperature: None,
+                    thinking: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                },
+            )
+            .await?;
+            cancellation.cancelled().await;
+            anyhow::bail!("simulated unsettled operation cancellation");
         }
 
         async fn run_verifier(
@@ -1618,6 +1706,87 @@ mod tests {
                 .pause_reason,
             Some(crate::control_plane::GoalPauseReason::OperatorPaused)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_an_admitted_operation_fails_outcome_unknown() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                AdmittingCancellationAdapter,
+            )])),
+            goals.clone(),
+            Arc::new(Config::default()),
+            tracker,
+        );
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-task".into(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("admitting-cancellation-route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = crate::control_plane::GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            crate::control_plane::GoalTransitionResult::Applied
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let scope = GoalExecutionScope {
+            task_id: "goal-task".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new(
+                "session".into(),
+                "main".into(),
+                "admitting-cancellation-route".into(),
+                None,
+            )
+            .unwrap(),
+            execution_epoch: 1,
+            turn_kind: crate::goal_mode::GoalTurnKind::Start,
+            cancellation: cancellation.clone(),
+            deadline: None,
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let task = tokio::spawn(async move { driver.run_scope(scope).await });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        task.await.unwrap();
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(goal.pending_call_id.is_none());
     }
 
     #[tokio::test]
