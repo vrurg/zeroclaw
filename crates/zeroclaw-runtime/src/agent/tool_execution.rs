@@ -273,14 +273,27 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
+    let goal_child_tool = crate::agent::cost::current_goal_child_scope().is_some()
+        && matches!(
+            call_name,
+            crate::tools::SpawnSubagentTool::NAME | crate::tools::DelegateTool::NAME
+        );
+
     let tool_future = tool
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
+            if goal_child_tool {
+                // A joined child owns durable settlement. Its derived token
+                // stops work; the parent must await the child cleanup rather
+                // than drop that future on the outer cancellation path.
+                Ok(tool_future.await)
+            } else {
+                tokio::select! {
+                    () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
+                    result = tool_future => Ok(result),
+                }
             }
         } else {
             Ok(tool_future.await)
@@ -331,6 +344,10 @@ pub(crate) async fn execute_one_tool(
                             })),
                         format!("tool failed: {call_name}")
                     );
+                }
+                if goal_child_tool && !r.success {
+                    let reason = r.error.as_deref().unwrap_or_else(|| r.output.as_str());
+                    anyhow::bail!("goal foreground child failed: {reason}");
                 }
                 if r.success {
                     let normalized_output = if r.output.is_empty() {
@@ -386,6 +403,9 @@ pub(crate) async fn execute_one_tool(
                 }
             }
             Err(e) => {
+                if goal_child_tool {
+                    return Err(e);
+                }
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -470,6 +490,15 @@ pub fn should_execute_tools_in_parallel(
     // race condition where the tool lookup happens before activation completes.
     // Force sequential execution whenever tool_search is in the batch.
     if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
+    if crate::agent::cost::current_goal_child_scope().is_some()
+        && tool_calls.iter().any(|call| {
+            call.name == crate::tools::SpawnSubagentTool::NAME
+                || call.name == crate::tools::DelegateTool::NAME
+        })
+    {
         return false;
     }
 
@@ -583,6 +612,8 @@ mod tests {
         invocations: Arc<AtomicUsize>,
     }
 
+    struct FailingGoalChildTool;
+
     impl CountingTool {
         fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
             Self {
@@ -598,6 +629,16 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "test-counting-tool"
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingGoalChildTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-failing-goal-child"
         }
     }
 
@@ -644,6 +685,32 @@ mod tests {
                 success: true,
                 output: "executed via poisoned lock recovery".into(),
                 error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingGoalChildTool {
+        fn name(&self) -> &str {
+            crate::tools::SpawnSubagentTool::NAME
+        }
+
+        fn description(&self) -> &str {
+            "Fails as a Goal child"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: crate::tools::ToolOutput::default(),
+                error: Some("child provider failed".into()),
             })
         }
     }
@@ -761,6 +828,51 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn goal_child_tool_failure_aborts_the_parent_turn() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(FailingGoalChildTool)];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "goal-child-failure",
+            channel_name: "test",
+        };
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let result = crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(
+                Some(scope),
+                execute_one_tool(
+                    crate::tools::SpawnSubagentTool::NAME,
+                    serde_json::json!({}),
+                    None,
+                    ToolDispatchContext {
+                        tools_registry: &tools,
+                        activated_tools: None,
+                        excluded_tools: &[],
+                        model_switch_callback: None,
+                    },
+                    &meta,
+                    &NoopObserver,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await;
+        let error = result
+            .err()
+            .expect("Goal child failure must abort the parent");
+        assert!(error.to_string().contains("goal foreground child failed"));
+    }
+
     use super::should_execute_tools_in_parallel;
     use crate::agent::loop_::ParsedToolCall;
     use crate::approval::ApprovalManager;
@@ -830,6 +942,28 @@ mod tests {
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
         );
+    }
+
+    #[tokio::test]
+    async fn goal_child_creation_in_batch_forces_serial() {
+        let calls = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call(crate::tools::SpawnSubagentTool::NAME),
+        ];
+        let scope = crate::agent::cost::GoalChildScope {
+            task_id: "goal-task".into(),
+            session_id: "goal-session".into(),
+            execution_epoch: 1,
+            originator_route: None,
+            principal_id: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        crate::agent::cost::GOAL_CHILD_SCOPE
+            .scope(Some(scope), async {
+                assert!(!should_execute_tools_in_parallel(&calls, None));
+            })
+            .await;
     }
 
     // --- approval-required + control branches---

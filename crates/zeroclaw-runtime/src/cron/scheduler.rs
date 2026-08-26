@@ -847,6 +847,7 @@ async fn run_agent_job(
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
+        cancellation_token: None,
         is_subagent: false,
         // `uses_memory = false` fully opts the job out of the engine's
         // memory-context injection (stateless digest jobs)...

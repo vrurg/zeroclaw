@@ -693,14 +693,24 @@ impl GoalExecutionDriver {
                     Some(Arc::clone(&accounting)),
                     crate::agent::cost::GOAL_TOOL_PHASE_FENCE.scope(
                         Some(Arc::clone(&tool_phase_fence)),
-                        lease.run_parent_turn(
-                            GoalParentTurn {
-                                objective: goal.objective.clone(),
-                                success_criteria: goal.success_criteria.clone(),
-                                turn_kind,
-                                working_history,
-                            },
-                            scope.cancellation.child_token(),
+                        crate::agent::cost::GOAL_CHILD_SCOPE.scope(
+                            Some(crate::agent::cost::GoalChildScope {
+                                task_id: scope.task_id.clone(),
+                                session_id: scope.session_id.clone(),
+                                execution_epoch: scope.execution_epoch,
+                                originator_route: task.originator_route.clone(),
+                                principal_id: task.principal_id.clone(),
+                                cancellation: scope.cancellation.clone(),
+                            }),
+                            lease.run_parent_turn(
+                                GoalParentTurn {
+                                    objective: goal.objective.clone(),
+                                    success_criteria: goal.success_criteria.clone(),
+                                    turn_kind,
+                                    working_history,
+                                },
+                                scope.cancellation.child_token(),
+                            ),
                         ),
                     ),
                 ),

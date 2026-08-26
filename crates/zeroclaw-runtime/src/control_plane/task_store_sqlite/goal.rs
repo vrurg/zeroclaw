@@ -1216,6 +1216,54 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn create_foreground_goal_child(
+        &self,
+        parent_task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        child: TaskRecord,
+    ) -> Result<GoalTransitionResult> {
+        if child.id.trim().is_empty()
+            || !matches!(child.kind, TaskKind::Delegate | TaskKind::Subagent)
+            || child.status != TaskStatus::Running
+            || child.finished_at.is_some()
+            || child.parent_id.as_deref() != Some(parent_task_id)
+            || child.session_id.as_deref() != Some(session_id)
+            || child.execution_epoch != expected_epoch
+        {
+            anyhow::bail!("invalid foreground Goal child binding");
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start guarded foreground Goal child creation")?;
+        let parent_is_current = tx
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                       AND status = 'running' AND execution_epoch = ?3
+                       AND EXISTS (
+                           SELECT 1 FROM goal_tasks
+                            WHERE task_id = tasks.id AND tool_phase = 'in_flight'
+                       )
+                )",
+                params![parent_task_id, session_id, expected_epoch],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("verify exact parent Goal child binding")?;
+        if !parent_is_current {
+            return transition_failure(&tx, parent_task_id, session_id);
+        }
+        if insert_task_record(&tx, child)? != 1 {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        tx.commit()
+            .context("commit guarded foreground Goal child creation")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn admit_pending_call_with_reservation(
         &self,
         task_id: &str,
@@ -1759,6 +1807,87 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn fenced_file_backed_goal_cannot_create_a_foreground_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let creator = SqliteTaskStore::new(dir.path()).unwrap();
+        let fencer = SqliteTaskStore::new(dir.path()).unwrap();
+        assert_eq!(
+            creator
+                .create_or_replace_session_goal(
+                    session_goal_task("goal-parent", "goal-session"),
+                    goal_record("goal-parent", "objective"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            creator
+                .begin_goal_tool_phase("goal-parent", "goal-session", 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let mut admitted_child = rec("admitted-child", "main", 1, "boot-1");
+        admitted_child.parent_id = Some("goal-parent".into());
+        admitted_child.session_id = Some("goal-session".into());
+        admitted_child.execution_epoch = 1;
+        assert_eq!(
+            creator
+                .create_foreground_goal_child("goal-parent", "goal-session", 1, admitted_child,)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(creator.get("admitted-child").await.unwrap().is_some());
+
+        let mut unrelated_child = rec("peer-inbox-child", "main", 1, "boot-1");
+        unrelated_child.kind = TaskKind::PeerInbox;
+        unrelated_child.parent_id = Some("goal-parent".into());
+        unrelated_child.session_id = Some("goal-session".into());
+        unrelated_child.execution_epoch = 1;
+        let error = creator
+            .create_foreground_goal_child("goal-parent", "goal-session", 1, unrelated_child)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid foreground Goal child binding")
+        );
+        assert!(creator.get("peer-inbox-child").await.unwrap().is_none());
+        assert_eq!(
+            fencer
+                .pause_session_goal(
+                    "goal-parent",
+                    "goal-session",
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let mut child = rec("fenced-child", "main", 1, "boot-1");
+        child.parent_id = Some("goal-parent".into());
+        child.session_id = Some("goal-session".into());
+        child.execution_epoch = 1;
+        assert_eq!(
+            creator
+                .create_foreground_goal_child("goal-parent", "goal-session", 1, child)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert!(creator.get("fenced-child").await.unwrap().is_none());
     }
 
     #[tokio::test]

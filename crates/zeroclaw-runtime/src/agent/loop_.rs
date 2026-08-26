@@ -1083,6 +1083,8 @@ pub fn apply_text_tool_prompt_policy(
 pub struct AgentRunOverrides {
     pub security: Option<Arc<SecurityPolicy>>,
     pub memory: Option<Arc<dyn Memory>>,
+    /// Parent cancellation inherited by a joined foreground child.
+    pub cancellation_token: Option<CancellationToken>,
     pub is_subagent: bool,
     /// Spawn-site opt-out of the engine's memory-context injection (e.g. a
     /// cron job configured with `uses_memory = false`). Default `false`.
@@ -1270,6 +1272,7 @@ pub async fn run(
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
+        let inherited_cancellation = overrides.cancellation_token.clone();
         let suppress_memory_inject = overrides.suppress_memory_inject;
         let memory_free = overrides.memory_free;
         let security = match overrides.security {
@@ -1971,7 +1974,7 @@ pub async fn run(
                                 history: &mut history,
                                 channel_name,
                                 channel_reply_target: None,
-                                cancellation_token: None,
+                                cancellation_token: inherited_cancellation.clone(),
                                 on_delta: None,
                                 shared_budget: None,
                                 channel: None,
@@ -2450,7 +2453,7 @@ pub async fn run(
                 });
 
                 // Ctrl+C cancels the in-flight turn instead of killing the process.
-                let cancel_token = CancellationToken::new();
+                let cancel_token = inherited_cancellation.clone().unwrap_or_default();
                 let cancel_token_clone = cancel_token.clone();
                 let ctrlc_handle = zeroclaw_spawn::spawn!(async move {
                     if tokio::signal::ctrl_c().await.is_ok() {
