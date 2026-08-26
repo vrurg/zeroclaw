@@ -44,7 +44,7 @@ const VERIFIER_BLOCKER_MESSAGE_MAX_CHARS: usize = 1_024;
 /// Derive the conservative reservation used by a live-session adapter before
 /// admission. The calculation is shared, so RPC and future channel adapters
 /// cannot drift in their Reliable-route or pricing interpretation.
-pub(crate) fn preflight_reservation(
+pub fn preflight_reservation(
     config: &Config,
     request: &GoalExecutionPreflight,
     parent: &GoalHostModelBinding,
@@ -81,7 +81,7 @@ pub(crate) fn preflight_reservation(
 /// Run the isolated verifier through the ordinary configured provider path.
 /// Session adapters share this helper; they never manufacture a verifier
 /// provider or receive a transport-specific verifier protocol.
-pub(crate) async fn run_isolated_verifier(
+pub async fn run_isolated_verifier(
     config: &Config,
     turn: &GoalVerifierTurn,
     cancellation: tokio_util::sync::CancellationToken,
