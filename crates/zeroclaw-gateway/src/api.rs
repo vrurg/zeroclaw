@@ -1831,6 +1831,16 @@ pub async fn handle_api_session_message_post(
         }
     };
 
+    // Deletion shares this queue. Re-check after waiting so a queued POST
+    // cannot recreate metadata that DELETE removed while it was pending.
+    if !backend.session_exists(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
     if let Err(e) = backend.append(&session_key, &message) {
         return (
@@ -1901,8 +1911,34 @@ pub async fn handle_api_session_delete(
         );
     }
 
+    // Wait for the cancelled turn's finalization path before deleting durable
+    // state. The turn and deletion therefore share one serialization boundary.
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
+            )
+                .into_response();
+        }
+    };
+
     match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
+        Ok(true) => {
+            // Invalidate every already-connected holder only after durable
+            // deletion succeeds. A successor that later reuses this ID gets
+            // the new incarnation.
+            state.session_queue.invalidate(&session_key).await;
+            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -3252,7 +3288,7 @@ pub(crate) mod tests {
         assert!(channel["readiness"].get("health").is_none());
     }
 
-    fn test_state_with_session_backend(
+    pub(crate) fn test_state_with_session_backend(
         config: zeroclaw_config::schema::Config,
         backend: Arc<dyn SessionBackend>,
     ) -> AppState {
@@ -3436,6 +3472,56 @@ pub(crate) mod tests {
         let messages = backend.load("gw_operator-1");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "queued notification");
+    }
+
+    #[tokio::test]
+    async fn session_message_post_does_not_recreate_a_session_deleted_while_queued() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let response_fut = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "stale queued notification"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should be queued before deletion"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!backend.session_exists("gw_operator-1"));
+        assert!(backend.load("gw_operator-1").is_empty());
     }
 
     #[test]

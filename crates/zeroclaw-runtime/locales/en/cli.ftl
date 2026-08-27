@@ -964,6 +964,7 @@ channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized fo
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
+channel-runtime-session-prompt-load-failed = ⚠️ I couldn't load the persistent session context, so this request was not sent to the model.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`

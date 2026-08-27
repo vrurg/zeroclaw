@@ -11,6 +11,10 @@ use tokio::time::Instant;
 /// Per-session serialization queue.
 pub struct SessionActorQueue {
     slots: Mutex<HashMap<String, Arc<SessionSlot>>>,
+    /// Per-session incarnation counters. Deletion advances the counter while
+    /// holding the session queue; long-lived holders use it to reject writes
+    /// from a predecessor after an ID is reused.
+    generations: Mutex<HashMap<String, u64>>,
     max_queue_depth: usize,
     lock_timeout: Duration,
     idle_ttl: Duration,
@@ -72,12 +76,32 @@ impl SessionActorQueue {
     pub fn new(max_queue_depth: usize, lock_timeout_secs: u64, idle_ttl_secs: u64) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
             max_queue_depth,
             lock_timeout: Duration::from_secs(lock_timeout_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
             #[cfg(test)]
             registration_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Return the current lifecycle incarnation for a session key.
+    pub async fn generation(&self, session_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .await
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Invalidate all holders of the current incarnation. Must be called
+    /// while holding this session's [`SessionGuard`].
+    pub async fn invalidate(&self, session_id: &str) -> u64 {
+        let mut generations = self.generations.lock().await;
+        let generation = generations.entry(session_id.to_string()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+        *generation
     }
 
     /// Acquire exclusive access to a session. Blocks until the session is free
@@ -184,6 +208,25 @@ mod tests {
         let guard1 = queue.acquire("s1").await.unwrap();
         drop(guard1);
         let _guard2 = queue.acquire("s1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidation_advances_the_session_incarnation() {
+        let queue = SessionActorQueue::new(8, 5, 600);
+        assert_eq!(queue.generation("s1").await, 0);
+        let guard = queue.acquire("s1").await.unwrap();
+        assert_eq!(queue.invalidate("s1").await, 1);
+        drop(guard);
+        assert_eq!(queue.generation("s1").await, 1);
+    }
+
+    #[tokio::test]
+    async fn generation_reads_do_not_retain_unseen_session_ids() {
+        let queue = SessionActorQueue::new(8, 5, 600);
+        for i in 0..128 {
+            assert_eq!(queue.generation(&format!("unseen-{i}")).await, 0);
+        }
+        assert!(queue.generations.lock().await.is_empty());
     }
 
     #[tokio::test]

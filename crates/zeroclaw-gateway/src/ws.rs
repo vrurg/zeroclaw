@@ -350,6 +350,10 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // DELETE advances this queue-owned value while holding the same queue.
+    // This connection can therefore never write into a successor that reuses
+    // its caller-selected session ID.
+    let session_generation = state.session_queue.generation(&session_key).await;
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -610,6 +614,15 @@ async fn handle_socket(
                             return;
                         }
                     };
+                    if state.session_queue.generation(&session_key).await != session_generation {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": "Session not found",
+                            "code": "SESSION_NOT_FOUND"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        return;
+                    }
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -781,6 +794,16 @@ async fn handle_socket(
                         continue;
                     }
                 };
+                if state.session_queue.generation(&session_key).await != session_generation
+                {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Session not found",
+                        "code": "SESSION_NOT_FOUND"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
 
                 process_chat_message(
                     &state,
@@ -1868,6 +1891,128 @@ data: {\"type\":\"message_stop\"}\n\n",
 
         gateway_server.abort();
         mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn deleted_websocket_cannot_write_into_a_same_id_successor() {
+        use axum::extract::Path;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("gateway data directory");
+        config.memory.backend = "none".to_string();
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(config.data_dir.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = crate::api::tests::test_state_with_session_backend(config, backend.clone());
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let (mut socket, _) = connect_async(format!(
+            "ws://{address}/ws/chat?agent=web&session_id=delete-race"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+        let _ = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+
+        let deleted = crate::api::handle_api_session_delete(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            Path("delete-race".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(deleted.status(), axum::http::StatusCode::OK);
+        assert!(!backend.session_exists("gw_delete-race"));
+
+        // Simulate a fresh connection creating the same caller-selected ID.
+        backend
+            .append(
+                "gw_delete-race",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "stale write"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("stale connection can send its frame");
+        let frame = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("deletion rejection deadline")
+            .expect("stale connection remains readable")
+            .expect("rejection frame");
+        let frame: serde_json::Value =
+            serde_json::from_str(&frame.into_text().expect("text rejection frame"))
+                .expect("JSON rejection frame");
+        assert_eq!(frame["code"], "SESSION_NOT_FOUND");
+        let messages = backend.load("gw_delete-race");
+        assert_eq!(
+            messages.len(),
+            1,
+            "predecessor must not contaminate successor"
+        );
+        assert_eq!(messages[0].content, "successor");
+        server.abort();
     }
 
     #[tokio::test]

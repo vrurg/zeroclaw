@@ -7,6 +7,9 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_infra::session_backend::{
+    ScopedSessionBackend, SessionBackend, TOOL_LOOP_SESSION_BACKEND,
+};
 
 pub enum TurnOutcome {
     Completed {
@@ -71,6 +74,7 @@ pub async fn execute_turn<F, Fut>(
     cancel: CancellationToken,
     attribution: TurnAttribution,
     cost_context: Option<ToolLoopCostTrackingContext>,
+    session_prompt_backend: Option<Arc<dyn SessionBackend>>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -84,32 +88,40 @@ where
     let mut turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
-            use ::zeroclaw_log::Instrument as _;
-            let span = ::zeroclaw_log::info_span!(
-                target: "zeroclaw_log_internal_scope",
-                "zeroclaw_scope",
-                session_key = %sk.as_deref().unwrap_or(""),
-                agent_alias = %attribution.agent_alias,
-                model_provider = %attribution.model_provider,
-                model = %attribution.model,
-                channel = %attribution.channel,
-            );
-            TOOL_LOOP_COST_TRACKING_CONTEXT
-                .scope(
-                    cost_context,
-                    guard
-                        .turn_streamed_with_steering_state(
-                            &prompt,
-                            event_tx,
-                            Some(cancel_clone),
-                            None,
-                        )
-                        .instrument(span),
-                )
-                .await
-        })
-        .await
+        let session_prompt_tools_allowed = session_prompt_backend.is_some();
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                session_prompt_tools_allowed,
+                TOOL_LOOP_SESSION_BACKEND.scope(
+                    session_prompt_backend.map(ScopedSessionBackend),
+                    crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+                        use ::zeroclaw_log::Instrument as _;
+                        let span = ::zeroclaw_log::info_span!(
+                            target: "zeroclaw_log_internal_scope",
+                            "zeroclaw_scope",
+                            session_key = %sk.as_deref().unwrap_or(""),
+                            agent_alias = %attribution.agent_alias,
+                            model_provider = %attribution.model_provider,
+                            model = %attribution.model,
+                            channel = %attribution.channel,
+                        );
+                        TOOL_LOOP_COST_TRACKING_CONTEXT
+                            .scope(
+                                cost_context,
+                                guard
+                                    .turn_streamed_with_steering_state(
+                                        &prompt,
+                                        event_tx,
+                                        Some(cancel_clone),
+                                        None,
+                                    )
+                                    .instrument(span),
+                            )
+                            .await
+                    }),
+                ),
+            )
+            .await
     });
 
     let mut accumulated_text = String::new();
@@ -528,6 +540,7 @@ mod tests {
                 channel: "rpc",
             },
             Some(cost_context),
+            None,
             noop,
         )
         .await

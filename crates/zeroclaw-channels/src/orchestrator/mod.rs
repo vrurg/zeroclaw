@@ -6468,6 +6468,12 @@ async fn process_channel_message_body(
                         .with_attrs(::serde_json::json!({"error": error.to_string()})),
                     "Session prompt attachments skipped because they could not be loaded"
                 );
+                if let Some(channel) = target_channel.as_ref() {
+                    let message =
+                        channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
+                    let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                }
+                return;
             }
         }
     }
@@ -7110,7 +7116,11 @@ async fn process_channel_message_body(
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
             let tool_loop = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                .scope(ctx.session_store.is_some(), tool_loop);
+                .scope(
+                    ctx.prompt_config.channels.session_prompts_enabled
+                        && ctx.session_store.is_some(),
+                    tool_loop,
+                );
             let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND
                 .scope(
                     ctx.session_store

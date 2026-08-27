@@ -265,10 +265,45 @@ fn session_prompt_approval_summary(
             .ok_or("the prompt content is missing")?;
         let digest = Sha256::digest(content.as_bytes());
         let _ = writeln!(summary, "content_sha256: {digest:x}");
-        let _ = writeln!(summary, "content:");
-        summary.push_str(content);
+        let _ = writeln!(
+            summary,
+            "content_escaped: {}",
+            escape_prompt_preview(content)
+        );
     }
     Ok(summary)
+}
+
+/// Render untrusted prompt text for an approval surface without allowing
+/// terminal controls or invisible direction changes to affect the display.
+fn escape_prompt_preview(content: &str) -> String {
+    let mut escaped = String::with_capacity(content.len() + 2);
+    escaped.push('"');
+    for ch in content.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{200e}'
+                    | '\u{200f}'
+                        | '\u{061c}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                ) =>
+            {
+                let _ = write!(escaped, "\\u{{{:04X}}}", ch as u32);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 async fn gate_session_prompt_approval(
@@ -293,7 +328,7 @@ async fn gate_session_prompt_approval(
         return denied("no approval manager is available");
     };
 
-    let approved = if mgr.is_non_interactive() {
+    let (approved, decision_channel) = if mgr.is_non_interactive() {
         let Some(channel) = ctx.channel else {
             return denied("no approval-capable channel is available");
         };
@@ -304,19 +339,41 @@ async fn gate_session_prompt_approval(
             // generic structured arguments that downstream event consumers log.
             raw_arguments: None,
         };
-        match channel
+        let approved = match channel
             .request_approval_attributed(ctx.channel_reply_target.unwrap_or_default(), &request)
             .await
         {
             Ok(Some(attributed)) => is_one_time_session_prompt_approval(&attributed),
             Ok(_) | Err(_) => false,
-        }
+        };
+        (approved, ctx.channel_name)
     } else {
-        mgr.prompt_cli_once(
-            &crate::i18n::get_required_cli_string("session-prompt-approval-heading"),
-            &summary,
+        (
+            mgr.prompt_cli_once(
+                &crate::i18n::get_required_cli_string("session-prompt-approval-heading"),
+                &summary,
+            ),
+            ctx.channel_name,
         )
     };
+
+    let audit_args = serde_json::json!({
+        "storage_domain": "sqlite chat session prompts",
+        "session_id": zeroclaw_api::TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten(),
+        "attachment_id": tool_args.get("id").and_then(serde_json::Value::as_str).map(str::trim),
+        "action": if tool_name == "session_prompt_set" { "set" } else { "delete" },
+        "content_sha256": tool_args.get("content").and_then(serde_json::Value::as_str).map(|content| format!("{:x}", Sha256::digest(content.as_bytes()))),
+    });
+    mgr.record_decision(
+        tool_name,
+        &audit_args,
+        &if approved {
+            crate::approval::ApprovalResponse::Yes
+        } else {
+            crate::approval::ApprovalResponse::No
+        },
+        decision_channel,
+    );
 
     if approved {
         ApprovalGateOutcome::Proceed { approved: true }
@@ -337,7 +394,9 @@ fn is_one_time_session_prompt_approval(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_one_time_session_prompt_approval, session_prompt_approval_summary};
+    use super::{
+        escape_prompt_preview, is_one_time_session_prompt_approval, session_prompt_approval_summary,
+    };
     use zeroclaw_api::channel::{
         ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
     };
@@ -361,10 +420,35 @@ mod tests {
         assert!(summary.contains("storage_domain: sqlite chat session prompts"));
         assert!(summary.contains("session_id: matrix:room:thread"));
         assert!(summary.contains("attachment_id: current-task"));
-        assert!(summary.contains("content:\nFinish RFC reconciliation."));
+        assert!(summary.contains("content_escaped: \"Finish RFC reconciliation.\""));
         assert!(summary.contains(
             "content_sha256: 16e48f498e379a0e5530eb194069ef5ce3f2133b53b6bdd28c80472425e552de"
         ));
+    }
+
+    #[tokio::test]
+    async fn session_prompt_confirmation_escapes_control_characters() {
+        let summary = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("session".to_string()), async {
+                session_prompt_approval_summary(
+                    "session_prompt_set",
+                    &serde_json::json!({"id": "task", "content": "first\n\u{001b}[2J"}),
+                )
+                .unwrap()
+            })
+            .await;
+
+        assert!(summary.contains("content_escaped: \"first\\n\\u{001B}[2J\""));
+        assert!(!summary.contains('\u{001b}'));
+    }
+
+    #[test]
+    fn session_prompt_preview_escapes_c1_and_bidi_controls() {
+        let preview = escape_prompt_preview("a\u{009b}2J\u{061c}\u{202e}txt");
+        assert_eq!(preview, "\"a\\u{009B}2J\\u{061C}\\u{202E}txt\"");
+        assert!(!preview.contains('\u{009b}'));
+        assert!(!preview.contains('\u{061c}'));
+        assert!(!preview.contains('\u{202e}'));
     }
 
     #[test]

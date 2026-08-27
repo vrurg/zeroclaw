@@ -1111,6 +1111,16 @@ impl RpcDispatcher {
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Session replacement is part of the same lifecycle as a turn and
+        // deletion. Hold this per-ID guard through installation so a pending
+        // delete cannot observe one incarnation and later remove another.
+        let _session_guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let config = self.ctx.config.read().clone();
         let chat_mode = req
@@ -1794,6 +1804,15 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // Persisting a completed turn is valid only for the same in-memory
+        // session incarnation that accepted it. A concurrent session/new or
+        // delete may reuse this caller-supplied ID while the provider runs.
+        let session_generation = self
+            .ctx
+            .sessions
+            .get_generation(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
@@ -1817,10 +1836,18 @@ impl RpcDispatcher {
         } else {
             sid.to_string()
         };
-        if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
-            && self.ctx.config.read().channels.session_prompts_enabled
-        {
-            let prompts = match self.ctx.session_backend.as_ref() {
+        let session_prompts_enabled = matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+            && self.ctx.config.read().channels.session_prompts_enabled;
+        // Take one configuration snapshot for the entire turn. Reading the
+        // live setting again below would let a reload produce an overlay/tool
+        // policy mismatch within one request.
+        let session_prompt_backend = if session_prompts_enabled {
+            self.ctx.session_backend.clone()
+        } else {
+            None
+        };
+        let attachments = if session_prompts_enabled {
+            let prompts = match session_prompt_backend.as_ref() {
                 Some(backend) => backend
                     .list_session_prompts(&tool_loop_session_key)
                     .map_err(|error| {
@@ -1849,13 +1876,20 @@ impl RpcDispatcher {
                     return Err(error);
                 }
             };
-            let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
-            if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
-                agent
-                    .lock()
-                    .await
-                    .set_session_prompt_attachments(attachments);
-            }
+            zeroclaw_infra::session_prompts::render_session_prompts(&prompts)
+        } else {
+            String::new()
+        };
+        // The agent is long-lived across RPC turns. Always refresh the
+        // overlay, including after a live feature disable, so stale prompts
+        // cannot survive a configuration transition.
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+            && let Some(agent) = self.ctx.sessions.get_agent(sid).await
+        {
+            agent
+                .lock()
+                .await
+                .set_session_prompt_attachments(attachments);
         }
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
@@ -1921,6 +1955,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            session_prompt_backend,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -1950,24 +1985,7 @@ impl RpcDispatcher {
                 }
             },
         );
-        let outcome = if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
-            && self.ctx.session_backend.is_some()
-        {
-            zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                .scope(
-                    true,
-                    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
-                        self.ctx
-                            .session_backend
-                            .clone()
-                            .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
-                        turn,
-                    ),
-                )
-                .await
-        } else {
-            turn.await
-        };
+        let outcome = turn.await;
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -2061,7 +2079,9 @@ impl RpcDispatcher {
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
+                if self.ctx.sessions.get_generation(sid).await == Some(session_generation)
+                    && let Some(ref backend) = self.ctx.session_backend
+                {
                     let key = format!("rpc_{sid}");
                     let _ = backend.append(&key, &ChatMessage::user(&prompt));
                     match &outcome {
@@ -2596,6 +2616,39 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // A session ID may be reused while this request waits for an active
+        // turn. Capture its incarnation before waiting so deletion never
+        // applies to a successor created with the same ID.
+        let expected_generation = self.ctx.sessions.get_generation(&req.session_id).await;
+        self.handle_session_delete_at_generation(req, expected_generation)
+            .await
+    }
+
+    /// Delete only the incarnation observed when the request was accepted.
+    /// `session/new` shares this queue; the generation fence also makes the
+    /// request fail safely if another lifecycle path replaced the ID first.
+    async fn handle_session_delete_at_generation(
+        &self,
+        req: SessionIdParams,
+        expected_generation: Option<u64>,
+    ) -> RpcResult {
+        self.ctx.sessions.cancel_session(&req.session_id);
+        // This is the same finalization authority used by prompt turns. Wait
+        // for any accepted turn to finish before deleting its durable row,
+        // then the generation check in the turn path rejects stale writes.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if self.ctx.sessions.get_generation(&req.session_id).await != expected_generation {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session was replaced while deletion was pending",
+            ));
+        }
         let chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
         let should_delete_durable_chat = if chat_mode.is_none() {
             let acp_session_exists = match self.ctx.acp_session_store.as_ref() {
@@ -8250,6 +8303,74 @@ mod tests {
                 .len(),
             1,
             "an ACP deletion must not cross into the chat session domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_session_delete_does_not_remove_a_same_id_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "reused-session-id";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("original session/new should succeed");
+        chat_backend
+            .set_session_prompt(&format!("rpc_{sid}"), "task", "original context")
+            .unwrap();
+        // Freeze the per-ID lifecycle boundary, then queue deletion followed
+        // by same-ID session/new. The latter must not install until the delete
+        // has completed, even though it replaces the caller-supplied ID.
+        let guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let dispatcher = Arc::new(dispatcher);
+        let delete_dispatcher = dispatcher.clone();
+        let delete = zeroclaw_spawn::spawn!(async move {
+            delete_dispatcher
+                .handle_session_delete(&json!({"session_id": sid}))
+                .await
+        });
+        while sessions.session_queue.queue_depth(sid).await < 2 {
+            tokio::task::yield_now().await;
+        }
+        let new_dispatcher = dispatcher.clone();
+        let replacement = zeroclaw_spawn::spawn!(async move {
+            new_dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                }))
+                .await
+        });
+        while sessions.session_queue.queue_depth(sid).await < 3 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+
+        delete
+            .await
+            .expect("delete task must join")
+            .expect("delete must target the original session");
+        replacement
+            .await
+            .expect("replacement task must join")
+            .expect("replacement session/new must succeed");
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "same-ID successor must remain active"
+        );
+        assert_eq!(
+            chat_backend
+                .list_session_prompts(&format!("rpc_{sid}"))
+                .unwrap()
+                .len(),
+            0,
+            "replacement must not inherit durable context deleted with its predecessor"
         );
     }
 
