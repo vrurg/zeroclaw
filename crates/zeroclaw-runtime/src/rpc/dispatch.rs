@@ -2840,6 +2840,33 @@ impl RpcDispatcher {
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         let disposal = self.dispose_goal_for_session(&req.session_id).await?;
+        let _absent_deletion = if disposal.is_none() {
+            let reservation = self
+                .ctx
+                .sessions
+                .reserve_absent_deletion(&req.session_id)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_BUSY, "Session changed during deletion"))?;
+            if let Some(control_plane) = crate::control_plane::control_plane()
+                && control_plane
+                    .goal_store
+                    .current_goal_for_session(&req.session_id)
+                    .await
+                    .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session deletion: {error}")))?
+                    .is_some()
+            {
+                self.goal_runtime()
+                    .await?
+                    .dispose_session(&req.session_id)
+                    .await
+                    .map_err(|error| {
+                        rpc_err(INTERNAL_ERROR, format!("session deletion: {error}"))
+                    })?;
+            }
+            Some(reservation)
+        } else {
+            None
+        };
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2857,7 +2884,11 @@ impl RpcDispatcher {
                     )
                     .await
             }
-            None => self.ctx.sessions.remove(&req.session_id).await,
+            // `reserve_absent_deletion` above holds the ID closed through
+            // durable Goal cleanup. There is deliberately no live entry left
+            // to remove, and calling the generic remover would re-enter that
+            // reservation's writer lock.
+            None => false,
         };
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
@@ -7581,6 +7612,35 @@ mod tests {
             "same-ID reconnect must retain the session agent and any Goal worker bound to it"
         );
         assert_eq!(sessions.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_id_session_new_never_overwrites_a_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut first, mut second, sessions) = make_two_dispatchers_sharing_context(config);
+        first.set_tui_id_for_test(Some("shared-owner".into()));
+        second.set_tui_id_for_test(Some("shared-owner".into()));
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "concurrent-same-id",
+        });
+
+        let (first_result, second_result) = tokio::join!(
+            first.handle_session_new_for_test(&params),
+            second.handle_session_new_for_test(&params),
+        );
+
+        assert!(
+            first_result.is_ok() || second_result.is_ok(),
+            "one creator must establish the session: first={first_result:?}, second={second_result:?}"
+        );
+        assert_eq!(sessions.count().await, 1);
+        assert!(
+            sessions.get_agent("concurrent-same-id").await.is_some(),
+            "a racing session/new may reconnect or reject, but must never overwrite the live session"
+        );
     }
 
     #[tokio::test]

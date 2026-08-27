@@ -146,6 +146,14 @@ pub(crate) struct SessionGoalAdmission {
     _guard: OwnedRwLockReadGuard<()>,
 }
 
+/// Exclusive reservation for deleting a durable session which is not currently
+/// published in the live RPC map. It prevents a concurrent reconnect or
+/// rehydration from creating the same ID until shared Goal supervision has
+/// classified and quiesced any worker it owns.
+pub(crate) struct AbsentSessionDeletionReservation {
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 pub(crate) enum SessionReconnectAdmission {
     Missing,
     Incompatible,
@@ -268,6 +276,18 @@ impl SessionStore {
             sealed: false,
             _guard: guard,
         })
+    }
+
+    pub(crate) async fn reserve_absent_deletion(
+        &self,
+        id: &str,
+    ) -> Option<AbsentSessionDeletionReservation> {
+        let gate = self.lifecycle_gate(id);
+        let guard = gate.write_owned().await;
+        if self.sessions.lock().await.contains_key(id) {
+            return None;
+        }
+        Some(AbsentSessionDeletionReservation { _guard: guard })
     }
 
     /// Reserve an idle sibling for same-mode replacement. Idle is checked
@@ -1248,6 +1268,35 @@ mod tests {
                 .await
         );
         assert!(store.get_agent("session").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_delete_blocks_recreation_until_cleanup_finishes() {
+        let store = Arc::new(make_store(4));
+        let deletion = store.reserve_absent_deletion("session").await.unwrap();
+        let insertion_store = Arc::clone(&store);
+        let mut insertion = tokio::spawn(async move {
+            insertion_store
+                .insert(
+                    "session".into(),
+                    RpcSession::new(
+                        make_agent(),
+                        "agent",
+                        ".",
+                        crate::rpc::types::ChatMode::Chat,
+                    ),
+                )
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut insertion)
+                .await
+                .is_err(),
+            "recreation must wait while absent-session Goal cleanup owns the ID"
+        );
+        drop(deletion);
+        insertion.await.unwrap().unwrap();
     }
 
     #[tokio::test]
