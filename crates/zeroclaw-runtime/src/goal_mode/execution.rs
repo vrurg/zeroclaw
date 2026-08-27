@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, RwLock, oneshot},
+    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, oneshot},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -577,6 +577,10 @@ pub struct GoalExecutionDriver {
 #[derive(Default)]
 pub struct GoalExecutionSlot {
     executor: tokio::sync::OnceCell<Arc<GoalExecutionDriver>>,
+    /// Serializes Goal command admission with removal of this exact live
+    /// session. It is process-local coordination only; durable Goal facts
+    /// remain in the control plane.
+    lifecycle_gate: Arc<Mutex<()>>,
 }
 
 impl GoalExecutionSlot {
@@ -586,6 +590,10 @@ impl GoalExecutionSlot {
         Fut: Future<Output = anyhow::Result<Arc<GoalExecutionDriver>>>,
     {
         self.executor.get_or_try_init(init).await.map(Arc::clone)
+    }
+
+    pub async fn lock_lifecycle(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.lifecycle_gate).lock_owned().await
     }
 }
 

@@ -151,6 +151,50 @@ impl SessionStore {
             .map(|session| Arc::clone(&session.goal_execution))
     }
 
+    pub(crate) async fn goal_execution_slot_is_current(
+        &self,
+        id: &str,
+        expected: &Arc<crate::goal_mode::execution::GoalExecutionSlot>,
+    ) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|session| Arc::ptr_eq(&session.goal_execution, expected))
+    }
+
+    /// Remove exactly the live session that owns `expected` while its Goal
+    /// lifecycle gate is held by the caller. A later session with the same ID
+    /// is never removed by an earlier disposal request.
+    pub(crate) async fn remove_if_goal_execution_slot(
+        &self,
+        id: &str,
+        expected: &Arc<crate::goal_mode::execution::GoalExecutionSlot>,
+    ) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let matches = matches!(
+                sessions.get(id),
+                Some(session) if Arc::ptr_eq(&session.goal_execution, expected)
+            );
+            if !matches {
+                return false;
+            }
+            sessions.remove(id).is_some()
+        };
+        if removed
+            && let Some((_, token)) = self
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        removed
+    }
+
     pub(crate) async fn lock_model_provider_update(
         &self,
         id: &str,
@@ -412,7 +456,10 @@ impl SessionStore {
         self.sessions.lock().await.remove(id).is_some()
     }
 
-    pub async fn evict_same_mode_sibling(
+    /// List idle same-owner sessions eligible for replacement. The dispatcher
+    /// performs Goal disposal and the exact removal under each session's
+    /// lifecycle gate; this store must not drop a Goal supervisor directly.
+    pub async fn same_mode_evictable_siblings(
         &self,
         tui_id: &str,
         chat_mode: &crate::rpc::types::ChatMode,
@@ -425,8 +472,8 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
+        let sessions = self.sessions.lock().await;
+        sessions
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
@@ -434,15 +481,8 @@ impl SessionStore {
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                evicted.push((key, s.agent_alias));
-            }
-        }
-        evicted
+            .map(|(key, session)| (key.clone(), session.agent_alias.clone()))
+            .collect()
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -525,6 +565,35 @@ impl SessionStore {
             token.cancel();
         }
         self.sessions.lock().await.remove(id).is_some()
+    }
+
+    pub(crate) async fn kill_session_if_goal_execution_slot(
+        &self,
+        id: &str,
+        expected: &Arc<crate::goal_mode::execution::GoalExecutionSlot>,
+    ) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            let matches = matches!(
+                sessions.get(id),
+                Some(session) if Arc::ptr_eq(&session.goal_execution, expected)
+            );
+            if !matches {
+                return false;
+            }
+            sessions.remove(id).is_some()
+        };
+        if removed
+            && let Some((_, token)) = self
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(id)
+        {
+            self.record_cancel_cause(id, CancelCause::AdminKill);
+            token.cancel();
+        }
+        removed
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -860,7 +929,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_same_mode_sibling_drops_only_same_mode_owner() {
+    async fn exact_goal_slot_removal_cannot_remove_a_replacement_session() {
+        let store = make_store(4);
+        store
+            .insert(
+                "session".into(),
+                RpcSession::new(make_agent(), "old", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let old_slot = store.goal_execution_slot("session").await.unwrap();
+        assert!(store.remove("session").await);
+        store
+            .insert(
+                "session".into(),
+                RpcSession::new(make_agent(), "new", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !store
+                .remove_if_goal_execution_slot("session", &old_slot)
+                .await
+        );
+        assert_eq!(
+            store.get_agent_alias("session").await.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn same_mode_evictable_siblings_selects_only_same_mode_owner() {
         use crate::rpc::types::ChatMode;
         let store = make_store(8);
         let mk = |mode: ChatMode, owner: &str| {
@@ -884,7 +984,7 @@ mod tests {
             .unwrap();
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .same_mode_evictable_siblings("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
@@ -902,13 +1002,13 @@ mod tests {
             "other TUI session preserved"
         );
         assert!(
-            store.get_agent("old_chat").await.is_none(),
-            "abandoned same-mode session evicted"
+            store.get_agent("old_chat").await.is_some(),
+            "dispatcher performs the gated removal after Goal disposal"
         );
     }
 
     #[tokio::test]
-    async fn evict_same_mode_sibling_skips_in_flight_turn() {
+    async fn same_mode_evictable_siblings_skips_in_flight_turn() {
         use crate::rpc::types::ChatMode;
         let store = make_store(8);
         let mk = |mode: ChatMode, owner: &str| {
@@ -929,7 +1029,7 @@ mod tests {
         store.register_cancel_token("busy_chat", token.clone());
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .same_mode_evictable_siblings("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         assert!(

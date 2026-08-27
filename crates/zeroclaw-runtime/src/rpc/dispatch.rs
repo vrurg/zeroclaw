@@ -10,7 +10,7 @@ const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
-use crate::goal_mode::execution::GoalExecutionDriver;
+use crate::goal_mode::execution::{GoalExecutionDriver, GoalExecutionSlot};
 use crate::goal_mode::host::{GoalExecutionHost, GoalSessionAdapter};
 use crate::goal_mode::{GoalIngressContext, GoalMessageKey, GoalRuntime, parse_goal_command};
 use crate::rpc::goal_execution::RpcGoalSessionAdapter;
@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedMutexGuard, mpsc};
 use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
@@ -45,6 +45,14 @@ struct StatusRuntimeContext {
     config_file: String,
     config_kind: RuntimeConfigKind,
     local_ipc_endpoint: String,
+}
+
+/// Keeps the exact live session closed to new Goal admission until the caller
+/// has removed it from `SessionStore`. The durable Goal record remains in the
+/// control plane; this is only the live-session lifecycle boundary.
+struct RpcGoalSessionDisposal {
+    slot: Arc<GoalExecutionSlot>,
+    _lifecycle_guard: OwnedMutexGuard<()>,
 }
 
 fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
@@ -1258,6 +1266,36 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
+        // A caller may reuse a live ID. Treat that as true replacement rather
+        // than allowing `SessionStore::insert` to drop the prior Goal slot.
+        if self
+            .ctx
+            .sessions
+            .goal_execution_slot(&session_id)
+            .await
+            .is_some()
+        {
+            let disposal = self.dispose_goal_for_session(&session_id).await?;
+            let removed = match disposal {
+                Some(disposal) => {
+                    self.ctx
+                        .sessions
+                        .remove_if_goal_execution_slot(&session_id, &disposal.slot)
+                        .await
+                }
+                None => false,
+            };
+            if !removed {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "session changed during replacement",
+                ));
+            }
+            if let Some(ref hooks) = self.ctx.hooks {
+                hooks.fire_session_end(&session_id, "rpc").await;
+            }
+        }
+
         self.ctx
             .sessions
             .insert(
@@ -1271,11 +1309,27 @@ impl RpcDispatcher {
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
         {
-            let evicted = self
+            let candidates = self
                 .ctx
                 .sessions
-                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .same_mode_evictable_siblings(tui_id, &chat_mode, &session_id)
                 .await;
+            let mut evicted = Vec::with_capacity(candidates.len());
+            for (sibling_id, sibling_alias) in candidates {
+                let disposal = self.dispose_goal_for_session(&sibling_id).await?;
+                let removed = match disposal {
+                    Some(disposal) => {
+                        self.ctx
+                            .sessions
+                            .remove_if_goal_execution_slot(&sibling_id, &disposal.slot)
+                            .await
+                    }
+                    None => self.ctx.sessions.remove(&sibling_id).await,
+                };
+                if removed {
+                    evicted.push((sibling_id, sibling_alias));
+                }
+            }
             if !evicted.is_empty() {
                 if let Some(ref hooks) = self.ctx.hooks {
                     for (sid, _) in &evicted {
@@ -1480,6 +1534,7 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let disposal = self.dispose_goal_for_session(&req.session_id).await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1516,7 +1571,16 @@ impl RpcDispatcher {
             // promptly.
             drop(agent);
         }
-        if !self.ctx.sessions.remove(&req.session_id).await {
+        let removed = match disposal {
+            Some(disposal) => {
+                self.ctx
+                    .sessions
+                    .remove_if_goal_execution_slot(&req.session_id, &disposal.slot)
+                    .await
+            }
+            None => self.ctx.sessions.remove(&req.session_id).await,
+        };
+        if !removed {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         if let Some(ref hooks) = self.ctx.hooks {
@@ -1548,6 +1612,8 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        let disposal = self.dispose_goal_for_session(sid).await?;
 
         let chat_mode = self
             .ctx
@@ -1606,7 +1672,15 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = self.ctx.sessions.kill_session(sid).await;
+        let killed = match disposal {
+            Some(disposal) => {
+                self.ctx
+                    .sessions
+                    .kill_session_if_goal_execution_slot(sid, &disposal.slot)
+                    .await
+            }
+            None => self.ctx.sessions.kill_session(sid).await,
+        };
         if killed {
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
@@ -1766,18 +1840,44 @@ impl RpcDispatcher {
         let request: SessionGoalParams = parse_params(params)?;
         let command = parse_goal_command(&request.command)
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let agent = self
-            .ctx
-            .sessions
-            .get_agent_alias(&request.session_id)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
         let slot = self
             .ctx
             .sessions
             .goal_execution_slot(&request.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let _lifecycle_guard = slot.lock_lifecycle().await;
+        if !self
+            .ctx
+            .sessions
+            .goal_execution_slot_is_current(&request.session_id, &slot)
+            .await
+        {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        let agent = self
+            .ctx
+            .sessions
+            .get_agent_alias(&request.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let runtime = self.goal_runtime_for_slot(slot).await?;
+        let ingress = GoalIngressContext::trusted(request.session_id, agent, "zerocode", None)
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        let response = runtime
+            .submit(ingress, command)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
+        to_result(SessionGoalResult {
+            key: goal_message_key(response.key).to_string(),
+            status: response.status,
+        })
+    }
+
+    async fn goal_runtime_for_slot(
+        &self,
+        slot: Arc<GoalExecutionSlot>,
+    ) -> Result<Arc<GoalRuntime>, JsonRpcError> {
         let config = Arc::new(self.ctx.config.read().clone());
         let executor = slot
             .get_or_try_init({
@@ -1849,16 +1949,65 @@ impl RpcDispatcher {
             &control_plane.boot_id,
         )
         .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
-        let ingress = GoalIngressContext::trusted(request.session_id, agent, "zerocode", None)
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
-        let response = runtime
-            .submit(ingress, command)
+        Ok(Arc::new(runtime))
+    }
+
+    async fn dispose_goal_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<RpcGoalSessionDisposal>, JsonRpcError> {
+        let Some(slot) = self.ctx.sessions.goal_execution_slot(session_id).await else {
+            if let Some(control_plane) = crate::control_plane::control_plane() {
+                GoalRuntime::dispose_orphaned_session(
+                    Arc::clone(&control_plane.goal_store),
+                    session_id,
+                )
+                .await
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("orphaned session disposal: {error}"),
+                    )
+                })?;
+            }
+            return Ok(None);
+        };
+        let lifecycle_guard = slot.lock_lifecycle().await;
+        if !self
+            .ctx
+            .sessions
+            .goal_execution_slot_is_current(session_id, &slot)
             .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
-        to_result(SessionGoalResult {
-            key: goal_message_key(response.key).to_string(),
-            status: response.status,
-        })
+        {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        let Some(control_plane) = crate::control_plane::control_plane() else {
+            return Ok(Some(RpcGoalSessionDisposal {
+                slot,
+                _lifecycle_guard: lifecycle_guard,
+            }));
+        };
+        if control_plane
+            .goal_store
+            .current_goal_for_session(session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session disposal: {error}")))?
+            .is_none()
+        {
+            return Ok(Some(RpcGoalSessionDisposal {
+                slot,
+                _lifecycle_guard: lifecycle_guard,
+            }));
+        }
+        self.goal_runtime_for_slot(Arc::clone(&slot))
+            .await?
+            .dispose_session(session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session disposal: {error}")))?;
+        Ok(Some(RpcGoalSessionDisposal {
+            slot,
+            _lifecycle_guard: lifecycle_guard,
+        }))
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2655,6 +2804,7 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let disposal = self.dispose_goal_for_session(&req.session_id).await?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2662,7 +2812,15 @@ impl RpcDispatcher {
                 .channel_handles()
                 .unregister_channel("rpc");
         }
-        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        let existed = match disposal {
+            Some(disposal) => {
+                self.ctx
+                    .sessions
+                    .remove_if_goal_execution_slot(&req.session_id, &disposal.slot)
+                    .await
+            }
+            None => self.ctx.sessions.remove(&req.session_id).await,
+        };
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
