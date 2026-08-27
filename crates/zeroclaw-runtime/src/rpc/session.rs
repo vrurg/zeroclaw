@@ -149,15 +149,23 @@ impl SessionStore {
         }
     }
 
+    fn next_session_generation(&self) -> Result<u64, &'static str> {
+        self.session_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.checked_add(1),
+            )
+            .map(|previous| previous + 1)
+            .map_err(|_| "session generation exhausted")
+    }
+
     pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
-        let generation = self
-            .session_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .wrapping_add(1);
+        let generation = self.next_session_generation()?;
         session.generation = generation;
         sessions.insert(id, session);
         Ok(())
@@ -1302,6 +1310,54 @@ mod tests {
         assert_ne!(
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_exhausted_session_generation() {
+        let store = make_store(4);
+        store
+            .session_generation
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+
+        let result = store
+            .insert(
+                "exhausted".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await;
+
+        assert_eq!(result, Err("session generation exhausted"));
+        assert!(store.get_generation("exhausted").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn removal_then_same_id_replacement_rejects_the_old_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "reused".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let old_generation = store.get_generation("reused").await.unwrap();
+
+        assert!(store.remove("reused").await);
+        store
+            .insert(
+                "reused".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(store.get_generation("reused").await, Some(old_generation));
+        assert!(
+            store
+                .set_overrides_gated("reused", old_generation, SessionOverrides::default())
+                .await
+                .is_none()
         );
     }
 
