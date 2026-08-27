@@ -5,7 +5,9 @@ pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 mod foreground;
-pub mod goal_execution;
+mod goal_execution;
+mod goal_runtime_slot;
+use foreground::goal_policy_cutover_lock;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -134,7 +136,7 @@ use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
 
 use self::foreground::{
-    ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
+    ConversationLocks, foreground_lock, goal_runtime_slot, persist_lock, wait_for_foreground_lease,
 };
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -1608,7 +1610,7 @@ fn resolve_provider_ref_for_runtime_switch(config: &Config, raw: &str) -> anyhow
     }
 }
 
-fn resolved_runtime_model_provider_ref(
+pub(super) fn resolved_runtime_model_provider_ref(
     config: &Config,
     agent_alias: &str,
 ) -> anyhow::Result<String> {
@@ -1731,10 +1733,23 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
+#[cfg(test)]
 async fn load_runtime_config_and_defaults(
     path: &Path,
     agent_alias: &str,
 ) -> Result<(Config, ChannelRuntimeDefaults)> {
+    let parsed = load_runtime_config(path).await?;
+    let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
+    let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
+    Ok((parsed, defaults))
+}
+
+/// Load the prospective configuration before resolving this runtime's model.
+///
+/// Policy cutover needs this phase on its own: removing an agent or provider
+/// must durably revoke its Goals even though resolving the removed runtime
+/// model necessarily fails afterwards.
+async fn load_runtime_config(path: &Path) -> Result<Config> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -1750,13 +1765,19 @@ async fn load_runtime_config_and_defaults(
     let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
     parsed.env_overridden_paths = applied.paths;
     parsed.pre_override_snapshots = applied.snapshots;
-
-    let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
-    let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
-    Ok((parsed, defaults))
+    Ok(parsed)
 }
 
-async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
+async fn maybe_apply_runtime_config_update(ctx: &Arc<ChannelRuntimeContext>) -> Result<()> {
+    let _goal_policy_guard = goal_policy_cutover_lock().lock().await;
+    apply_runtime_config_update_while_goal_policy_locked(ctx).await
+}
+
+/// Apply a prospective runtime configuration while the caller holds the one
+/// Matrix Goal admission/cutover gate.
+async fn apply_runtime_config_update_while_goal_policy_locked(
+    ctx: &Arc<ChannelRuntimeContext>,
+) -> Result<()> {
     let Some(config_path) = runtime_config_path(ctx) else {
         return Ok(());
     };
@@ -1775,9 +1796,37 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let (next_config, next_defaults) =
-        load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
-    let next_config = Arc::new(next_config);
+    let next_config = Arc::new(load_runtime_config(&config_path).await?);
+    let cut_over_before_runtime_construction = next_config.goal.enabled
+        && (resolved_runtime_model_provider_ref(next_config.as_ref(), ctx.agent_alias.as_str())
+            .is_err()
+            || zeroclaw_runtime::agent::agent::build_session_model_provider(
+                next_config.as_ref(),
+                &next_config.goal.verifier.provider,
+                next_config.goal.verifier.model.as_deref(),
+            )
+            .is_err());
+
+    if !next_config.goal.enabled || cut_over_before_runtime_construction {
+        // An agent, provider, verifier, or the complete Goal surface may have
+        // intentionally disappeared. Fence those durable Goals before the
+        // later per-agent runtime construction fails on the removed choice.
+        goal_execution::cut_over_matrix_goals_for_runtime_reload(ctx, next_config.as_ref())
+            .await
+            .context("fence revoked Matrix Goals before runtime reload")?;
+    }
+
+    let model_provider =
+        resolved_runtime_model_provider_ref(next_config.as_ref(), ctx.agent_alias.as_str())?;
+    let next_defaults = runtime_defaults_from_config(next_config.as_ref(), &model_provider)?;
+    if next_config.goal.enabled {
+        zeroclaw_runtime::agent::agent::build_session_model_provider(
+            next_config.as_ref(),
+            &next_config.goal.verifier.provider,
+            next_config.goal.verifier.model.as_deref(),
+        )
+        .context("validate Goal verifier while applying runtime config")?;
+    }
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
@@ -1799,6 +1848,11 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
+            if !next_config.goal.enabled || cut_over_before_runtime_construction {
+                anyhow::bail!(
+                    "Goal policy was durably revoked but the replacement runtime could not warm up"
+                );
+            }
             return Ok(());
         }
         ::zeroclaw_log::record!(
@@ -1810,6 +1864,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
                 ),
             "ModelProvider warmup failed after config reload (retryable, applying anyway)"
         );
+    }
+
+    if next_config.goal.enabled && !cut_over_before_runtime_construction {
+        goal_execution::cut_over_matrix_goals_for_runtime_reload(ctx, next_config.as_ref())
+            .await
+            .context("fence running Matrix Goals before runtime reload")?;
     }
 
     {
@@ -1841,6 +1901,31 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": next_defaults.default_model_provider})), "Applied updated channel runtime config from disk");
 
     Ok(())
+}
+
+/// Submit a Matrix Goal command only after observing the current policy under
+/// the same gate used by runtime reload. This keeps the transport-specific
+/// cutover protocol private to the orchestrator; the Goal adapter receives an
+/// already-current runtime context.
+async fn submit_matrix_goal_command(
+    context: &Arc<ChannelRuntimeContext>,
+    message: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    let _goal_policy_guard = goal_policy_cutover_lock().lock().await;
+    let parsed = zeroclaw_runtime::goal_mode::parse_goal_command(&message.content);
+    if matches!(
+        &parsed,
+        Ok(zeroclaw_runtime::goal_mode::GoalCommand::Help) | Err(_)
+    ) {
+        return goal_execution::submit_matrix_goal_command(context, message, parsed).await;
+    }
+    if apply_runtime_config_update_while_goal_policy_locked(context)
+        .await
+        .is_err()
+    {
+        return channel_runtime_cli_string("goal-response-controller-failed");
+    }
+    goal_execution::submit_matrix_goal_command(context, message, parsed).await
 }
 
 fn default_route_selection_from_snapshot(
@@ -6031,15 +6116,24 @@ async fn process_channel_message_body(
     cancellation_token: CancellationToken,
     channel_composite: String,
 ) {
+    // Snapshot recognized Matrix Goal input before hooks receive the mutable
+    // message. A hook may cancel the message below, but cannot create or
+    // rewrite Goal authority, route, principal, or command text.
+    let matrix_goal_command = goal_execution::is_matrix_goal_command(&msg).then(|| msg.clone());
+    let (inbound_sender, inbound_content) = if matrix_goal_command.is_some() {
+        ("[goal principal redacted]", "[goal command redacted]")
+    } else {
+        (msg.sender.as_str(), msg.content.as_str())
+    };
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
             ::serde_json::json!({
-                "sender": msg.sender,
+                "sender": inbound_sender,
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content": inbound_content,
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -6064,6 +6158,36 @@ async fn process_channel_message_body(
     } else {
         msg
     };
+
+    if let Some(original) = matrix_goal_command {
+        let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &original).cloned()
+        else {
+            return;
+        };
+        if channel.drop_self_messages(&original)
+            || zeroclaw_runtime::peers::should_drop_self_loop(
+                &original.sender,
+                channel.self_handle().as_deref(),
+            )
+        {
+            return;
+        }
+        let response = submit_matrix_goal_command(&ctx, &original).await;
+        if let Err(error) = channel
+            .send(&zeroclaw_api::channel::SendMessage::reply_to(
+                &original, response,
+            ))
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                &format!("failed to send Matrix Goal command response: {error}")
+            );
+        }
+        return;
+    }
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
@@ -6228,7 +6352,7 @@ async fn process_channel_message_body(
         }
     }
 
-    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
+    if let Err(err) = maybe_apply_runtime_config_update(&ctx).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8441,6 +8565,13 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+/// Goal commands are control-plane input, not ordinary prompt content. They
+/// must bypass message coalescing so their immutable pre-hook snapshot is the
+/// exact Matrix event text rather than a newline-joined prompt batch.
+fn should_debounce_inbound_message(message: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    message.channel != "cli" && !goal_execution::is_matrix_goal_command(message)
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -8545,7 +8676,7 @@ async fn run_message_dispatch_loop(
 
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
+        let msg = if should_debounce_inbound_message(&msg) {
             let debounce_key = conversation_history_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -13363,6 +13494,19 @@ pub(crate) mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+    use zeroclaw_runtime::{
+        cost::CostTracker,
+        goal_mode::{
+            GoalBudgetRequest, GoalCommand, GoalExecutionPreflight, GoalExecutionScope,
+            GoalExecutor, GoalOperationReservation, GoalRuntime,
+            execution::GoalExecutionDriver,
+            host::{
+                GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
+                GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate,
+                GoalVerifierTurn,
+            },
+        },
+    };
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.
     ///
@@ -13401,6 +13545,96 @@ pub(crate) mod tests {
 
     struct CountingObserver {
         events: Arc<AtomicUsize>,
+    }
+
+    /// A live Goal worker fixture for the Matrix policy-cutover failure path.
+    /// The lease blocks only after launch has acquired it, so the test can
+    /// distinguish "no worker was started" from "the existing worker was not
+    /// cancelled before the durable cutover committed".
+    struct CutoverBlockingGoalAdapter {
+        parent_started: Arc<tokio::sync::Notify>,
+        parent_cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    struct CutoverBlockingGoalLease {
+        parent_started: Arc<tokio::sync::Notify>,
+        parent_cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalSessionAdapter for CutoverBlockingGoalAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "matrix:primary:!room:example.org"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test.provider".into(),
+                model: "test-model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(CutoverBlockingGoalLease {
+                parent_started: Arc::clone(&self.parent_started),
+                parent_cancelled: Arc::clone(&self.parent_cancelled),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GoalSessionLease for CutoverBlockingGoalLease {
+        fn working_history(&self) -> anyhow::Result<Vec<ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _turn: GoalParentTurn,
+            cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<ChatMessage>)> {
+            self.parent_started.notify_one();
+            cancellation.cancelled().await;
+            self.parent_cancelled.notify_one();
+            anyhow::bail!("test Goal worker was cancelled")
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _turn: GoalVerifierTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<String> {
+            unreachable!("the blocking parent fixture never produces a candidate")
+        }
+
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            unreachable!("the blocking parent fixture never produces a candidate")
+        }
     }
 
     impl Observer for CountingObserver {
@@ -15437,6 +15671,403 @@ temperature = 0.3
             sop_engine: None,
             sop_audit: None,
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_matrix_goal_command_returns_before_session_runtime_setup() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = Arc::new(channel_runtime_context_for_defaults_test(
+            directory.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        ));
+        let message = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            channel_alias: Some("primary".into()),
+            sender: "@alice:example.org".into(),
+            reply_target: "!room:example.org".into(),
+            content: "/goal status".into(),
+            ..Default::default()
+        };
+
+        let response = submit_matrix_goal_command(&context, &message).await;
+
+        assert_eq!(
+            response,
+            channel_runtime_cli_string("goal-response-disabled"),
+        );
+        let locks = context
+            .persist_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            !locks.contains_key(&conversation_history_key(&message)),
+            "a disabled Goal command must not create a session executor slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_preserves_policy_when_goal_control_plane_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.toml"),
+            r#"
+default_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "openrouter"
+
+[agents.main]
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"
+"#,
+        )
+        .unwrap();
+        let context = Arc::new(channel_runtime_context_for_defaults_test(
+            directory.path(),
+            "main",
+            "startup.provider",
+            "startup-model",
+        ));
+        let original_config = Arc::new(zeroclaw_config::schema::Config::default());
+        *context
+            .runtime_defaults_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::new(ChannelRuntimeOverride {
+            config: Arc::clone(&original_config),
+            defaults: ChannelRuntimeDefaults {
+                default_model_provider: "startup.provider".into(),
+                model: "startup-model".into(),
+                temperature: None,
+                api_key: None,
+                api_url: None,
+                reliability: zeroclaw_config::schema::ReliabilityConfig::default(),
+            },
+            generation: 7,
+        }));
+
+        let error = apply_runtime_config_update_while_goal_policy_locked(&context)
+            .await
+            .expect_err("a disabled Goal policy must fail closed without a control plane");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fence revoked Matrix Goals before runtime reload"),
+            "the production reload must fail at the durable cutover, not install policy first: {error:#}"
+        );
+        let snapshot = runtime_defaults_snapshot(context.as_ref());
+        assert!(snapshot.hot);
+        assert_eq!(snapshot.generation, 7);
+        assert_eq!(snapshot.defaults.default_model_provider, "startup.provider");
+        assert!(Arc::ptr_eq(&snapshot.config, &original_config));
+        assert!(
+            context
+                .last_applied_config_stamp
+                .lock()
+                .unwrap_or_else(|lock_error| lock_error.into_inner())
+                .is_none(),
+            "a failed durable cutover must not advance the applied-policy stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_matrix_cutover_does_not_quiesce_when_sqlite_transition_fails() {
+        use zeroclaw_runtime::control_plane::{
+            ControlPlaneHandle, GoalTaskRegistry, SqliteTaskStore, TaskKind, TaskStatus,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new(directory.path()).unwrap());
+        let session_id = "matrix_primary__room_example_org__alice_example_org";
+        let parent_started = Arc::new(tokio::sync::Notify::new());
+        let parent_cancelled = Arc::new(tokio::sync::Notify::new());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                CutoverBlockingGoalAdapter {
+                    parent_started: Arc::clone(&parent_started),
+                    parent_cancelled: Arc::clone(&parent_cancelled),
+                },
+            )])),
+            Arc::clone(&goals),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let executor: Arc<dyn GoalExecutor> = driver.clone();
+        let runtime = GoalRuntime::new(
+            Arc::clone(&config),
+            Arc::clone(&goals),
+            tracker,
+            executor,
+            "test-boot",
+        )
+        .unwrap();
+        let context = Arc::new(channel_runtime_context_for_defaults_test(
+            directory.path(),
+            "main",
+            "startup.provider",
+            "startup-model",
+        ));
+        // Seed the same process-local supervisor slot that the production
+        // cutover would quiesce after a successful SQLite transition.
+        super::goal_runtime_slot(&context.persist_locks, session_id)
+            .get_or_try_init(|| async { Ok(Arc::clone(&driver)) })
+            .await
+            .unwrap();
+        let response = runtime
+            .submit(
+                zeroclaw_runtime::goal_mode::GoalIngressContext::trusted(
+                    session_id,
+                    "main",
+                    "matrix:primary:!room:example.org",
+                    Some("@alice:example.org".into()),
+                )
+                .unwrap(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    objective: "prove the failure path".into(),
+                    success_criteria: "the verifier accepts the result".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.key,
+            zeroclaw_runtime::goal_mode::GoalMessageKey::Started
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), parent_started.notified())
+            .await
+            .expect("the live Goal worker must enter its parent turn before cutover");
+        let task = store
+            .current_goal_for_session(session_id)
+            .await
+            .unwrap()
+            .expect("the started Goal must be durable before cutover");
+        assert_eq!(task.status, TaskStatus::Running);
+        assert_eq!(task.kind, TaskKind::Goal);
+
+        let trigger_connection =
+            rusqlite::Connection::open(directory.path().join("control_plane.db")).unwrap();
+        trigger_connection
+            .execute_batch(
+                "CREATE TRIGGER fail_live_matrix_goal_cutover
+                   BEFORE UPDATE OF status ON tasks
+                   BEGIN
+                       SELECT RAISE(ABORT, 'injected live Matrix cutover failure');
+                   END;",
+            )
+            .unwrap();
+        let control_plane = ControlPlaneHandle {
+            store: store.clone(),
+            goal_store: store.clone(),
+            boot_id: "test-boot".into(),
+        };
+
+        let error = goal_execution::cut_over_matrix_goals_with_control_plane(
+            &context,
+            &zeroclaw_config::schema::Config::default(),
+            &control_plane,
+        )
+        .await
+        .expect_err("a real SQLite failure must reject the live Matrix cutover");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected live Matrix cutover failure")
+        );
+        let current = store
+            .current_goal_for_session(session_id)
+            .await
+            .unwrap()
+            .expect("failed cutover must retain the current Goal");
+        assert_eq!(current.status, TaskStatus::Running);
+        assert_eq!(current.execution_epoch, 1);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                parent_cancelled.notified(),
+            )
+            .await
+            .is_err(),
+            "a failed durable cutover must not cancel the already-running worker"
+        );
+        assert!(
+            context
+                .persist_locks
+                .lock()
+                .unwrap_or_else(|lock_error| lock_error.into_inner())
+                .contains_key("matrix_primary__room_example_org__alice_example_org"),
+            "the existing live Goal executor must remain in its supervisor slot"
+        );
+        trigger_connection
+            .execute_batch("DROP TRIGGER fail_live_matrix_goal_cutover;")
+            .unwrap();
+        driver
+            .cancel_and_quiesce(&task.id, task.execution_epoch)
+            .await
+            .expect("test cleanup must quiesce the real Goal worker");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            parent_cancelled.notified(),
+        )
+        .await
+        .expect("test cleanup must reach the real worker cancellation boundary");
+        assert!(driver.task_is_quiescent(&task.id).await);
+    }
+
+    #[test]
+    fn exact_matrix_goal_commands_bypass_prompt_debouncing() {
+        let goal = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            content: "/goal status".into(),
+            ..Default::default()
+        };
+        let ordinary_matrix = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            content: "ordinary follow-up".into(),
+            ..Default::default()
+        };
+        let cli_goal = zeroclaw_api::channel::ChannelMessage {
+            channel: "cli".into(),
+            content: "/goal status".into(),
+            ..Default::default()
+        };
+
+        assert!(!should_debounce_inbound_message(&goal));
+        assert!(should_debounce_inbound_message(&ordinary_matrix));
+        assert!(!should_debounce_inbound_message(&cli_goal));
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_snapshot_survives_a_mutating_inbound_hook() {
+        struct RewriteInboundMessage;
+
+        #[async_trait::async_trait]
+        impl zeroclaw_runtime::hooks::HookHandler for RewriteInboundMessage {
+            fn name(&self) -> &str {
+                "rewrite-inbound-message"
+            }
+
+            async fn on_message_received(
+                &self,
+                mut message: zeroclaw_api::channel::ChannelMessage,
+            ) -> zeroclaw_runtime::hooks::HookResult<zeroclaw_api::channel::ChannelMessage>
+            {
+                message.sender = "@rewritten:example.org".into();
+                message.reply_target = "!rewritten:example.org".into();
+                message.content = "ordinary prompt manufactured by a hook".into();
+                zeroclaw_runtime::hooks::HookResult::Continue(message)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut context = channel_runtime_context_for_defaults_test(
+            directory.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        );
+        context.channels_by_name = Arc::new(HashMap::from([("matrix.primary".into(), channel)]));
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteInboundMessage));
+        context.hooks = Some(Arc::new(hooks));
+        let message = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            channel_alias: Some("primary".into()),
+            sender: "@alice:example.org".into(),
+            reply_target: "!original:example.org".into(),
+            content: "/goal help".into(),
+            ..Default::default()
+        };
+
+        process_channel_message_body(
+            Arc::new(context),
+            message,
+            CancellationToken::new(),
+            "matrix.primary".into(),
+        )
+        .await;
+
+        assert_eq!(
+            *channel_impl.sent_messages.lock().await,
+            vec![format!(
+                "!original:example.org:{}",
+                channel_runtime_cli_string("goal-response-help")
+            )],
+            "the pre-hook Matrix Goal snapshot must own command text, principal, and reply route"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_goal_hook_cancellation_prevents_goal_submission() {
+        struct CancelInboundMessage;
+
+        #[async_trait::async_trait]
+        impl zeroclaw_runtime::hooks::HookHandler for CancelInboundMessage {
+            fn name(&self) -> &str {
+                "cancel-inbound-message"
+            }
+
+            async fn on_message_received(
+                &self,
+                _message: zeroclaw_api::channel::ChannelMessage,
+            ) -> zeroclaw_runtime::hooks::HookResult<zeroclaw_api::channel::ChannelMessage>
+            {
+                zeroclaw_runtime::hooks::HookResult::Cancel("synthetic policy rejection".into())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut context = channel_runtime_context_for_defaults_test(
+            directory.path(),
+            "main",
+            "openrouter.default",
+            "test-model",
+        );
+        context.channels_by_name = Arc::new(HashMap::from([("matrix.primary".into(), channel)]));
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(CancelInboundMessage));
+        context.hooks = Some(Arc::new(hooks));
+        let message = zeroclaw_api::channel::ChannelMessage {
+            channel: "matrix".into(),
+            channel_alias: Some("primary".into()),
+            sender: "@alice:example.org".into(),
+            reply_target: "!original:example.org".into(),
+            content: "/goal help".into(),
+            ..Default::default()
+        };
+
+        process_channel_message_body(
+            Arc::new(context),
+            message,
+            CancellationToken::new(),
+            "matrix.primary".into(),
+        )
+        .await;
+
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "a cancelling hook must prevent the snapped Goal command from reaching the controller"
+        );
     }
 
     #[test]

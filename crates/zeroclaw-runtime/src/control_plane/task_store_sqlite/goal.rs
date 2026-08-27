@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
-    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskContinuationContext,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalPolicyCutoverAction,
+    GoalPolicyCutoverTransition, GoalTaskRecord, GoalTaskRegistry, GoalToolPhase,
+    GoalTransitionResult, TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -1016,6 +1017,116 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("get current goal for session")
     }
 
+    async fn running_session_goals_for_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
+        if agent.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT * FROM tasks
+                  WHERE kind = 'goal' AND agent = ?1
+                    AND session_id IS NOT NULL AND trim(session_id) <> ''
+                    AND status = 'running'
+                  ORDER BY started_at ASC, rowid ASC",
+            )
+            .context("prepare running session goals by agent")?;
+        let rows = statement
+            .query_map(params![agent], row_to_record)
+            .context("query running session goals by agent")?;
+        let mut goals = Vec::new();
+        for row in rows {
+            match row {
+                Ok(goal) => goals.push(goal),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(goals)
+    }
+
+    async fn nonterminal_session_goals_for_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
+        if agent.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT * FROM tasks
+                  WHERE kind = 'goal' AND agent = ?1
+                    AND session_id IS NOT NULL AND trim(session_id) <> ''
+                    AND status IN ('running', 'paused')
+                  ORDER BY started_at ASC, rowid ASC",
+            )
+            .context("prepare nonterminal session goals by agent")?;
+        let rows = statement
+            .query_map(params![agent], row_to_record)
+            .context("query nonterminal session goals by agent")?;
+        let mut goals = Vec::new();
+        for row in rows {
+            match row {
+                Ok(goal) => goals.push(goal),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(goals)
+    }
+
+    async fn apply_goal_policy_cutover(
+        &self,
+        transitions: &[GoalPolicyCutoverTransition],
+    ) -> Result<GoalTransitionResult> {
+        if transitions.is_empty() {
+            return Ok(GoalTransitionResult::Applied);
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic goal policy cutover")?;
+        for transition in transitions {
+            let updated = match transition.action {
+                GoalPolicyCutoverAction::PauseForReload => tx.execute(
+                    "UPDATE tasks SET status = 'paused', execution_epoch = execution_epoch + 1
+                      WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                        AND status = 'running' AND execution_epoch = ?3
+                        AND execution_epoch < 9223372036854775807",
+                    params![
+                        transition.task_id,
+                        transition.session_id,
+                        transition.execution_epoch
+                    ],
+                )?,
+                GoalPolicyCutoverAction::CancelForRevocation => tx.execute(
+                    "UPDATE tasks
+                        SET status = 'cancelled', error = 'runtime_policy_revoked',
+                            finished_at = COALESCE(finished_at, ?4),
+                            execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                                THEN execution_epoch + 1 ELSE execution_epoch END
+                      WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                        AND status IN ('running', 'paused') AND execution_epoch = ?3",
+                    params![
+                        transition.task_id,
+                        transition.session_id,
+                        transition.execution_epoch,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?,
+            };
+            if updated != 1 {
+                return transition_failure(&tx, &transition.task_id, &transition.session_id);
+            }
+            if transition.action == GoalPolicyCutoverAction::PauseForReload {
+                tx.execute(
+                    "UPDATE goal_tasks SET pause_reason = 'daemon_restart',
+                        pause_description = 'runtime configuration changed', blockers_json = '[]'
+                      WHERE task_id = ?1",
+                    params![transition.task_id],
+                )?;
+            }
+        }
+        tx.commit().context("commit atomic goal policy cutover")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn terminal_reason_for_session_goal(
         &self,
         task_id: &str,
@@ -1555,6 +1666,214 @@ mod tests {
             interruption_scope_id: Some("scope-1".into()),
             conversation_scope:
                 crate::control_plane::goal_task::TaskContinuationConversationScope::Sender,
+        }
+    }
+
+    #[tokio::test]
+    async fn running_session_goals_are_enumerated_by_agent_only() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        for (id, session, agent) in [
+            ("goal-main-a", "session-a", "main"),
+            ("goal-main-b", "session-b", "main"),
+            ("goal-other", "session-c", "other"),
+        ] {
+            let mut task = session_goal_task(id, session);
+            task.agent = agent.into();
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(task, goal_record(id, "ship it"))
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+
+        let goals = store.running_session_goals_for_agent("main").await.unwrap();
+        let ids = goals.into_iter().map(|goal| goal.id).collect::<Vec<_>>();
+        assert_eq!(ids, ["goal-main-a", "goal-main-b"]);
+        assert!(
+            store
+                .running_session_goals_for_agent(" ")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn nonterminal_session_goals_include_paused_but_exclude_terminal_rows() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        for (id, session) in [("running", "session-running"), ("paused", "session-paused")] {
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(
+                        session_goal_task(id, session),
+                        goal_record(id, "ship it"),
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+        let paused = store
+            .current_goal_for_session("session-paused")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &paused.id,
+                    "session-paused",
+                    paused.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let running = store
+            .current_goal_for_session("session-running")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &running.id,
+                    "session-running",
+                    running.execution_epoch,
+                    TaskStatus::Cancelled,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let ids = store
+            .nonterminal_session_goals_for_agent("main")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|goal| goal.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["paused"]);
+    }
+
+    #[tokio::test]
+    async fn stale_policy_cutover_rolls_back_every_prior_transition_in_the_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        for (id, session_id) in [("first", "session-first"), ("second", "session-second")] {
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(
+                        session_goal_task(id, session_id),
+                        goal_record(id, "ship it"),
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+
+        let result = store
+            .apply_goal_policy_cutover(&[
+                GoalPolicyCutoverTransition {
+                    task_id: "first".into(),
+                    session_id: "session-first".into(),
+                    execution_epoch: 1,
+                    action: GoalPolicyCutoverAction::PauseForReload,
+                },
+                GoalPolicyCutoverTransition {
+                    task_id: "second".into(),
+                    session_id: "session-second".into(),
+                    execution_epoch: 99,
+                    action: GoalPolicyCutoverAction::CancelForRevocation,
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(result, GoalTransitionResult::Stale);
+        for (id, session_id) in [("first", "session-first"), ("second", "session-second")] {
+            let goal = store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .expect("the stale batch must not delete a current Goal");
+            assert_eq!(goal.id, id);
+            assert_eq!(goal.status, TaskStatus::Running);
+            assert_eq!(goal.execution_epoch, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_policy_cutover_persistence_rolls_back_every_prior_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(directory.path()).unwrap();
+        for (id, session_id) in [("first", "session-first"), ("second", "session-second")] {
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(
+                        session_goal_task(id, session_id),
+                        goal_record(id, "ship it"),
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER test_fail_goal_policy_cutover
+                   BEFORE UPDATE OF status ON tasks
+                   WHEN NEW.id = 'second'
+                   BEGIN
+                       SELECT RAISE(ABORT, 'injected goal policy cutover failure');
+                   END;",
+            )
+            .unwrap();
+        }
+
+        let error = store
+            .apply_goal_policy_cutover(&[
+                GoalPolicyCutoverTransition {
+                    task_id: "first".into(),
+                    session_id: "session-first".into(),
+                    execution_epoch: 1,
+                    action: GoalPolicyCutoverAction::PauseForReload,
+                },
+                GoalPolicyCutoverTransition {
+                    task_id: "second".into(),
+                    session_id: "session-second".into(),
+                    execution_epoch: 1,
+                    action: GoalPolicyCutoverAction::CancelForRevocation,
+                },
+            ])
+            .await
+            .expect_err("an injected storage failure must reject the whole cutover");
+        assert!(
+            error
+                .to_string()
+                .contains("injected goal policy cutover failure")
+        );
+
+        for (id, session_id) in [("first", "session-first"), ("second", "session-second")] {
+            let goal = store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .expect("a failed batch must leave each current Goal intact");
+            assert_eq!(goal.id, id);
+            assert_eq!(goal.status, TaskStatus::Running);
+            assert_eq!(goal.execution_epoch, 1);
         }
     }
 

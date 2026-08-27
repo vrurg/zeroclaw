@@ -3,7 +3,7 @@
 //! Goal lifecycle and execution stay in `zeroclaw-runtime`; this module only
 //! reconstructs the Matrix facts that must agree with durable task state.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
@@ -16,11 +16,13 @@ use zeroclaw_runtime::{
         ToolLoop, run_tool_call_loop, scope_session_key,
     },
     goal_mode::{
-        GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation,
-        execution::{preflight_reservation, run_isolated_verifier},
+        GoalCommandErrorKey, GoalExecutionPreflight, GoalExecutionScope, GoalMessageKey,
+        GoalOperationReservation, GoalResponse, GoalRuntime,
+        execution::{GoalExecutionDriver, preflight_reservation, run_isolated_verifier},
         host::{
-            GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn, GoalSessionAdapter,
-            GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate, GoalVerifierTurn,
+            GoalExecutionHost, GoalHostModelBinding, GoalHostPreflightError, GoalParentTurn,
+            GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifiedCandidate,
+            GoalVerifierTurn,
         },
     },
 };
@@ -28,9 +30,10 @@ use zeroclaw_runtime::{
 use super::{
     CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP, ChannelRouteSelection, ChannelRuntimeContext,
     ChannelRuntimeDefaultsSnapshot, channel_message_timeout_budget_secs_with_cap,
-    composite_channel_key, foreground_lock, get_or_create_provider, get_route_selection,
-    normalize_cached_channel_turns, resolve_channel_thinking, runtime_defaults_snapshot,
-    sanitize_verified_goal_delivery, system_prompt_for_channel_turn, wait_for_foreground_lease,
+    composite_channel_key, conversation_history_key, foreground_lock, get_or_create_provider,
+    get_route_selection, normalize_cached_channel_turns, resolve_channel_thinking,
+    runtime_defaults_snapshot, sanitize_verified_goal_delivery, system_prompt_for_channel_turn,
+    wait_for_foreground_lease,
 };
 
 const MATRIX_ROUTE_PREFIX: &str = "matrix:";
@@ -98,28 +101,40 @@ impl MatrixGoalRoute {
 /// It owns no Goal lifecycle or accounting state. The existing channel runtime
 /// remains the source of the configured provider, tool policy, history, and
 /// foreground lock; the generic Goal runtime owns durable control-plane work.
-pub struct MatrixGoalSessionAdapter {
-    pub(super) context: Arc<ChannelRuntimeContext>,
+struct MatrixGoalSessionAdapter {
+    context: Weak<ChannelRuntimeContext>,
 }
 
 impl MatrixGoalSessionAdapter {
-    fn route_for_binding(&self, binding: &GoalSessionBinding) -> Result<MatrixGoalRoute> {
+    fn new(context: Weak<ChannelRuntimeContext>) -> Self {
+        Self { context }
+    }
+
+    fn route_for_binding(
+        &self,
+        binding: &GoalSessionBinding,
+    ) -> Result<(Arc<ChannelRuntimeContext>, MatrixGoalRoute)> {
+        let context = self
+            .context
+            .upgrade()
+            .context("Matrix Goal runtime context is no longer available")?;
         let route = MatrixGoalRoute::parse(binding.route())?;
-        if !route.matches_binding(binding, self.context.agent_alias.as_str()) {
+        if !route.matches_binding(binding, context.agent_alias.as_str()) {
             bail!("Matrix Goal binding does not match the live agent or session");
         }
         let channel_key = composite_channel_key("matrix", Some(route.alias.as_str()));
-        if !self.context.channels_by_name.contains_key(&channel_key) {
+        if !context.channels_by_name.contains_key(&channel_key) {
             bail!("Matrix Goal channel alias is no longer available");
         }
+        let defaults = runtime_defaults_snapshot(context.as_ref());
         if !route_is_owned_by_agent(
-            self.context.prompt_config.as_ref(),
+            defaults.config.as_ref(),
             &channel_key,
-            self.context.agent_alias.as_str(),
+            context.agent_alias.as_str(),
         ) {
             bail!("Matrix Goal channel alias is not owned by the live agent");
         }
-        Ok(route)
+        Ok((context, route))
     }
 
     fn session_message(
@@ -139,14 +154,14 @@ impl MatrixGoalSessionAdapter {
     }
 
     fn effective_route(
-        &self,
+        context: &ChannelRuntimeContext,
         binding: &GoalSessionBinding,
         route: &MatrixGoalRoute,
         defaults: &ChannelRuntimeDefaultsSnapshot,
     ) -> Result<ChannelRouteSelection> {
         let message = Self::session_message(binding, route)?;
         Ok(get_route_selection(
-            self.context.as_ref(),
+            context,
             &message,
             binding.session_id(),
             defaults,
@@ -165,9 +180,7 @@ impl MatrixGoalSessionLease {
     fn current_route(&self) -> Result<(ChannelRuntimeDefaultsSnapshot, ChannelRouteSelection)> {
         let defaults = runtime_defaults_snapshot(self.context.as_ref());
         let route = MatrixGoalSessionAdapter::effective_route(
-            &MatrixGoalSessionAdapter {
-                context: Arc::clone(&self.context),
-            },
+            self.context.as_ref(),
             &self.binding,
             &self.route,
             &defaults,
@@ -187,12 +200,11 @@ impl GoalSessionAdapter for MatrixGoalSessionAdapter {
         binding: &GoalSessionBinding,
         request: &GoalExecutionPreflight,
     ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
-        let route = self
+        let (context, route) = self
             .route_for_binding(binding)
             .map_err(|_| GoalHostPreflightError::BindingUnavailable)?;
-        let defaults = runtime_defaults_snapshot(self.context.as_ref());
-        let selection = self
-            .effective_route(binding, &route, &defaults)
+        let defaults = runtime_defaults_snapshot(context.as_ref());
+        let selection = Self::effective_route(context.as_ref(), binding, &route, &defaults)
             .map_err(|_| GoalHostPreflightError::BindingUnavailable)?;
         zeroclaw_runtime::agent::agent::build_session_model_provider(
             defaults.config.as_ref(),
@@ -218,9 +230,9 @@ impl GoalSessionAdapter for MatrixGoalSessionAdapter {
     }
 
     async fn model_binding(&self, binding: &GoalSessionBinding) -> Result<GoalHostModelBinding> {
-        let route = self.route_for_binding(binding)?;
-        let defaults = runtime_defaults_snapshot(self.context.as_ref());
-        let selection = self.effective_route(binding, &route, &defaults)?;
+        let (context, route) = self.route_for_binding(binding)?;
+        let defaults = runtime_defaults_snapshot(context.as_ref());
+        let selection = Self::effective_route(context.as_ref(), binding, &route, &defaults)?;
         Ok(GoalHostModelBinding {
             provider_ref: selection.model_provider,
             model: selection.model,
@@ -228,10 +240,10 @@ impl GoalSessionAdapter for MatrixGoalSessionAdapter {
     }
 
     async fn deadline(&self, binding: &GoalSessionBinding) -> Result<Option<tokio::time::Instant>> {
-        self.route_for_binding(binding)?;
+        let (context, _route) = self.route_for_binding(binding)?;
         let timeout = channel_message_timeout_budget_secs_with_cap(
-            self.context.message_timeout_secs,
-            self.context.max_tool_iterations,
+            context.message_timeout_secs,
+            context.max_tool_iterations,
             CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP,
         );
         Ok(Some(
@@ -244,19 +256,348 @@ impl GoalSessionAdapter for MatrixGoalSessionAdapter {
         scope: &GoalExecutionScope,
         binding: &GoalSessionBinding,
     ) -> Result<Box<dyn GoalSessionLease>> {
-        let route = self.route_for_binding(binding)?;
-        let lock = foreground_lock(&self.context.persist_locks, binding.session_id());
+        let (context, _route) = self.route_for_binding(binding)?;
+        let lock = foreground_lock(&context.persist_locks, binding.session_id());
         let foreground_guard = wait_for_foreground_lease(lock, scope.cancellation.clone())
             .await
             .context("Matrix Goal foreground lease was cancelled")?;
-        self.route_for_binding(binding)?;
+        let (context, route) = self.route_for_binding(binding)?;
         Ok(Box::new(MatrixGoalSessionLease {
             _foreground_guard: foreground_guard,
-            context: Arc::clone(&self.context),
+            context,
             binding: binding.clone(),
             route,
         }))
     }
+}
+
+/// Build a current-config controller for one canonical Matrix session.
+///
+/// The process-local slot retains only executor supervision; the controller,
+/// control plane, and ledger are reconstructed from their canonical owners.
+pub(super) async fn runtime_for_matrix_session(
+    context: &Arc<ChannelRuntimeContext>,
+    session_id: &str,
+) -> Result<Arc<GoalRuntime>> {
+    let slot = super::goal_runtime_slot(&context.persist_locks, session_id);
+    let defaults = runtime_defaults_snapshot(context.as_ref());
+    let executor = slot
+        .get_or_try_init(|| async {
+            let control_plane = zeroclaw_runtime::control_plane::control_plane()
+                .context("Goal control plane is unavailable for Matrix")?;
+            let tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global_for_goal(
+                defaults.config.cost.clone(),
+                &defaults.config.data_dir,
+            )
+            .context("Goal cost ledger is unavailable for Matrix")?;
+            let adapter: Arc<dyn GoalSessionAdapter> =
+                Arc::new(MatrixGoalSessionAdapter::new(Arc::downgrade(context)));
+            let host = Arc::new(GoalExecutionHost::new(vec![adapter]));
+            Ok(Arc::new(GoalExecutionDriver::new(
+                host,
+                Arc::clone(&control_plane.goal_store),
+                Arc::clone(&defaults.config),
+                Arc::clone(&tracker),
+            )))
+        })
+        .await?;
+    // Existing workers have been fenced and joined before a reload replaces
+    // this source. A new controller therefore observes the live config while
+    // the persistent executor retains only worker supervision.
+    executor
+        .replace_config_after_quiescence(Arc::clone(&defaults.config))
+        .await;
+    let control_plane = zeroclaw_runtime::control_plane::control_plane()
+        .context("Goal control plane is unavailable for Matrix")?;
+    let tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global_for_goal(
+        defaults.config.cost.clone(),
+        &defaults.config.data_dir,
+    )
+    .context("Goal cost ledger is unavailable for Matrix")?;
+    Ok(Arc::new(GoalRuntime::new(
+        defaults.config,
+        Arc::clone(&control_plane.goal_store),
+        tracker,
+        executor,
+        &control_plane.boot_id,
+    )?))
+}
+
+/// Fence every running Goal owned by this Matrix runtime before a validated
+/// configuration replacement becomes visible. The task store, rather than the
+/// process-local slot cache, supplies the complete affected-session set.
+pub(super) async fn cut_over_matrix_goals_for_runtime_reload(
+    context: &Arc<ChannelRuntimeContext>,
+    next_config: &zeroclaw_config::schema::Config,
+) -> Result<()> {
+    let control_plane = zeroclaw_runtime::control_plane::control_plane()
+        .context("Goal control plane is unavailable for Matrix reload")?;
+    cut_over_matrix_goals_with_control_plane(context, next_config, control_plane).await
+}
+
+/// Apply the production Matrix cutover using its already-booted control plane.
+/// Keeping the handle explicit here lets the file-backed integration test drive
+/// the same transition and quiescence ordering without replacing global daemon
+/// state inside a parallel unit-test process.
+pub(super) async fn cut_over_matrix_goals_with_control_plane(
+    context: &Arc<ChannelRuntimeContext>,
+    next_config: &zeroclaw_config::schema::Config,
+    control_plane: &zeroclaw_runtime::control_plane::ControlPlaneHandle,
+) -> Result<()> {
+    let goals = control_plane
+        .goal_store
+        .nonterminal_session_goals_for_agent(context.agent_alias.as_str())
+        .await
+        .context("list nonterminal Matrix Goals for reload")?;
+    let mut affected = Vec::new();
+    let mut transitions = Vec::new();
+    for goal in goals {
+        // The control plane is shared with other Goal transports. Agent
+        // ownership alone is deliberately insufficient: this Matrix reload
+        // may act only on rows whose durable route is an exact Matrix route.
+        if !is_matrix_goal_route(&goal) {
+            continue;
+        }
+        let session_id = goal
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.trim().is_empty())
+            .context("running Matrix Goal has no session binding")?;
+        let action =
+            if matrix_goal_policy_is_revoked(next_config, context.agent_alias.as_str(), &goal) {
+                zeroclaw_runtime::control_plane::GoalPolicyCutoverAction::CancelForRevocation
+            } else if goal.status == zeroclaw_runtime::control_plane::TaskStatus::Running {
+                zeroclaw_runtime::control_plane::GoalPolicyCutoverAction::PauseForReload
+            } else {
+                continue;
+            };
+        transitions.push(
+            zeroclaw_runtime::control_plane::GoalPolicyCutoverTransition {
+                task_id: goal.id.clone(),
+                session_id: session_id.to_owned(),
+                execution_epoch: goal.execution_epoch,
+                action,
+            },
+        );
+        affected.push(goal);
+    }
+    let result = control_plane
+        .goal_store
+        .apply_goal_policy_cutover(&transitions)
+        .await?;
+    if result != zeroclaw_runtime::control_plane::GoalTransitionResult::Applied {
+        anyhow::bail!("atomic Matrix Goal policy cutover became stale");
+    }
+    for goal in affected {
+        let session_id = goal
+            .session_id
+            .as_deref()
+            .context("cut-over Matrix Goal has no session binding")?;
+        runtime_for_matrix_session(context, session_id)
+            .await?
+            .quiesce_exact_after_policy_cutover(&goal)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+    Ok(())
+}
+
+fn matrix_goal_route(
+    task: &zeroclaw_runtime::control_plane::TaskRecord,
+) -> Option<MatrixGoalRoute> {
+    task.originator_route
+        .as_deref()
+        .and_then(|route| MatrixGoalRoute::parse(route).ok())
+}
+
+fn is_matrix_goal_route(task: &zeroclaw_runtime::control_plane::TaskRecord) -> bool {
+    task.originator_route
+        .as_deref()
+        .is_some_and(|route| route.starts_with(MATRIX_ROUTE_PREFIX))
+}
+
+/// Determine whether a prospective configuration revokes the durable Matrix
+/// binding. This deliberately uses only task-owned binding facts and the
+/// prospective configuration: the process-local session slot is never policy
+/// authority.
+fn matrix_goal_policy_is_revoked(
+    next_config: &zeroclaw_config::schema::Config,
+    expected_agent: &str,
+    task: &zeroclaw_runtime::control_plane::TaskRecord,
+) -> bool {
+    if !next_config.goal.enabled || task.agent != expected_agent {
+        return true;
+    }
+    let Some(route) = matrix_goal_route(task) else {
+        return true;
+    };
+    let channel_key = composite_channel_key("matrix", Some(route.alias.as_str()));
+    if !route_is_owned_by_agent(next_config, &channel_key, expected_agent) {
+        return true;
+    }
+    if super::resolved_runtime_model_provider_ref(next_config, expected_agent).is_err() {
+        return true;
+    }
+    zeroclaw_runtime::agent::agent::build_session_model_provider(
+        next_config,
+        &next_config.goal.verifier.provider,
+        next_config.goal.verifier.model.as_deref(),
+    )
+    .is_err()
+}
+
+pub(super) fn is_matrix_goal_command(message: &zeroclaw_api::channel::ChannelMessage) -> bool {
+    if message.channel != "matrix" {
+        return false;
+    }
+    let command = message.content.trim_start();
+    command
+        .strip_prefix("/goal")
+        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
+
+/// Parse and submit an immutable Matrix command snapshot after the parent
+/// orchestrator has refreshed policy under its admission/cutover gate. The
+/// caller captures `message` before hooks run; hooks may cancel the outer
+/// message but cannot manufacture a Goal command or retarget this binding.
+pub(super) async fn submit_matrix_goal_command(
+    context: &Arc<ChannelRuntimeContext>,
+    message: &zeroclaw_api::channel::ChannelMessage,
+    parsed: std::result::Result<
+        zeroclaw_runtime::goal_mode::GoalCommand,
+        zeroclaw_runtime::goal_mode::GoalCommandParseError,
+    >,
+) -> String {
+    let response = async {
+        let command = match parsed {
+            Ok(command) => command,
+            Err(error) => {
+                return Ok(GoalResponse {
+                    key: parse_error_key(error.key),
+                    status: None,
+                });
+            }
+        };
+        let defaults = runtime_defaults_snapshot(context.as_ref());
+        if let Some(response) = local_goal_response(&command, defaults.config.goal.enabled) {
+            return Ok(response);
+        }
+        let alias = message
+            .channel_alias
+            .as_deref()
+            .filter(|alias| !alias.trim().is_empty())
+            .context("Matrix Goal command has no configured channel alias")?;
+        let session_id = conversation_history_key(message);
+        let ingress = zeroclaw_runtime::goal_mode::GoalIngressContext::trusted(
+            session_id.clone(),
+            context.agent_alias.as_str().to_owned(),
+            format!("matrix:{alias}:{}", message.reply_target),
+            Some(message.sender.clone()),
+        )?;
+        let runtime = runtime_for_matrix_session(context, &session_id).await?;
+        runtime
+            .submit(ingress, command)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+    .await;
+    match response {
+        Ok(response) => render_goal_response(&response),
+        Err(_) => super::channel_runtime_cli_string("goal-response-controller-failed"),
+    }
+}
+
+/// Responses that do not require session binding or runtime-owned state.
+///
+/// A disabled Goal surface is deliberately inert: reporting that it is off
+/// must not initialize the daemon control plane or open the canonical ledger.
+fn local_goal_response(
+    command: &zeroclaw_runtime::goal_mode::GoalCommand,
+    enabled: bool,
+) -> Option<GoalResponse> {
+    let key = if *command == zeroclaw_runtime::goal_mode::GoalCommand::Help {
+        GoalMessageKey::Help
+    } else if !enabled {
+        GoalMessageKey::Disabled
+    } else {
+        return None;
+    };
+    Some(GoalResponse { key, status: None })
+}
+
+fn parse_error_key(error: GoalCommandErrorKey) -> GoalMessageKey {
+    match error {
+        GoalCommandErrorKey::InvalidBudget => GoalMessageKey::InvalidBudget,
+        GoalCommandErrorKey::SuccessCriteriaRequired => GoalMessageKey::SuccessCriteriaRequired,
+        GoalCommandErrorKey::InputTooLong => GoalMessageKey::InputTooLong,
+        GoalCommandErrorKey::InvalidGrammar
+        | GoalCommandErrorKey::ObjectiveRequired
+        | GoalCommandErrorKey::InvalidArguments => GoalMessageKey::InvalidCommand,
+    }
+}
+
+fn render_goal_response(response: &GoalResponse) -> String {
+    let key = match response.key {
+        GoalMessageKey::Help => "goal-response-help",
+        GoalMessageKey::Disabled => "goal-response-disabled",
+        GoalMessageKey::InvalidConfiguration => "goal-response-invalid-configuration",
+        GoalMessageKey::NoCurrentGoal => "goal-response-no-current-goal",
+        GoalMessageKey::AlreadyActive => "goal-response-already-active",
+        GoalMessageKey::BudgetRequired => "goal-response-budget-required",
+        GoalMessageKey::PricingUnavailable => "goal-response-pricing-unavailable",
+        GoalMessageKey::VerifierUnavailable => "goal-response-verifier-unavailable",
+        GoalMessageKey::BindingUnavailable => "goal-response-binding-unavailable",
+        GoalMessageKey::Started => "goal-response-started",
+        GoalMessageKey::Status => "goal-response-status",
+        GoalMessageKey::Budget => "goal-response-budget",
+        GoalMessageKey::Paused => "goal-response-paused",
+        GoalMessageKey::AlreadyPaused => "goal-response-already-paused",
+        GoalMessageKey::Resumed => "goal-response-resumed",
+        GoalMessageKey::Cancelled => "goal-response-cancelled",
+        GoalMessageKey::AlreadyCancelled => "goal-response-already-cancelled",
+        GoalMessageKey::BudgetUpdated => "goal-response-budget-updated",
+        GoalMessageKey::InvalidCommand => "goal-response-invalid-command",
+        GoalMessageKey::InvalidBudget => "goal-response-invalid-budget",
+        GoalMessageKey::SuccessCriteriaRequired => "goal-response-success-criteria-required",
+        GoalMessageKey::InputTooLong => "goal-response-input-too-long",
+        GoalMessageKey::BudgetExhausted => "goal-response-budget-exhausted",
+        GoalMessageKey::AccountingIncomplete => "goal-response-accounting-incomplete",
+        GoalMessageKey::ReservationUnavailable => "goal-response-reservation-unavailable",
+        GoalMessageKey::ReservationExceedsBudget => "goal-response-reservation-exceeds-budget",
+        GoalMessageKey::ToolPhaseNonResumable => "goal-response-tool-phase-nonresumable",
+        GoalMessageKey::Terminal => "goal-response-terminal",
+        GoalMessageKey::ExecutorStartFailed => "goal-response-executor-start-failed",
+        GoalMessageKey::ExecutorQuiescing => "goal-response-executor-quiescing",
+        GoalMessageKey::Stale => "goal-response-stale",
+    };
+    let mut rendered = super::channel_runtime_cli_string(key);
+    if let Some(status) = &response.status {
+        let status_label = match status.status {
+            zeroclaw_runtime::control_plane::TaskStatus::Running => "running",
+            zeroclaw_runtime::control_plane::TaskStatus::Paused => "paused",
+            zeroclaw_runtime::control_plane::TaskStatus::Completed => "completed",
+            zeroclaw_runtime::control_plane::TaskStatus::Failed => "failed",
+            zeroclaw_runtime::control_plane::TaskStatus::Cancelled => "cancelled",
+            zeroclaw_runtime::control_plane::TaskStatus::Lost => "lost",
+            zeroclaw_runtime::control_plane::TaskStatus::TimedOut => "timed_out",
+        };
+        let resumable = status.resumable.to_string();
+        let tokens = status.known_token_usage.to_string();
+        let cost = format!("{:.6}", status.known_cost_usd);
+        rendered.push_str(&format!(
+            "\n\n{}",
+            zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "goal-response-status-summary",
+                &[
+                    ("status", status_label),
+                    ("resumable", &resumable),
+                    ("tokens", &tokens),
+                    ("cost", &cost),
+                ],
+            )
+        ));
+    }
+    rendered
 }
 
 #[async_trait]
@@ -448,9 +789,76 @@ impl GoalSessionLease for MatrixGoalSessionLease {
 #[cfg(test)]
 mod tests {
     use zeroclaw_config::{providers::ChannelRef, schema::AliasedAgentConfig};
-    use zeroclaw_runtime::goal_mode::host::GoalSessionBinding;
+    use zeroclaw_runtime::control_plane::{TaskKind, TaskRecord, TaskStatus};
+    use zeroclaw_runtime::goal_mode::{GoalCommand, GoalMessageKey, host::GoalSessionBinding};
 
-    use super::{MatrixGoalRoute, route_is_owned_by_agent};
+    use super::{
+        MatrixGoalRoute, is_matrix_goal_command, is_matrix_goal_route, local_goal_response,
+        matrix_goal_policy_is_revoked, matrix_goal_route, route_is_owned_by_agent,
+    };
+
+    fn goal_task(route: Option<&str>) -> TaskRecord {
+        TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: route.map(str::to_owned),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 1,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+        }
+    }
+
+    fn message(channel: &str, content: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            channel: channel.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn matrix_goal_recognition_is_exact_and_transport_scoped() {
+        for content in ["/goal", "/goal status", "  /goal help"] {
+            assert!(
+                is_matrix_goal_command(&message("matrix", content)),
+                "{content}"
+            );
+        }
+        for (channel, content) in [
+            ("matrix", "/goalpost"),
+            ("matrix", "please /goal status"),
+            ("telegram", "/goal status"),
+        ] {
+            assert!(
+                !is_matrix_goal_command(&message(channel, content)),
+                "{channel}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_goal_commands_need_no_runtime_or_control_plane() {
+        let disabled = local_goal_response(&GoalCommand::Status, false)
+            .expect("a disabled Goal command must return before runtime setup");
+        assert_eq!(disabled.key, GoalMessageKey::Disabled);
+        assert!(disabled.status.is_none());
+
+        let help = local_goal_response(&GoalCommand::Help, false)
+            .expect("help remains locally available while Goal Mode is disabled");
+        assert_eq!(help.key, GoalMessageKey::Help);
+        assert!(local_goal_response(&GoalCommand::Status, true).is_none());
+    }
 
     #[test]
     fn matrix_route_recomputes_the_thread_independent_session_key() {
@@ -520,5 +928,27 @@ mod tests {
 
         assert!(route_is_owned_by_agent(&config, "matrix.primary", "main"));
         assert!(!route_is_owned_by_agent(&config, "matrix.primary", "other"));
+    }
+
+    #[test]
+    fn reload_filters_other_goal_transports_by_the_durable_route() {
+        assert!(matrix_goal_route(&goal_task(Some("matrix:primary:!room:example.org"))).is_some());
+        assert!(matrix_goal_route(&goal_task(Some("rpc:session"))).is_none());
+        assert!(matrix_goal_route(&goal_task(None)).is_none());
+        assert!(
+            is_matrix_goal_route(&goal_task(Some("matrix:malformed"))),
+            "malformed Matrix-owned rows must be classified and fail closed during reload"
+        );
+        assert!(!is_matrix_goal_route(&goal_task(Some("rpc:session"))));
+    }
+
+    #[test]
+    fn disabled_goal_mode_revokes_a_durably_bound_matrix_goal() {
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(matrix_goal_policy_is_revoked(
+            &config,
+            "main",
+            &goal_task(Some("matrix:primary:!room:example.org")),
+        ));
     }
 }
