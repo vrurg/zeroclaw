@@ -261,7 +261,10 @@ impl ApprovalManager {
         eprintln!();
         eprintln!("🔐 {title}");
         eprintln!("{details}");
-        eprint!("   [Y]es / [N]o: ");
+        eprint!(
+            "{}",
+            crate::i18n::get_required_cli_string("cli-approval-prompt-yesno")
+        );
         let _ = io::stderr().flush();
         read_cli_approval_line()
             .map(|line| matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))

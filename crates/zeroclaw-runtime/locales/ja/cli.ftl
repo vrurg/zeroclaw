@@ -978,6 +978,7 @@ sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できませ�
 # ASCII ショートカットは Rust 側の応答パーサーと一致させます。
 cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
 cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
+cli-approval-prompt-yesno = { "   " }[Y] はい / [N] いいえ:{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared

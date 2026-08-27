@@ -978,6 +978,7 @@ sop-rpc-policy-unavailable = La política del SOP en espera no está disponible:
 # Los atajos ASCII se mantienen alineados con el analizador de respuestas de Rust.
 cli-approval-request = 🔧 El agente quiere ejecutar: {$tool}
 cli-approval-prompt = { "   " }[Y] Sí / [N] No / [A] Siempre para {$tool}:{ " " }
+cli-approval-prompt-yesno = { "   " }[Y] Sí / [N] No:{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
