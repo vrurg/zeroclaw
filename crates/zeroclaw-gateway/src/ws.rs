@@ -1961,7 +1961,7 @@ data: {\"type\":\"message_stop\"}\n\n",
         });
 
         let (mut socket, _) = connect_async(format!(
-            "ws://{address}/ws/chat?agent=web&session_id=delete-race"
+            "ws://{address}/ws/chat?agent=web&session_id=delete-race" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         ))
         .await
         .expect("chat WebSocket upgrade");
