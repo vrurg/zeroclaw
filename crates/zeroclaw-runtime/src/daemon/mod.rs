@@ -745,6 +745,9 @@ pub async fn run(
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: std::sync::Arc::new(
+                crate::goal_mode::execution::GoalExecutionSlot::default(),
+            ),
             session_backend,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel

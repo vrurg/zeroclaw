@@ -10,7 +10,7 @@ const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
-use crate::goal_mode::execution::{GoalExecutionDriver, GoalExecutionSlot};
+use crate::goal_mode::execution::GoalExecutionDriver;
 use crate::goal_mode::host::{GoalExecutionHost, GoalSessionAdapter};
 use crate::goal_mode::{GoalIngressContext, GoalMessageKey, GoalRuntime, parse_goal_command};
 use crate::rpc::goal_execution::RpcGoalSessionAdapter;
@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{OwnedMutexGuard, mpsc};
+use tokio::sync::mpsc;
 use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
@@ -51,8 +51,7 @@ struct StatusRuntimeContext {
 /// has removed it from `SessionStore`. The durable Goal record remains in the
 /// control plane; this is only the live-session lifecycle boundary.
 struct RpcGoalSessionDisposal {
-    slot: Arc<GoalExecutionSlot>,
-    _lifecycle_guard: OwnedMutexGuard<()>,
+    reservation: super::session::SessionRemovalReservation,
 }
 
 fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
@@ -1169,6 +1168,49 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
+        match self
+            .ctx
+            .sessions
+            .admit_reconnect(
+                &session_id,
+                &req.agent_alias,
+                &chat_mode,
+                self.tui_id.as_deref(),
+            )
+            .await
+        {
+            super::session::SessionReconnectAdmission::Admitted(lease) => {
+                let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
+                    "rpc",
+                    session_id.clone(),
+                    Arc::clone(&self.rpc),
+                    Arc::clone(&self.ctx.approval_pending),
+                    self.client_elicitation_caps,
+                ));
+                let message_count = {
+                    let mut agent = lease.agent.lock().await;
+                    agent.set_channel_name("rpc".to_string());
+                    agent.channel_handles().register_channel("rpc", approval_ch);
+                    agent.history().len()
+                };
+                let workspace_dir = lease.workspace_dir.clone();
+                drop(lease);
+                return to_result(SessionNewResult {
+                    session_id,
+                    agent_alias: req.agent_alias,
+                    message_count,
+                    workspace_dir,
+                });
+            }
+            super::session::SessionReconnectAdmission::Incompatible => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "session ID is already bound to a different agent, mode, or owner",
+                ));
+            }
+            super::session::SessionReconnectAdmission::Missing => {}
+        }
+
         // Resuming an ACP session with no caller cwd: recover the original
         // working directory from the persisted store so the rehydrated session
         // keeps its own cwd instead of falling back to the agent workspace dir.
@@ -1266,36 +1308,6 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        // A caller may reuse a live ID. Treat that as true replacement rather
-        // than allowing `SessionStore::insert` to drop the prior Goal slot.
-        if self
-            .ctx
-            .sessions
-            .goal_execution_slot(&session_id)
-            .await
-            .is_some()
-        {
-            let disposal = self.dispose_goal_for_session(&session_id).await?;
-            let removed = match disposal {
-                Some(disposal) => {
-                    self.ctx
-                        .sessions
-                        .remove_if_goal_execution_slot(&session_id, &disposal.slot)
-                        .await
-                }
-                None => false,
-            };
-            if !removed {
-                return Err(rpc_err(
-                    INTERNAL_ERROR,
-                    "session changed during replacement",
-                ));
-            }
-            if let Some(ref hooks) = self.ctx.hooks {
-                hooks.fire_session_end(&session_id, "rpc").await;
-            }
-        }
-
         self.ctx
             .sessions
             .insert(
@@ -1316,16 +1328,25 @@ impl RpcDispatcher {
                 .await;
             let mut evicted = Vec::with_capacity(candidates.len());
             for (sibling_id, sibling_alias) in candidates {
-                let disposal = self.dispose_goal_for_session(&sibling_id).await?;
-                let removed = match disposal {
-                    Some(disposal) => {
-                        self.ctx
-                            .sessions
-                            .remove_if_goal_execution_slot(&sibling_id, &disposal.slot)
-                            .await
-                    }
-                    None => self.ctx.sessions.remove(&sibling_id).await,
+                let Some(reservation) = self
+                    .ctx
+                    .sessions
+                    .reserve_idle_same_mode_sibling(&sibling_id, tui_id, &chat_mode)
+                    .await
+                else {
+                    continue;
                 };
+                let disposal = self
+                    .dispose_goal_with_reservation(&sibling_id, reservation)
+                    .await?;
+                let removed = self
+                    .ctx
+                    .sessions
+                    .remove_reserved(
+                        disposal.reservation,
+                        super::session::CancelCause::SessionRemoved,
+                    )
+                    .await;
                 if removed {
                     evicted.push((sibling_id, sibling_alias));
                 }
@@ -1391,7 +1412,7 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx.sessions.remove(&session_id).await;
+                        self.remove_failed_new_session(&session_id).await;
                         return Err(rpc_err(
                             INTERNAL_ERROR,
                             "ACP session store is not available",
@@ -1424,7 +1445,7 @@ impl RpcDispatcher {
                             if let Some(ref hooks) = self.ctx.hooks {
                                 hooks.fire_session_end(&session_id, "rpc").await;
                             }
-                            self.ctx.sessions.remove(&session_id).await;
+                            self.remove_failed_new_session(&session_id).await;
                             return Err(rpc_err(
                                 INVALID_PARAMS,
                                 "ACP session belongs to a different agent",
@@ -1463,14 +1484,14 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx.sessions.remove(&session_id).await;
+                        self.remove_failed_new_session(&session_id).await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                     }
                     Ok(Err(e)) => {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx.sessions.remove(&session_id).await;
+                        self.remove_failed_new_session(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1487,7 +1508,7 @@ impl RpcDispatcher {
                         if let Some(ref hooks) = self.ctx.hooks {
                             hooks.fire_session_end(&session_id, "rpc").await;
                         }
-                        self.ctx.sessions.remove(&session_id).await;
+                        self.remove_failed_new_session(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1575,7 +1596,10 @@ impl RpcDispatcher {
             Some(disposal) => {
                 self.ctx
                     .sessions
-                    .remove_if_goal_execution_slot(&req.session_id, &disposal.slot)
+                    .remove_reserved(
+                        disposal.reservation,
+                        super::session::CancelCause::SessionRemoved,
+                    )
                     .await
             }
             None => self.ctx.sessions.remove(&req.session_id).await,
@@ -1613,7 +1637,12 @@ impl RpcDispatcher {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        let disposal = self.dispose_goal_for_session(sid).await?;
+        let reservation = self
+            .ctx
+            .sessions
+            .reserve_removal(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         let chat_mode = self
             .ctx
@@ -1672,15 +1701,15 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = match disposal {
-            Some(disposal) => {
-                self.ctx
-                    .sessions
-                    .kill_session_if_goal_execution_slot(sid, &disposal.slot)
-                    .await
-            }
-            None => self.ctx.sessions.kill_session(sid).await,
-        };
+        // ACP persistence is the authority for an admin kill. If its
+        // tombstone write fails, dropping the unconsumed reservation restores
+        // the exact live session and leaves its Goal/turn untouched.
+        let disposal = self.dispose_goal_with_reservation(sid, reservation).await?;
+        let killed = self
+            .ctx
+            .sessions
+            .remove_reserved(disposal.reservation, super::session::CancelCause::AdminKill)
+            .await;
         if killed {
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
@@ -1840,46 +1869,35 @@ impl RpcDispatcher {
         let request: SessionGoalParams = parse_params(params)?;
         let command = parse_goal_command(&request.command)
             .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
-        let slot = self
+        let admission = self
             .ctx
             .sessions
-            .goal_execution_slot(&request.session_id)
+            .admit_goal(&request.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let _lifecycle_guard = slot.lock_lifecycle().await;
-        if !self
-            .ctx
-            .sessions
-            .goal_execution_slot_is_current(&request.session_id, &slot)
-            .await
-        {
-            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-        }
-        let agent = self
-            .ctx
-            .sessions
-            .get_agent_alias(&request.session_id)
-            .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        let runtime = self.goal_runtime_for_slot(slot).await?;
+        let agent = admission.agent_alias.clone();
+        let runtime = self.goal_runtime().await?;
         let ingress = GoalIngressContext::trusted(request.session_id, agent, "zerocode", None)
             .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let response = runtime
             .submit(ingress, command)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
+        drop(admission);
         to_result(SessionGoalResult {
             key: goal_message_key(response.key).to_string(),
             status: response.status,
         })
     }
 
-    async fn goal_runtime_for_slot(
-        &self,
-        slot: Arc<GoalExecutionSlot>,
-    ) -> Result<Arc<GoalRuntime>, JsonRpcError> {
+    /// Build the daemon-scoped RPC Goal runtime. The cache belongs to
+    /// `RpcContext`, rather than a replaceable `RpcSession`, so lifecycle
+    /// cleanup always retains the worker supervisor until quiescence.
+    async fn goal_runtime(&self) -> Result<Arc<GoalRuntime>, JsonRpcError> {
         let config = Arc::new(self.ctx.config.read().clone());
-        let executor = slot
+        let executor = self
+            .ctx
+            .goal_execution
             .get_or_try_init({
                 let config = Arc::clone(&config);
                 let sessions = Arc::clone(&self.ctx.sessions);
@@ -1956,36 +1974,25 @@ impl RpcDispatcher {
         &self,
         session_id: &str,
     ) -> Result<Option<RpcGoalSessionDisposal>, JsonRpcError> {
-        let Some(slot) = self.ctx.sessions.goal_execution_slot(session_id).await else {
-            if let Some(control_plane) = crate::control_plane::control_plane() {
-                GoalRuntime::dispose_orphaned_session(
-                    Arc::clone(&control_plane.goal_store),
-                    session_id,
-                )
-                .await
-                .map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("orphaned session disposal: {error}"),
-                    )
-                })?;
-            }
+        let Some(reservation) = self.ctx.sessions.reserve_removal(session_id).await else {
             return Ok(None);
         };
-        let lifecycle_guard = slot.lock_lifecycle().await;
-        if !self
-            .ctx
-            .sessions
-            .goal_execution_slot_is_current(session_id, &slot)
+        self.dispose_goal_with_reservation(session_id, reservation)
             .await
-        {
-            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-        }
+            .map(Some)
+    }
+
+    async fn dispose_goal_with_reservation(
+        &self,
+        session_id: &str,
+        mut reservation: super::session::SessionRemovalReservation,
+    ) -> Result<RpcGoalSessionDisposal, JsonRpcError> {
+        // Once durable Goal disposal may begin, a failure must leave this exact
+        // session quarantined for a compatible retry. It must not return to
+        // ordinary prompt/Goal admission after a partial fence.
+        self.ctx.sessions.seal_removal_reservation(&mut reservation);
         let Some(control_plane) = crate::control_plane::control_plane() else {
-            return Ok(Some(RpcGoalSessionDisposal {
-                slot,
-                _lifecycle_guard: lifecycle_guard,
-            }));
+            return Ok(RpcGoalSessionDisposal { reservation });
         };
         if control_plane
             .goal_store
@@ -1994,20 +2001,46 @@ impl RpcDispatcher {
             .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session disposal: {error}")))?
             .is_none()
         {
-            return Ok(Some(RpcGoalSessionDisposal {
-                slot,
-                _lifecycle_guard: lifecycle_guard,
-            }));
+            return Ok(RpcGoalSessionDisposal { reservation });
         }
-        self.goal_runtime_for_slot(Arc::clone(&slot))
+        self.goal_runtime()
             .await?
             .dispose_session(session_id)
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session disposal: {error}")))?;
-        Ok(Some(RpcGoalSessionDisposal {
-            slot,
-            _lifecycle_guard: lifecycle_guard,
-        }))
+        Ok(RpcGoalSessionDisposal { reservation })
+    }
+
+    /// Undo a newly published session only through the same Goal-aware
+    /// lifecycle reservation used by close/delete/kill. ACP initialization
+    /// failures used to remove the map entry directly, which could strand a
+    /// Goal worker if a concurrent command had already been admitted.
+    async fn remove_failed_new_session(&self, session_id: &str) {
+        match self.dispose_goal_for_session(session_id).await {
+            Ok(Some(disposal)) => {
+                let _ = self
+                    .ctx
+                    .sessions
+                    .remove_reserved(
+                        disposal.reservation,
+                        super::session::CancelCause::SessionRemoved,
+                    )
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"session_id": session_id, "error": error.message})
+                        ),
+                    "Failed to dispose Goal state after session/new initialization failure"
+                );
+            }
+        }
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2086,8 +2119,13 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        let turn_lease = self
+            .ctx
+            .sessions
+            .begin_turn(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let cancel = turn_lease.token();
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -2198,13 +2236,10 @@ impl RpcDispatcher {
         )
         .await;
 
-        // Drain the cancel cause BEFORE removing the token (removal clears the
-        // cause map). Every cancel firing site records its cause before firing;
-        // a cancel with no recorded cause is a bug, not user attribution.
-        let cancel_cause = self.ctx.sessions.take_cancel_cause(sid);
-        self.ctx
-            .sessions
-            .remove_cancel_token(sid, cancel_generation);
+        // An old completion may clear only its exact lease; a successor turn
+        // for a recycled session ID keeps both its token and cancellation
+        // verdict untouched.
+        let cancel_cause = self.ctx.sessions.finish_turn(&turn_lease);
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -2816,7 +2851,10 @@ impl RpcDispatcher {
             Some(disposal) => {
                 self.ctx
                     .sessions
-                    .remove_if_goal_execution_slot(&req.session_id, &disposal.slot)
+                    .remove_reserved(
+                        disposal.reservation,
+                        super::session::CancelCause::SessionRemoved,
+                    )
                     .await
             }
             None => self.ctx.sessions.remove(&req.session_id).await,
@@ -7509,6 +7547,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_id_reconnect_retains_the_live_session_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("reconnect-owner".into()));
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "same-id-reconnect",
+        });
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("initial session/new must succeed");
+        let original = sessions
+            .get_agent("same-id-reconnect")
+            .await
+            .expect("initial session must be live");
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("compatible same-ID reconnect must succeed");
+        let reconnected = sessions
+            .get_agent("same-id-reconnect")
+            .await
+            .expect("reconnected session must remain live");
+
+        assert!(
+            Arc::ptr_eq(&original, &reconnected),
+            "same-ID reconnect must retain the session agent and any Goal worker bound to it"
+        );
+        assert_eq!(sessions.count().await, 1);
+    }
+
+    #[tokio::test]
     async fn session_new_keep_siblings_spares_idle_same_mode_sibling() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -10410,9 +10485,11 @@ mod tests {
              measuring nothing"
         );
 
-        let token = tokio_util::sync::CancellationToken::new();
-        sessions.register_cancel_token(session_id, token.clone());
-        token
+        sessions
+            .begin_turn(session_id)
+            .await
+            .expect("session/new must create an active session")
+            .token()
     }
 
     fn make_dispatcher_with_capture(
@@ -10610,6 +10687,7 @@ mod tests {
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
+            goal_execution: Arc::new(crate::goal_mode::execution::GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -10653,6 +10731,7 @@ mod tests {
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
+            goal_execution: Arc::new(crate::goal_mode::execution::GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -10753,6 +10832,7 @@ mod tests {
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::clone(&sessions),
+            goal_execution: Arc::new(crate::goal_mode::execution::GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,

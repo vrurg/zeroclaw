@@ -1266,102 +1266,6 @@ impl GoalRuntime {
         Ok(())
     }
 
-    /// Dispose a Goal whose live session has already been reaped. Callers must
-    /// establish that no execution host remains before using this durable-only
-    /// path; it cannot quiesce a worker without a live session adapter.
-    pub async fn dispose_orphaned_session(
-        goals: Arc<dyn GoalTaskRegistry>,
-        session_id: &str,
-    ) -> Result<(), GoalRuntimeError> {
-        let Some(task) = goals
-            .current_goal_for_session(session_id)
-            .await
-            .map_err(GoalRuntimeError::control_plane)?
-        else {
-            return Ok(());
-        };
-        let goal = goals
-            .get_goal_task(&task.id)
-            .await
-            .map_err(GoalRuntimeError::control_plane)?
-            .ok_or_else(|| {
-                GoalRuntimeError::control_plane(anyhow::Error::msg(
-                    "goal control record disappeared during orphaned session disposal",
-                ))
-            })?;
-        let delete_epoch = if !task.status.is_terminal() {
-            let status = if goal.pending_call_id.is_some() {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Cancelled
-            };
-            let reason = if goal.pending_call_id.is_some() {
-                "accounting_outcome_unknown"
-            } else {
-                "session_disposed"
-            };
-            match goals
-                .finish_session_goal(
-                    &task.id,
-                    session_id,
-                    task.execution_epoch,
-                    status,
-                    Some(reason.into()),
-                )
-                .await
-                .map_err(GoalRuntimeError::control_plane)?
-            {
-                GoalTransitionResult::Applied => task.execution_epoch + 1,
-                GoalTransitionResult::Missing => return Ok(()),
-                GoalTransitionResult::Stale => {
-                    return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
-                        "goal lifecycle changed during orphaned session disposal",
-                    )));
-                }
-            }
-        } else {
-            task.execution_epoch
-        };
-        let goal = goals
-            .get_goal_task(&task.id)
-            .await
-            .map_err(GoalRuntimeError::control_plane)?
-            .ok_or_else(|| {
-                GoalRuntimeError::control_plane(anyhow::Error::msg(
-                    "goal control record disappeared during orphaned session disposal",
-                ))
-            })?;
-        let pending = goal.pending_call_id.as_deref().zip(goal.pending_call_epoch);
-        if let Some((call_id, call_epoch)) = pending
-            && goals
-                .settle_pending_call(
-                    &task.id,
-                    session_id,
-                    call_epoch,
-                    call_id,
-                    GoalAccountingState::OutcomeUnknown,
-                )
-                .await
-                .map_err(GoalRuntimeError::control_plane)?
-                != GoalTransitionResult::Applied
-        {
-            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
-                "goal pending operation changed during orphaned session disposal",
-            )));
-        }
-        if goals
-            .delete_session_goal(&task.id, session_id, delete_epoch)
-            .await
-            .map_err(GoalRuntimeError::control_plane)?
-            != GoalTransitionResult::Applied
-        {
-            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
-                "goal deletion changed during orphaned session disposal",
-            )));
-        }
-        Ok(())
-    }
-
     async fn launch_exact(
         &self,
         ingress: GoalIngressContext,
@@ -1929,24 +1833,6 @@ mod tests {
                 .is_none()
         );
         assert_eq!(executor.cancelled.lock().as_slice(), &[(task.id, -1)]);
-    }
-
-    #[tokio::test]
-    async fn orphaned_session_disposal_removes_durable_goal_control_state() {
-        let (runtime, store, _executor, _directory) = controller(ready(), false);
-        runtime.submit(ingress(), start_command()).await.unwrap();
-
-        GoalRuntime::dispose_orphaned_session(store.clone(), "session")
-            .await
-            .unwrap();
-
-        assert!(
-            store
-                .current_goal_for_session("session")
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     fn start_command() -> GoalCommand {

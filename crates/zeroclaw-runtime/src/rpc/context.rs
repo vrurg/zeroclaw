@@ -16,6 +16,7 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
+use crate::goal_mode::execution::GoalExecutionSlot;
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
@@ -125,6 +126,13 @@ pub struct RpcContext {
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
 
+    /// RPC-wide Goal execution-host cache. This owns only the transport
+    /// adapter/driver cache; per-session lifecycle authority remains in
+    /// [`SessionStore`]. Keeping it here means removing a session entry can
+    /// never discard the supervisor needed to quiesce that session's Goal
+    /// worker.
+    pub goal_execution: Arc<GoalExecutionSlot>,
+
     /// Persistent session backend (SQLite / JSONL) for history and
     /// session metadata. `None` when persistence is disabled.
     pub session_backend: Option<Arc<dyn SessionBackend>>,
@@ -181,6 +189,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -202,6 +211,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -227,6 +237,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -252,6 +263,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,
@@ -277,6 +289,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: Some(memory),
             cost_tracker: None,
@@ -302,6 +315,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: Some(cost_tracker),
@@ -328,6 +342,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend,
             memory: None,
             cost_tracker: None,
@@ -354,6 +369,7 @@ impl RpcContext {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions,
+            goal_execution: Arc::new(GoalExecutionSlot::default()),
             session_backend: None,
             memory: None,
             cost_tracker: None,

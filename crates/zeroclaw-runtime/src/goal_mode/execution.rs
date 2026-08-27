@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, oneshot},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -568,19 +568,17 @@ pub struct GoalExecutionDriver {
     workers: Arc<Mutex<HashMap<GoalWorkerKey, Arc<GoalWorker>>>>,
 }
 
-/// Process-local supervisor cache for one canonical live session.
+/// Process-local supervisor cache for one execution host.
 ///
 /// This stores no Goal lifecycle, identity, policy, or accounting fact. Those
 /// remain in the durable control plane and canonical ledger; the slot merely
 /// preserves the runtime-owned worker supervisor between short-lived command
-/// controllers for a transport session.
+/// controllers for one transport host. Session lifecycle coordination belongs
+/// to the host's session store, not to this cache: replacing a session must
+/// not drop the only handle capable of quiescing its Goal worker.
 #[derive(Default)]
 pub struct GoalExecutionSlot {
     executor: tokio::sync::OnceCell<Arc<GoalExecutionDriver>>,
-    /// Serializes Goal command admission with removal of this exact live
-    /// session. It is process-local coordination only; durable Goal facts
-    /// remain in the control plane.
-    lifecycle_gate: Arc<Mutex<()>>,
 }
 
 impl GoalExecutionSlot {
@@ -590,10 +588,6 @@ impl GoalExecutionSlot {
         Fut: Future<Output = anyhow::Result<Arc<GoalExecutionDriver>>>,
     {
         self.executor.get_or_try_init(init).await.map(Arc::clone)
-    }
-
-    pub async fn lock_lifecycle(&self) -> OwnedMutexGuard<()> {
-        Arc::clone(&self.lifecycle_gate).lock_owned().await
     }
 }
 
