@@ -1960,11 +1960,15 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .expect("test gateway server");
         });
 
-        let (mut socket, _) = connect_async(format!(
-            "ws://{address}/ws/chat?agent=web&session_id=delete-race" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
-        ))
-        .await
-        .expect("chat WebSocket upgrade");
+        let request = axum::http::Uri::builder()
+            .scheme("ws")
+            .authority(address.to_string())
+            .path_and_query("/ws/chat?agent=web&session_id=delete-race")
+            .build()
+            .expect("test WebSocket URI");
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("chat WebSocket upgrade");
         let _ = tokio::time::timeout(Duration::from_secs(1), socket.next())
             .await
             .expect("session_start timeout")
