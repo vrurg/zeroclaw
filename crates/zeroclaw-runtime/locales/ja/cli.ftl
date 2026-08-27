@@ -629,6 +629,7 @@ cli-no-channels-compiled = {"  "}このバイナリにコンパイルされて�
 cli-quickstart-complete = クイックスタートが完了しました。エージェント `{$alias}` を作成しました。
 cli-next-steps = 次のステップ:
 cli-agent-not-created = エージェントは作成されませんでした — ディスク上の変更はありません。
+cli-agent-not-created-disk-state-uncertain = エージェントは作成されませんでした。設定は保存されていませんが、Anthropic 認証情報のロールバックに失敗しました。再試行する前に保存済みのプロファイルを確認してください。
 cli-onboard-deprecated = `zeroclaw onboard` は非推奨です — `zeroclaw quickstart` を使用してください。
 cli-otp-initialized = ZeroClaw用のOTPシークレットを初期化しました。
 cli-otp-enrollment-uri = 登録URI: {$uri}

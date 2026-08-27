@@ -25,6 +25,17 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 
 Family-specific entries add their own typed fields on top of these shared fields.
 
+### Provider-alias compatibility
+
+Provider aliases must not contain `:`. The character is reserved by the
+authentication-profile identifier grammar, so ZeroClaw rejects a configuration
+that uses it rather than risking selection of a different stored credential.
+To upgrade a legacy colon-bearing alias, rename it to a colon-free value (for
+example, `team:prod` to `team-prod`) and update every reference to it, including
+`agents.<alias>.model_provider`, `fallback`, `model_routes`, and multimodal
+provider references. This is a manual configuration migration; Quickstart does
+not rewrite existing aliases.
+
 ## Field resolution order
 
 For most families, the URL is resolved in this order:

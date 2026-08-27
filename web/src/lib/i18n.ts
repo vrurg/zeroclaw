@@ -811,6 +811,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'quickstart.add_peer_group': "Add peer group",
     'quickstart.agent_name_placeholder': "some_nickname",
     'quickstart.agent_title': "Agent",
+    'quickstart.anthropic_setup_token_help': "Paste the token from `claude setup-token`. ZeroClaw stores it in the same-named Anthropic auth profile, never in config.toml.",
+    'quickstart.anthropic_setup_token_label': "setup_token",
     'quickstart.alias': "alias",
     'quickstart.alias_label': "Alias",
     'quickstart.all_channels_staged': "Every available channel has a peer-group staged.",

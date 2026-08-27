@@ -30,6 +30,7 @@ import {
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
 import {
+  quickstartCredentialPresentation,
   requiredQuickstartSelectionsComplete,
   runtimeAfterProviderChange,
   runtimeDefaultForProvider,
@@ -922,28 +923,41 @@ function ProviderForm({
               (fieldValues["auth_mode"] ?? "").trim() === "codex"
             ),
         )
-        .map((d) =>
-          d.enum_variants && d.enum_variants.length > 0 ? (
-            <LabeledSelect
-              key={d.key}
-              label={d.label}
-              help={d.help}
-              options={d.enum_variants}
-              value={
-                fieldValues[d.key] ??
-                d.default ??
-                d.enum_variants[0] ??
-                ""
-              }
-              onChange={(value) =>
-                setFieldValues((prev) => ({ ...prev, [d.key]: value }))
-              }
-            />
-          ) : (
+        .map((d) => {
+          if (d.enum_variants && d.enum_variants.length > 0) {
+            return (
+              <LabeledSelect
+                key={d.key}
+                label={d.label}
+                help={d.help}
+                options={d.enum_variants}
+                value={
+                  fieldValues[d.key] ??
+                  d.default ??
+                  d.enum_variants[0] ??
+                  ""
+                }
+                onChange={(value) =>
+                  setFieldValues((prev) => ({ ...prev, [d.key]: value }))
+                }
+              />
+            );
+          }
+
+          const presentation = quickstartCredentialPresentation({
+            providerType: type,
+            authMode: fieldValues.auth_mode,
+            fieldKey: d.key,
+            label: d.label,
+            help: d.help,
+            setupTokenLabel: t("quickstart.anthropic_setup_token_label"),
+            setupTokenHelp: t("quickstart.anthropic_setup_token_help"),
+          });
+          return (
             <LabeledInput
               key={d.key}
-              label={d.label}
-              help={d.help}
+              label={presentation.label}
+              help={presentation.help}
               type={d.is_secret ? "password" : "text"}
               value={fieldValues[d.key] ?? ""}
               placeholder={d.default ?? ""}
@@ -951,8 +965,8 @@ function ProviderForm({
                 setFieldValues((prev) => ({ ...prev, [d.key]: value }))
               }
             />
-          ),
-        )}
+          );
+        })}
 
       <div className="flex justify-end">
         <Button

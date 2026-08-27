@@ -788,32 +788,16 @@ mod tests {
         // carries it, and that the four localized ones are actually translated
         // rather than copied from `en` — a copy would pass a mere
         // "the key resolves" check while leaving the string un-localized.
-        const KEY: &str = "channel-approval-group-visibility-warning";
+        assert_cli_key_translated_in_every_locale("channel-approval-group-visibility-warning");
+    }
 
-        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", KEY, &[])
-            .unwrap_or_else(|| panic!("{KEY} should format in en"));
-        assert!(
-            !english.trim().is_empty(),
-            "{KEY} must not be empty in en; got {english:?}"
-        );
-
-        for (source, locale) in [
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
-            let value = format_ftl_message(source, locale, KEY, &[])
-                .unwrap_or_else(|| panic!("{KEY} should format in {locale}"));
-            assert!(
-                !value.trim().is_empty(),
-                "{KEY} must not be empty in {locale}; got {value:?}"
-            );
-            assert_ne!(
-                value, english,
-                "{KEY} in {locale} is the English string verbatim, so that catalogue was never translated"
-            );
-        }
+    #[test]
+    fn quickstart_uncertain_credential_rollback_warning_is_translated_in_every_locale() {
+        // This warning tells an operator that the config was not committed but
+        // a stored credential may remain. It must be available in the locale
+        // selected for the failed Quickstart surface, rather than silently
+        // falling back to English at a security-relevant recovery boundary.
+        assert_cli_key_translated_in_every_locale("cli-agent-not-created-disk-state-uncertain");
     }
 
     #[test]
@@ -1555,7 +1539,7 @@ mod tests {
         "channel-approval-opt-reject-with-edit",
     ];
 
-    fn channel_approval_locale_sources() -> [(&'static str, &'static str); 5] {
+    fn builtin_cli_locale_sources() -> [(&'static str, &'static str); 5] {
         [
             (include_str!("../locales/en/cli.ftl"), "en"),
             (include_str!("../locales/es/cli.ftl"), "es"),
@@ -1565,13 +1549,35 @@ mod tests {
         ]
     }
 
+    fn assert_cli_key_translated_in_every_locale(key: &str) {
+        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, &[])
+            .unwrap_or_else(|| panic!("{key} should format in en"));
+        assert!(
+            !english.trim().is_empty(),
+            "{key} must not be empty in en; got {english:?}"
+        );
+
+        for (source, locale) in builtin_cli_locale_sources().into_iter().skip(1) {
+            let value = format_ftl_message(source, locale, key, &[])
+                .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+            assert!(
+                !value.trim().is_empty(),
+                "{key} must not be empty in {locale}; got {value:?}"
+            );
+            assert_ne!(
+                value, english,
+                "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+            );
+        }
+    }
+
     #[test]
     fn channel_approval_keys_are_defined_in_every_locale() {
         // Key-parity + command-preservation guard: every new
         // `channel-approval-*` key must be defined in all 5 committed
         // locales, and the complete Rust-built reply commands — plus the
         // tool arg — must survive translation verbatim.
-        for (source, locale) in channel_approval_locale_sources() {
+        for (source, locale) in builtin_cli_locale_sources() {
             for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));

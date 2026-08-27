@@ -632,6 +632,7 @@ cli-no-channels-compiled = {"  "}Aucun type de canal n'est compilé dans ce bina
 cli-quickstart-complete = Quickstart terminé. Agent `{$alias}` créé.
 cli-next-steps = Étapes suivantes :
 cli-agent-not-created = Votre agent n'a pas été créé — et rien n'a été modifié sur le disque.
+cli-agent-not-created-disk-state-uncertain = Votre agent n’a pas été créé. La configuration n’a pas été enregistrée, mais l’annulation des identifiants Anthropic a échoué ; inspectez le profil stocké avant de réessayer.
 cli-onboard-deprecated = `zeroclaw onboard` est obsolète — utilisez `zeroclaw quickstart`.
 cli-otp-initialized = Secret OTP initialisé pour ZeroClaw.
 cli-otp-enrollment-uri = URI d'enregistrement : {$uri}
