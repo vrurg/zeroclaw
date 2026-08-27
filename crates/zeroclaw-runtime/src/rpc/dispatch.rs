@@ -1834,21 +1834,29 @@ impl RpcDispatcher {
 
         let message_count = data.messages.len();
         let seed_event = agent.seed_conversation_history_with_event(data.messages);
+        let plan_store = self.ctx.acp_session_store.clone()?;
+        let plan_session_id = sid.to_string();
+        let plan = tokio::task::spawn_blocking(move || plan_store.get_plan(&plan_session_id))
+            .await
+            .ok()?
+            .ok()?;
+        let mut session = super::session::RpcSession::new(
+            agent,
+            &data.agent_alias,
+            &data.workspace_dir,
+            crate::rpc::types::ChatMode::Acp,
+        )
+        .with_owner(self.tui_id.clone());
+        session.plan = plan.clone();
         self.ctx
             .sessions
-            .commit_creation(
-                creation,
-                super::session::RpcSession::new(
-                    agent,
-                    &data.agent_alias,
-                    &data.workspace_dir,
-                    crate::rpc::types::ChatMode::Acp,
-                )
-                .with_owner(self.tui_id.clone()),
-            )
+            .commit_creation(creation, session)
             .await
             .ok()?;
         self.forward_seed_event(sid, seed_event).await;
+        if let Some(notification) = plan_replay_notification(sid, &plan) {
+            let _ = self.rpc.send_raw(notification).await;
+        }
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -8188,6 +8196,33 @@ mod tests {
         (dispatcher, sessions, chat_backend, acp_store)
     }
 
+    fn make_persistence_test_dispatcher_with_capture(
+        config: zeroclaw_config::schema::Config,
+        data_dir: &std::path::Path,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        (dispatcher, rx, sessions, acp_store)
+    }
+
     #[tokio::test]
     async fn seed_trim_event_is_forwarded_exactly_once() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8664,6 +8699,65 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydrated_acp_session_restores_and_replays_the_durable_plan() {
+        use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, mut notifications, sessions, acp_store) =
+            make_persistence_test_dispatcher_with_capture(config, &data_dir);
+        let sid = "acp-reaped-plan-001";
+        let plan = vec![PlanEntry {
+            content: "Restore durable plan".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: Some("Restoring durable plan".to_string()),
+        }];
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        acp_store
+            .set_plan(sid, &plan)
+            .expect("test should persist the durable plan");
+        assert!(
+            sessions.remove(sid).await,
+            "reap must remove the live session"
+        );
+
+        dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("the reaped ACP session should rehydrate");
+
+        assert_eq!(
+            sessions.get_plan(sid).await,
+            Some(plan.clone()),
+            "rehydration must publish the durable plan with the live session"
+        );
+        let notification: Value = serde_json::from_str(
+            &notifications
+                .try_recv()
+                .expect("rehydration must replay a nonempty durable plan"),
+        )
+        .expect("plan replay must be JSON");
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], sid);
+        assert_eq!(notification["params"]["type"], "plan");
+        assert_eq!(
+            notification["params"]["entries"][0]["content"],
+            plan[0].content
         );
     }
 
