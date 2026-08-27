@@ -10,7 +10,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, oneshot},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -560,7 +560,10 @@ impl GoalOperationAccounting for GoalOperationAccountant {
 pub struct GoalExecutionDriver {
     host: Arc<GoalExecutionHost>,
     goals: Arc<dyn GoalTaskRegistry>,
-    config: Arc<Config>,
+    /// Current configuration for the next execution epoch. A running scope
+    /// snapshots this before it acquires its foreground lease, so a runtime
+    /// reload cannot change policy beneath an already-admitted operation.
+    config: Arc<RwLock<Arc<Config>>>,
     cost_tracker: Arc<CostTracker>,
     workers: Arc<Mutex<HashMap<GoalWorkerKey, Arc<GoalWorker>>>>,
 }
@@ -590,10 +593,18 @@ impl GoalExecutionDriver {
         Self {
             host,
             goals,
-            config,
+            config: Arc::new(RwLock::new(config)),
             cost_tracker,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Replace the configuration used by future Goal execution epochs.
+    /// Callers must first fence and quiesce every running epoch that owns this
+    /// driver. Keeping this update here makes the driver reusable by channel
+    /// and RPC hosts without giving either transport a policy bypass.
+    pub async fn replace_config_after_quiescence(&self, config: Arc<Config>) {
+        *self.config.write().await = config;
     }
 
     fn terminal_reason_for_operation_error(
@@ -719,9 +730,13 @@ impl GoalExecutionDriver {
         mut scope: GoalExecutionScope,
         mut ready: Option<oneshot::Sender<Result<(), ()>>>,
     ) {
+        // A scope deliberately owns one immutable policy snapshot. Runtime
+        // cutover fences and joins existing scopes before replacing the
+        // driver's source config, so this cannot cross a configuration epoch.
+        let config = Arc::clone(&*self.config.read().await);
         let (task, goal) = match GoalOperationAccountant::new(
             Arc::clone(&self.goals),
-            Arc::clone(&self.config),
+            Arc::clone(&config),
             Arc::clone(&self.cost_tracker),
             scope.clone(),
             scope.binding.agent().to_owned(),
@@ -755,7 +770,7 @@ impl GoalExecutionDriver {
         };
         if GoalOperationAccountant::new(
             Arc::clone(&self.goals),
-            Arc::clone(&self.config),
+            Arc::clone(&config),
             Arc::clone(&self.cost_tracker),
             scope.clone(),
             task.agent.clone(),
@@ -780,7 +795,7 @@ impl GoalExecutionDriver {
         };
         let accountant = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.goals),
-            Arc::clone(&self.config),
+            config,
             Arc::clone(&self.cost_tracker),
             scope.clone(),
             task.agent,
@@ -1456,9 +1471,9 @@ mod tests {
 
         let waiter = {
             let driver = Arc::clone(&driver);
-            zeroclaw_spawn::spawn!(async move {
-                driver.wait_task_quiescent("completed-goal").await
-            })
+            zeroclaw_spawn::spawn!(
+                async move { driver.wait_task_quiescent("completed-goal").await }
+            )
         };
         tokio::task::yield_now().await;
         assert!(

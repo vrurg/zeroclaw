@@ -136,6 +136,12 @@ mod markers {
 mod mention {
     use matrix_sdk::ruma::UserId;
 
+    fn is_goal_command(text: &str) -> bool {
+        text.strip_prefix("/goal").is_some_and(|suffix| {
+            suffix.is_empty() || suffix.chars().next().is_some_and(char::is_whitespace)
+        })
+    }
+
     pub(super) fn is_mentioned(
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
@@ -172,6 +178,37 @@ mod mention {
             }
         }
         false
+    }
+
+    /// Return the shared Goal command text after removing one leading Matrix
+    /// mention. This runs on the SDK's original plain-text body, before any
+    /// thread-root preamble or media enrichment can obscure the command.
+    pub(super) fn normalize_leading_goal_command(
+        body: &str,
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        m_mentions_user_ids: Option<&[String]>,
+    ) -> Option<String> {
+        let body = body.trim_start();
+        if is_goal_command(body) {
+            return Some(body.to_owned());
+        }
+        if !is_mentioned(bot_user_id, bot_display_name, m_mentions_user_ids, body) {
+            return None;
+        }
+
+        let mut forms = vec![bot_user_id.as_str().to_owned()];
+        forms.push(format!("@{}", bot_user_id.localpart()));
+        if let Some(display_name) = bot_display_name.filter(|name| !name.is_empty()) {
+            forms.push(display_name.to_owned());
+        }
+        forms.into_iter().find_map(|form| {
+            body.strip_prefix(&form).and_then(|suffix| {
+                let command = suffix
+                    .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ','));
+                is_goal_command(command).then(|| command.to_owned())
+            })
+        })
     }
 
     /// Group `mention_only` admits either an explicit mention or a direct reply
@@ -2185,6 +2222,14 @@ mod inbound {
         let body = ctx_mod::body_for(&ev.content.msgtype);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
+        let display_name = ctx.bot_display_name.read().await.clone();
+        let mention_user_ids = extract_mentions_user_ids(&raw);
+        let normalized_goal_command = mention::normalize_leading_goal_command(
+            &body,
+            &ctx.bot_user_id,
+            display_name.as_deref(),
+            mention_user_ids.as_deref(),
+        );
 
         // Approval reply has highest priority — operator answer must work even
         // if the room/user filters would otherwise drop the message.
@@ -2222,8 +2267,6 @@ mod inbound {
         let mut cached_reply_parent = None;
 
         if ctx.config.mention_only && is_group_room(&room).await {
-            let display_name = ctx.bot_display_name.read().await.clone();
-            let mention_user_ids = extract_mentions_user_ids(&raw);
             let mentioned = mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
@@ -2275,101 +2318,109 @@ mod inbound {
         }
 
         let thread_id = extract_thread_id(&raw);
-        let mut content = body.clone();
-        if let Some(tid) = thread_id.as_ref()
-            && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
-        {
-            match room.event(tid, None).await {
-                Ok(timeline_event) => {
-                    if let Some((root_sender, root_body)) =
-                        extract_root_summary(timeline_event.into_raw())
-                    {
-                        content = format!(
-                            "{}{}",
-                            ctx_mod::format_preamble(&root_sender, &root_body),
-                            content
-                        );
+        let is_goal_command = normalized_goal_command.is_some();
+        let mut content = normalized_goal_command.unwrap_or_else(|| body.clone());
+        // Goal commands are controller input, not a model prompt. Preserve
+        // their normalized command text verbatim: a thread-root preamble or
+        // media annotation would otherwise make the command unrecognizable.
+        if !is_goal_command {
+            if let Some(tid) = thread_id.as_ref()
+                && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
+            {
+                match room.event(tid, None).await {
+                    Ok(timeline_event) => {
+                        if let Some((root_sender, root_body)) =
+                            extract_root_summary(timeline_event.into_raw())
+                        {
+                            content = format!(
+                                "{}{}",
+                                ctx_mod::format_preamble(&root_sender, &root_body),
+                                content
+                            );
+                        }
                     }
+                    Err(e) => ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "tid": tid})
+                            ),
+                        "matrix: failed to fetch thread root"
+                    ),
                 }
-                Err(e) => ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "tid": tid})),
-                    "matrix: failed to fetch thread root"
-                ),
             }
-        }
 
-        let media_kind = match &ev.content.msgtype {
-            MessageType::Image(m) => Some(MediaInfo::new(
-                m.source.clone(),
-                m.body.clone(),
-                m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                MediaCategory::Image,
-            )),
-            MessageType::File(m) => Some(MediaInfo::new(
-                m.source.clone(),
-                m.body.clone(),
-                m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                MediaCategory::File,
-            )),
-            MessageType::Video(m) => Some(MediaInfo::new(
-                m.source.clone(),
-                m.body.clone(),
-                m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                MediaCategory::Video,
-            )),
-            MessageType::Audio(m) => {
-                let kind = if is_voice_message(&raw) {
-                    MediaCategory::Voice
-                } else {
-                    MediaCategory::Audio
-                };
-                let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
-                let file_name = m
-                    .filename
-                    .as_deref()
-                    .filter(|f| !f.is_empty())
-                    .unwrap_or(&m.body)
-                    .to_string();
-                Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
-            }
-            _ => None,
-        };
-
-        if let Some(info) = media_kind {
-            content = attach_media(
-                &room,
-                &info,
-                ctx.workspace_dir.as_deref(),
-                &body,
-                content,
-                ctx.transcription.as_deref(),
-            )
-            .await;
-        } else if let Some(reply_id) = reply_target.as_ref() {
-            let parent = if let Some(cached) = cached_reply_parent.take() {
-                Ok(cached)
-            } else {
-                room.event(reply_id, None).await
+            let media_kind = match &ev.content.msgtype {
+                MessageType::Image(m) => Some(MediaInfo::new(
+                    m.source.clone(),
+                    m.body.clone(),
+                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                    MediaCategory::Image,
+                )),
+                MessageType::File(m) => Some(MediaInfo::new(
+                    m.source.clone(),
+                    m.body.clone(),
+                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                    MediaCategory::File,
+                )),
+                MessageType::Video(m) => Some(MediaInfo::new(
+                    m.source.clone(),
+                    m.body.clone(),
+                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                    MediaCategory::Video,
+                )),
+                MessageType::Audio(m) => {
+                    let kind = if is_voice_message(&raw) {
+                        MediaCategory::Voice
+                    } else {
+                        MediaCategory::Audio
+                    };
+                    let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
+                    let file_name = m
+                        .filename
+                        .as_deref()
+                        .filter(|f| !f.is_empty())
+                        .unwrap_or(&m.body)
+                        .to_string();
+                    Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
+                }
+                _ => None,
             };
-            match parent {
-                Ok(timeline_event) => {
-                    if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
-                        content = attach_media(
-                            &room,
-                            &info,
-                            ctx.workspace_dir.as_deref(),
-                            "",
-                            content,
-                            ctx.transcription.as_deref(),
-                        )
-                        .await;
+
+            if let Some(info) = media_kind {
+                content = attach_media(
+                    &room,
+                    &info,
+                    ctx.workspace_dir.as_deref(),
+                    &body,
+                    content,
+                    ctx.transcription.as_deref(),
+                )
+                .await;
+            } else if let Some(reply_id) = reply_target.as_ref() {
+                let parent = if let Some(cached) = cached_reply_parent.take() {
+                    Ok(cached)
+                } else {
+                    room.event(reply_id, None).await
+                };
+                match parent {
+                    Ok(timeline_event) => {
+                        if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
+                            content = attach_media(
+                                &room,
+                                &info,
+                                ctx.workspace_dir.as_deref(),
+                                "",
+                                content,
+                                ctx.transcription.as_deref(),
+                            )
+                            .await;
+                        }
                     }
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_id})), "matrix: could not fetch in_reply_to parent")
+                    Err(e) => {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_id})), "matrix: could not fetch in_reply_to parent")
+                    }
                 }
             }
         }
@@ -6054,7 +6105,9 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
+        use super::super::mention::{
+            admit_group_message, is_mentioned, normalize_leading_goal_command, sender_is_user,
+        };
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -6106,6 +6159,55 @@ mod tests {
                 None,
                 "no mention here"
             ));
+        }
+
+        #[test]
+        fn leading_mentions_normalize_goal_commands_before_thread_preamble() {
+            let bot = user_id!("@bot:example.org");
+            assert_eq!(
+                normalize_leading_goal_command(
+                    "@bot:example.org /goal status",
+                    bot,
+                    Some("ZeroClaw"),
+                    None,
+                )
+                .as_deref(),
+                Some("/goal status")
+            );
+            assert_eq!(
+                normalize_leading_goal_command(
+                    "@bot, /goal help",
+                    bot,
+                    Some("ZeroClaw"),
+                    Some(&["@bot:example.org".to_string()]),
+                )
+                .as_deref(),
+                Some("/goal help")
+            );
+            assert_eq!(
+                normalize_leading_goal_command(
+                    "ZeroClaw: /goal budget",
+                    bot,
+                    Some("ZeroClaw"),
+                    None,
+                )
+                .as_deref(),
+                Some("/goal budget")
+            );
+        }
+
+        #[test]
+        fn prose_cannot_admit_a_goal_command() {
+            let bot = user_id!("@bot:example.org");
+            assert!(
+                normalize_leading_goal_command(
+                    "please run /goal status",
+                    bot,
+                    Some("ZeroClaw"),
+                    None,
+                )
+                .is_none()
+            );
         }
 
         #[test]

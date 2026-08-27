@@ -1020,6 +1020,135 @@ impl GoalRuntime {
         )))
     }
 
+    /// Fence one exact running Goal for a runtime configuration cutover.
+    ///
+    /// The caller obtains `task` from the canonical store enumeration. The
+    /// durable pause commits before worker cancellation, so a failed join
+    /// cannot leave this epoch eligible for another model operation.
+    pub async fn pause_exact_for_runtime_reload(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(session_id) = task
+            .session_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if task.kind != TaskKind::Goal || task.status != TaskStatus::Running {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let result = self
+            .goals
+            .pause_session_goal(
+                &task.id,
+                session_id,
+                task.execution_epoch,
+                GoalPauseState {
+                    reason: GoalPauseReason::DaemonRestart,
+                    description: Some("runtime configuration changed".into()),
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            self.executor
+                .cancel_and_quiesce(&task.id, task.execution_epoch)
+                .await
+                .map_err(|_| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "goal executor did not quiesce after runtime reload fence"
+                    );
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "goal executor did not quiesce after runtime reload fence",
+                    ))
+                })?;
+        }
+        Ok(result)
+    }
+
+    /// Cancel one exact nonterminal Goal after a live runtime-policy revocation.
+    ///
+    /// The durable transition fences the epoch before the owned worker is
+    /// signalled. This is intentionally transport-neutral: the transport
+    /// classifies revocation, while the Goal runtime retains lifecycle and
+    /// quiescence ownership.
+    pub async fn cancel_exact_for_runtime_revocation(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<GoalTransitionResult, GoalRuntimeError> {
+        let Some(session_id) = task
+            .session_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if task.kind != TaskKind::Goal
+            || !matches!(task.status, TaskStatus::Running | TaskStatus::Paused)
+        {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let result = self
+            .goals
+            .finish_session_goal(
+                &task.id,
+                session_id,
+                task.execution_epoch,
+                TaskStatus::Cancelled,
+                Some("runtime_policy_revoked".into()),
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?;
+        if result == GoalTransitionResult::Applied {
+            self.executor
+                .cancel_and_quiesce(&task.id, task.execution_epoch)
+                .await
+                .map_err(|_| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail,)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "goal executor did not quiesce after runtime policy revocation"
+                    );
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "goal executor did not quiesce after runtime policy revocation",
+                    ))
+                })?;
+        }
+        Ok(result)
+    }
+
+    /// Quiesce a worker only after its exact lifecycle transition was already
+    /// committed by an atomic runtime policy cutover.
+    pub async fn quiesce_exact_after_policy_cutover(
+        &self,
+        task: &TaskRecord,
+    ) -> Result<(), GoalRuntimeError> {
+        self.executor
+            .cancel_and_quiesce(&task.id, task.execution_epoch)
+            .await
+            .map_err(|_| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "goal executor did not quiesce after runtime policy cutover"
+                );
+                GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "goal executor did not quiesce after runtime policy cutover",
+                ))
+            })
+    }
+
     async fn launch_exact(
         &self,
         ingress: GoalIngressContext,
@@ -2043,6 +2172,65 @@ mod tests {
             executor.cancelled.lock().as_slice(),
             &[(running.id, running.execution_epoch)]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_reload_fences_then_quiesces_the_exact_running_goal() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let running = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .pause_exact_for_runtime_reload(&running)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let paused = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, TaskStatus::Paused);
+        assert_eq!(paused.execution_epoch, running.execution_epoch + 1);
+        assert_eq!(
+            executor.cancelled.lock().as_slice(),
+            &[(running.id, running.execution_epoch)]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_revocation_cancels_a_paused_goal_without_relaunching_it() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        runtime.submit(ingress(), GoalCommand::Pause).await.unwrap();
+        let paused = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let cancelled_before = executor.cancelled.lock().len();
+
+        assert_eq!(
+            runtime
+                .cancel_exact_for_runtime_revocation(&paused)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let cancelled = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(cancelled.execution_epoch, paused.execution_epoch + 1);
+        assert_eq!(executor.cancelled.lock().len(), cancelled_before + 1);
     }
 
     #[tokio::test]

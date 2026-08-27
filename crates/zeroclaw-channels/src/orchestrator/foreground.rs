@@ -1,21 +1,31 @@
 //! Process-local, per-conversation foreground coordination.
 //!
-//! This module intentionally depends only on Tokio and the standard library.
 //! The channel orchestrator owns the canonical conversation key and decides
-//! which transports participate; a future transport adapter can reuse this
-//! lease without creating another session or authority store.
+//! which transports participate. The optional Goal runtime slot is a
+//! transport-agnostic executor cache, not another session or authority store;
+//! a future transport adapter can reuse the same lease and slot contract.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use tokio_util::sync::CancellationToken;
+
+use super::goal_runtime_slot::GoalRuntimeSlot;
+
+// This lock carries no Goal lifecycle, identity, policy, or accounting fact.
+// It only serializes one daemon process's Matrix Goal admission and config
+// cutover across every agent runtime context. Durable state remains in the
+// control plane, and separate daemon processes rely on guarded SQLite writes.
+static GOAL_POLICY_CUTOVER_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Clone)]
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
+    goal_runtime: Arc<GoalRuntimeSlot>,
 }
 
 impl ConversationLocks {
@@ -23,6 +33,7 @@ impl ConversationLocks {
         Self {
             persist: Arc::new(Mutex::new(())),
             foreground: Arc::new(tokio::sync::Mutex::new(())),
+            goal_runtime: Arc::new(GoalRuntimeSlot::default()),
         }
     }
 }
@@ -50,6 +61,19 @@ pub(crate) fn foreground_lock(
     key: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
     locks_for_key(locks, key).foreground
+}
+
+pub(crate) fn goal_runtime_slot(
+    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    key: &str,
+) -> Arc<GoalRuntimeSlot> {
+    locks_for_key(locks, key).goal_runtime
+}
+
+/// One daemon-wide Matrix Goal admission/cutover gate. This is process-local
+/// coordination only; durable Goal lifecycle remains in the control plane.
+pub(crate) fn goal_policy_cutover_lock() -> &'static tokio::sync::Mutex<()> {
+    &GOAL_POLICY_CUTOVER_LOCK
 }
 
 pub(crate) async fn wait_for_foreground_lease(
@@ -99,6 +123,40 @@ mod tests {
             .await
             .expect("the queued conversation must proceed after release")
             .expect("lease waiter task must not panic");
+    }
+
+    #[test]
+    fn goal_runtime_slot_is_scoped_to_the_canonical_conversation() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let first = goal_runtime_slot(&locks, "matrix:room:thread");
+        let same_conversation = goal_runtime_slot(&locks, "matrix:room:thread");
+        let other_conversation = goal_runtime_slot(&locks, "matrix:other-room:thread");
+
+        assert!(Arc::ptr_eq(&first, &same_conversation));
+        assert!(!Arc::ptr_eq(&first, &other_conversation));
+    }
+
+    #[tokio::test]
+    async fn goal_policy_cutover_gate_is_shared_by_independent_context_maps() {
+        let first_map = Arc::new(Mutex::new(HashMap::new()));
+        let second_map = Arc::new(Mutex::new(HashMap::new()));
+        let first = goal_policy_cutover_lock();
+        let second = goal_policy_cutover_lock();
+
+        let held = first.lock().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), second.lock())
+                .await
+                .is_err(),
+            "independent agent context maps must share the daemon Goal cutover gate"
+        );
+        drop(held);
+
+        // The maps remain independent for conversation-scoped coordination.
+        assert!(!Arc::ptr_eq(
+            &foreground_lock(&first_map, "matrix:room"),
+            &foreground_lock(&second_map, "matrix:room"),
+        ));
     }
 
     #[tokio::test]

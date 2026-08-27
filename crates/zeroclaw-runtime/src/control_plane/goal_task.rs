@@ -106,6 +106,24 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// One exact durable transition prepared by a runtime policy cutover. The
+/// storage layer applies the complete slice atomically before any executor is
+/// interrupted, so a failed revocation never leaves a partially changed goal
+/// population beneath the old policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalPolicyCutoverAction {
+    PauseForReload,
+    CancelForRevocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPolicyCutoverTransition {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+    pub action: GoalPolicyCutoverAction,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -372,6 +390,27 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// List the current running Goals owned by one agent. Runtime policy
+    /// cutovers use this canonical projection to fence every affected session;
+    /// channel-local executor caches are not an authority for that decision.
+    async fn running_session_goals_for_agent(&self, agent: &str)
+    -> anyhow::Result<Vec<TaskRecord>>;
+
+    /// List every current nonterminal session Goal owned by an agent. Policy
+    /// revocation must include already-paused rows, which have no worker but
+    /// remain resumable unless the durable control plane cancels them.
+    async fn nonterminal_session_goals_for_agent(
+        &self,
+        agent: &str,
+    ) -> anyhow::Result<Vec<TaskRecord>>;
+
+    /// Apply all exact policy-cutover transitions in one transaction. A stale
+    /// or missing row rolls the entire batch back.
+    async fn apply_goal_policy_cutover(
+        &self,
+        transitions: &[GoalPolicyCutoverTransition],
+    ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Return the raw internal terminal error from the canonical task row for
     /// one exact session-bound Goal. Presentation code must sanitize it before
