@@ -6,6 +6,8 @@ use super::events::StreamDelta;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 pub(crate) enum ApprovalGateOutcome {
@@ -24,6 +26,10 @@ pub(crate) async fn gate_tool_approval(
     tool_args: &serde_json::Value,
     iteration: usize,
 ) -> ApprovalGateOutcome {
+    if is_session_prompt_mutation(tool_name) && ctx.session_prompt_approval_required {
+        return gate_session_prompt_approval(ctx, tool_name, tool_args).await;
+    }
+
     let mut approval_requirement = ctx
         .approval
         .map(|mgr| mgr.approval_requirement(tool_name))
@@ -216,5 +222,177 @@ pub(crate) async fn gate_tool_approval(
 
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
+    }
+}
+
+fn is_session_prompt_mutation(tool_name: &str) -> bool {
+    matches!(tool_name, "session_prompt_set" | "session_prompt_delete")
+}
+
+fn session_prompt_approval_summary(
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> Result<String, &'static str> {
+    let session_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .ok_or("no active chat session is available for confirmation")?;
+    let raw_id = tool_args
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the attachment id is missing")?;
+    // Storage accepts only this canonical representation. Validate before the
+    // operator sees the binding so approval and execution cannot disagree.
+    let id = zeroclaw_infra::session_prompts::validate_prompt_id(raw_id)
+        .map_err(|_| "the attachment id is invalid")?;
+    let action = if tool_name == "session_prompt_set" {
+        "set"
+    } else {
+        "delete"
+    };
+    let mut summary = String::from(
+        "Approve this one persistent session-prompt mutation. This approval cannot be remembered.\n",
+    );
+    let _ = writeln!(summary, "action: {action}");
+    let _ = writeln!(summary, "storage_domain: sqlite chat session prompts");
+    let _ = writeln!(summary, "session_id: {session_id}");
+    let _ = writeln!(summary, "attachment_id: {id}");
+    if action == "set" {
+        let content = tool_args
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("the prompt content is missing")?;
+        let digest = Sha256::digest(content.as_bytes());
+        let _ = writeln!(summary, "content_sha256: {digest:x}");
+        let _ = writeln!(summary, "content:");
+        summary.push_str(content);
+    }
+    Ok(summary)
+}
+
+async fn gate_session_prompt_approval(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> ApprovalGateOutcome {
+    let denied = |reason: &str| {
+        ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+            output: format!("Session prompt mutation not executed: {reason}"),
+            success: false,
+            error_reason: Some("session prompt mutation denied".to_string()),
+            duration: Duration::ZERO,
+            receipt: None,
+            output_data: None,
+        })
+    };
+    let Ok(summary) = session_prompt_approval_summary(tool_name, tool_args) else {
+        return denied("the runtime could not bind an exact session confirmation");
+    };
+    let Some(mgr) = ctx.approval else {
+        return denied("no approval manager is available");
+    };
+
+    let approved = if mgr.is_non_interactive() {
+        let Some(channel) = ctx.channel else {
+            return denied("no approval-capable channel is available");
+        };
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: tool_name.to_string(),
+            arguments_summary: summary,
+            // Prompt content belongs only on the approval surface, never in the
+            // generic structured arguments that downstream event consumers log.
+            raw_arguments: None,
+        };
+        match channel
+            .request_approval_attributed(ctx.channel_reply_target.unwrap_or_default(), &request)
+            .await
+        {
+            Ok(Some(attributed)) => is_one_time_session_prompt_approval(&attributed),
+            Ok(_) | Err(_) => false,
+        }
+    } else {
+        mgr.prompt_cli_once(
+            &crate::i18n::get_required_cli_string("session-prompt-approval-heading"),
+            &summary,
+        )
+    };
+
+    if approved {
+        ApprovalGateOutcome::Proceed { approved: true }
+    } else {
+        denied("a one-time operator approval was not granted")
+    }
+}
+
+fn is_one_time_session_prompt_approval(
+    approval: &zeroclaw_api::channel::AttributedApprovalResponse,
+) -> bool {
+    !approval.source.is_runtime_fail_closed()
+        && matches!(
+            approval.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_one_time_session_prompt_approval, session_prompt_approval_summary};
+    use zeroclaw_api::channel::{
+        ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
+    };
+
+    #[tokio::test]
+    async fn session_prompt_confirmation_binds_session_id_content_and_digest() {
+        let summary = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("matrix:room:thread".to_string()),
+                async {
+                    session_prompt_approval_summary(
+                        "session_prompt_set",
+                        &serde_json::json!({"id": "current-task", "content": "Finish RFC reconciliation."}),
+                    )
+                    .unwrap()
+                },
+            )
+            .await;
+
+        assert!(summary.contains("action: set"));
+        assert!(summary.contains("storage_domain: sqlite chat session prompts"));
+        assert!(summary.contains("session_id: matrix:room:thread"));
+        assert!(summary.contains("attachment_id: current-task"));
+        assert!(summary.contains("content:\nFinish RFC reconciliation."));
+        assert!(summary.contains(
+            "content_sha256: 16e48f498e379a0e5530eb194069ef5ce3f2133b53b6bdd28c80472425e552de"
+        ));
+    }
+
+    #[test]
+    fn session_prompt_confirmation_rejects_persistent_and_runtime_decisions() {
+        assert!(is_one_time_session_prompt_approval(
+            &AttributedApprovalResponse::operator(ChannelApprovalResponse::Approve)
+        ));
+        assert!(!is_one_time_session_prompt_approval(
+            &AttributedApprovalResponse::operator(ChannelApprovalResponse::AlwaysApprove)
+        ));
+        assert!(!is_one_time_session_prompt_approval(
+            &AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Approve,
+                ApprovalSource::TimedOut,
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_prompt_confirmation_canonicalizes_attachment_ids() {
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("matrix:room:thread".to_string()), async {
+                session_prompt_approval_summary(
+                    "session_prompt_delete",
+                    &serde_json::json!({"id": " task "}),
+                )
+            })
+            .await;
+        assert!(result.unwrap().contains("attachment_id: task"));
     }
 }

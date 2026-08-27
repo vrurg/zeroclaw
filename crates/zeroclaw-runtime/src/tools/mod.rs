@@ -118,6 +118,15 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+/// Reserved even while the optional native implementations are disabled: a
+/// plugin must never acquire a sensitive session-prompt name and accidentally
+/// receive its approval/redaction treatment.
+pub(crate) const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
+    "session_prompt_list",
+    "session_prompt_set",
+    "session_prompt_delete",
+];
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -393,10 +402,14 @@ pub fn register_skill_tools_with_context_and_runtime(
         unfiltered_registry,
         runtime,
     );
-    let existing_names: std::collections::HashSet<String> = tools_registry
+    let mut existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    // These names are reserved for the native session-prompt capability even
+    // while it is disabled.  Otherwise a skill could claim one of them and be
+    // mistaken for the sensitive built-in operation at execution time.
+    existing_names.extend(SESSION_PROMPT_TOOL_NAMES.map(str::to_owned));
     for tool in skill_tools {
         if existing_names.contains(tool.name()) {
             ::zeroclaw_log::record!(
@@ -418,6 +431,7 @@ pub fn register_skill_tools_with_context_and_runtime(
                 )
             );
         } else {
+            existing_names.insert(tool.name().to_string());
             tools_registry.push(tool);
         }
     }
@@ -1670,6 +1684,11 @@ pub fn all_tools_with_runtime(
                         .iter()
                         .map(|tool| tool.name().to_string())
                         .collect();
+                    registered_names.extend(
+                        SESSION_PROMPT_TOOL_NAMES
+                            .iter()
+                            .map(|name| (*name).to_string()),
+                    );
                     if root_config.pipeline.enabled {
                         registered_names.insert(PipelineTool::NAME.to_string());
                     }

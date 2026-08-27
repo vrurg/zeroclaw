@@ -2843,9 +2843,11 @@ impl DelegateTool {
                     )
                     .await
             }
-            None => zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-                .scope(false, delegated_turn)
-                .await,
+            None => {
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .scope(false, delegated_turn)
+                    .await
+            }
         };
 
         match result {

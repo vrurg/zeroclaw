@@ -1081,7 +1081,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
         // Find stale sessions
@@ -1096,14 +1096,19 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         let count = stale_keys.len();
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
         for key in &stale_keys {
-            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
-            let _ = conn.execute(
-                "DELETE FROM session_metadata WHERE session_key = ?1",
-                params![key],
-            );
+            transaction
+                .execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            transaction
+                .execute(
+                    "DELETE FROM session_metadata WHERE session_key = ?1",
+                    params![key],
+                )
+                .map_err(std::io::Error::other)?;
         }
-
+        transaction.commit().map_err(std::io::Error::other)?;
         Ok(count)
     }
 
@@ -1130,7 +1135,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
 
         // Check if session exists
         let exists: bool = conn
@@ -1139,26 +1144,30 @@ impl SessionBackend for SqliteSessionBackend {
                 params![session_key],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .map_err(std::io::Error::other)?;
 
         if !exists {
             return Ok(false);
         }
 
-        // Delete messages (FTS5 trigger handles sessions_fts cleanup)
-        conn.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        let transaction = conn.transaction().map_err(std::io::Error::other)?;
+        // Delete messages (FTS5 trigger handles sessions_fts cleanup).
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
 
         // Delete metadata
-        conn.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1",
-            params![session_key],
-        )
-        .map_err(std::io::Error::other)?;
+        transaction
+            .execute(
+                "DELETE FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+            )
+            .map_err(std::io::Error::other)?;
 
+        transaction.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -1548,10 +1557,10 @@ impl SessionBackend for SqliteSessionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use crate::session_store::SessionStore;
     use std::sync::{Arc, mpsc};
     use std::time::Duration as StdDuration;
-    use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use tempfile::TempDir;
 
     #[test]
@@ -1689,6 +1698,31 @@ mod tests {
             .unwrap();
         assert!(backend.delete_session("reset").unwrap());
         assert!(backend.list_session_prompts("reset").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_session_rolls_back_when_metadata_deletion_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend
+            .append("session", &ChatMessage::user("hello"))
+            .unwrap();
+        backend
+            .set_session_prompt("session", "task", "current task")
+            .unwrap();
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_session_delete BEFORE DELETE ON session_metadata \
+                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        }
+
+        assert!(backend.delete_session("session").is_err());
+        assert!(backend.session_exists("session"));
+        assert_eq!(backend.load("session").len(), 1);
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
     }
 
     #[test]

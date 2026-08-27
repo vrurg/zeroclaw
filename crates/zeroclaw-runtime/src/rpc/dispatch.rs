@@ -1820,13 +1820,36 @@ impl RpcDispatcher {
         if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
             && self.ctx.config.read().channels.session_prompts_enabled
         {
-            let attachments = self
-                .ctx
-                .session_backend
-                .as_ref()
-                .and_then(|backend| backend.list_session_prompts(&tool_loop_session_key).ok())
-                .map(|prompts| zeroclaw_infra::session_prompts::render_session_prompts(&prompts))
-                .unwrap_or_default();
+            let prompts = match self.ctx.session_backend.as_ref() {
+                Some(backend) => backend
+                    .list_session_prompts(&tool_loop_session_key)
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load persistent session prompts: {error}"),
+                        )
+                    }),
+                None => Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "Persistent session prompts are enabled but the chat session backend is unavailable.",
+                )),
+            };
+            let prompts = match prompts {
+                Ok(prompts) => prompts,
+                Err(error) => {
+                    self.ctx
+                        .sessions
+                        .remove_cancel_token(sid, cancel_generation);
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: session_prompt_load_failed".to_string(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
             if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
                 agent
                     .lock()
@@ -2573,6 +2596,37 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        let should_delete_durable_chat = if chat_mode.is_none() {
+            let acp_session_exists = match self.ctx.acp_session_store.as_ref() {
+                Some(store) => store
+                    .load_session(&req.session_id)
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to inspect ACP session ownership: {error}"),
+                        )
+                    })?
+                    .is_some(),
+                None => false,
+            };
+            !acp_session_exists
+        } else {
+            matches!(chat_mode, Some(crate::rpc::types::ChatMode::Chat))
+        };
+        // RPC chat sessions use this canonical persistence key.  Delete it
+        // before mutable in-memory state so a storage failure cannot report a
+        // successful reset while leaving prompt attachments behind.
+        if should_delete_durable_chat && let Some(ref backend) = self.ctx.session_backend {
+            backend
+                .delete_session(&format!("rpc_{}", req.session_id))
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to delete persistent session: {error}"),
+                    )
+                })?;
+        }
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2583,16 +2637,6 @@ impl RpcDispatcher {
         let existed = self.ctx.sessions.remove(&req.session_id).await;
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
-        }
-        // Remove from persistent backend — try raw id, then prefixed variants.
-        if let Some(ref backend) = self.ctx.session_backend {
-            for key in &[
-                req.session_id.clone(),
-                format!("rpc_{}", req.session_id),
-                format!("gw_{}", req.session_id),
-            ] {
-                let _ = backend.delete_session(key);
-            }
         }
         to_result(SessionDeleteResult {
             session_id: req.session_id,
@@ -8172,6 +8216,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_an_acp_session_does_not_delete_a_colliding_chat_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "same-id";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+        chat_backend
+            .append(&format!("rpc_{sid}"), &ChatMessage::user("chat history"))
+            .unwrap();
+        chat_backend
+            .set_session_prompt(&format!("rpc_{sid}"), "task", "chat context")
+            .unwrap();
+
+        dispatcher
+            .handle_session_delete(&json!({"session_id": sid}))
+            .await
+            .expect("ACP session/delete should succeed");
+
+        assert_eq!(
+            chat_backend
+                .list_session_prompts(&format!("rpc_{sid}"))
+                .unwrap()
+                .len(),
+            1,
+            "an ACP deletion must not cross into the chat session domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_reaped_chat_session_removes_its_prompt_attachments() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "reaped-chat";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("chat session/new should succeed");
+        chat_backend
+            .set_session_prompt(&format!("rpc_{sid}"), "task", "chat context")
+            .unwrap();
+        assert!(
+            sessions.remove(sid).await,
+            "test must reap the live session"
+        );
+
+        dispatcher
+            .handle_session_delete(&json!({"session_id": sid}))
+            .await
+            .expect("reaped chat session/delete should succeed");
+
+        assert!(
+            chat_backend
+                .list_session_prompts(&format!("rpc_{sid}"))
+                .unwrap()
+                .is_empty(),
+            "deleting a reaped chat session must clear durable attachments"
+        );
+    }
+
+    struct FailingDeleteBackend;
+
+    impl SessionBackend for FailingDeleteBackend {
+        fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+
+        fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+            Err(std::io::Error::other("injected delete failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_reaped_chat_session_propagates_storage_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend);
+        let ctx = RpcContext::for_persistence_tests(config, sessions, Some(backend), None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+
+        let error = dispatcher
+            .handle_session_delete(&json!({"session_id": "reaped-chat"}))
+            .await
+            .expect_err("storage failure must not report a successful deletion");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("Failed to delete persistent session")
+        );
+    }
+
+    #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
@@ -10259,6 +10427,48 @@ mod tests {
              distinct Failed verdict. Folding it into Cancelled would lie \
              about whether the user pressed Esc."
         );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_attachment_load_failure_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.channels.session_prompts_enabled = true;
+        config.channels.session_persistence = true;
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        // The JSONL backend deliberately does not implement prompt attachments,
+        // giving this test a deterministic load failure before provider work.
+        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let ctx =
+            RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "prompt-load-failure",
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": "prompt-load-failure",
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(result.is_err(), "attachment load must fail the turn");
+        let raw = rx
+            .try_recv()
+            .expect("failed attachment load must complete the client turn");
+        let notification: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "prompt-load-failure");
+        assert_eq!(notification["params"]["outcome"], "failed");
     }
 
     #[tokio::test]

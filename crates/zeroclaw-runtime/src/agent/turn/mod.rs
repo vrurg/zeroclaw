@@ -437,6 +437,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
+    // A missing config is a test/degraded path. Preserve the production
+    // fail-closed default rather than accidentally treating it as disabled.
+    let session_prompt_approval_required = config
+        .map(|config| {
+            config.session_prompt_approval_for_agent(agent_alias)
+                == zeroclaw_config::schema::SessionPromptApproval::Required
+        })
+        .unwrap_or(true);
+
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
@@ -543,6 +552,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         temperature,
         approval,
+        session_prompt_approval_required,
         channel_name,
         channel_reply_target,
         cancellation_token: cancellation_token.as_ref(),

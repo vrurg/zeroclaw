@@ -325,6 +325,9 @@ pub fn register_eager_mcp_tool_if_allowed(
     delegate_handle: Option<&tools::DelegateParentToolsHandle>,
     policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
 ) -> bool {
+    if crate::tools::SESSION_PROMPT_TOOL_NAMES.contains(&wrapper.name()) {
+        return false;
+    }
     if !eager_mcp_tool_allowed(wrapper.name(), policy) {
         return false;
     }
@@ -15765,6 +15768,12 @@ Let me check the result."#;
         // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("session_prompt_set"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),

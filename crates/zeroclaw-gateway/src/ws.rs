@@ -1007,12 +1007,38 @@ async fn process_chat_message(
 
     let session_prompts_enabled = state.config.read().channels.session_prompts_enabled;
     let attachments = if session_prompts_enabled {
-        state
-            .session_backend
-            .as_ref()
-            .and_then(|backend| backend.list_session_prompts(session_key).ok())
-            .map(|prompts| zeroclaw_infra::session_prompts::render_session_prompts(&prompts))
-            .unwrap_or_default()
+        let Some(backend) = state.session_backend.as_ref() else {
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": "Persistent session prompts are enabled but the chat session backend is unavailable.",
+                        "code": "SESSION_PROMPT_LOAD_FAILED",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            return;
+        };
+        match backend.list_session_prompts(session_key) {
+            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
+            Err(error) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": error.to_string(), "session_key": session_key})), "Failed to load persistent session prompts");
+                let _ = sender
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "error",
+                            "message": "Failed to load persistent session prompts; the turn was not started.",
+                            "code": "SESSION_PROMPT_LOAD_FAILED",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            }
+        }
     } else {
         String::new()
     };

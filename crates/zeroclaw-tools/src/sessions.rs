@@ -4,12 +4,24 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_infra::session_prompts::SessionPromptSetOutcome;
+
+static SESSION_PROMPT_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSION_PROMPT_SET_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SESSION_PROMPT_DELETE_DESCRIPTION: OnceLock<String> = OnceLock::new();
+
+fn session_prompt_tool_msg(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn session_prompt_tool_msg_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, args)
+}
 
 fn current_session_key() -> Result<String, ToolResult> {
     let allowed = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
@@ -19,10 +31,9 @@ fn current_session_key() -> Result<String, ToolResult> {
         return Err(ToolResult {
             success: false,
             output: ToolOutput::default(),
-            error: Some(
-                "No active chat-session context. This tool is unavailable to auxiliary calls."
-                    .into(),
-            ),
+            error: Some(session_prompt_tool_msg(
+                "tool-session-prompt-error-no-context",
+            )),
         });
     }
     zeroclaw_api::TOOL_LOOP_SESSION_KEY
@@ -32,10 +43,9 @@ fn current_session_key() -> Result<String, ToolResult> {
         .ok_or_else(|| ToolResult {
             success: false,
             output: ToolOutput::default(),
-            error: Some(
-                "No active chat-session context. This tool is unavailable to auxiliary calls."
-                    .into(),
-            ),
+            error: Some(session_prompt_tool_msg(
+                "tool-session-prompt-error-no-context",
+            )),
         })
 }
 
@@ -48,10 +58,9 @@ fn current_session_backend() -> Result<Arc<dyn SessionBackend>, ToolResult> {
         .ok_or_else(|| ToolResult {
             success: false,
             output: ToolOutput::default(),
-            error: Some(
-                "No active chat-session backend. This tool is unavailable to auxiliary calls."
-                    .into(),
-            ),
+            error: Some(session_prompt_tool_msg(
+                "tool-session-prompt-error-no-backend",
+            )),
         })
 }
 
@@ -569,7 +578,9 @@ impl Tool for SessionPromptListTool {
     }
 
     fn description(&self) -> &str {
-        "List persistent prompt attachments for the chat session currently running this agent."
+        SESSION_PROMPT_LIST_DESCRIPTION
+            .get_or_init(|| session_prompt_tool_msg("tool-session-prompt-list"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -610,7 +621,10 @@ impl Tool for SessionPromptListTool {
             Err(error) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to list session prompts: {error}")),
+                error: Some(session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-error-list",
+                    &[("err", &error.to_string())],
+                )),
             }),
         }
     }
@@ -633,12 +647,14 @@ impl Tool for SessionPromptSetTool {
         "session_prompt_set"
     }
     fn description(&self) -> &str {
-        "Create or replace one persistent prompt attachment for the current chat session."
+        SESSION_PROMPT_SET_DESCRIPTION
+            .get_or_init(|| session_prompt_tool_msg("tool-session-prompt-set"))
+            .as_str()
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({"type": "object", "properties": {
-            "id": {"type": "string", "description": "Lowercase symbolic ID: [a-z][a-z0-9_.-]{0,63}"},
-            "content": {"type": "string", "description": "Prompt text, up to 2048 UTF-8 bytes"}
+            "id": {"type": "string", "description": session_prompt_tool_msg("tool-session-prompt-param-id")},
+            "content": {"type": "string", "description": session_prompt_tool_msg("tool-session-prompt-param-content")}
         }, "required": ["id", "content"]})
     }
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -653,10 +669,14 @@ impl Tool for SessionPromptSetTool {
             });
         }
         let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
-            anyhow::bail!("Missing 'id' parameter");
+            anyhow::bail!(session_prompt_tool_msg(
+                "tool-session-prompt-error-missing-id"
+            ));
         };
         let Some(content) = args.get("content").and_then(serde_json::Value::as_str) else {
-            anyhow::bail!("Missing 'content' parameter");
+            anyhow::bail!(session_prompt_tool_msg(
+                "tool-session-prompt-error-missing-content"
+            ));
         };
         let key = match current_session_key() {
             Ok(key) => key,
@@ -669,16 +689,18 @@ impl Tool for SessionPromptSetTool {
         match backend.set_session_prompt(&key, id, content) {
             Ok(SessionPromptSetOutcome::Created) => Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "Session prompt '{id}' created; it applies on the next top-level turn."
+                output: session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-set-created",
+                    &[("id", id)],
                 )
                 .into(),
                 error: None,
             }),
             Ok(SessionPromptSetOutcome::Updated) => Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "Session prompt '{id}' updated; it applies on the next top-level turn."
+                output: session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-set-updated",
+                    &[("id", id)],
                 )
                 .into(),
                 error: None,
@@ -686,7 +708,10 @@ impl Tool for SessionPromptSetTool {
             Err(error) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to set session prompt: {error}")),
+                error: Some(session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-error-set",
+                    &[("err", &error.to_string())],
+                )),
             }),
         }
     }
@@ -709,10 +734,12 @@ impl Tool for SessionPromptDeleteTool {
         "session_prompt_delete"
     }
     fn description(&self) -> &str {
-        "Delete one persistent prompt attachment from the current chat session."
+        SESSION_PROMPT_DELETE_DESCRIPTION
+            .get_or_init(|| session_prompt_tool_msg("tool-session-prompt-delete"))
+            .as_str()
     }
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]})
+        json!({"type": "object", "properties": {"id": {"type": "string", "description": session_prompt_tool_msg("tool-session-prompt-param-id")}}, "required": ["id"]})
     }
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Err(error) = self
@@ -726,7 +753,9 @@ impl Tool for SessionPromptDeleteTool {
             });
         }
         let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
-            anyhow::bail!("Missing 'id' parameter");
+            anyhow::bail!(session_prompt_tool_msg(
+                "tool-session-prompt-error-missing-id"
+            ));
         };
         let key = match current_session_key() {
             Ok(key) => key,
@@ -739,8 +768,9 @@ impl Tool for SessionPromptDeleteTool {
         match backend.delete_session_prompt(&key, id) {
             Ok(true) => Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "Session prompt '{id}' deleted; the change applies on the next top-level turn."
+                output: session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-delete-success",
+                    &[("id", id)],
                 )
                 .into(),
                 error: None,
@@ -748,12 +778,18 @@ impl Tool for SessionPromptDeleteTool {
             Ok(false) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Session prompt '{id}' does not exist.")),
+                error: Some(session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-error-missing",
+                    &[("id", id)],
+                )),
             }),
             Err(error) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Failed to delete session prompt: {error}")),
+                error: Some(session_prompt_tool_msg_with_args(
+                    "tool-session-prompt-error-delete",
+                    &[("err", &error.to_string())],
+                )),
             }),
         }
     }

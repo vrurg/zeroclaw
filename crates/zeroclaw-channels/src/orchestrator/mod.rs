@@ -3138,26 +3138,28 @@ async fn handle_runtime_command_if_needed(
             // Serialize per-sender persistence to prevent interleaving
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-            clear_sender_history(ctx, &sender_key);
-            ctx.thinking_overrides
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&sender_key);
             if let Some(ref store) = ctx.session_store
                 && let Err(e) = store.delete_session(&sender_key)
             {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(
                             ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
                         ),
                     "Failed to delete persisted session for"
                 );
+                channel_runtime_cli_string("channel-runtime-new-session-failed")
+            } else {
+                clear_sender_history(ctx, &sender_key);
+                ctx.thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&sender_key);
+                mark_sender_for_new_session(ctx, &sender_key);
+                channel_runtime_cli_string("channel-runtime-new-session")
             }
-            mark_sender_for_new_session(ctx, &sender_key);
-            channel_runtime_cli_string("channel-runtime-new-session")
         }
         ChannelRuntimeCommand::SetThinking(level) => match level {
             Some(level) => {
