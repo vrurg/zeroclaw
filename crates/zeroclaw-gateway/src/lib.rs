@@ -7981,6 +7981,7 @@ path = "{trigger_path}"
 
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
