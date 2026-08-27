@@ -1267,6 +1267,16 @@ impl RpcDispatcher {
                     .to_string()
             });
 
+        // Hold the session ID closed while construction runs. This is a
+        // process-local creation lease only; the session is not visible to
+        // prompts, Goal commands, hooks, or sibling eviction until commit.
+        let creation = self
+            .ctx
+            .sessions
+            .reserve_creation(&session_id)
+            .await
+            .map_err(|_| rpc_err(SESSION_BUSY, "Session changed during creation"))?;
+
         let cwd_path = Some(std::path::Path::new(&cwd));
         let tui_env = req
             .tui_id
@@ -1310,8 +1320,8 @@ impl RpcDispatcher {
 
         self.ctx
             .sessions
-            .insert(
-                session_id.clone(),
+            .commit_creation(
+                creation,
                 super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
                     .with_owner(self.tui_id.clone()),
             )
@@ -1746,6 +1756,13 @@ impl RpcDispatcher {
         &self,
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
+        // Reserve the absent ID before touching durable ACP state. A deletion
+        // or competing rehydration must not race this reconstruction into a
+        // different live instance.
+        let creation = match self.ctx.sessions.reserve_creation(sid).await {
+            Ok(creation) => creation,
+            Err(_) => return self.ctx.sessions.get_agent(sid).await,
+        };
         let store = self.ctx.acp_session_store.clone()?;
         let sid_owned = sid.to_string();
         let loaded =
@@ -1829,8 +1846,8 @@ impl RpcDispatcher {
         let message_count = data.messages.len();
         self.ctx
             .sessions
-            .insert(
-                sid.to_string(),
+            .commit_creation(
+                creation,
                 super::session::RpcSession::new(
                     agent,
                     &data.agent_alias,

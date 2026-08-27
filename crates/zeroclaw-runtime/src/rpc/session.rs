@@ -154,6 +154,14 @@ pub(crate) struct AbsentSessionDeletionReservation {
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
+/// Exclusive reservation for constructing a previously absent live session.
+/// The slot is not published until `commit_creation`, so failed preparation
+/// cannot expose a half-initialized agent or require teardown hooks.
+pub(crate) struct SessionCreationReservation {
+    id: String,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 pub(crate) enum SessionReconnectAdmission {
     Missing,
     Incompatible,
@@ -253,6 +261,38 @@ impl SessionStore {
         }
         session.generation = self.next_generation()?;
         sessions.insert(id, session);
+        Ok(())
+    }
+
+    pub(crate) async fn reserve_creation(
+        &self,
+        id: &str,
+    ) -> Result<SessionCreationReservation, &'static str> {
+        let gate = self.lifecycle_gate(id);
+        let guard = gate.write_owned().await;
+        if self.sessions.lock().await.contains_key(id) {
+            return Err("session already exists");
+        }
+        Ok(SessionCreationReservation {
+            id: id.to_string(),
+            _guard: guard,
+        })
+    }
+
+    pub(crate) async fn commit_creation(
+        &self,
+        reservation: SessionCreationReservation,
+        mut session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        if sessions.contains_key(&reservation.id) {
+            return Err("session already exists");
+        }
+        session.generation = self.next_generation()?;
+        sessions.insert(reservation.id, session);
         Ok(())
     }
 
@@ -1297,6 +1337,35 @@ mod tests {
         );
         drop(deletion);
         insertion.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn creation_reservation_serializes_same_id_construction() {
+        let store = Arc::new(make_store(4));
+        let creation = store.reserve_creation("session").await.unwrap();
+        let competing_store = Arc::clone(&store);
+        let mut competing =
+            tokio::spawn(async move { competing_store.reserve_creation("session").await });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut competing)
+                .await
+                .is_err(),
+            "a second same-ID construction must wait for the first creator"
+        );
+        store
+            .commit_creation(
+                creation,
+                RpcSession::new(
+                    make_agent(),
+                    "agent",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(competing.await.unwrap().is_err());
     }
 
     #[tokio::test]
