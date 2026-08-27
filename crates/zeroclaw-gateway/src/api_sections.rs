@@ -1391,7 +1391,6 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 false,
                 &[],
