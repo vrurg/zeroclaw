@@ -214,6 +214,7 @@ impl SessionStore {
             .lifecycle_gates
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
         if let Some(gate) = gates.get(id).and_then(Weak::upgrade) {
             return gate;
         }
@@ -239,7 +240,7 @@ impl SessionStore {
             .is_some_and(|removing| *removing == generation)
     }
 
-    fn seal_removal(&self, reservation: &mut SessionRemovalReservation) {
+    fn seal_removal(&self, reservation: &mut SessionRemovalReservation, cause: CancelCause) {
         if reservation.sealed {
             return;
         }
@@ -247,6 +248,39 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(reservation.id.clone(), reservation.generation);
+        // The writer reservation excludes `begin_turn`, so cancel the exact
+        // live lease before any fallible Goal disposal. A sealed session is
+        // quarantined; it must not retain an ordinary model turn merely
+        // because subsequent durable cleanup is slow or fails.
+        let mut tokens = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let turn = tokens.remove(&reservation.id).and_then(
+            |(session_generation, turn_generation, token)| {
+                (session_generation == reservation.generation).then_some((turn_generation, token))
+            },
+        );
+        if let Some((turn_generation, token)) = turn {
+            // Keep the token-map lock through the verdict insertion. The
+            // ordinary completion path takes these locks in the same order,
+            // so it cannot observe a removed lease before its cause exists.
+            self.cancel_causes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    (
+                        reservation.id.clone(),
+                        reservation.generation,
+                        turn_generation,
+                    ),
+                    cause,
+                );
+            drop(tokens);
+            token.cancel();
+        } else {
+            drop(tokens);
+        }
         reservation.sealed = true;
     }
 
@@ -300,6 +334,22 @@ impl SessionStore {
         let sessions = self.sessions.lock().await;
         let session = sessions.get(id)?;
         (!self.is_removing(id, session.generation)).then(|| Arc::clone(&session.agent))
+    }
+
+    /// Snapshot the agent held by an exact removal reservation. This is only
+    /// for teardown work such as unregistering the RPC approval channel:
+    /// regular admission must continue to use `get_agent`, which rejects a
+    /// sealed generation.
+    pub(crate) async fn agent_for_removal(
+        &self,
+        reservation: &SessionRemovalReservation,
+    ) -> Option<Arc<Mutex<Agent>>> {
+        self.sessions
+            .lock()
+            .await
+            .get(&reservation.id)
+            .filter(|session| session.generation == reservation.generation)
+            .map(|session| Arc::clone(&session.agent))
     }
 
     /// Reserve exclusive lifecycle ownership of the current session. The
@@ -446,8 +496,12 @@ impl SessionStore {
         removed
     }
 
-    pub(crate) fn seal_removal_reservation(&self, reservation: &mut SessionRemovalReservation) {
-        self.seal_removal(reservation);
+    pub(crate) fn seal_removal_reservation(
+        &self,
+        reservation: &mut SessionRemovalReservation,
+        cause: CancelCause,
+    ) {
+        self.seal_removal(reservation, cause);
     }
 
     pub(crate) async fn lock_model_provider_update(
@@ -1291,7 +1345,7 @@ mod tests {
             .await
             .unwrap();
         let mut failed_disposal = store.reserve_removal("session").await.unwrap();
-        store.seal_removal_reservation(&mut failed_disposal);
+        store.seal_removal_reservation(&mut failed_disposal, CancelCause::SessionRemoved);
         drop(failed_disposal);
 
         assert!(store.admit_goal("session").await.is_none());
@@ -1308,6 +1362,39 @@ mod tests {
                 .await
         );
         assert!(store.get_agent("session").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sealing_removal_cancels_the_live_turn_before_cleanup() {
+        let store = make_store(4);
+        store
+            .insert(
+                "session".into(),
+                RpcSession::new(
+                    make_agent(),
+                    "agent",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let turn = store.begin_turn("session").await.unwrap();
+        let token = turn.token();
+
+        let mut reservation = store.reserve_removal("session").await.unwrap();
+        store.seal_removal_reservation(&mut reservation, CancelCause::SessionRemoved);
+
+        assert!(
+            token.is_cancelled(),
+            "the exact live turn must be cancelled before fallible Goal cleanup"
+        );
+        assert_eq!(
+            store.finish_turn(&turn),
+            Some(CancelCause::SessionRemoved),
+            "the fenced turn keeps its exact cancellation verdict"
+        );
+        drop(reservation);
     }
 
     #[tokio::test]

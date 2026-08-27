@@ -1318,16 +1318,6 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        self.ctx
-            .sessions
-            .commit_creation(
-                creation,
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
-
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
         {
@@ -1347,7 +1337,11 @@ impl RpcDispatcher {
                     continue;
                 };
                 let disposal = self
-                    .dispose_goal_with_reservation(&sibling_id, reservation)
+                    .dispose_goal_with_reservation(
+                        &sibling_id,
+                        reservation,
+                        super::session::CancelCause::SessionRemoved,
+                    )
                     .await?;
                 let removed = self
                     .ctx
@@ -1410,6 +1404,8 @@ impl RpcDispatcher {
         }
 
         let mut message_count = 0;
+        let mut initial_seed_event = None;
+        let mut initial_plan = Vec::new();
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 // Reuse the data already loaded for cwd recovery on resume so the
@@ -1419,10 +1415,6 @@ impl RpcDispatcher {
                     Ok(Ok(AcpSessionNewLoad::Restored(data)))
                 } else {
                     let Some(ref store) = self.ctx.acp_session_store else {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.remove_failed_new_session(&session_id).await;
                         return Err(rpc_err(
                             INTERNAL_ERROR,
                             "ACP session store is not available",
@@ -1452,22 +1444,14 @@ impl RpcDispatcher {
                 match loaded {
                     Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
                         if data.agent_alias != req.agent_alias {
-                            if let Some(ref hooks) = self.ctx.hooks {
-                                hooks.fire_session_end(&session_id, "rpc").await;
-                            }
-                            self.remove_failed_new_session(&session_id).await;
                             return Err(rpc_err(
                                 INVALID_PARAMS,
                                 "ACP session belongs to a different agent",
                             ));
                         }
                         message_count = data.messages.len();
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_conversation_history_with_event(&session_id, data.messages)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
+                        initial_seed_event =
+                            agent.seed_conversation_history_with_event(data.messages);
                         // Restore the durable TodoWrite plan into the fresh
                         // in-memory session and re-emit it so the resuming /
                         // reconnecting client's tracker repopulates without a
@@ -1481,27 +1465,14 @@ impl RpcDispatcher {
                             })
                             .await
                             .unwrap_or_default();
-                            if !plan.is_empty() {
-                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
-                            }
+                            initial_plan = plan;
                         }
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.remove_failed_new_session(&session_id).await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                     }
                     Ok(Err(e)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.remove_failed_new_session(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1515,10 +1486,6 @@ impl RpcDispatcher {
                         ));
                     }
                     Err(join) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.remove_failed_new_session(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1539,16 +1506,27 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
+                        initial_seed_event = agent.seed_history_with_event(&stored);
                         message_count = stored.len();
                     }
                 }
             }
+        }
+
+        let mut session =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        session.plan = initial_plan.clone();
+        self.ctx
+            .sessions
+            .commit_creation(creation, session)
+            .await
+            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+
+        self.forward_seed_event(&session_id, initial_seed_event)
+            .await;
+        if let Some(n) = plan_replay_notification(&session_id, &initial_plan) {
+            let _ = self.rpc.send_raw(n).await;
         }
 
         if let Some(ref hooks) = self.ctx.hooks {
@@ -1566,7 +1544,16 @@ impl RpcDispatcher {
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         let disposal = self.dispose_goal_for_session(&req.session_id).await?;
-        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+        let teardown_agent = match disposal.as_ref() {
+            Some(disposal) => {
+                self.ctx
+                    .sessions
+                    .agent_for_removal(&disposal.reservation)
+                    .await
+            }
+            None => self.ctx.sessions.get_agent(&req.session_id).await,
+        };
+        if let Some(agent) = teardown_agent {
             agent
                 .lock()
                 .await
@@ -1714,7 +1701,9 @@ impl RpcDispatcher {
         // ACP persistence is the authority for an admin kill. If its
         // tombstone write fails, dropping the unconsumed reservation restores
         // the exact live session and leaves its Goal/turn untouched.
-        let disposal = self.dispose_goal_with_reservation(sid, reservation).await?;
+        let disposal = self
+            .dispose_goal_with_reservation(sid, reservation, super::session::CancelCause::AdminKill)
+            .await?;
         let killed = self
             .ctx
             .sessions
@@ -1844,6 +1833,7 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
+        let seed_event = agent.seed_conversation_history_with_event(data.messages);
         self.ctx
             .sessions
             .commit_creation(
@@ -1858,11 +1848,6 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
-        let seed_event = self
-            .ctx
-            .sessions
-            .seed_conversation_history_with_event(sid, data.messages)
-            .await;
         self.forward_seed_event(sid, seed_event).await;
         self.ctx.sessions.touch(sid).await;
 
@@ -1994,20 +1979,27 @@ impl RpcDispatcher {
         let Some(reservation) = self.ctx.sessions.reserve_removal(session_id).await else {
             return Ok(None);
         };
-        self.dispose_goal_with_reservation(session_id, reservation)
-            .await
-            .map(Some)
+        self.dispose_goal_with_reservation(
+            session_id,
+            reservation,
+            super::session::CancelCause::SessionRemoved,
+        )
+        .await
+        .map(Some)
     }
 
     async fn dispose_goal_with_reservation(
         &self,
         session_id: &str,
         mut reservation: super::session::SessionRemovalReservation,
+        cause: super::session::CancelCause,
     ) -> Result<RpcGoalSessionDisposal, JsonRpcError> {
         // Once durable Goal disposal may begin, a failure must leave this exact
         // session quarantined for a compatible retry. It must not return to
         // ordinary prompt/Goal admission after a partial fence.
-        self.ctx.sessions.seal_removal_reservation(&mut reservation);
+        self.ctx
+            .sessions
+            .seal_removal_reservation(&mut reservation, cause);
         let Some(control_plane) = crate::control_plane::control_plane() else {
             return Ok(RpcGoalSessionDisposal { reservation });
         };
@@ -2026,38 +2018,6 @@ impl RpcDispatcher {
             .await
             .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session disposal: {error}")))?;
         Ok(RpcGoalSessionDisposal { reservation })
-    }
-
-    /// Undo a newly published session only through the same Goal-aware
-    /// lifecycle reservation used by close/delete/kill. ACP initialization
-    /// failures used to remove the map entry directly, which could strand a
-    /// Goal worker if a concurrent command had already been admitted.
-    async fn remove_failed_new_session(&self, session_id: &str) {
-        match self.dispose_goal_for_session(session_id).await {
-            Ok(Some(disposal)) => {
-                let _ = self
-                    .ctx
-                    .sessions
-                    .remove_reserved(
-                        disposal.reservation,
-                        super::session::CancelCause::SessionRemoved,
-                    )
-                    .await;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(
-                            ::serde_json::json!({"session_id": session_id, "error": error.message})
-                        ),
-                    "Failed to dispose Goal state after session/new initialization failure"
-                );
-            }
-        }
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -2857,6 +2817,15 @@ impl RpcDispatcher {
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         let disposal = self.dispose_goal_for_session(&req.session_id).await?;
+        let teardown_agent = match disposal.as_ref() {
+            Some(disposal) => {
+                self.ctx
+                    .sessions
+                    .agent_for_removal(&disposal.reservation)
+                    .await
+            }
+            None => None,
+        };
         let _absent_deletion = if disposal.is_none() {
             let reservation = self
                 .ctx
@@ -2884,7 +2853,7 @@ impl RpcDispatcher {
         } else {
             None
         };
-        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+        if let Some(agent) = teardown_agent {
             agent
                 .lock()
                 .await
@@ -8806,11 +8775,26 @@ mod tests {
             acp_store.load_session(sid).unwrap().is_some(),
             "durable row must exist before kill"
         );
+        let turn = sessions
+            .begin_turn(sid)
+            .await
+            .expect("live ACP session must admit the test turn");
+        let token = turn.token();
 
         dispatcher
             .handle_session_kill(&json!({ "session_id": sid }))
             .await
             .expect("session/kill should succeed");
+
+        assert!(
+            token.is_cancelled(),
+            "a successful ACP tombstone must not coexist with a live turn"
+        );
+        assert_eq!(
+            sessions.finish_turn(&turn),
+            Some(crate::rpc::session::CancelCause::AdminKill),
+            "the killed session's exact turn keeps its admin-kill verdict"
+        );
 
         assert!(
             sessions.get_agent(sid).await.is_none(),
@@ -10897,6 +10881,11 @@ mod tests {
             crate::rpc::types::ChatMode::Chat,
         );
         sessions.insert(sid.clone(), rpc_session).await.unwrap();
+        let turn = sessions
+            .begin_turn(&sid)
+            .await
+            .expect("real session must admit the test turn");
+        let token = turn.token();
 
         // Wire a counting hook.
         let mut runner = crate::hooks::HookRunner::new();
@@ -10931,6 +10920,15 @@ mod tests {
             .handle_session_close(&serde_json::json!({"session_id": sid}))
             .await;
         assert!(result.is_ok(), "close on real session must succeed");
+        assert!(
+            token.is_cancelled(),
+            "close must cancel the live turn before Goal cleanup or final removal"
+        );
+        assert_eq!(
+            sessions.finish_turn(&turn),
+            Some(crate::rpc::session::CancelCause::SessionRemoved),
+            "the cancelled turn keeps its removal verdict after close"
+        );
 
         assert_eq!(
             end_count.load(std::sync::atomic::Ordering::SeqCst),
