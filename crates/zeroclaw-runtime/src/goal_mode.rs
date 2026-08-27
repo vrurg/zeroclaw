@@ -399,7 +399,7 @@ impl GoalResponse {
 }
 
 /// Current Goal status derived from canonical task rows and the usage ledger.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GoalStatusProjection {
     pub task_id: String,
     pub status: TaskStatus,

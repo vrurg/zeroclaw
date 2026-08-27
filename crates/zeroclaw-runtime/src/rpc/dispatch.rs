@@ -10,6 +10,10 @@ const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 use crate::agent::agent::TurnEvent;
+use crate::goal_mode::execution::GoalExecutionDriver;
+use crate::goal_mode::host::{GoalExecutionHost, GoalSessionAdapter};
+use crate::goal_mode::{GoalIngressContext, GoalMessageKey, GoalRuntime, parse_goal_command};
+use crate::rpc::goal_execution::RpcGoalSessionAdapter;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -79,6 +83,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionGoal,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -199,6 +204,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionGoal, "session/goal"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -324,6 +330,42 @@ fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
         code,
         message: msg.into(),
         data: None,
+    }
+}
+
+fn goal_message_key(key: GoalMessageKey) -> &'static str {
+    match key {
+        GoalMessageKey::Help => "help",
+        GoalMessageKey::Disabled => "disabled",
+        GoalMessageKey::InvalidConfiguration => "invalid_configuration",
+        GoalMessageKey::NoCurrentGoal => "no_current_goal",
+        GoalMessageKey::AlreadyActive => "already_active",
+        GoalMessageKey::BudgetRequired => "budget_required",
+        GoalMessageKey::PricingUnavailable => "pricing_unavailable",
+        GoalMessageKey::VerifierUnavailable => "verifier_unavailable",
+        GoalMessageKey::BindingUnavailable => "binding_unavailable",
+        GoalMessageKey::Started => "started",
+        GoalMessageKey::Status => "status",
+        GoalMessageKey::Budget => "budget",
+        GoalMessageKey::Paused => "paused",
+        GoalMessageKey::AlreadyPaused => "already_paused",
+        GoalMessageKey::Resumed => "resumed",
+        GoalMessageKey::Cancelled => "cancelled",
+        GoalMessageKey::AlreadyCancelled => "already_cancelled",
+        GoalMessageKey::BudgetUpdated => "budget_updated",
+        GoalMessageKey::InvalidCommand => "invalid_command",
+        GoalMessageKey::InvalidBudget => "invalid_budget",
+        GoalMessageKey::SuccessCriteriaRequired => "success_criteria_required",
+        GoalMessageKey::InputTooLong => "input_too_long",
+        GoalMessageKey::BudgetExhausted => "budget_exhausted",
+        GoalMessageKey::AccountingIncomplete => "accounting_incomplete",
+        GoalMessageKey::ReservationUnavailable => "reservation_unavailable",
+        GoalMessageKey::ReservationExceedsBudget => "reservation_exceeds_budget",
+        GoalMessageKey::ToolPhaseNonResumable => "tool_phase_non_resumable",
+        GoalMessageKey::Terminal => "terminal",
+        GoalMessageKey::ExecutorStartFailed => "executor_start_failed",
+        GoalMessageKey::ExecutorQuiescing => "executor_quiescing",
+        GoalMessageKey::Stale => "stale",
     }
 }
 
@@ -779,6 +821,7 @@ impl RpcDispatcher {
                 });
                 return;
             }
+            Method::SessionGoal => self.handle_session_goal(&req.params).await,
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
@@ -1717,6 +1760,105 @@ impl RpcDispatcher {
         );
 
         self.ctx.sessions.get_agent(sid).await
+    }
+
+    async fn handle_session_goal(&self, params: &Value) -> RpcResult {
+        let request: SessionGoalParams = parse_params(params)?;
+        let command = parse_goal_command(&request.command)
+            .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
+        let agent = self
+            .ctx
+            .sessions
+            .get_agent_alias(&request.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let slot = self
+            .ctx
+            .sessions
+            .goal_execution_slot(&request.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let config = Arc::new(self.ctx.config.read().clone());
+        let executor = slot
+            .get_or_try_init({
+                let config = Arc::clone(&config);
+                let sessions = Arc::clone(&self.ctx.sessions);
+                move || async move {
+                    let Some(control_plane) = crate::control_plane::control_plane() else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            ),
+                            "Goal control plane is unavailable for ZeroCode"
+                        );
+                        return Err(anyhow::Error::msg(
+                            "Goal control plane is unavailable for ZeroCode",
+                        ));
+                    };
+                    let tracker = crate::cost::CostTracker::get_or_init_global_for_goal(
+                        config.cost.clone(),
+                        &config.data_dir,
+                    );
+                    let Some(tracker) = tracker else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail,
+                            ),
+                            "Goal cost ledger is unavailable for ZeroCode"
+                        );
+                        return Err(anyhow::Error::msg(
+                            "Goal cost ledger is unavailable for ZeroCode",
+                        ));
+                    };
+                    let adapter: Arc<dyn GoalSessionAdapter> =
+                        Arc::new(RpcGoalSessionAdapter::new(sessions, Arc::clone(&config)));
+                    Ok(Arc::new(GoalExecutionDriver::new(
+                        Arc::new(GoalExecutionHost::new(vec![adapter])),
+                        Arc::clone(&control_plane.goal_store),
+                        config,
+                        tracker,
+                    )))
+                }
+            })
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
+        let control_plane = crate::control_plane::control_plane().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "Goal control plane is unavailable for ZeroCode",
+            )
+        })?;
+        let runtime = GoalRuntime::new(
+            config,
+            Arc::clone(&control_plane.goal_store),
+            crate::cost::CostTracker::get_or_init_global_for_goal(
+                self.ctx.config.read().cost.clone(),
+                &self.ctx.config.read().data_dir,
+            )
+            .ok_or_else(|| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    "Goal cost ledger is unavailable for ZeroCode",
+                )
+            })?,
+            executor,
+            &control_plane.boot_id,
+        )
+        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
+        let ingress = GoalIngressContext::trusted(request.session_id, agent, "zerocode", None)
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        let response = runtime
+            .submit(ingress, command)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, format!("session/goal: {error}")))?;
+        to_result(SessionGoalResult {
+            key: goal_message_key(response.key).to_string(),
+            status: response.status,
+        })
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {

@@ -568,6 +568,27 @@ pub struct GoalExecutionDriver {
     workers: Arc<Mutex<HashMap<GoalWorkerKey, Arc<GoalWorker>>>>,
 }
 
+/// Process-local supervisor cache for one canonical live session.
+///
+/// This stores no Goal lifecycle, identity, policy, or accounting fact. Those
+/// remain in the durable control plane and canonical ledger; the slot merely
+/// preserves the runtime-owned worker supervisor between short-lived command
+/// controllers for a transport session.
+#[derive(Default)]
+pub struct GoalExecutionSlot {
+    executor: tokio::sync::OnceCell<Arc<GoalExecutionDriver>>,
+}
+
+impl GoalExecutionSlot {
+    pub async fn get_or_try_init<F, Fut>(&self, init: F) -> anyhow::Result<Arc<GoalExecutionDriver>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<Arc<GoalExecutionDriver>>>,
+    {
+        self.executor.get_or_try_init(init).await.map(Arc::clone)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GoalWorkerKey {
     task_id: String,

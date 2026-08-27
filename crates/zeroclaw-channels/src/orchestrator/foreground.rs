@@ -12,7 +12,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use super::goal_runtime_slot::GoalRuntimeSlot;
+use zeroclaw_runtime::goal_mode::execution::GoalExecutionSlot;
 
 // This lock carries no Goal lifecycle, identity, policy, or accounting fact.
 // It only serializes one daemon process's Matrix Goal admission and config
@@ -25,7 +25,7 @@ static GOAL_POLICY_CUTOVER_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
-    goal_runtime: Arc<GoalRuntimeSlot>,
+    goal_runtime: Arc<GoalExecutionSlot>,
 }
 
 impl ConversationLocks {
@@ -33,7 +33,7 @@ impl ConversationLocks {
         Self {
             persist: Arc::new(Mutex::new(())),
             foreground: Arc::new(tokio::sync::Mutex::new(())),
-            goal_runtime: Arc::new(GoalRuntimeSlot::default()),
+            goal_runtime: Arc::new(GoalExecutionSlot::default()),
         }
     }
 }
@@ -66,7 +66,7 @@ pub(crate) fn foreground_lock(
 pub(crate) fn goal_runtime_slot(
     locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
     key: &str,
-) -> Arc<GoalRuntimeSlot> {
+) -> Arc<GoalExecutionSlot> {
     locks_for_key(locks, key).goal_runtime
 }
 

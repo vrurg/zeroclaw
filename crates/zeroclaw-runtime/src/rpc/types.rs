@@ -8,6 +8,7 @@ use serde_json::Value;
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
+pub use crate::goal_mode::GoalStatusProjection;
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
@@ -256,6 +257,25 @@ rpc_type! {
         pub session_id: String,
         pub stop_reason: String,
         pub content: String,
+    }
+}
+
+rpc_type! {
+    /// A raw Goal command bound by the server to an existing RPC session.
+    /// The caller never supplies agent, route, or principal identity facts.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Transport-neutral Goal outcome. The ZeroCode client renders `key`
+    /// through its own Fluent catalogue.
+    pub struct SessionGoalResult {
+        pub key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<GoalStatusProjection>,
     }
 }
 

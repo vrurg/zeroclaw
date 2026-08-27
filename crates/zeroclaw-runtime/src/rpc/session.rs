@@ -67,6 +67,9 @@ pub struct RpcSession {
     pub plan: Vec<PlanEntry>,
     pub chat_mode: crate::rpc::types::ChatMode,
     pub owner_tui_id: Option<String>,
+    /// Runtime-owned Goal worker supervision for this live session. Durable
+    /// Goal state remains in the control plane; this is not a second store.
+    goal_execution: Arc<crate::goal_mode::execution::GoalExecutionSlot>,
 }
 
 impl RpcSession {
@@ -88,6 +91,7 @@ impl RpcSession {
             plan: Vec::new(),
             chat_mode,
             owner_tui_id: None,
+            goal_execution: Arc::new(crate::goal_mode::execution::GoalExecutionSlot::default()),
         }
     }
 
@@ -134,6 +138,17 @@ impl SessionStore {
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
+    }
+
+    pub(crate) async fn goal_execution_slot(
+        &self,
+        id: &str,
+    ) -> Option<Arc<crate::goal_mode::execution::GoalExecutionSlot>> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.goal_execution))
     }
 
     pub(crate) async fn lock_model_provider_update(

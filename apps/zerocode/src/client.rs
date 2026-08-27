@@ -87,6 +87,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_GOAL: &str = "session/goal";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";

@@ -96,6 +96,8 @@ pub(crate) struct Chat {
     /// Background-fetched git status updates: (session_id, branch, hash).
     git_branch_tx: mpsc::Sender<GitStatusUpdate>,
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
+    goal_result_tx: mpsc::Sender<GoalCommandResult>,
+    goal_result_rx: mpsc::Receiver<GoalCommandResult>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
     /// Background model-catalog fetch result, routed back so the Loading
@@ -165,6 +167,11 @@ struct GitStatusUpdate {
     hash: Option<String>,
 }
 
+struct GoalCommandResult {
+    session_id: String,
+    result: Result<String, String>,
+}
+
 /// Result of a background model-catalog fetch, routed back so the Loading
 /// picker swaps to the populated list (or surfaces an error) on the draw loop.
 struct ModelFetchResult {
@@ -182,6 +189,7 @@ fn should_retry_on_entry(phase: &ChatPhase) -> bool {
 impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
+        let (goal_result_tx, goal_result_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
@@ -190,6 +198,8 @@ impl Chat {
             inbound_rx: rpc.subscribe_inbound_requests(),
             git_branch_tx,
             git_branch_rx,
+            goal_result_tx,
+            goal_result_rx,
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
@@ -927,6 +937,11 @@ impl Chat {
             _ => return,
         };
 
+        if msg.attachments.is_empty() && msg.text.trim_start().starts_with("/goal") {
+            self.spawn_goal_command(sid, msg.text);
+            return;
+        }
+
         let transport = self.rpc.transport();
         let attachments_json = if msg.attachments.is_empty() {
             Vec::new()
@@ -975,6 +990,55 @@ impl Chat {
             }
             rpc_arc.notify(method::SESSION_PROMPT, params).await;
         });
+    }
+
+    fn spawn_goal_command(&self, sid: String, command: String) {
+        let rpc = Arc::clone(&self.rpc_out);
+        let tx = self.goal_result_tx.clone();
+        tokio::spawn(async move {
+            let result: Result<String, String> = rpc
+                .request(
+                    method::SESSION_GOAL,
+                    serde_json::json!({
+                        "session_id": sid,
+                        "command": command,
+                    }),
+                )
+                .await
+                .map_err(|error| error.message)
+                .map(|value| {
+                    value
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| "invalid Goal response".to_string())
+                })
+                .and_then(|result| result);
+            let _ = tx
+                .send(GoalCommandResult {
+                    session_id: sid,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn drain_goal_command_results(&mut self) {
+        while let Ok(update) = self.goal_result_rx.try_recv() {
+            if let ChatPhase::Active(ref mut state) = self.phase
+                && state.session_id == update.session_id
+            {
+                let message = match update.result {
+                    Ok(key) => crate::i18n::try_t(&format!("zc-goal-response-{key}"))
+                        .unwrap_or_else(|| crate::i18n::t("zc-goal-response-unknown")),
+                    Err(error) => crate::i18n::t_args("zc-goal-failed", &[("error", &error)]),
+                };
+                state
+                    .entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+                state.mark_dirty_append();
+            }
+        }
     }
 
     fn drain_git_branch_results(&mut self) {
@@ -1043,6 +1107,7 @@ impl Chat {
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
+        self.drain_goal_command_results();
         self.drain_model_fetch_results();
         self.maybe_refresh_git_branch();
 
@@ -12148,6 +12213,40 @@ mod tests {
         assert_eq!(s.message_queue[0].id, id);
         assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
         assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+    }
+
+    #[tokio::test]
+    async fn queued_goal_command_uses_session_goal_not_session_prompt() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message("/goal status".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Goal command should issue a request")
+            .expect("writer channel open");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::SESSION_GOAL);
+        assert_eq!(request["params"]["command"], "/goal status");
+        assert!(request["params"].get("prompt").is_none());
+        let request_id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&request_id, Some(serde_json::json!({"key":"status"})), None);
+        tokio::task::yield_now().await;
+        chat.drain_goal_command_results();
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(matches!(
+            state.entries.last(),
+            Some(ChatEntry::SystemMessage(_))
+        ));
     }
 
     #[tokio::test]

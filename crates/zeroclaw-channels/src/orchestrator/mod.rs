@@ -6,7 +6,6 @@ pub mod acp_embedded;
 pub mod acp_server;
 mod foreground;
 mod goal_execution;
-mod goal_runtime_slot;
 use foreground::goal_policy_cutover_lock;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
