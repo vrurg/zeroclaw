@@ -10,9 +10,39 @@ use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
 
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+pub(crate) const SYSTEM_PROMPT_TRUNCATION_MARKER: &str =
+    "\n\n[System prompt truncated to fit context budget]\n";
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
+}
+
+/// Truncate a host-authored system prompt to a finite character budget.
+///
+/// The timestamp orientation is runtime-critical and is retained with the
+/// truncation marker, matching the legacy system-prompt construction path.
+pub(crate) fn truncate_system_prompt_to_budget(prompt: &mut String, max_chars: usize) {
+    if max_chars == 0 || prompt.len() <= max_chars {
+        return;
+    }
+
+    let reserved = TIMESTAMP_ORIENTATION.len() + SYSTEM_PROMPT_TRUNCATION_MARKER.len();
+    if max_chars >= reserved {
+        let mut end = max_chars - reserved;
+        while end > 0 && !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        prompt.truncate(end);
+        prompt.push_str(SYSTEM_PROMPT_TRUNCATION_MARKER);
+        append_timestamp_orientation(prompt);
+    } else {
+        let mut end = max_chars.min(TIMESTAMP_ORIENTATION.len());
+        while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
+            end -= 1;
+        }
+        prompt.clear();
+        prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
+    }
 }
 
 pub struct PromptContext<'a> {

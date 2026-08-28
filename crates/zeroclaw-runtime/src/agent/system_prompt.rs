@@ -2,7 +2,7 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
-use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
+use crate::agent::prompt::{append_timestamp_orientation, truncate_system_prompt_to_budget};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -12,7 +12,6 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
-const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -485,35 +484,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     append_timestamp_orientation(&mut prompt);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
-    if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // The orientation is runtime-critical, so it must land inside the
-        // budget. Reserve room for the orientation (and the truncation
-        // marker) at the head-retained portion, then re-append it so it
-        // always survives even when the assembled prompt overflows.
-        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
-        if max_system_prompt_chars >= reserved {
-            // Keep the top portion (identity + safety) minus the reserved tail.
-            let mut end = max_system_prompt_chars - reserved;
-            // Ensure we don't split a multi-byte UTF-8 character.
-            while end > 0 && !prompt.is_char_boundary(end) {
-                end -= 1;
-            }
-            prompt.truncate(end);
-            prompt.push_str(TRUNCATION_MARKER);
-            append_timestamp_orientation(&mut prompt);
-        } else {
-            // When the budget cannot hold both retained content and the
-            // critical tail, prioritize as much of the orientation as fits.
-            // This preserves the full orientation whenever possible without
-            // violating the configured prompt ceiling for very small budgets.
-            let mut end = max_system_prompt_chars.min(TIMESTAMP_ORIENTATION.len());
-            while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
-                end -= 1;
-            }
-            prompt.clear();
-            prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
-        }
-    }
+    truncate_system_prompt_to_budget(&mut prompt, max_system_prompt_chars);
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -571,6 +542,7 @@ fn inject_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::prompt::{SYSTEM_PROMPT_TRUNCATION_MARKER, TIMESTAMP_ORIENTATION};
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
     fn prompt_with_compact_context(compact_context: bool) -> String {
@@ -1075,7 +1047,7 @@ mod tests {
             "shell",
             "Run a shell command with enough description to overflow",
         )];
-        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+        let reserved = TIMESTAMP_ORIENTATION.len() + SYSTEM_PROMPT_TRUNCATION_MARKER.len();
 
         for compact in [false, true] {
             for budget in [

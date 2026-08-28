@@ -1,6 +1,9 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder, append_timestamp_orientation};
+use crate::agent::prompt::{
+    PromptContext, SystemPromptBuilder, append_timestamp_orientation,
+    truncate_system_prompt_to_budget,
+};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -2117,17 +2120,20 @@ impl Agent {
             prompt.push_str("\n\n");
             prompt.push_str(&self.mcp_pinned_section);
         }
-        if !self.session_prompt_attachments.is_empty() {
+        let max = self.config.resolved.max_system_prompt_chars;
+        if self.session_prompt_attachments.is_empty() {
+            truncate_system_prompt_to_budget(&mut prompt, max);
+        } else {
             let attachment_len = self.session_prompt_attachments.len().saturating_add(2);
-            let max = self.config.resolved.max_system_prompt_chars;
-            if max == 0 || prompt.len().saturating_add(attachment_len) <= max {
-                prompt.push_str("\n\n");
-                prompt.push_str(&self.session_prompt_attachments);
-            } else {
+            if max > 0 && attachment_len >= max {
                 anyhow::bail!(
                     "Persistent session prompts exceed max_system_prompt_chars ({max}); refusing to dispatch without them"
                 );
             }
+            let host_budget = if max == 0 { 0 } else { max - attachment_len };
+            truncate_system_prompt_to_budget(&mut prompt, host_budget);
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.session_prompt_attachments);
         }
         Ok(prompt)
     }
@@ -5166,6 +5172,7 @@ mod tests {
     mod surface2_tests {
         use super::*;
         use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+        use crate::agent::prompt::TIMESTAMP_ORIENTATION;
 
         /// Marker text produced by the section-based prompt builder when tools
         /// are advertised as XML/text instructions rather than native tool specs.
@@ -5400,13 +5407,27 @@ mod tests {
             let (provider, _) = capturing_provider(true);
             let mut agent = test_agent_with_provider(provider, Vec::new());
             let host_prompt_len = agent.system_prompt_for_test().unwrap().len();
-            agent.config.resolved.max_system_prompt_chars = host_prompt_len + 1;
-            agent.set_session_prompt_attachments(
-                "## Session Prompts\n- id: \"task\"; content: \"too large\"\n".to_string(),
+            let first_attachment =
+                "## Session Prompts\n- id: \"task\"; content: \"first\"\n".to_string();
+            agent.config.resolved.max_system_prompt_chars = host_prompt_len;
+            agent.set_session_prompt_attachments(first_attachment);
+            let capped_prompt = agent
+                .system_prompt_for_test()
+                .expect("a finite budget must reserve space for persistent prompts");
+            assert!(
+                capped_prompt.len() <= host_prompt_len,
+                "prompt must respect max_system_prompt_chars"
             );
+            assert!(capped_prompt.contains("content: \"first\""));
+            assert!(capped_prompt.contains(TIMESTAMP_ORIENTATION));
+
+            let too_large_attachment =
+                "## Session Prompts\n- id: \"task\"; content: \"too large\"\n".to_string();
+            agent.config.resolved.max_system_prompt_chars = too_large_attachment.len() + 2;
+            agent.set_session_prompt_attachments(too_large_attachment);
             let error = agent
                 .system_prompt_for_test()
-                .expect_err("an overflowing persistent prompt must block dispatch");
+                .expect_err("an attachment that cannot fit must block dispatch");
             assert!(
                 error
                     .to_string()
