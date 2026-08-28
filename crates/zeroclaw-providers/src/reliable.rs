@@ -1786,6 +1786,22 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
+                            if let Some(recovery) = terminal_recovery_disposition(&e) {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal_completion",
+                                    Some(&diagnostic),
+                                );
+                                if recovery == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(e);
+                                }
+                                final_cause = Some(e);
+                                break;
+                            }
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -1806,22 +1822,6 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
-                                break;
-                            }
-                            final_cause_is_semantic_empty = false;
-                            if let Some(recovery) = terminal_recovery_disposition(&e) {
-                                let diagnostic = provider_error_diagnostic(&e);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "terminal_completion",
-                                    Some(&diagnostic),
-                                );
-                                if recovery == TerminalRecoveryDisposition::NoReplay {
-                                    return Err(e);
-                                }
-                                final_cause = Some(e);
                                 break;
                             }
                             // Context window exceeded: no history to truncate
@@ -2070,6 +2070,22 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
+                            if let Some(recovery) = terminal_recovery_disposition(&e) {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal_completion",
+                                    Some(&diagnostic),
+                                );
+                                if recovery == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(e);
+                                }
+                                final_cause = Some(e);
+                                break;
+                            }
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2090,22 +2106,6 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
-                                final_cause = Some(e);
-                                break;
-                            }
-                            final_cause_is_semantic_empty = false;
-                            if let Some(recovery) = terminal_recovery_disposition(&e) {
-                                let diagnostic = provider_error_diagnostic(&e);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "terminal_completion",
-                                    Some(&diagnostic),
-                                );
-                                if recovery == TerminalRecoveryDisposition::NoReplay {
-                                    return Err(e);
-                                }
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2460,6 +2460,22 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
+                            if let Some(recovery) = terminal_recovery_disposition(&e) {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal_completion",
+                                    Some(&diagnostic),
+                                );
+                                if recovery == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(e);
+                                }
+                                final_cause = Some(e);
+                                break;
+                            }
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2480,22 +2496,6 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
-                                break;
-                            }
-                            final_cause_is_semantic_empty = false;
-                            if let Some(recovery) = terminal_recovery_disposition(&e) {
-                                let diagnostic = provider_error_diagnostic(&e);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "terminal_completion",
-                                    Some(&diagnostic),
-                                );
-                                if recovery == TerminalRecoveryDisposition::NoReplay {
-                                    return Err(e);
-                                }
-                                final_cause = Some(e);
                                 break;
                             }
                             // Context window exceeded: truncate history and retry
@@ -2771,6 +2771,22 @@ impl ModelProvider for ReliableModelProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
+                            final_cause_is_semantic_empty = false;
+                            if let Some(recovery) = terminal_recovery_disposition(&e) {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "terminal_completion",
+                                    Some(&diagnostic),
+                                );
+                                if recovery == TerminalRecoveryDisposition::NoReplay {
+                                    return Err(e);
+                                }
+                                final_cause = Some(e);
+                                break;
+                            }
                             if is_semantic_empty_completion_error(&e) {
                                 if attempt < self.max_retries {
                                     self.backoff_after_empty_completion(
@@ -2791,22 +2807,6 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
-                                break;
-                            }
-                            final_cause_is_semantic_empty = false;
-                            if let Some(recovery) = terminal_recovery_disposition(&e) {
-                                let diagnostic = provider_error_diagnostic(&e);
-                                push_failure(
-                                    &mut failures,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "terminal_completion",
-                                    Some(&diagnostic),
-                                );
-                                if recovery == TerminalRecoveryDisposition::NoReplay {
-                                    return Err(e);
-                                }
-                                final_cause = Some(e);
                                 break;
                             }
                             // Context window exceeded: truncate history and retry
@@ -4029,6 +4029,12 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    /// Emits a completed empty outcome that is explicitly ineligible for
+    /// retry or fallback because replay could duplicate provider-side work.
+    struct NoReplaySemanticEmptyMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[derive(Debug)]
     struct ContextWindowTypedError;
 
@@ -4072,6 +4078,12 @@ mod tests {
             crate::terminal::default_terminal_policy(
                 zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
             ),
+        )
+    }
+
+    fn no_replay_semantic_empty_error() -> anyhow::Error {
+        anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(None),
         )
     }
 
@@ -4359,6 +4371,51 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for NoReplaySemanticEmptyMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(no_replay_semantic_empty_error())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(no_replay_semantic_empty_error())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(no_replay_semantic_empty_error())
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(no_replay_semantic_empty_error())
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for OutputLimitTerminalMock {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -4370,6 +4427,20 @@ mod tests {
 
         fn alias(&self) -> &str {
             "OutputLimitTerminalMock"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NoReplaySemanticEmptyMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NoReplaySemanticEmptyMock"
         }
     }
 
@@ -5062,6 +5133,56 @@ mod tests {
         );
     }
 
+    fn reliable_with_no_replay_semantic_empty_primary()
+    -> (ReliableModelProvider, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(NoReplaySemanticEmptyMock {
+                        calls: Arc::clone(&primary_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "must-not-run",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        (reliable, primary_calls, fallback_calls)
+    }
+
+    fn assert_no_replay_semantic_empty(
+        error: &anyhow::Error,
+        primary: &AtomicUsize,
+        fallback: &AtomicUsize,
+    ) {
+        assert!(
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(error).is_some(),
+            "the non-replayable semantic-empty cause must remain typed: {error:#}"
+        );
+        assert_eq!(
+            primary.load(Ordering::SeqCst),
+            1,
+            "a completed non-replayable request must not retry its selected candidate"
+        );
+        assert_eq!(
+            fallback.load(Ordering::SeqCst),
+            0,
+            "a completed non-replayable request must not advance to a fallback candidate"
+        );
+    }
+
     #[test]
     fn terminal_recovery_disposition_preserves_no_replay_policy() {
         let error = crate::terminal::terminal_completion_context_error(
@@ -5141,6 +5262,48 @@ mod tests {
 
         assert_eq!(response.text.as_deref(), Some("recovered"));
         assert_terminal_fallback_calls(&primary, &fallback);
+    }
+
+    #[tokio::test]
+    async fn every_reliable_chat_entrypoint_returns_non_replayable_semantic_empty() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let (reliable, primary, fallback) = reliable_with_no_replay_semantic_empty_primary();
+        let error = reliable
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect_err("non-replayable semantic emptiness must fail chat_with_system");
+        assert_no_replay_semantic_empty(&error, &primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_no_replay_semantic_empty_primary();
+        let error = reliable
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .expect_err("non-replayable semantic emptiness must fail chat_with_history");
+        assert_no_replay_semantic_empty(&error, &primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_no_replay_semantic_empty_primary();
+        let error = reliable
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("non-replayable semantic emptiness must fail chat");
+        assert_no_replay_semantic_empty(&error, &primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_no_replay_semantic_empty_primary();
+        let error = reliable
+            .chat_with_tools(&messages, &tools, "test", Some(0.0))
+            .await
+            .expect_err("non-replayable semantic emptiness must fail chat_with_tools");
+        assert_no_replay_semantic_empty(&error, &primary, &fallback);
     }
 
     #[tokio::test]
