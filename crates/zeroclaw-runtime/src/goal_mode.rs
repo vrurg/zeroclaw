@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_config::{cost::CostTracker, schema::Config};
@@ -453,6 +454,8 @@ pub struct GoalExecutionScope {
     pub session_id: String,
     /// Immutable ingress facts selected before any adapter or model work.
     pub binding: host::GoalSessionBinding,
+    /// Shared serialization authority for every logical model operation in this epoch.
+    pub operation_permit: Arc<Semaphore>,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
@@ -946,6 +949,7 @@ impl GoalRuntime {
             .map_err(|_| {
                 GoalRuntimeError::control_plane(anyhow::anyhow!("invalid Goal binding"))
             })?,
+            operation_permit: Arc::new(Semaphore::new(1)),
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
@@ -1599,6 +1603,7 @@ mod tests {
             launches[0].binding.principal_id.as_deref(),
             Some("principal")
         );
+        assert_eq!(launches[0].operation_permit.available_permits(), 1);
         drop(launches);
         assert_eq!(
             runtime
