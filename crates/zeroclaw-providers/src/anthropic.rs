@@ -2659,10 +2659,22 @@ impl AnthropicModelProvider {
         }
     }
 
-    fn stream_transport(&self) -> Result<StreamTransport, reqwest::Error> {
+    fn stream_transport(
+        &self,
+        use_native_thinking_fallback: bool,
+    ) -> Result<StreamTransport, reqwest::Error> {
         Ok(StreamTransport {
             alias: self.alias.clone(),
-            client: self.streaming_http_client()?,
+            // Native thinking uses one complete non-streaming request and must
+            // honor the configured provider timeout. SSE instead needs an
+            // unbounded request lifetime plus its separate phase/idle limits.
+            // Select before constructing transport so every request creates
+            // only the client it can actually use.
+            client: if use_native_thinking_fallback {
+                self.http_client()
+            } else {
+                self.streaming_http_client()?
+            },
             url: format!("{}/v1/messages", self.base_url),
             phase_timeout: std::time::Duration::from_secs(self.timeout_secs),
         })
@@ -2902,7 +2914,7 @@ impl AnthropicModelProvider {
         }
 
         let prepared = self.prepare_stream_request(request, model, temperature);
-        let transport = match self.stream_transport() {
+        let transport = match self.stream_transport(prepared.thinking.is_some()) {
             Ok(transport) => transport,
             Err(error) => {
                 let message = format!(
@@ -3814,7 +3826,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[tokio::test]
     async fn oauth_mode_without_same_named_profile_fails_despite_active_profile() {
-        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode, Config};
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig, Config};
 
         let state_dir = tempfile::tempdir().expect("temporary state directory");
         AuthService::new(state_dir.path(), false)
@@ -3832,7 +3844,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "subscription".to_string(),
             AnthropicModelProviderConfig {
                 base: Default::default(),
-                auth_mode: Some(AuthMode::OAuth),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
             },
         );
         let options = crate::ModelProviderRuntimeOptions {
@@ -4035,11 +4047,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn oauth_factory_allows_profile_backed_fallback_but_rejects_api_key_conflicts() {
         use crate::ModelProviderRuntimeOptions;
         use crate::factory::FamilyProviderFactory;
-        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
 
         let config = AnthropicModelProviderConfig {
             base: Default::default(),
-            auth_mode: Some(AuthMode::OAuth),
+            auth_mode: Some(AnthropicAuthMode::OAuth),
         };
         assert!(config.fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()));
         let error = config
@@ -4058,11 +4070,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn oauth_factory_accepts_only_the_official_anthropic_endpoint() {
         use crate::ModelProviderRuntimeOptions;
         use crate::factory::FamilyProviderFactory;
-        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
 
         let config = AnthropicModelProviderConfig {
             base: Default::default(),
-            auth_mode: Some(AuthMode::OAuth),
+            auth_mode: Some(AnthropicAuthMode::OAuth),
         };
         let options = ModelProviderRuntimeOptions::default();
         config
@@ -5779,10 +5791,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn anthropic_factory_forwards_timeout_to_native_provider() {
+    async fn anthropic_thinking_fallback_honors_provider_timeout() {
         use crate::ModelProviderRuntimeOptions;
         use crate::factory::FamilyProviderFactory;
         use axum::{Json, Router, routing::post};
+        use futures_util::StreamExt as _;
         use serde_json::json;
         use tokio::time::{Duration, Instant};
         use zeroclaw_config::schema::AnthropicModelProviderConfig;
@@ -5823,16 +5836,30 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("anthropic provider should build");
 
         let started = Instant::now();
-        let result = provider
-            .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
-            .await;
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                    budget_tokens: 1_024,
+                }),
+            },
+            "claude-sonnet-4-5",
+            Some(0.7),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        let result = stream.next().await.expect("fallback must yield a result");
         let elapsed = started.elapsed();
 
         server.abort();
 
         assert!(
             result.is_err(),
-            "slow response should time out when factory forwards provider_timeout_secs"
+            "native-thinking fallback should time out when the factory forwards provider_timeout_secs"
         );
         assert!(
             elapsed < Duration::from_secs(3),

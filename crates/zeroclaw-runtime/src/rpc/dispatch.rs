@@ -567,10 +567,11 @@ impl RpcDispatcher {
         );
         let mut snapshot = self.ctx.config.read().clone();
         let saved_paths = snapshot.dirty_paths.clone();
-        snapshot
-            .save_dirty()
+        let outcome = snapshot
+            .save_dirty_with_outcome()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.record_committed_config_warning(outcome);
         self.ctx
             .config
             .write()
@@ -598,12 +599,35 @@ impl RpcDispatcher {
             self.ctx.config_write_lock.try_lock().is_err(),
             "save_and_swap_config caller must hold ctx.config_write_lock"
         );
-        snapshot
-            .save_dirty()
+        let outcome = snapshot
+            .save_dirty_with_outcome()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.record_committed_config_warning(outcome);
         *self.ctx.config.write() = snapshot;
         Ok(())
+    }
+
+    fn record_committed_config_warning(&self, outcome: zeroclaw_config::schema::ConfigSaveOutcome) {
+        if let zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(error) =
+            outcome
+        {
+            // A config/set or alias-rename response must agree with the already
+            // committed file and installed live snapshot. This narrow bridge
+            // must be replaced by a dedicated config-persistence refactor that
+            // makes every legacy save caller outcome-aware.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.directory_sync_after_replace_failed",
+                        "error": error.to_string(),
+                        "caller": "rpc",
+                    })),
+                "Config change committed with a directory durability warning"
+            );
+        }
     }
 
     async fn agent_rename_residue_exists(
@@ -8021,6 +8045,57 @@ mod tests {
         assert!(!written.contains("[agents.alpha]"), "{written}");
         assert!(written.contains("agent = \"beta\""), "{written}");
         assert!(written.contains("default_agent = \"beta\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn alias_rename_post_rename_sync_failure_still_commits_disk_and_live_config() {
+        // `handle_config_alias_rename` persists through save_and_swap_config,
+        // rather than config/set's flush_config path. A post-rename directory
+        // sync fault still means the replacement file was committed, so the
+        // RPC must report success and publish that same snapshot live.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        config.save().await.expect("seed the on-disk config");
+        let config_path = config.config_path.clone();
+        let prior_disk = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("seeded config must exist on disk");
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        zeroclaw_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a post-rename sync fault must still report a committed alias rename: {result:?}"
+        );
+        assert!(
+            !zeroclaw_config::schema::post_replace_sync_failure_armed(&config_path),
+            "the injected fault must fire inside alias-rename persistence"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert!(!live.agents.contains_key("alpha"));
+        assert!(live.agents.contains_key("beta"));
+        drop(live);
+
+        let disk = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("config.toml must survive the injected fault");
+        assert!(disk.contains("[agents.beta]"), "{disk}");
+        assert!(!disk.contains("[agents.alpha]"), "{disk}");
+
+        let backup = tokio::fs::read_to_string(config_path.with_extension("toml.bak"))
+            .await
+            .expect("durability uncertainty must retain the prior backup");
+        assert_eq!(backup, prior_disk, ".bak must retain the prior config");
     }
 
     #[tokio::test]

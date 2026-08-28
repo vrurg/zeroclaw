@@ -5113,7 +5113,7 @@ path = "{trigger_path}"
                     model: Some("claude-sonnet-4-5".to_string()),
                     ..Default::default()
                 },
-                auth_mode: Some(zeroclaw_config::schema::AuthMode::OAuth),
+                auth_mode: Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth),
             },
         );
         zeroclaw_providers::auth::AuthService::from_config(&config)

@@ -477,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn execute_preserves_anthropic_oauth_dotted_alias() {
         use zeroclaw_config::schema::{
-            AnthropicModelProviderConfig, AuthMode, ModelProviderConfig,
+            AnthropicAuthMode, AnthropicModelProviderConfig, ModelProviderConfig,
         };
 
         let mut config = Config {
@@ -491,7 +491,7 @@ mod tests {
                     model: Some("claude-sonnet-4-5".to_string()),
                     ..Default::default()
                 },
-                auth_mode: Some(AuthMode::OAuth),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
             },
         );
         let tool = LlmTaskTool::new(

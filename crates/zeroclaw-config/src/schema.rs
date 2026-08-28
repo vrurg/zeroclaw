@@ -791,7 +791,27 @@ pub enum AuthMode {
     ApiKey,
     /// OAuth flow — credential resolution defers to the family runtime impl
     /// (typically reading a vendor-specific token cache or env var).
-    #[serde(rename = "oauth", alias = "o_auth")]
+    OAuth,
+}
+
+/// Authentication mode for Anthropic aliases.
+///
+/// This provider-local type is intentional: the shared [`AuthMode`] has the
+/// established `o_auth` wire spelling for existing provider families, while
+/// Anthropic introduced this field with the operator-facing `oauth` spelling.
+/// Keeping the type local makes serde, schema-derived configuration metadata,
+/// and Web/TUI enum choices agree without rewriting other providers' configs.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicAuthMode {
+    /// Standard API key authentication via the `api_key` field.
+    #[default]
+    ApiKey,
+    /// Stored OAuth setup-token profile with the same name as the alias.
+    #[serde(rename = "oauth")]
     OAuth,
 }
 
@@ -1150,7 +1170,7 @@ pub struct AnthropicModelProviderConfig {
     /// unambiguous.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_mode: Option<AuthMode>,
+    pub auth_mode: Option<AnthropicAuthMode>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -21061,7 +21081,9 @@ impl Config {
         }
 
         for (alias, provider) in &self.providers.models.anthropic {
-            if provider.auth_mode == Some(AuthMode::OAuth) && provider.base.api_key.is_some() {
+            if provider.auth_mode == Some(AnthropicAuthMode::OAuth)
+                && provider.base.api_key.is_some()
+            {
                 let path = format!("providers.models.anthropic.{alias}.api_key");
                 validation_bail!(
                     InvalidFormat,
@@ -43056,7 +43078,7 @@ model_provider = \"ollama.default\"
                     api_key: Some("not-allowed-in-oauth-mode".into()),
                     ..Default::default()
                 },
-                auth_mode: Some(AuthMode::OAuth),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
             },
         );
 
@@ -43094,12 +43116,86 @@ model_provider = \"ollama.default\"
     }
 
     #[::core::prelude::v1::test]
-    fn auth_mode_accepts_legacy_o_auth_spelling_but_serializes_as_oauth() {
+    fn shared_oauth_modes_preserve_the_legacy_o_auth_wire_spelling() {
         let parsed: AuthMode = serde_json::from_str("\"o_auth\"").expect("legacy spelling parses");
         assert_eq!(parsed, AuthMode::OAuth);
         assert_eq!(
             serde_json::to_string(&parsed).expect("serialize mode"),
-            "\"oauth\""
+            "\"o_auth\""
+        );
+
+        for (family, serialized) in [
+            (
+                "qwen",
+                toml::to_string(&QwenModelProviderConfig {
+                    auth_mode: Some(AuthMode::OAuth),
+                    ..Default::default()
+                })
+                .expect("Qwen config serializes"),
+            ),
+            (
+                "minimax",
+                toml::to_string(&MinimaxModelProviderConfig {
+                    auth_mode: Some(AuthMode::OAuth),
+                    ..Default::default()
+                })
+                .expect("MiniMax config serializes"),
+            ),
+            (
+                "gemini",
+                toml::to_string(&GeminiModelProviderConfig {
+                    auth_mode: Some(AuthMode::OAuth),
+                    ..Default::default()
+                })
+                .expect("Gemini config serializes"),
+            ),
+        ] {
+            assert!(
+                serialized.contains("auth_mode = \"o_auth\""),
+                "{family} must retain its downgrade-compatible auth mode: {serialized}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_oauth_uses_its_provider_local_wire_spelling() {
+        let config: AnthropicModelProviderConfig =
+            toml::from_str("auth_mode = \"oauth\"").expect("Anthropic OAuth spelling parses");
+        assert_eq!(config.auth_mode, Some(AnthropicAuthMode::OAuth));
+        assert_eq!(
+            toml::to_string(&config).expect("Anthropic config serializes"),
+            "auth_mode = \"oauth\"\n"
+        );
+        assert!(
+            toml::from_str::<AnthropicModelProviderConfig>("auth_mode = \"o_auth\"").is_err(),
+            "Anthropic has no legacy auth_mode field and must not inherit another family's spelling"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn anthropic_auth_mode_metadata_advertises_the_accepted_oauth_spelling() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+        let field = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == "providers.models.anthropic.subscription.auth_mode")
+            .expect("configured Anthropic alias must expose auth_mode metadata");
+        assert_eq!(
+            (field.enum_variants.expect("auth_mode is an enum"))(),
+            vec!["api_key", "oauth"],
+            "Web/TUI must only advertise values accepted by Anthropic config"
+        );
+
+        config
+            .set_prop_persistent("providers.models.anthropic.subscription.auth_mode", "oauth")
+            .expect("the advertised OAuth spelling must be writable");
+        assert_eq!(
+            config.providers.models.anthropic["subscription"].auth_mode,
+            Some(AnthropicAuthMode::OAuth)
         );
     }
 }

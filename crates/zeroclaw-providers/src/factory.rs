@@ -473,10 +473,10 @@ pub(crate) fn fallback_auth_ready_for_alias(
 }
 
 use zeroclaw_config::schema::{
-    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicAuthMode,
+    AnthropicModelProviderConfig, AnyscaleModelProviderConfig, ArceeModelProviderConfig,
+    AstraiModelProviderConfig, AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig,
+    AuthMode, AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
     CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
@@ -1088,7 +1088,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let oauth = self.auth_mode == Some(AuthMode::OAuth);
+        let oauth = self.auth_mode == Some(AnthropicAuthMode::OAuth);
         if oauth && has_api_key(key) {
             anyhow::bail!(
                 "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
@@ -1138,7 +1138,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
-        self.auth_mode == Some(AuthMode::OAuth) || has_api_key(key)
+        self.auth_mode == Some(AnthropicAuthMode::OAuth) || has_api_key(key)
     }
 }
 

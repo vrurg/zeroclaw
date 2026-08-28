@@ -1701,6 +1701,11 @@ pub fn create_model_provider_from_ref_with_model(
         && !family.contains(':')
         && let Some(entry) = config.providers.models.find(family, alias)
     {
+        if alias.contains(':') {
+            anyhow::bail!(
+                "model provider alias {alias:?} contains ':' and cannot be used to construct a provider"
+            );
+        }
         let options = provider_runtime_options_for_alias(config, family, alias);
         let provider = create_model_provider_inner(
             Some(config),
@@ -3413,6 +3418,45 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn persisted_colon_alias_is_rejected_before_auth_resolution() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temporary config directory");
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.providers.models.anthropic.insert(
+            "subscription:work".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig::default(),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+            },
+        );
+        config.save().await.expect("persist invalid alias fixture");
+        let serialized = std::fs::read_to_string(&config.config_path)
+            .expect("persisted fixture must be readable");
+        assert!(
+            serialized.contains("[providers.models.anthropic.\"subscription:work\"]"),
+            "fixture must exercise a persisted colon-bearing alias: {serialized}"
+        );
+
+        let error = match create_model_provider_from_ref(&config, "anthropic.subscription:work") {
+            Ok(_) => panic!("a colon-bearing persisted alias must fail before profile lookup"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be used to construct a provider"),
+            "unexpected rejection: {error}"
+        );
     }
 
     // ── Error cases ──────────────────────────────────────────
