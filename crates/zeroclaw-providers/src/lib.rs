@@ -1309,6 +1309,15 @@ fn create_model_provider_inner(
     api_url: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // Config loading deliberately keeps an invalid entry available so the
+    // operator can repair it through /config. A provider factory must still
+    // fail closed before such an alias reaches auth-profile selection, where
+    // ':' has a different meaning as the profile-ID separator.
+    if config.is_some() && alias.contains(':') {
+        anyhow::bail!(
+            "model provider alias {alias:?} contains ':' and cannot be used to construct a provider"
+        );
+    }
     if let Some(idx) = raw_name.find(':') {
         let prefix = &raw_name[..idx];
         let url = raw_name[idx + 1..].trim();
@@ -1701,11 +1710,6 @@ pub fn create_model_provider_from_ref_with_model(
         && !family.contains(':')
         && let Some(entry) = config.providers.models.find(family, alias)
     {
-        if alias.contains(':') {
-            anyhow::bail!(
-                "model provider alias {alias:?} contains ':' and cannot be used to construct a provider"
-            );
-        }
         let options = provider_runtime_options_for_alias(config, family, alias);
         let provider = create_model_provider_inner(
             Some(config),
@@ -3421,7 +3425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_colon_alias_is_rejected_before_auth_resolution() {
+    async fn persisted_colon_alias_is_rejected_by_all_factories_before_auth_resolution() {
         use zeroclaw_config::schema::{
             AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
         };
@@ -3447,16 +3451,27 @@ mod tests {
             "fixture must exercise a persisted colon-bearing alias: {serialized}"
         );
 
-        let error = match create_model_provider_from_ref(&config, "anthropic.subscription:work") {
-            Ok(_) => panic!("a colon-bearing persisted alias must fail before profile lookup"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("cannot be used to construct a provider"),
-            "unexpected rejection: {error}"
-        );
+        let direct = create_model_provider_from_ref(&config, "anthropic.subscription:work").err();
+        let resilient = create_resilient_model_provider_from_ref(
+            &config,
+            "anthropic.subscription:work",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .err();
+
+        for error in [direct, resilient] {
+            let error =
+                error.expect("a colon-bearing persisted alias must fail before profile lookup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot be used to construct a provider"),
+                "unexpected rejection: {error}"
+            );
+        }
     }
 
     // ── Error cases ──────────────────────────────────────────
