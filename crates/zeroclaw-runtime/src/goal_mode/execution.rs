@@ -20,7 +20,10 @@ use zeroclaw_config::{cost::CostTracker, schema::Config};
 
 use super::{
     GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor, GoalTurnKind,
-    host::{GoalExecutionHost, GoalParentTurn, GoalSessionLease, GoalVerifierTurn},
+    host::{
+        GoalExecutionHost, GoalHostPreflightError, GoalParentTurn, GoalSessionLease,
+        GoalVerifierTurn,
+    },
 };
 use crate::{
     agent::{
@@ -571,7 +574,16 @@ impl GoalExecutor for GoalExecutionDriver {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
         match self.host.preflight(&request.binding, request).await {
             Ok(reservation) => GoalExecutionReadiness::Ready(reservation),
-            Err(_) => GoalExecutionReadiness::VerifierUnavailable,
+            Err(GoalHostPreflightError::PricingUnavailable) => {
+                GoalExecutionReadiness::PricingUnavailable
+            }
+            Err(GoalHostPreflightError::ReservationUnavailable) => {
+                GoalExecutionReadiness::ReservationUnavailable
+            }
+            Err(
+                GoalHostPreflightError::BindingUnavailable
+                | GoalHostPreflightError::VerifierUnavailable,
+            ) => GoalExecutionReadiness::VerifierUnavailable,
         }
     }
 

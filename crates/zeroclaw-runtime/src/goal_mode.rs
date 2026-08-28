@@ -505,6 +505,7 @@ pub struct GoalOperationReservation {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GoalExecutionReadiness {
     Ready(GoalOperationReservation),
+    ReservationUnavailable,
     PricingUnavailable,
     VerifierUnavailable,
 }
@@ -666,6 +667,11 @@ impl GoalRuntime {
             GoalExecutionReadiness::Ready(_) => {
                 return Ok(GoalResponse::message(
                     GoalMessageKey::ReservationExceedsBudget,
+                ));
+            }
+            GoalExecutionReadiness::ReservationUnavailable => {
+                return Ok(GoalResponse::message(
+                    GoalMessageKey::ReservationUnavailable,
                 ));
             }
             GoalExecutionReadiness::PricingUnavailable if cost_limit_usd.is_some() => {
@@ -1099,6 +1105,9 @@ impl GoalRuntime {
                 GoalResumeReadiness::ReservationExceedsBudget
             }
             GoalExecutionReadiness::Ready(_) => GoalResumeReadiness::Ready,
+            GoalExecutionReadiness::ReservationUnavailable => {
+                GoalResumeReadiness::ReservationUnavailable
+            }
             GoalExecutionReadiness::PricingUnavailable
                 if current.goal.effective_cost_limit_usd.is_some() =>
             {
