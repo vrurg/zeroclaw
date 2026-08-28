@@ -6467,44 +6467,41 @@ async fn process_channel_message_body(
         match prompt_result {
             Ok(prompts) => {
                 let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
-                if !attachments.is_empty() {
-                    // Attachments are loaded once for this primary channel turn.
-                    // Tool mutations intentionally affect the next turn only.
-                    let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
-                    if append_session_prompts_to_channel_system_prompt(
-                        &mut system_prompt,
-                        &attachments,
-                        max,
-                    )
-                    .is_err()
-                    {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
+                // Attachments are loaded once for this primary channel turn.
+                // Tool mutations intentionally affect the next turn only. The
+                // helper also caps the completed host prompt when this session
+                // has no attachments.
+                let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+                if append_session_prompts_to_channel_system_prompt(
+                    &mut system_prompt,
+                    &attachments,
+                    max,
+                )
+                .is_err()
+                {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
-                            "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
+                        "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
+                    );
+                    if let Some(channel) = target_channel.as_ref() {
+                        let message = channel_runtime_cli_string(
+                            "channel-runtime-session-prompt-budget-exceeded",
                         );
-                        if let Some(channel) = target_channel.as_ref() {
-                            let message = channel_runtime_cli_string(
-                                "channel-runtime-session-prompt-budget-exceeded",
-                            );
-                            let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
-                        }
-                        rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
-                        reconcile_early_ack(
-                            ctx.as_ref(),
-                            &msg,
-                            target_channel.as_ref(),
-                            early_ack_task,
-                            Some("\u{26A0}\u{FE0F}"),
-                        )
-                        .await;
-                        return;
+                        let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
                     }
+                    rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                    reconcile_early_ack(
+                        ctx.as_ref(),
+                        &msg,
+                        target_channel.as_ref(),
+                        early_ack_task,
+                        Some("\u{26A0}\u{FE0F}"),
+                    )
+                    .await;
+                    return;
                 }
             }
             Err(error) => {
@@ -33818,6 +33815,18 @@ Done."#;
         assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
         assert!(prompt.contains("content: \"persisted\""));
         assert!(prompt.ends_with(attachments));
+    }
+
+    #[test]
+    fn channel_session_prompt_empty_collection_caps_completed_host_prompt() {
+        let mut prompt = "host context ".repeat(64);
+        let max = prompt.len() / 2;
+
+        append_session_prompts_to_channel_system_prompt(&mut prompt, "", max)
+            .expect("an empty attachment collection must still cap host context");
+
+        assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
+        assert!(!prompt.contains("## Session Prompts"));
     }
 
     #[test]
