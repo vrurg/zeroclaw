@@ -451,6 +451,8 @@ pub enum GoalTurnKind {
 pub struct GoalExecutionScope {
     pub task_id: String,
     pub session_id: String,
+    /// Immutable ingress facts selected before any adapter or model work.
+    pub binding: host::GoalSessionBinding,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub cancellation: CancellationToken,
@@ -935,6 +937,15 @@ impl GoalRuntime {
         let scope = GoalExecutionScope {
             task_id: task_id.to_owned(),
             session_id: ingress.session_id.clone(),
+            binding: host::GoalSessionBinding::new(
+                ingress.session_id.clone(),
+                ingress.agent.clone(),
+                ingress.route.clone(),
+                ingress.principal_id.clone(),
+            )
+            .map_err(|_| {
+                GoalRuntimeError::control_plane(anyhow::anyhow!("invalid Goal binding"))
+            })?,
             execution_epoch: epoch,
             turn_kind,
             cancellation: CancellationToken::new(),
@@ -1579,7 +1590,16 @@ mod tests {
             goal.success_criteria,
             "the reported answer meets the stated objective"
         );
-        assert_eq!(executor.launches.lock().len(), 1);
+        let launches = executor.launches.lock();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].binding.session_id, "session");
+        assert_eq!(launches[0].binding.agent, "main");
+        assert_eq!(launches[0].binding.route, "room");
+        assert_eq!(
+            launches[0].binding.principal_id.as_deref(),
+            Some("principal")
+        );
+        drop(launches);
         assert_eq!(
             runtime
                 .submit(ingress(), start_command())
