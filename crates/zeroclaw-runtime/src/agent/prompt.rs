@@ -45,6 +45,38 @@ pub(crate) fn truncate_system_prompt_to_budget(prompt: &mut String, max_chars: u
     }
 }
 
+/// Reserve a finite system-prompt budget for mandatory session attachments.
+///
+/// Attachments are durable session context, so callers must never silently
+/// omit them. When a finite budget leaves room for the attachment section,
+/// truncate only the host-authored prefix and append the complete section.
+pub fn append_required_session_prompt_attachments(
+    prompt: &mut String,
+    attachments: &str,
+    max_chars: usize,
+) -> Result<()> {
+    if attachments.is_empty() {
+        truncate_system_prompt_to_budget(prompt, max_chars);
+        return Ok(());
+    }
+
+    let attachment_len = attachments.len().saturating_add(2);
+    if max_chars > 0 && attachment_len >= max_chars {
+        anyhow::bail!(
+            "Persistent session prompts exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
+        );
+    }
+    let host_budget = if max_chars == 0 {
+        0
+    } else {
+        max_chars - attachment_len
+    };
+    truncate_system_prompt_to_budget(prompt, host_budget);
+    prompt.push_str("\n\n");
+    prompt.push_str(attachments);
+    Ok(())
+}
+
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub agent_workspace_dir: &'a Path,

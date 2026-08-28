@@ -1109,6 +1109,18 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
+fn append_session_prompts_to_channel_system_prompt(
+    system_prompt: &mut String,
+    attachments: &str,
+    max_system_prompt_chars: usize,
+) -> anyhow::Result<()> {
+    ::zeroclaw_runtime::agent::prompt::append_required_session_prompt_attachments(
+        system_prompt,
+        attachments,
+        max_system_prompt_chars,
+    )
+}
+
 fn current_date_section() -> String {
     let now = chrono::Local::now();
     format!(
@@ -6458,12 +6470,14 @@ async fn process_channel_message_body(
                 if !attachments.is_empty() {
                     // Attachments are loaded once for this primary channel turn.
                     // Tool mutations intentionally affect the next turn only.
-                    let attachment_len = attachments.len().saturating_add(2);
                     let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
-                    if max == 0 || system_prompt.len().saturating_add(attachment_len) <= max {
-                        system_prompt.push_str("\n\n");
-                        system_prompt.push_str(&attachments);
-                    } else {
+                    if append_session_prompts_to_channel_system_prompt(
+                        &mut system_prompt,
+                        &attachments,
+                        max,
+                    )
+                    .is_err()
+                    {
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -33789,6 +33803,36 @@ Done."#;
         assert!(
             !prompt.contains("delivery="),
             "system prompt must not include the cron_add delivery hint; got {prompt}"
+        );
+    }
+
+    #[test]
+    fn channel_session_prompt_attachments_reserve_the_exact_cap() {
+        let attachments = "## Session Prompts\n- id: \"task\"; content: \"persisted\"\n";
+        let mut prompt = "host context ".repeat(64);
+        let max = prompt.len();
+
+        append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
+            .expect("a fitting attachment must reserve host prompt budget");
+
+        assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
+        assert!(prompt.contains("content: \"persisted\""));
+        assert!(prompt.ends_with(attachments));
+    }
+
+    #[test]
+    fn channel_session_prompt_attachment_that_cannot_fit_fails_closed() {
+        let attachments = "## Session Prompts\n- id: \"task\"; content: \"persisted\"\n";
+        let mut prompt = "host context".to_string();
+        let max = attachments.len() + 2;
+
+        let error = append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
+            .expect_err("an attachment with no remaining host budget must block dispatch");
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to dispatch without them")
         );
     }
 
