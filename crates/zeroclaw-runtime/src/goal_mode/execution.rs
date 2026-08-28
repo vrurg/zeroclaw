@@ -359,7 +359,29 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await
             .take()
             .context("goal operation has no pending admission")?;
-        let (state, pricing_complete) = self.record_attempts(&attempts).await?;
+        let (state, pricing_complete) = match self.record_attempts(&attempts).await {
+            Ok(result) => result,
+            Err(error) => {
+                match self
+                    .goals
+                    .mark_pending_call_outcome_unknown(
+                        &self.scope.task_id,
+                        &self.scope.session_id,
+                        self.scope.execution_epoch,
+                        &operation.call_id,
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied => {}
+                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                        anyhow::bail!("goal ledger failure classification is stale")
+                    }
+                }
+                return Err(
+                    anyhow::Error::new(GoalOperationError::AccountingOutcomeUnknown).context(error),
+                );
+            }
+        };
         match self
             .goals
             .settle_pending_call(

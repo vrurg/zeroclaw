@@ -1307,6 +1307,29 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn mark_pending_call_outcome_unknown(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE goal_tasks SET accounting_state = 'outcome_unknown'
+              WHERE task_id = ?1 AND pending_call_id = ?4 AND pending_call_epoch = ?3
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                )",
+            params![task_id, session_id, admitted_epoch, pending_call_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&conn, task_id, session_id);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn begin_goal_tool_phase(
         &self,
         task_id: &str,
@@ -1854,6 +1877,39 @@ mod tests {
                 .unwrap()
                 .accounting_state,
             GoalAccountingState::OutcomeUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_ledger_write_keeps_the_exact_pending_operation_fenced() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("pending", "session"),
+                goal_record("pending", "objective"),
+            )
+            .await
+            .unwrap();
+        store
+            .admit_pending_call_with_reservation("pending", "session", 1, "operation", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_pending_call_outcome_unknown("pending", "session", 1, "operation")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let goal = store.get_goal_task("pending").await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(goal.pending_call_id.as_deref(), Some("operation"));
+        assert_eq!(
+            store
+                .resume_session_goal("pending", "session", 1, 2, "boot")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
         );
     }
 

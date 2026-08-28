@@ -446,6 +446,17 @@ pub trait GoalTaskRegistry: Send + Sync {
         accounting_state: GoalAccountingState,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Fail closed after ledger persistence becomes uncertain. The pending
+    /// operation remains present until boot reconciliation classifies it, so
+    /// neither replacement nor resume can replay a potentially billed call.
+    async fn mark_pending_call_outcome_unknown(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     /// Enter the durable in-flight phase before a prepared Goal tool batch is
     /// polled. The runtime owns pairing and is the sole caller allowed to
     /// complete it after appending paired results to its working transcript.
