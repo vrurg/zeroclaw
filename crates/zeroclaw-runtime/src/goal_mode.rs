@@ -996,7 +996,7 @@ impl GoalRuntime {
         let task_id = task_id.to_owned();
         let tracker = Arc::clone(&self.cost_tracker);
         tokio::task::spawn_blocking(move || {
-            tracker.get_usage_totals_for_task_with_pricing(&task_id)
+            tracker.get_strict_usage_totals_for_task_with_pricing(&task_id)
         })
         .await
         .map_err(GoalRuntimeError::accounting)?
