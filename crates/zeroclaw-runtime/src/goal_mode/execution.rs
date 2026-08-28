@@ -208,7 +208,10 @@ impl GoalOperationAccountant {
         let reserved_cost_usd = goal
             .effective_cost_limit_usd
             .map(|_| conservative_cost_reservation(&self.config, &plan, input_tokens))
-            .transpose()?;
+            .transpose()
+            .map_err(|error| {
+                anyhow::Error::new(GoalOperationError::PricingUnavailable).context(error)
+            })?;
         Ok((reserved_tokens, reserved_cost_usd))
     }
 
@@ -271,53 +274,38 @@ impl GoalOperationAccountant {
     /// storage error here would let the worker misclassify an admitted spend as
     /// an ordinary parent failure while the daemon remains alive.
     async fn retain_outcome_unknown(&self, call_id: &str) -> anyhow::Result<()> {
-        loop {
-            match self
-                .goals
-                .mark_pending_call_outcome_unknown(
-                    &self.scope.task_id,
-                    &self.scope.session_id,
-                    self.scope.execution_epoch,
-                    call_id,
-                )
-                .await
-            {
-                Ok(GoalTransitionResult::Applied) => return Ok(()),
-                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
-                    match self.goals.get_goal_task(&self.scope.task_id).await {
-                        Ok(Some(goal))
-                            if goal.accounting_state == GoalAccountingState::OutcomeUnknown =>
-                        {
-                            return Ok(());
-                        }
-                        Ok(_) => anyhow::bail!(
-                            "goal ledger failure classification was fenced before outcome reconciliation"
-                        ),
-                        Err(error) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail,
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                                "Goal uncertainty reconciliation read failed; retaining operation ownership"
-                            );
-                        }
+        let goals = Arc::clone(&self.goals);
+        let task_id = self.scope.task_id.clone();
+        let session_id = self.scope.session_id.clone();
+        let epoch = self.scope.execution_epoch;
+        let call_id = call_id.to_owned();
+        match retry_required_goal_transition(move || {
+            let goals = Arc::clone(&goals);
+            let task_id = task_id.clone();
+            let session_id = session_id.clone();
+            let call_id = call_id.clone();
+            async move {
+                goals
+                    .mark_pending_call_outcome_unknown(&task_id, &session_id, epoch, &call_id)
+                    .await
+            }
+        })
+        .await
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                match self.goals.get_goal_task(&self.scope.task_id).await {
+                    Ok(Some(goal)) if goal.accounting_state == GoalAccountingState::OutcomeUnknown => {
+                        Ok(())
                     }
-                }
-                Err(error) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                        "Goal uncertainty classification persistence failed; retaining operation ownership"
-                    );
+                    Ok(_) => anyhow::bail!(
+                        "goal ledger failure classification was fenced before outcome reconciliation"
+                    ),
+                    Err(error) => Err(error).context(
+                        "goal ledger failure classification was fenced before outcome reconciliation",
+                    ),
                 }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -1183,6 +1171,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncertain_accounting_classification_retries_and_retains_the_pending_operation() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        assert_eq!(
+            goals
+                .create_or_replace_session_goal(
+                    TaskRecord {
+                        id: "goal".into(),
+                        kind: TaskKind::Goal,
+                        agent: "main".into(),
+                        status: TaskStatus::Running,
+                        owner_pid: std::process::id(),
+                        owner_boot_id: "boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some("route".into()),
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        session_id: Some("session".into()),
+                        execution_epoch: 0,
+                        started_at: Utc::now().to_rfc3339(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id: "goal".into(),
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            goals
+                .admit_pending_call_with_reservation("goal", "session", 1, "operation", None, None)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = super::retry_required_goal_transition({
+            let goals = Arc::clone(&goals);
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let goals = Arc::clone(&goals);
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("injected outcome-unknown write failure");
+                    }
+                    goals
+                        .mark_pending_call_outcome_unknown("goal", "session", 1, "operation")
+                        .await
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, GoalTransitionResult::Applied);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let goal = store.get_goal_task("goal").await.unwrap().unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(goal.pending_call_id.as_deref(), Some("operation"));
+        assert_eq!(goal.pending_call_epoch, Some(1));
+    }
+
+    #[tokio::test]
     async fn predecessor_quiescence_waits_for_the_shared_final_delivery_join() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
@@ -1649,6 +1710,78 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::GoalOperationError>(),
+            Some(super::GoalOperationError::PricingUnavailable)
+        ));
+    }
+
+    #[test]
+    fn unpriced_resolved_candidate_returns_the_typed_pricing_failure() {
+        let mut config = Config::default();
+        let _ = config.providers.models.ensure("provider", "model");
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: 0,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 1,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            effective_cost_limit_usd: Some(1.0),
+            ..GoalTaskRecord::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let accountant = super::GoalOperationAccountant::new(
+            Arc::new(SqliteTaskStore::new_in_memory().unwrap()),
+            Arc::new(config),
+            Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap()),
+            GoalExecutionScope {
+                task_id: "goal".into(),
+                session_id: "session".into(),
+                binding: GoalSessionBinding::new(
+                    "session".into(),
+                    "main".into(),
+                    "route".into(),
+                    None,
+                )
+                .unwrap(),
+                operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                execution_epoch: 1,
+                turn_kind: GoalTurnKind::Start,
+                cancellation: CancellationToken::new(),
+            },
+            "main".into(),
+        );
+        let error = accountant
+            .reservation(
+                &task,
+                &goal,
+                &crate::agent::cost::GoalOperationRequest {
+                    model_provider: "provider".into(),
+                    model: "model".into(),
+                    temperature: None,
+                    thinking: None,
+                    messages: vec![zeroclaw_api::model_provider::ChatMessage::user("goal")],
+                    tools: Vec::new(),
+                },
+            )
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<super::GoalOperationError>(),
             Some(super::GoalOperationError::PricingUnavailable)
