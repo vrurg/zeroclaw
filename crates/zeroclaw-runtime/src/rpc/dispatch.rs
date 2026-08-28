@@ -2735,12 +2735,15 @@ impl RpcDispatcher {
                 }
                 mode
             }
-            None => req.chat_mode.clone().ok_or_else(|| {
-                rpc_err(
-                    SESSION_NOT_FOUND,
-                    "A reaped session requires an explicit chat_mode for deletion",
-                )
-            })?,
+            // `session/delete` has always been idempotent for the canonical
+            // Chat domain.  Keep that contract for a reaped or already
+            // missing session: an omitted mode means Chat, while an explicit
+            // ACP mode remains unavailable here because this lifecycle does
+            // not own ACP persistence.
+            None => req
+                .chat_mode
+                .clone()
+                .unwrap_or(crate::rpc::types::ChatMode::Chat),
         };
         // A raw RPC ID is not a storage-domain discriminator. Never inspect
         // the ACP store to infer one: Chat and ACP IDs may collide. The first
