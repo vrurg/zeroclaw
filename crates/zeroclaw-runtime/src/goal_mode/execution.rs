@@ -49,10 +49,40 @@ struct ActiveGoalOperation {
 enum GoalOperationError {
     #[error("goal budget is exhausted")]
     BudgetExhausted,
+    #[error("goal accounting is missing or invalid")]
+    AccountingMissingOrInvalid,
+    #[error("goal accounting outcome is unknown")]
+    AccountingOutcomeUnknown,
+    #[error("goal pricing is unavailable")]
+    PricingUnavailable,
 }
 
 type GoalWorkerKey = (String, i64);
-type GoalWorkerMap = HashMap<GoalWorkerKey, tokio::task::JoinHandle<()>>;
+type GoalWorkerMap = HashMap<GoalWorkerKey, Arc<GoalWorker>>;
+
+/// One runtime-owned worker remains discoverable until its entire final
+/// delivery action has ended. Concurrent replacement commands share the same
+/// join state, so none can observe the terminal row and overtake delivery.
+struct GoalWorker {
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl GoalWorker {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    async fn quiesce(&self) {
+        let mut handle = self.handle.lock().await;
+        let Some(join) = handle.as_mut() else {
+            return;
+        };
+        let _ = join.await;
+        *handle = None;
+    }
+}
 
 /// A worker which still owns a running Goal must not exit merely because the
 /// durable transition that releases that ownership hit a transient error.
@@ -347,10 +377,17 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             }
         }
         if state != GoalAccountingState::Complete {
-            anyhow::bail!("goal accounting is incomplete");
+            return Err(match state {
+                GoalAccountingState::Missing | GoalAccountingState::Invalid => {
+                    GoalOperationError::AccountingMissingOrInvalid
+                }
+                GoalAccountingState::OutcomeUnknown => GoalOperationError::AccountingOutcomeUnknown,
+                GoalAccountingState::Complete => unreachable!("handled above"),
+            }
+            .into());
         }
         if operation.requires_complete_pricing && !pricing_complete {
-            anyhow::bail!("goal pricing is unavailable");
+            return Err(GoalOperationError::PricingUnavailable.into());
         }
         self.settled_operations.fetch_add(1, Ordering::Release);
         Ok(())
@@ -449,19 +486,58 @@ impl GoalExecutionDriver {
         .await
     }
 
+    async fn load_initial_goal(&self, scope: &GoalExecutionScope) -> Option<GoalTaskRecord> {
+        loop {
+            match self.goals.get_goal_task(&scope.task_id).await {
+                Ok(Some(goal)) => return Some(goal),
+                Ok(None) => {
+                    self.finish_failed(scope, "goal_extension_missing").await;
+                    return None;
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "Goal initial state read failed; retaining worker ownership"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_operation_error(&self, scope: &GoalExecutionScope, error: &anyhow::Error) {
+        match error.downcast_ref::<GoalOperationError>() {
+            Some(GoalOperationError::BudgetExhausted) => {
+                self.pause_budget_exhausted(scope).await;
+            }
+            Some(GoalOperationError::AccountingMissingOrInvalid) => {
+                self.finish_failed(scope, "accounting_missing_or_invalid")
+                    .await;
+            }
+            Some(GoalOperationError::AccountingOutcomeUnknown) => {
+                self.finish_failed(scope, "accounting_outcome_unknown")
+                    .await;
+            }
+            Some(GoalOperationError::PricingUnavailable) => {
+                self.finish_failed(scope, "pricing_unavailable").await;
+            }
+            None => {
+                self.finish_failed(scope, "goal_parent_execution_failed")
+                    .await;
+            }
+        }
+    }
+
     async fn run_scope(
         &self,
         scope: GoalExecutionScope,
         mut lease: Box<dyn GoalSessionLease>,
         accountant: Arc<GoalOperationAccountant>,
     ) {
-        let Some(goal) = self
-            .goals
-            .get_goal_task(&scope.task_id)
-            .await
-            .ok()
-            .flatten()
-        else {
+        let Some(goal) = self.load_initial_goal(&scope).await else {
             return;
         };
         let mut working_transcript = Vec::new();
@@ -501,13 +577,8 @@ impl GoalExecutionDriver {
                         .await;
                     return;
                 }
-                Err(error) if error.downcast_ref::<GoalOperationError>().is_some() => {
-                    self.pause_budget_exhausted(&scope).await;
-                    return;
-                }
-                Err(_) => {
-                    self.finish_failed(&scope, "goal_parent_execution_failed")
-                        .await;
+                Err(error) => {
+                    self.handle_operation_error(&scope, &error).await;
                     return;
                 }
             };
@@ -538,12 +609,26 @@ impl GoalExecutionDriver {
                         .await;
                     return;
                 }
-                Err(error) if error.downcast_ref::<GoalOperationError>().is_some() => {
-                    self.pause_budget_exhausted(&scope).await;
-                    return;
-                }
-                Err(_) => {
-                    self.finish_failed(&scope, "goal_verifier_failed").await;
+                Err(error) => {
+                    match error.downcast_ref::<GoalOperationError>() {
+                        Some(GoalOperationError::BudgetExhausted) => {
+                            self.pause_budget_exhausted(&scope).await;
+                        }
+                        Some(GoalOperationError::AccountingMissingOrInvalid) => {
+                            self.finish_failed(&scope, "accounting_missing_or_invalid")
+                                .await;
+                        }
+                        Some(GoalOperationError::AccountingOutcomeUnknown) => {
+                            self.finish_failed(&scope, "accounting_outcome_unknown")
+                                .await;
+                        }
+                        Some(GoalOperationError::PricingUnavailable) => {
+                            self.finish_failed(&scope, "pricing_unavailable").await;
+                        }
+                        None => {
+                            self.finish_failed(&scope, "goal_verifier_failed").await;
+                        }
+                    }
                     return;
                 }
             };
@@ -672,6 +757,34 @@ impl GoalExecutor for GoalExecutionDriver {
         }
     }
 
+    async fn quiesce_terminal_predecessor(
+        &self,
+        task_id: &str,
+        _session_id: &str,
+    ) -> Result<(), ()> {
+        let workers: Vec<_> = self
+            .workers
+            .lock()
+            .await
+            .iter()
+            .filter(|((candidate_task_id, _), _)| candidate_task_id == task_id)
+            .map(|(key, worker)| (key.clone(), Arc::clone(worker)))
+            .collect();
+        for (_, worker) in &workers {
+            worker.quiesce().await;
+        }
+        let mut live_workers = self.workers.lock().await;
+        for (key, worker) in workers {
+            if live_workers
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &worker))
+            {
+                live_workers.remove(&key);
+            }
+        }
+        Ok(())
+    }
+
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let accountant = Arc::new(GoalOperationAccountant::new(
             Arc::clone(&self.goals),
@@ -693,7 +806,6 @@ impl GoalExecutor for GoalExecutionDriver {
         }
         let key = (scope.task_id.clone(), scope.execution_epoch);
         let mut workers = self.workers.lock().await;
-        workers.retain(|_, handle| !handle.is_finished());
         if workers.contains_key(&key) {
             return Err(());
         }
@@ -707,7 +819,7 @@ impl GoalExecutor for GoalExecutionDriver {
         let handle = zeroclaw_spawn::spawn!(async move {
             runner.run_scope(scope, lease, accountant).await;
         });
-        workers.insert(key, handle);
+        workers.insert(key, Arc::new(GoalWorker::new(handle)));
         Ok(())
     }
 }

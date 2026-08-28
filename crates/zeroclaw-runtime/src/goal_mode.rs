@@ -514,6 +514,11 @@ pub enum GoalExecutionReadiness {
 #[async_trait]
 pub trait GoalExecutor: Send + Sync {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
+    /// Wait for a terminal predecessor's final controller-owned action before
+    /// its durable control row may be replaced. The executor is the only
+    /// owner that can prove a live worker has finished delivery.
+    async fn quiesce_terminal_predecessor(&self, task_id: &str, session_id: &str)
+    -> Result<(), ()>;
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
 }
 
@@ -618,10 +623,18 @@ impl GoalRuntime {
         {
             return Ok(GoalResponse::message(GoalMessageKey::InputTooLong));
         }
-        if let Some(current) = self.current_goal(&ingress).await?
-            && !current.task.status.is_terminal()
-        {
-            return Ok(GoalResponse::message(GoalMessageKey::AlreadyActive));
+        if let Some(current) = self.current_goal(&ingress).await? {
+            if !current.task.status.is_terminal() {
+                return Ok(GoalResponse::message(GoalMessageKey::AlreadyActive));
+            }
+            if self
+                .executor
+                .quiesce_terminal_predecessor(&current.task.id, ingress.session_id())
+                .await
+                .is_err()
+            {
+                return Ok(GoalResponse::message(GoalMessageKey::Stale));
+            }
         }
         let (token_limit, cost_limit_usd) = match self.resolve_limits(request) {
             Ok(limits) => limits,
@@ -1331,6 +1344,7 @@ mod tests {
     struct FakeExecutor {
         readiness: Mutex<GoalExecutionReadiness>,
         preflights: Mutex<Vec<GoalExecutionPreflight>>,
+        quiesced_predecessors: Mutex<Vec<(String, String)>>,
         launches: Mutex<Vec<GoalExecutionScope>>,
         fail_launch: bool,
     }
@@ -1340,6 +1354,17 @@ mod tests {
         async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness {
             self.preflights.lock().push(request.clone());
             *self.readiness.lock()
+        }
+
+        async fn quiesce_terminal_predecessor(
+            &self,
+            task_id: &str,
+            session_id: &str,
+        ) -> Result<(), ()> {
+            self.quiesced_predecessors
+                .lock()
+                .push((task_id.into(), session_id.into()));
+            Ok(())
         }
 
         async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
@@ -1375,6 +1400,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(readiness),
             preflights: Mutex::new(Vec::new()),
+            quiesced_predecessors: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch,
         });
@@ -1420,6 +1446,10 @@ mod tests {
                 token_count: declaration_len,
                 cost_usd: Some(0.0),
             })
+        }
+
+        async fn quiesce_terminal_predecessor(&self, _: &str, _: &str) -> Result<(), ()> {
+            Ok(())
         }
 
         async fn launch(&self, _scope: GoalExecutionScope) -> Result<(), ()> {
@@ -2019,6 +2049,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(ready()),
             preflights: Mutex::new(Vec::new()),
+            quiesced_predecessors: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
@@ -2084,6 +2115,40 @@ mod tests {
         assert_eq!(
             status.terminal_error.as_deref(),
             Some("executor_start_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_quiesces_the_terminal_predecessor_before_creation() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let predecessor = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish_session_goal(
+                &predecessor.id,
+                "session",
+                predecessor.execution_epoch,
+                TaskStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), start_command())
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Started
+        );
+        assert_eq!(
+            executor.quiesced_predecessors.lock().as_slice(),
+            [(predecessor.id, "session".into())]
         );
     }
 
@@ -2320,6 +2385,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             readiness: Mutex::new(ready()),
             preflights: Mutex::new(Vec::new()),
+            quiesced_predecessors: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             fail_launch: false,
         });
