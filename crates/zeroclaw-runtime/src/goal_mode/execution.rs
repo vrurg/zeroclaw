@@ -5,10 +5,12 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -21,8 +23,8 @@ use zeroclaw_config::{cost::CostTracker, schema::Config};
 use super::{
     GoalExecutionPreflight, GoalExecutionReadiness, GoalExecutionScope, GoalExecutor, GoalTurnKind,
     host::{
-        GoalExecutionHost, GoalHostPreflightError, GoalParentTurn, GoalSessionLease,
-        GoalVerifierTurn,
+        GoalDeliveryScope, GoalExecutionHost, GoalHostPreflightError, GoalParentTurn,
+        GoalSessionLease, GoalVerifierTurn,
     },
 };
 use crate::{
@@ -51,6 +53,32 @@ enum GoalOperationError {
 
 type GoalWorkerKey = (String, i64);
 type GoalWorkerMap = HashMap<GoalWorkerKey, tokio::task::JoinHandle<()>>;
+
+/// A worker which still owns a running Goal must not exit merely because the
+/// durable transition that releases that ownership hit a transient error.
+/// `Stale` and `Missing` prove that another durable transition already fenced
+/// it; only those results may end the retry loop.
+async fn retry_required_goal_transition<F, Fut>(mut transition: F) -> GoalTransitionResult
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<GoalTransitionResult>>,
+{
+    loop {
+        match transition().await {
+            Ok(result) => return result,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Goal lifecycle transition persistence failed; retaining worker ownership"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
 
 /// Goal-only controller for one execution epoch's logical provider operations.
 ///
@@ -358,33 +386,67 @@ impl GoalExecutionDriver {
         }
     }
 
-    async fn finish_failed(&self, scope: &GoalExecutionScope, reason: &'static str) {
-        let _ = self
-            .goals
-            .finish_session_goal(
-                &scope.task_id,
-                &scope.session_id,
-                scope.execution_epoch,
-                TaskStatus::Failed,
-                Some(reason.into()),
-            )
-            .await;
+    async fn finish_failed(
+        &self,
+        scope: &GoalExecutionScope,
+        reason: &'static str,
+    ) -> GoalTransitionResult {
+        let goals = Arc::clone(&self.goals);
+        let task_id = scope.task_id.clone();
+        let session_id = scope.session_id.clone();
+        let epoch = scope.execution_epoch;
+        retry_required_goal_transition(move || {
+            let goals = Arc::clone(&goals);
+            let task_id = task_id.clone();
+            let session_id = session_id.clone();
+            async move {
+                goals
+                    .finish_session_goal(
+                        &task_id,
+                        &session_id,
+                        epoch,
+                        TaskStatus::Failed,
+                        Some(reason.into()),
+                    )
+                    .await
+            }
+        })
+        .await
     }
 
-    async fn pause_budget_exhausted(&self, scope: &GoalExecutionScope) {
-        let _ = self
-            .goals
-            .pause_session_goal(
-                &scope.task_id,
-                &scope.session_id,
-                scope.execution_epoch,
-                crate::control_plane::GoalPauseState {
-                    reason: crate::control_plane::GoalPauseReason::BudgetExhausted,
-                    description: None,
-                    blockers: Vec::new(),
-                },
-            )
-            .await;
+    async fn pause_budget_exhausted(&self, scope: &GoalExecutionScope) -> GoalTransitionResult {
+        self.pause_goal(
+            scope,
+            crate::control_plane::GoalPauseState {
+                reason: crate::control_plane::GoalPauseReason::BudgetExhausted,
+                description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    async fn pause_goal(
+        &self,
+        scope: &GoalExecutionScope,
+        pause: crate::control_plane::GoalPauseState,
+    ) -> GoalTransitionResult {
+        let goals = Arc::clone(&self.goals);
+        let task_id = scope.task_id.clone();
+        let session_id = scope.session_id.clone();
+        let epoch = scope.execution_epoch;
+        retry_required_goal_transition(move || {
+            let goals = Arc::clone(&goals);
+            let task_id = task_id.clone();
+            let session_id = session_id.clone();
+            let pause = pause.clone();
+            async move {
+                goals
+                    .pause_session_goal(&task_id, &session_id, epoch, pause)
+                    .await
+            }
+        })
+        .await
     }
 
     async fn run_scope(
@@ -490,8 +552,37 @@ impl GoalExecutionDriver {
                     if accountant.current_goal().await.is_err() {
                         return;
                     }
+                    let goals = Arc::clone(&self.goals);
+                    let task_id = scope.task_id.clone();
+                    let session_id = scope.session_id.clone();
+                    let epoch = scope.execution_epoch;
+                    if retry_required_goal_transition(move || {
+                        let goals = Arc::clone(&goals);
+                        let task_id = task_id.clone();
+                        let session_id = session_id.clone();
+                        async move {
+                            goals
+                                .finish_session_goal(
+                                    &task_id,
+                                    &session_id,
+                                    epoch,
+                                    TaskStatus::Completed,
+                                    None,
+                                )
+                                .await
+                        }
+                    })
+                    .await
+                        != GoalTransitionResult::Applied
+                    {
+                        return;
+                    }
+                    let Ok(delivery_scope) = GoalDeliveryScope::from_completed_execution(&scope)
+                    else {
+                        return;
+                    };
                     let delivered = match lease
-                        .append_verified_candidate(&scope, &parent.candidate)
+                        .append_verified_candidate(&delivery_scope, &parent.candidate)
                         .await
                     {
                         Ok(()) => true,
@@ -509,28 +600,26 @@ impl GoalExecutionDriver {
                             false
                         }
                     };
-                    if matches!(
-                        self.goals
-                            .finish_session_goal(
-                                &scope.task_id,
-                                &scope.session_id,
-                                scope.execution_epoch,
-                                TaskStatus::Completed,
-                                None,
-                            )
-                            .await,
-                        Ok(GoalTransitionResult::Applied)
-                    ) {
-                        if delivered {
-                            let _ = self
-                                .goals
-                                .acknowledge_session_goal_delivery(
-                                    &scope.task_id,
-                                    &scope.session_id,
-                                    scope.execution_epoch.saturating_add(1),
-                                )
-                                .await;
-                        }
+                    if delivered {
+                        let goals = Arc::clone(&self.goals);
+                        let task_id = scope.task_id.clone();
+                        let session_id = scope.session_id.clone();
+                        let completed_epoch = delivery_scope.completed_epoch;
+                        let _ = retry_required_goal_transition(move || {
+                            let goals = Arc::clone(&goals);
+                            let task_id = task_id.clone();
+                            let session_id = session_id.clone();
+                            async move {
+                                goals
+                                    .acknowledge_session_goal_delivery(
+                                        &task_id,
+                                        &session_id,
+                                        completed_epoch,
+                                    )
+                                    .await
+                            }
+                        })
+                        .await;
                     }
                     return;
                 }
@@ -544,19 +633,15 @@ impl GoalExecutionDriver {
                     turn_kind = GoalTurnKind::Continue;
                 }
                 Ok(VerifierOutcome::Blocked(reason, blockers)) => {
-                    let _ = self
-                        .goals
-                        .pause_session_goal(
-                            &scope.task_id,
-                            &scope.session_id,
-                            scope.execution_epoch,
-                            crate::control_plane::GoalPauseState {
-                                reason: crate::control_plane::GoalPauseReason::VerifierBlocked,
-                                description: Some(reason),
-                                blockers,
-                            },
-                        )
-                        .await;
+                    self.pause_goal(
+                        &scope,
+                        crate::control_plane::GoalPauseState {
+                            reason: crate::control_plane::GoalPauseReason::VerifierBlocked,
+                            description: Some(reason),
+                            blockers,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 Err(_) => {
@@ -805,7 +890,10 @@ fn parse_verifier_response(text: &str) -> anyhow::Result<VerifierOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use anyhow::Result;
     use async_trait::async_trait;
@@ -827,6 +915,7 @@ mod tests {
             GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore, TaskKind,
             TaskRecord, TaskStatus,
         },
+        goal_mode::host::GoalDeliveryScope,
         goal_mode::{
             GoalExecutionScope, GoalExecutor, GoalOperationReservation, GoalTurnKind,
             host::{
@@ -892,6 +981,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transition_retries_a_storage_error_before_releasing_the_worker() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = super::retry_required_goal_transition({
+            let attempts = Arc::clone(&attempts);
+            move || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("injected pause persistence failure");
+                    }
+                    Ok(GoalTransitionResult::Applied)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, GoalTransitionResult::Applied);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1001,7 +1110,7 @@ mod tests {
 
         async fn append_verified_candidate(
             &mut self,
-            _: &GoalExecutionScope,
+            _: &GoalDeliveryScope,
             _: &str,
         ) -> Result<()> {
             Ok(())
@@ -1028,7 +1137,7 @@ mod tests {
 
         async fn append_verified_candidate(
             &mut self,
-            _: &GoalExecutionScope,
+            _: &GoalDeliveryScope,
             _: &str,
         ) -> Result<()> {
             unreachable!("the exhausted parent operation cannot complete")

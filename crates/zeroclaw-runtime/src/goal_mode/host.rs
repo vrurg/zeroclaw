@@ -73,6 +73,32 @@ pub struct GoalVerifierTurn {
     pub candidate: String,
 }
 
+/// Exact terminal identity an adapter must revalidate before it appends a
+/// verified candidate to canonical session history.
+///
+/// This is deliberately not an execution scope: terminal completion fences
+/// the running epoch before delivery, so the adapter must require the next
+/// durable epoch and reject a replaced or disposed Goal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalDeliveryScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub completed_epoch: i64,
+}
+
+impl GoalDeliveryScope {
+    pub fn from_completed_execution(scope: &GoalExecutionScope) -> Result<Self> {
+        let Some(completed_epoch) = scope.execution_epoch.checked_add(1) else {
+            bail!("Goal execution epoch cannot be advanced for delivery");
+        };
+        Ok(Self {
+            task_id: scope.task_id.clone(),
+            session_id: scope.session_id.clone(),
+            completed_epoch,
+        })
+    }
+}
+
 /// An adapter-owned exclusive foreground lease for one Goal execution epoch.
 ///
 /// A lease holds the channel/session mechanics that ordinary turns already use.
@@ -93,9 +119,13 @@ pub trait GoalSessionLease: Send {
     ) -> Result<String>;
 
     /// Append only a controller-verified final candidate to canonical history.
+    ///
+    /// The lease must reject this request unless `scope` still names the exact
+    /// completed Goal and its foreground session lease remains valid. This
+    /// keeps a completion that lost a replacement/disposal race out of history.
     async fn append_verified_candidate(
         &mut self,
-        scope: &GoalExecutionScope,
+        scope: &GoalDeliveryScope,
         candidate: &str,
     ) -> Result<()>;
 }
@@ -191,7 +221,7 @@ mod tests {
 
         async fn append_verified_candidate(
             &mut self,
-            _: &GoalExecutionScope,
+            _: &GoalDeliveryScope,
             _: &str,
         ) -> Result<()> {
             Ok(())
@@ -237,6 +267,29 @@ mod tests {
             token_accounting_complete: true,
             cost_accounting_complete: true,
         }
+    }
+
+    #[test]
+    fn delivery_scope_uses_the_fenced_completion_epoch() {
+        let mut scope = GoalExecutionScope {
+            task_id: "task".into(),
+            session_id: "session".into(),
+            binding: binding(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            execution_epoch: 7,
+            turn_kind: GoalTurnKind::Continue,
+            cancellation: CancellationToken::new(),
+        };
+        assert_eq!(
+            GoalDeliveryScope::from_completed_execution(&scope).unwrap(),
+            GoalDeliveryScope {
+                task_id: "task".into(),
+                session_id: "session".into(),
+                completed_epoch: 8,
+            }
+        );
+        scope.execution_epoch = i64::MAX;
+        assert!(GoalDeliveryScope::from_completed_execution(&scope).is_err());
     }
     #[tokio::test]
     async fn host_requires_exactly_one_owner() {

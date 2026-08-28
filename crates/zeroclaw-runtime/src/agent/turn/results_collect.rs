@@ -8,7 +8,7 @@ use crate::agent::history::{
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Mutex;
@@ -30,6 +30,45 @@ pub(crate) struct CollectedResults {
 
 /// Verify that a Goal-owned tool round has one exact, unambiguous result for
 /// every tool call before its durable phase fence can be cleared.
+///
+/// Text protocols have no provider-issued call ID. The runtime assigns those
+/// IDs before tool preparation so the result collector can retain the normal
+/// positional execution path without making Goal settlement positional.
+pub(crate) fn ensure_goal_tool_call_ids(
+    tool_calls: &mut [ParsedToolCall],
+    native_tool_calls_present: bool,
+    turn_id: &str,
+    iteration: usize,
+) -> Result<()> {
+    let mut seen = HashSet::<String>::with_capacity(tool_calls.len());
+    for (index, call) in tool_calls.iter_mut().enumerate() {
+        let valid = call
+            .tool_call_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .filter(|id| seen.insert((*id).to_owned()))
+            .is_some();
+        if valid {
+            continue;
+        }
+        if native_tool_calls_present {
+            anyhow::bail!("Goal native tool call has no unique stable ID");
+        }
+        let mut suffix = 0_u64;
+        loop {
+            let candidate = format!("goal-tool-{turn_id}-{iteration}-{index}-{suffix}");
+            if seen.insert(candidate.clone()) {
+                call.tool_call_id = Some(candidate);
+                break;
+            }
+            suffix = suffix
+                .checked_add(1)
+                .context("Goal tool ID suffix overflow")?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_goal_tool_result_pairing(
     tool_calls: &[ParsedToolCall],
     individual_results: &[(Option<String>, String)],
@@ -317,6 +356,37 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn goal_text_protocol_calls_receive_runtime_ids_before_collection() {
+        let (_, mut calls) = zeroclaw_tool_call_parser::parse_tool_calls(
+            "<tool_call>{\"name\":\"file_read\",\"arguments\":{\"path\":\"a\"}}</tool_call>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].tool_call_id.is_none());
+
+        ensure_goal_tool_call_ids(&mut calls, false, "turn", 0).unwrap();
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut history = Vec::new();
+        let collected = collect_tool_results(
+            vec![Some((
+                "file_read".into(),
+                calls[0].tool_call_id.clone(),
+                outcome("contents", true),
+            ))],
+            &calls,
+            &mut history,
+            &mut detector,
+            &HashSet::new(),
+            10_000,
+            None,
+            "model",
+            0,
+            "turn",
+        )
+        .unwrap();
+        assert!(validate_goal_tool_result_pairing(&calls, &collected.individual_results).is_ok());
     }
 
     /// Run one results-collection pass over `n` `file_read` calls that each use

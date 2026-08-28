@@ -919,7 +919,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let (
             response_text,
             parsed_text,
-            tool_calls,
+            mut tool_calls,
             assistant_history_content,
             native_tool_calls,
             parse_issue_detected,
@@ -1006,6 +1006,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             !tool_calls.is_empty(),
             !native_tool_calls.is_empty(),
         );
+
+        if crate::agent::cost::goal_tool_phase_is_scoped() {
+            results_collect::ensure_goal_tool_call_ids(
+                &mut tool_calls,
+                !native_tool_calls.is_empty(),
+                turn_id,
+                iteration,
+            )?;
+        }
 
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
@@ -1366,6 +1375,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             )?;
         }
 
+        if cancelled_mid_batch {
+            return Err(ToolLoopCancelled.into());
+        }
+
+        if crate::agent::cost::goal_tool_phase_is_scoped() {
+            results_collect::validate_goal_tool_result_pairing(&tool_calls, &individual_results)?;
+        }
+
         turn_state.append_tool_round(
             assistant_history_content,
             &native_tool_calls,
@@ -1373,14 +1390,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &tool_results,
             use_native_tools,
         );
-
-        if crate::agent::cost::goal_tool_phase_is_scoped() {
-            results_collect::validate_goal_tool_result_pairing(&tool_calls, &individual_results)?;
-        }
-
-        if cancelled_mid_batch {
-            return Err(ToolLoopCancelled.into());
-        }
 
         if !executable_calls.is_empty() {
             crate::agent::cost::complete_goal_tool_phase_if_scoped().await?;
