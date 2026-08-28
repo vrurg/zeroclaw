@@ -69,7 +69,6 @@ pub struct GoalParentTurnResult {
 #[derive(Debug)]
 pub struct GoalVerifierTurn {
     pub objective: String,
-    pub success_criteria: String,
     pub candidate: String,
 }
 
@@ -91,6 +90,9 @@ pub trait GoalSessionLease: Send {
         turn: GoalVerifierTurn,
         cancellation: CancellationToken,
     ) -> Result<String>;
+
+    /// Append only a controller-verified final candidate to canonical history.
+    async fn append_verified_candidate(&mut self, candidate: &str) -> Result<()>;
 }
 
 #[async_trait]
@@ -181,6 +183,10 @@ mod tests {
         ) -> Result<String> {
             Ok(r#"{"decision":"complete","reason":"ok"}"#.into())
         }
+
+        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
     }
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
@@ -209,6 +215,7 @@ mod tests {
         GoalExecutionPreflight {
             task_id: "t".into(),
             session_id: "s".into(),
+            binding: binding(),
             execution_epoch: 1,
             turn_kind: GoalTurnKind::Start,
             agent: "a".into(),
@@ -267,7 +274,6 @@ mod tests {
             .run_verifier(
                 GoalVerifierTurn {
                     objective: "o".into(),
-                    success_criteria: "c".into(),
                     candidate: result.candidate,
                 },
                 scope.cancellation.clone(),

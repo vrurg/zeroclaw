@@ -295,6 +295,36 @@ fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates
     zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
 }
 
+/// Resolve complete pricing for a Goal-owned actual provider route.
+///
+/// The route comes from the #10144 accounted attempt, never from a requested
+/// model name. This remains a runtime helper rather than a Goal-specific
+/// pricing store so ordinary and Goal paths use the same configuration and
+/// catalog facts.
+pub(crate) fn goal_pricing_rates(
+    config: &Config,
+    model_provider_name: &str,
+    model: &str,
+) -> ModelRates {
+    let configured = provider_pricing(&build_model_provider_pricing(config), model_provider_name)
+        .map(|pricing| resolve_rates_opt(pricing, model))
+        .unwrap_or_default();
+    let live = (!configured.is_complete())
+        .then(|| live_pricing_for(model_provider_name, model))
+        .flatten();
+    let mut rates = configured.or(live.unwrap_or_default());
+    if let Some((input, output, cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: Some(input),
+            output_per_mtok: Some(output),
+            cached_input_per_mtok: Some(cached),
+        });
+    }
+    rates
+}
+
 /// Flatten config rates merged with the live-price fallback into the
 /// `(input, output, cached)` tuple used for cost math. Config wins per
 /// dimension ([`ModelRates::or`]); live only fills dimensions config left

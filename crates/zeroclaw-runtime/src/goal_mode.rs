@@ -17,6 +17,7 @@ use crate::control_plane::{
     GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
 
+pub mod execution;
 pub mod host;
 
 /// Bound durable, user-supplied Goal text before it can reach SQLite or a
@@ -471,6 +472,8 @@ pub struct GoalExecutionPreflight {
     /// The task and epoch that the prospective execution scope must own.
     pub task_id: String,
     pub session_id: String,
+    /// Immutable trusted ingress selected before adapter or model work.
+    pub binding: host::GoalSessionBinding,
     pub execution_epoch: i64,
     pub turn_kind: GoalTurnKind,
     pub agent: String,
@@ -990,10 +993,20 @@ impl GoalRuntime {
         cost_limit_usd: Option<f64>,
         totals: (u64, f64, bool),
     ) -> GoalExecutionReadiness {
+        let binding = match host::GoalSessionBinding::new(
+            ingress.session_id.clone(),
+            ingress.agent.clone(),
+            ingress.route.clone(),
+            ingress.principal_id.clone(),
+        ) {
+            Ok(binding) => binding,
+            Err(_) => return GoalExecutionReadiness::VerifierUnavailable,
+        };
         self.executor
             .preflight(&GoalExecutionPreflight {
                 task_id: task_id.to_owned(),
                 session_id: ingress.session_id.clone(),
+                binding,
                 execution_epoch,
                 turn_kind,
                 agent: ingress.agent.clone(),
@@ -1420,6 +1433,13 @@ mod tests {
         GoalExecutionPreflight {
             task_id: "task".into(),
             session_id: "session".into(),
+            binding: host::GoalSessionBinding::new(
+                "session".into(),
+                "main".into(),
+                "route".into(),
+                None,
+            )
+            .unwrap(),
             execution_epoch: 1,
             turn_kind,
             agent: "main".into(),
