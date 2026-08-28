@@ -40,6 +40,12 @@ struct ActiveGoalOperation {
     _permit: OwnedSemaphorePermit,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum GoalOperationError {
+    #[error("goal budget is exhausted")]
+    BudgetExhausted,
+}
+
 type GoalWorkerKey = (String, i64);
 type GoalWorkerMap = HashMap<GoalWorkerKey, tokio::task::JoinHandle<()>>;
 
@@ -234,7 +240,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .effective_cost_limit_usd
                 .is_some_and(|limit| known_cost >= limit)
         {
-            anyhow::bail!("goal budget is exhausted");
+            return Err(GoalOperationError::BudgetExhausted.into());
         }
         let (reserved_tokens, reserved_cost_usd) = self.reservation(&task, &goal, &request)?;
         if let Some(limit) = goal.effective_token_limit {
@@ -244,14 +250,14 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 .context("goal token reservation overflows")?
                 > limit
             {
-                anyhow::bail!("goal token reservation exceeds budget");
+                return Err(GoalOperationError::BudgetExhausted.into());
             }
         }
         if let Some(limit) = goal.effective_cost_limit_usd {
             let reserved = reserved_cost_usd.context("goal cost reservation is missing")?;
             let projected = known_cost + reserved;
             if !projected.is_finite() || projected > limit {
-                anyhow::bail!("goal cost reservation exceeds budget");
+                return Err(GoalOperationError::BudgetExhausted.into());
             }
         }
         let call_id = Uuid::new_v4().to_string();
@@ -362,6 +368,22 @@ impl GoalExecutionDriver {
             .await;
     }
 
+    async fn pause_budget_exhausted(&self, scope: &GoalExecutionScope) {
+        let _ = self
+            .goals
+            .pause_session_goal(
+                &scope.task_id,
+                &scope.session_id,
+                scope.execution_epoch,
+                crate::control_plane::GoalPauseState {
+                    reason: crate::control_plane::GoalPauseReason::BudgetExhausted,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await;
+    }
+
     async fn run_scope(
         &self,
         scope: GoalExecutionScope,
@@ -414,6 +436,10 @@ impl GoalExecutionDriver {
                         .await;
                     return;
                 }
+                Err(error) if error.downcast_ref::<GoalOperationError>().is_some() => {
+                    self.pause_budget_exhausted(&scope).await;
+                    return;
+                }
                 Err(_) => {
                     self.finish_failed(&scope, "goal_parent_execution_failed")
                         .await;
@@ -445,6 +471,10 @@ impl GoalExecutionDriver {
                 Ok(_) => {
                     self.finish_failed(&scope, "goal_verifier_accounting_missing")
                         .await;
+                    return;
+                }
+                Err(error) if error.downcast_ref::<GoalOperationError>().is_some() => {
+                    self.pause_budget_exhausted(&scope).await;
                     return;
                 }
                 Err(_) => {
@@ -855,6 +885,10 @@ mod tests {
 
     struct UnaccountedLease;
 
+    struct BudgetExhaustedAdapter;
+
+    struct BudgetExhaustedLease;
+
     #[async_trait]
     impl GoalSessionAdapter for UnaccountedAdapter {
         fn owns(&self, _: &GoalSessionBinding) -> bool {
@@ -875,6 +909,29 @@ mod tests {
             _: &GoalSessionBinding,
         ) -> Result<Box<dyn GoalSessionLease>> {
             Ok(Box::new(UnaccountedLease))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for BudgetExhaustedAdapter {
+        fn owns(&self, _: &GoalSessionBinding) -> bool {
+            true
+        }
+
+        async fn preflight(
+            &self,
+            _: &GoalSessionBinding,
+            _: &crate::goal_mode::GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn acquire(
+            &self,
+            _: &GoalExecutionScope,
+            _: &GoalSessionBinding,
+        ) -> Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(BudgetExhaustedLease))
         }
     }
 
@@ -901,6 +958,29 @@ mod tests {
 
         async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionLease for BudgetExhaustedLease {
+        async fn run_parent_turn(
+            &mut self,
+            _: GoalParentTurn,
+            _: CancellationToken,
+        ) -> Result<GoalParentTurnResult> {
+            Err(super::GoalOperationError::BudgetExhausted.into())
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _: GoalVerifierTurn,
+            _: CancellationToken,
+        ) -> Result<String> {
+            unreachable!("the exhausted parent operation cannot reach verification")
+        }
+
+        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+            unreachable!("the exhausted parent operation cannot complete")
         }
     }
 
@@ -992,6 +1072,95 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("goal_parent_accounting_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_refusal_pauses_instead_of_failing_the_goal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        assert_eq!(
+            goals
+                .create_or_replace_session_goal(
+                    task,
+                    GoalTaskRecord {
+                        task_id: "goal".into(),
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let driver = GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                BudgetExhaustedAdapter,
+            )])),
+            Arc::clone(&goals),
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap()),
+        );
+        driver
+            .launch(GoalExecutionScope {
+                task_id: "goal".into(),
+                session_id: "session".into(),
+                binding: GoalSessionBinding::new(
+                    "session".into(),
+                    "main".into(),
+                    "route".into(),
+                    None,
+                )
+                .unwrap(),
+                operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                execution_epoch: 1,
+                turn_kind: GoalTurnKind::Start,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .current_goal_for_session("session")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    == TaskStatus::Paused
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("budget refusal must pause the worker");
+        let goal = store.get_goal_task("goal").await.unwrap().unwrap();
+        assert_eq!(
+            goal.pause_reason,
+            Some(crate::control_plane::GoalPauseReason::BudgetExhausted)
         );
     }
 
