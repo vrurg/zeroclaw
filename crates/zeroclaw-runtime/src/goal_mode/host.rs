@@ -93,7 +93,11 @@ pub trait GoalSessionLease: Send {
     ) -> Result<String>;
 
     /// Append only a controller-verified final candidate to canonical history.
-    async fn append_verified_candidate(&mut self, candidate: &str) -> Result<()>;
+    async fn append_verified_candidate(
+        &mut self,
+        scope: &GoalExecutionScope,
+        candidate: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -185,7 +189,11 @@ mod tests {
             Ok(r#"{"decision":"complete","reason":"ok"}"#.into())
         }
 
-        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+        async fn append_verified_candidate(
+            &mut self,
+            _: &GoalExecutionScope,
+            _: &str,
+        ) -> Result<()> {
             Ok(())
         }
     }

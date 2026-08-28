@@ -417,6 +417,16 @@ pub trait GoalTaskRegistry: Send + Sync {
         error: Option<String>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Confirm one exact completed Goal's verified candidate reached canonical
+    /// session history. Delivery acknowledgement is distinct from lifecycle
+    /// completion so an adapter failure cannot reopen or rewrite `Completed`.
+    async fn acknowledge_session_goal_delivery(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        completed_epoch: i64,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     async fn admit_pending_call_with_reservation(
         &self,
         task_id: &str,

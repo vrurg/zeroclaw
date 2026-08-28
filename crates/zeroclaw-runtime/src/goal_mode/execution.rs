@@ -484,6 +484,28 @@ impl GoalExecutionDriver {
             };
             match verifier {
                 Ok(VerifierOutcome::Complete) => {
+                    if accountant.current_goal().await.is_err() {
+                        return;
+                    }
+                    let delivered = match lease
+                        .append_verified_candidate(&scope, &parent.candidate)
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                                "verified Goal candidate delivery failed"
+                            );
+                            false
+                        }
+                    };
                     if matches!(
                         self.goals
                             .finish_session_goal(
@@ -496,7 +518,16 @@ impl GoalExecutionDriver {
                             .await,
                         Ok(GoalTransitionResult::Applied)
                     ) {
-                        let _ = lease.append_verified_candidate(&parent.candidate).await;
+                        if delivered {
+                            let _ = self
+                                .goals
+                                .acknowledge_session_goal_delivery(
+                                    &scope.task_id,
+                                    &scope.session_id,
+                                    scope.execution_epoch.saturating_add(1),
+                                )
+                                .await;
+                        }
                     }
                     return;
                 }
@@ -956,7 +987,11 @@ mod tests {
             Ok(r#"{"decision":"complete","reason":"accepted"}"#.into())
         }
 
-        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+        async fn append_verified_candidate(
+            &mut self,
+            _: &GoalExecutionScope,
+            _: &str,
+        ) -> Result<()> {
             Ok(())
         }
     }
@@ -979,7 +1014,11 @@ mod tests {
             unreachable!("the exhausted parent operation cannot reach verification")
         }
 
-        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+        async fn append_verified_candidate(
+            &mut self,
+            _: &GoalExecutionScope,
+            _: &str,
+        ) -> Result<()> {
             unreachable!("the exhausted parent operation cannot complete")
         }
     }
