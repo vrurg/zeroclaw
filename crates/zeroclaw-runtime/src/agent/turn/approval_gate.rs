@@ -256,7 +256,11 @@ fn session_prompt_approval_summary(
     );
     let _ = writeln!(summary, "action: {action}");
     let _ = writeln!(summary, "storage_domain: sqlite chat session prompts");
-    let _ = writeln!(summary, "session_id: {session_id}");
+    let _ = writeln!(
+        summary,
+        "session_id: {}",
+        escape_prompt_preview(&session_id)
+    );
     let _ = writeln!(summary, "attachment_id: {id}");
     if action == "set" {
         let content = tool_args
@@ -418,7 +422,7 @@ mod tests {
 
         assert!(summary.contains("action: set"));
         assert!(summary.contains("storage_domain: sqlite chat session prompts"));
-        assert!(summary.contains("session_id: matrix:room:thread"));
+        assert!(summary.contains("session_id: \"matrix:room:thread\""));
         assert!(summary.contains("attachment_id: current-task"));
         assert!(summary.contains("content_escaped: \"Finish RFC reconciliation.\""));
         assert!(summary.contains(
@@ -440,6 +444,23 @@ mod tests {
 
         assert!(summary.contains("content_escaped: \"first\\n\\u{001B}[2J\""));
         assert!(!summary.contains('\u{001b}'));
+    }
+
+    #[tokio::test]
+    async fn session_prompt_confirmation_escapes_session_identifier_controls() {
+        let summary = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some("session\n\u{001b}[2J\u{202e}x".to_string()), async {
+                session_prompt_approval_summary(
+                    "session_prompt_delete",
+                    &serde_json::json!({"id": "task"}),
+                )
+            })
+            .await
+            .expect("the confirmation summary should render safely");
+
+        assert!(summary.contains("session_id: \"session\\n\\u{001B}[2J\\u{202E}x\""));
+        assert!(!summary.contains('\u{001b}'));
+        assert!(!summary.contains('\u{202e}'));
     }
 
     #[test]

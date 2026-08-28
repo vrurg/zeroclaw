@@ -1015,3 +1015,4 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+channel-runtime-session-prompt-budget-exceeded = ⚠️ Le contexte persistant de la session dépasse le budget du prompt système ; cette requête n’a donc pas été envoyée au modèle.

@@ -1012,3 +1012,4 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+channel-runtime-session-prompt-budget-exceeded = ⚠️ 永続セッションコンテキストがシステムプロンプトの上限を超えているため、このリクエストはモデルに送信されませんでした。

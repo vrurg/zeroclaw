@@ -1011,3 +1011,4 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+channel-runtime-session-prompt-budget-exceeded = ⚠️ 持久会话上下文超出了系统提示词预算，因此此请求未发送给模型。

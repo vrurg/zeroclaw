@@ -192,6 +192,17 @@ impl SessionActorQueue {
             slots.remove(key);
         }
 
+        // A slot with no pending holders has no queued or active operation
+        // that can still observe its incarnation. Reclaim its tombstone with
+        // the slot so attacker-controlled, one-shot session keys cannot grow
+        // the process-global generation map indefinitely.
+        if !to_remove.is_empty() {
+            let mut generations = self.generations.lock().await;
+            for key in &to_remove {
+                generations.remove(key);
+            }
+        }
+
         before - slots.len()
     }
 }
@@ -226,6 +237,19 @@ mod tests {
         for i in 0..128 {
             assert_eq!(queue.generation(&format!("unseen-{i}")).await, 0);
         }
+        assert!(queue.generations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_eviction_reclaims_invalidated_generation_tombstones() {
+        let queue = SessionActorQueue::new(8, 5, 0);
+        let guard = queue.acquire("deleted-session").await.unwrap();
+        queue.invalidate("deleted-session").await;
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(queue.evict_idle().await, 1);
+        assert_eq!(queue.generation("deleted-session").await, 0);
         assert!(queue.generations.lock().await.is_empty());
     }
 

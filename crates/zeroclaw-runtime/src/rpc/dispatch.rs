@@ -1121,6 +1121,14 @@ impl RpcDispatcher {
             .acquire(&session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        // A caller can reuse an RPC ID. Advance the queue incarnation before
+        // installing its successor so work admitted for a predecessor cannot
+        // run against this new session after waiting on the same queue.
+        self.ctx
+            .sessions
+            .session_queue
+            .invalidate(&session_id)
+            .await;
 
         let config = self.ctx.config.read().clone();
         let chat_mode = req
@@ -1447,6 +1455,18 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let _session_guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        self.ctx
+            .sessions
+            .session_queue
+            .invalidate(&req.session_id)
+            .await;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1515,6 +1535,15 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        let _session_guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        self.ctx.sessions.session_queue.invalidate(sid).await;
 
         let chat_mode = self
             .ctx
@@ -1740,10 +1769,21 @@ impl RpcDispatcher {
             ));
         }
 
-        let agent = match self.ctx.sessions.get_agent(sid).await {
-            Some(a) => a,
+        let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
+        let (agent, expected_session_generation, _) = match self
+            .ctx
+            .sessions
+            .admission_snapshot(sid)
+            .await
+        {
+            Some(snapshot) => snapshot,
             None => match self.rehydrate_reaped_session(sid).await {
-                Some(a) => a,
+                Some(_) => self
+                    .ctx
+                    .sessions
+                    .admission_snapshot(sid)
+                    .await
+                    .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?,
                 None => {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -1813,6 +1853,14 @@ impl RpcDispatcher {
             .get_generation(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        if session_generation != expected_session_generation
+            || self.ctx.sessions.session_queue.generation(sid).await != expected_queue_generation
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session was replaced while the turn was pending",
+            ));
+        }
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
@@ -2620,8 +2668,18 @@ impl RpcDispatcher {
         // turn. Capture its incarnation before waiting so deletion never
         // applies to a successor created with the same ID.
         let expected_generation = self.ctx.sessions.get_generation(&req.session_id).await;
-        self.handle_session_delete_at_generation(req, expected_generation)
-            .await
+        let expected_queue_generation = self
+            .ctx
+            .sessions
+            .session_queue
+            .generation(&req.session_id)
+            .await;
+        self.handle_session_delete_at_generation(
+            req,
+            expected_generation,
+            expected_queue_generation,
+        )
+        .await
     }
 
     /// Delete only the incarnation observed when the request was accepted.
@@ -2631,6 +2689,7 @@ impl RpcDispatcher {
         &self,
         req: SessionIdParams,
         expected_generation: Option<u64>,
+        expected_queue_generation: u64,
     ) -> RpcResult {
         self.ctx.sessions.cancel_session(&req.session_id);
         // This is the same finalization authority used by prompt turns. Wait
@@ -2643,30 +2702,56 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-        if self.ctx.sessions.get_generation(&req.session_id).await != expected_generation {
+        if self.ctx.sessions.get_generation(&req.session_id).await != expected_generation
+            || self
+                .ctx
+                .sessions
+                .session_queue
+                .generation(&req.session_id)
+                .await
+                != expected_queue_generation
+        {
             return Err(rpc_err(
                 SESSION_NOT_FOUND,
                 "Session was replaced while deletion was pending",
             ));
         }
-        let chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
-        let should_delete_durable_chat = if chat_mode.is_none() {
-            let acp_session_exists = match self.ctx.acp_session_store.as_ref() {
-                Some(store) => store
-                    .load_session(&req.session_id)
-                    .map_err(|error| {
-                        rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to inspect ACP session ownership: {error}"),
-                        )
-                    })?
-                    .is_some(),
-                None => false,
-            };
-            !acp_session_exists
-        } else {
-            matches!(chat_mode, Some(crate::rpc::types::ChatMode::Chat))
+        self.ctx
+            .sessions
+            .session_queue
+            .invalidate(&req.session_id)
+            .await;
+        let live_chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        let is_reaped = live_chat_mode.is_none();
+        let chat_mode = match live_chat_mode {
+            Some(mode) => {
+                if let Some(requested) = req.chat_mode.as_ref()
+                    && requested != &mode
+                {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        "The requested session storage domain does not match the live session",
+                    ));
+                }
+                mode
+            }
+            None => req.chat_mode.clone().ok_or_else(|| {
+                rpc_err(
+                    SESSION_NOT_FOUND,
+                    "A reaped session requires an explicit chat_mode for deletion",
+                )
+            })?,
         };
+        // A raw RPC ID is not a storage-domain discriminator. Never inspect
+        // the ACP store to infer one: Chat and ACP IDs may collide. The first
+        // PR owns durable Chat deletion; ACP lifecycle remains its own store.
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) && is_reaped {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "A reaped ACP session cannot be deleted through the Chat session lifecycle",
+            ));
+        }
+        let should_delete_durable_chat = matches!(chat_mode, crate::rpc::types::ChatMode::Chat);
         // RPC chat sessions use this canonical persistence key.  Delete it
         // before mutable in-memory state so a storage failure cannot report a
         // successful reset while leaving prompt attachments behind.

@@ -167,6 +167,24 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }
 
+    /// Atomically capture the concrete Agent and its session incarnation for
+    /// turn admission. Callers must validate this snapshot again after taking
+    /// the per-session queue, but must never combine separate `get_agent` and
+    /// `get_generation` reads: a same-ID replacement could otherwise pair an
+    /// old Agent with a successor's generation.
+    pub async fn admission_snapshot(
+        &self,
+        id: &str,
+    ) -> Option<(Arc<Mutex<Agent>>, u64, crate::rpc::types::ChatMode)> {
+        self.sessions.lock().await.get(id).map(|session| {
+            (
+                session.agent.clone(),
+                session.generation,
+                session.chat_mode.clone(),
+            )
+        })
+    }
+
     pub(crate) async fn lock_model_provider_update(
         &self,
         id: &str,
@@ -1303,6 +1321,39 @@ mod tests {
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
         );
+    }
+
+    #[tokio::test]
+    async fn admission_snapshot_keeps_agent_and_generation_from_one_incarnation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "same-id".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let (predecessor, predecessor_generation, predecessor_mode) = store
+            .admission_snapshot("same-id")
+            .await
+            .expect("predecessor snapshot");
+
+        store
+            .insert(
+                "same-id".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Acp),
+            )
+            .await
+            .unwrap();
+        let (successor, successor_generation, successor_mode) = store
+            .admission_snapshot("same-id")
+            .await
+            .expect("successor snapshot");
+
+        assert!(!Arc::ptr_eq(&predecessor, &successor));
+        assert_ne!(predecessor_generation, successor_generation);
+        assert_eq!(predecessor_mode, crate::rpc::types::ChatMode::Chat);
+        assert_eq!(successor_mode, crate::rpc::types::ChatMode::Acp);
     }
 
     #[tokio::test]

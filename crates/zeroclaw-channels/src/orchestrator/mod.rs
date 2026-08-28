@@ -223,7 +223,7 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
-/// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
+/// Per-sender one-shot marker that makes the next turn start a fresh session.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
@@ -585,10 +585,19 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
 
 #[derive(Clone)]
 struct InFlightSenderTaskState {
-    task_id: u64,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
 }
+
+#[derive(Default)]
+struct InFlightSenderScopeState {
+    tasks: HashMap<u64, InFlightSenderTaskState>,
+    /// The newest reset admitted for this sender. New ordinary turns wait for
+    /// it before observing mutable session state.
+    reset_barrier: Option<Arc<InFlightTaskCompletion>>,
+}
+
+type InFlightSenderTasks = Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderScopeState>>>;
 
 struct InFlightTaskCompletion {
     done: AtomicBool,
@@ -609,10 +618,15 @@ impl InFlightTaskCompletion {
     }
 
     async fn wait(&self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
+        // Register before testing the predicate. `notify_waiters` does not
+        // retain a permit, so checking first could otherwise miss a completion
+        // between that load and waiter registration.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.done.load(Ordering::Acquire) {
+            notified.await;
         }
-        self.notify.notified().await;
     }
 }
 
@@ -6331,7 +6345,6 @@ async fn process_channel_message_body(
         let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         clear_sender_history(ctx.as_ref(), &history_key);
     }
-
     let had_prior_history = if force_fresh_session {
         false
     } else {
@@ -6448,15 +6461,31 @@ async fn process_channel_message_body(
                         system_prompt.push_str(&attachments);
                     } else {
                         ::zeroclaw_log::record!(
-                            WARN,
+                            ERROR,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
-                            "Session prompt attachments skipped because the system prompt budget is exhausted"
+                            "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
                         );
+                        if let Some(channel) = target_channel.as_ref() {
+                            let message = channel_runtime_cli_string(
+                                "channel-runtime-session-prompt-budget-exceeded",
+                            );
+                            let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+                        }
+                        rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                        reconcile_early_ack(
+                            ctx.as_ref(),
+                            &msg,
+                            target_channel.as_ref(),
+                            early_ack_task,
+                            Some("\u{26A0}\u{FE0F}"),
+                        )
+                        .await;
+                        return;
                     }
                 }
             }
@@ -6473,6 +6502,15 @@ async fn process_channel_message_body(
                         channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
                     let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
                 }
+                rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
                 return;
             }
         }
@@ -7919,7 +7957,7 @@ async fn process_channel_message_body(
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
-    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    in_flight: InFlightSenderTasks,
     task_sequence: Arc<AtomicU64>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
@@ -7927,6 +7965,13 @@ async fn dispatch_worker(
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
+    // `/new` is a lifecycle barrier, not an ordinary message. Even where the
+    // channel deliberately permits parallel turns, it must cancel and await a
+    // predecessor before deleting durable history and prompt attachments.
+    let reset_requested = matches!(
+        parse_runtime_command(&msg.channel, &msg.content),
+        Some(ChannelRuntimeCommand::NewSession)
+    );
     let sender_scope_key = interruption_scope_key(&msg);
     let cancellation_token = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
@@ -7935,43 +7980,82 @@ async fn dispatch_worker(
     let register_in_flight = msg.channel != "cli" && !msg.passive_context;
 
     if register_in_flight {
-        let previous = {
+        let (predecessors, inherited_reset_barrier) = {
             let mut active = in_flight.lock().await;
-            active.insert(
-                sender_scope_key.clone(),
+            let scope = active.entry(sender_scope_key.clone()).or_default();
+            let predecessors = scope.tasks.values().cloned().collect::<Vec<_>>();
+            let inherited_reset_barrier = scope.reset_barrier.clone();
+            let reset_barrier = if reset_requested {
+                Some(Arc::clone(&completion))
+            } else {
+                inherited_reset_barrier.clone()
+            };
+            if reset_requested {
+                scope.reset_barrier = reset_barrier.clone();
+            }
+            scope.tasks.insert(
+                task_id,
                 InFlightSenderTaskState {
-                    task_id,
                     cancellation: cancellation_token.clone(),
                     completion: Arc::clone(&completion),
                 },
-            )
+            );
+            (predecessors, inherited_reset_barrier)
         };
 
-        if interrupt_enabled && let Some(previous) = previous {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "interrupting previous in-flight request for sender"
-            );
-            previous.cancellation.cancel();
-            previous.completion.wait().await;
+        if !predecessors.is_empty() {
+            if let Some(barrier) = inherited_reset_barrier {
+                // A successor may not pass `/new`: its reset must complete
+                // before a later turn can observe or recreate session state.
+                barrier.wait().await;
+                // A later `/new` has an additional obligation: after the
+                // earlier reset completes, it must still cancel and await
+                // its immediate predecessor before clearing the session.
+                if interrupt_enabled || reset_requested {
+                    for predecessor in &predecessors {
+                        predecessor.cancellation.cancel();
+                    }
+                    for predecessor in &predecessors {
+                        predecessor.completion.wait().await;
+                    }
+                }
+            } else if interrupt_enabled || reset_requested {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                    "interrupting previous in-flight request for sender"
+                );
+                for predecessor in &predecessors {
+                    predecessor.cancellation.cancel();
+                }
+                for predecessor in &predecessors {
+                    predecessor.completion.wait().await;
+                }
+            }
         }
     }
 
     process_channel_message(ctx, msg, cancellation_token).await;
 
+    completion.mark_done();
+
     if register_in_flight {
         let mut active = in_flight.lock().await;
-        if active
-            .get(&sender_scope_key)
-            .is_some_and(|state| state.task_id == task_id)
-        {
-            active.remove(&sender_scope_key);
+        if let Some(scope) = active.get_mut(&sender_scope_key) {
+            scope.tasks.remove(&task_id);
+            if scope
+                .reset_barrier
+                .as_ref()
+                .is_some_and(|barrier| Arc::ptr_eq(barrier, &completion))
+            {
+                scope.reset_barrier = None;
+            }
+            if scope.tasks.is_empty() && scope.reset_barrier.is_none() {
+                active.remove(&sender_scope_key);
+            }
         }
     }
-
-    completion.mark_done();
 }
 
 #[derive(Clone)]
@@ -8493,10 +8577,8 @@ async fn run_message_dispatch_loop(
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
-    let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        String,
-        InFlightSenderTaskState,
-    >::new()));
+    let in_flight_by_sender: InFlightSenderTasks =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
@@ -8562,11 +8644,15 @@ async fn run_message_dispatch_loop(
         if msg.channel != "cli" && is_stop_command(&msg.content) {
             let scope_key = interruption_scope_key(&msg);
             let previous = {
-                let mut active = in_flight_by_sender.lock().await;
-                active.remove(&scope_key)
+                let active = in_flight_by_sender.lock().await;
+                active
+                    .get(&scope_key)
+                    .map(|scope| scope.tasks.values().cloned().collect::<Vec<_>>())
             };
-            let reply = if let Some(state) = previous {
-                state.cancellation.cancel();
+            let reply = if let Some(tasks) = previous {
+                for state in tasks {
+                    state.cancellation.cancel();
+                }
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
                 zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
@@ -22288,7 +22374,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_interrupts_in_flight_telegram_request_and_preserves_context() {
+    async fn message_dispatch_new_session_fences_in_flight_turn_and_successors() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -22336,7 +22422,7 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: true,
+                telegram: false,
                 slack: false,
                 discord: false,
                 mattermost: false,
@@ -22400,7 +22486,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
-                content: "summarize this".to_string(),
+                content: "parallel predecessor".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
@@ -22408,7 +22494,56 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![],
                 subject: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-3".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/new".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 3,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
 
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-4".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "first fresh successor".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 4,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-5".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "second fresh successor".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 5,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
                 ..Default::default()
             })
             .await
@@ -22419,30 +22554,45 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-1:"));
-        assert!(sent_messages[0].contains("response-2"));
+        assert_eq!(sent_messages.len(), 3);
+        assert!(
+            sent_messages
+                .iter()
+                .all(|message| message.starts_with("chat-1:"))
+        );
+        assert!(sent_messages.iter().any(|message| message.contains(
+            &zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
+        )));
         drop(sent_messages);
 
         let calls = provider_impl
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 2);
-        let second_call = &calls[1];
+        assert_eq!(calls.len(), 4);
+        for successor_call in &calls[2..] {
+            assert!(
+                !successor_call.iter().any(|(role, content)| {
+                    role == "user"
+                        && (content.contains("forwarded content")
+                            || content.contains("parallel predecessor"))
+                }),
+                "no successor may overtake /new and observe predecessor history"
+            );
+        }
         assert!(
-            second_call
+            calls[2..]
                 .iter()
-                .any(|(role, content)| { role == "user" && content.contains("forwarded content") })
+                .any(|call| call.iter().any(|(role, content)| {
+                    role == "user" && content.contains("first fresh successor")
+                }))
         );
         assert!(
-            second_call
+            calls[2..]
                 .iter()
-                .any(|(role, content)| { role == "user" && content.contains("summarize this") })
-        );
-        assert!(
-            !second_call.iter().any(|(role, _)| role == "assistant"),
-            "cancelled turn should not persist an assistant response"
+                .any(|call| call.iter().any(|(role, content)| {
+                    role == "user" && content.contains("second fresh successor")
+                }))
         );
     }
 

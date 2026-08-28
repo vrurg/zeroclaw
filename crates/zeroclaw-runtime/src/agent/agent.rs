@@ -1655,7 +1655,7 @@ impl Agent {
             _ => (None, None),
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let mut all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -1684,6 +1684,25 @@ impl Agent {
             // documented snapshot fallback.
             live_config.clone(),
         );
+        // Persistent prompt attachments are a daemon-owned primary-chat
+        // capability. A generic/one-shot Agent has no durable current-session
+        // identity, so advertising these tools there is misleading even though
+        // their task-local execution gate would reject the call. ACP agents
+        // are likewise excluded until their stacked implementation exists.
+        if live_config.is_none() || exclude_memory {
+            all_tools_result.tools.retain(|tool| {
+                !matches!(
+                    tool.name(),
+                    "session_prompt_list" | "session_prompt_set" | "session_prompt_delete"
+                )
+            });
+            all_tools_result.unfiltered_tool_arcs.retain(|tool| {
+                !matches!(
+                    tool.name(),
+                    "session_prompt_list" | "session_prompt_set" | "session_prompt_delete"
+                )
+            });
+        }
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
@@ -2105,12 +2124,8 @@ impl Agent {
                 prompt.push_str("\n\n");
                 prompt.push_str(&self.session_prompt_attachments);
             } else {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
-                    "Session prompt attachments skipped because the system prompt budget is exhausted"
+                anyhow::bail!(
+                    "Persistent session prompts exceed max_system_prompt_chars ({max}); refusing to dispatch without them"
                 );
             }
         }
@@ -5389,11 +5404,13 @@ mod tests {
             agent.set_session_prompt_attachments(
                 "## Session Prompts\n- id: \"task\"; content: \"too large\"\n".to_string(),
             );
+            let error = agent
+                .system_prompt_for_test()
+                .expect_err("an overflowing persistent prompt must block dispatch");
             assert!(
-                !agent
-                    .system_prompt_for_test()
-                    .unwrap()
-                    .contains("content: \"too large\"")
+                error
+                    .to_string()
+                    .contains("refusing to dispatch without them")
             );
 
             agent.config.resolved.max_system_prompt_chars = 0;
