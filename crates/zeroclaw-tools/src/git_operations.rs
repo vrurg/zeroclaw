@@ -61,18 +61,22 @@ impl GitOperationsTool {
                 args.get("action").and_then(|value| value.as_str()),
                 Some("list")
             ))
+            || (operation == "worktree"
+                && !matches!(
+                    args.get("subcommand").and_then(|value| value.as_str()),
+                    Some("list")
+                ))
     }
 
-    /// Return whether a repository's physical `.git` directory is within any
-    /// authorized root.
+    /// Return whether a repository's Git metadata is within any authorized root.
     ///
     /// Git normally discovers repositories by walking to parent directories. That
     /// would let an approved child path operate on an unapproved parent repository,
     /// so discovery must stop after it leaves every root that authorized the
     /// requested path.
-    /// `.git` files used by linked worktrees are intentionally rejected: their
-    /// indirection cannot be validated against this boundary without widening
-    /// the authorization contract.
+    /// Linked worktrees use a `.git` file that points at a per-worktree Git
+    /// directory, which then points at a common Git directory. Both indirection
+    /// targets must be physical directories within the same applicable grants.
     fn has_repository_within_authorized_roots(
         &self,
         working_dir: &Path,
@@ -80,14 +84,21 @@ impl GitOperationsTool {
     ) -> bool {
         let mut current_dir = working_dir;
         loop {
-            if std::fs::symlink_metadata(current_dir.join(".git"))
-                .is_ok_and(|metadata| metadata.file_type().is_dir())
-                && (authorized_roots.is_empty()
+            let git_metadata = current_dir.join(".git");
+            if let Ok(metadata) = std::fs::symlink_metadata(&git_metadata) {
+                let current_dir_is_authorized = authorized_roots.is_empty()
                     || authorized_roots
                         .iter()
-                        .any(|root| current_dir.starts_with(root)))
-            {
-                return true;
+                        .any(|root| current_dir.starts_with(root));
+                if metadata.file_type().is_dir() && current_dir_is_authorized {
+                    return true;
+                }
+                if metadata.file_type().is_file()
+                    && current_dir_is_authorized
+                    && self.linked_worktree_metadata_is_authorized(&git_metadata, authorized_roots)
+                {
+                    return true;
+                }
             }
             let Some(parent) = current_dir.parent() else {
                 return false;
@@ -99,6 +110,135 @@ impl GitOperationsTool {
             }
             current_dir = parent;
         }
+    }
+
+    fn linked_worktree_metadata_is_authorized(
+        &self,
+        git_file: &Path,
+        authorized_roots: &[PathBuf],
+    ) -> bool {
+        let Ok(contents) = std::fs::read_to_string(git_file) else {
+            return false;
+        };
+        let Some(gitdir) = contents.strip_prefix("gitdir: ") else {
+            return false;
+        };
+        let gitdir = gitdir.trim_end_matches(['\r', '\n']);
+        if gitdir.is_empty() || gitdir.contains('\n') || gitdir.contains('\r') {
+            return false;
+        }
+        let gitdir = Path::new(gitdir);
+        let gitdir = if gitdir.is_absolute() {
+            gitdir.to_path_buf()
+        } else {
+            git_file
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(gitdir)
+        };
+        if !std::fs::symlink_metadata(&gitdir).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            return false;
+        }
+        let Ok(gitdir) = gitdir.canonicalize() else {
+            return false;
+        };
+        if !Self::is_physical_directory_within_roots(&gitdir, authorized_roots) {
+            return false;
+        }
+
+        let commondir_file = gitdir.join("commondir");
+        if !std::fs::symlink_metadata(&commondir_file)
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return false;
+        }
+        let Ok(commondir) = std::fs::read_to_string(&commondir_file) else {
+            return false;
+        };
+        let commondir = commondir.trim_end_matches(['\r', '\n']);
+        if commondir.is_empty() || commondir.contains('\n') || commondir.contains('\r') {
+            return false;
+        }
+        let commondir = Path::new(commondir);
+        let commondir = if commondir.is_absolute() {
+            commondir.to_path_buf()
+        } else {
+            gitdir.join(commondir)
+        };
+        if !std::fs::symlink_metadata(&commondir)
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return false;
+        }
+        let Ok(commondir) = commondir.canonicalize() else {
+            return false;
+        };
+        Self::is_physical_directory_within_roots(&commondir, authorized_roots)
+    }
+
+    fn is_physical_directory_within_roots(path: &Path, authorized_roots: &[PathBuf]) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+            && (authorized_roots.is_empty()
+                || authorized_roots.iter().any(|root| path.starts_with(root)))
+    }
+
+    fn candidate_path(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        if raw_path.contains('\0') {
+            anyhow::bail!("Path not allowed: contains null byte");
+        }
+        if Path::new(raw_path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("Path not allowed: parent-directory traversal is not allowed");
+        }
+        let path = Path::new(raw_path);
+        Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workspace_dir.join(path)
+        })
+    }
+
+    fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        let candidate = self.candidate_path(raw_path)?;
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| anyhow::Error::msg("Worktree path must have a parent directory"))?;
+        let name = candidate.file_name().ok_or_else(|| {
+            anyhow::Error::msg("Worktree path must include a final path component")
+        })?;
+        let parent = parent.canonicalize().map_err(|error| {
+            anyhow::Error::msg(format!(
+                "Cannot resolve worktree parent '{}': {error}",
+                parent.display()
+            ))
+        })?;
+        let target = parent.join(name);
+        if !self.security.is_resolved_path_allowed(&target) {
+            anyhow::bail!(
+                "Worktree path '{}' resolves outside the workspace or allowed roots",
+                raw_path
+            );
+        }
+        Ok(target)
+    }
+
+    fn ensure_worktree_remove_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
+        let candidate = self.candidate_path(raw_path)?;
+        let resolved = candidate.canonicalize().map_err(|error| {
+            anyhow::Error::msg(format!(
+                "Cannot resolve worktree path '{}': {error}",
+                raw_path
+            ))
+        })?;
+        if !self.security.is_resolved_path_allowed(&resolved) {
+            anyhow::bail!(
+                "Worktree path '{}' resolves outside the workspace or allowed roots",
+                raw_path
+            );
+        }
+        Ok(resolved)
     }
 
     /// Resolve a user-provided path authorized for the requested Git operation.
@@ -686,6 +826,142 @@ impl GitOperationsTool {
             }),
         }
     }
+
+    fn parse_worktree_list(&self, output: &str) -> serde_json::Value {
+        let mut worktrees = Vec::new();
+        let mut current_path = String::new();
+        let mut current_branch = String::new();
+        let mut current_head = String::new();
+        let mut is_detached = false;
+        let workspace = self.workspace_dir.to_string_lossy();
+
+        for line in output.lines().map(str::trim) {
+            if line.is_empty() {
+                if !current_path.is_empty() {
+                    worktrees.push(json!({
+                        "path": &current_path,
+                        "branch": if is_detached { "HEAD" } else { &current_branch },
+                        "head": &current_head,
+                        "detached": is_detached,
+                        "active": current_path == workspace.as_ref()
+                    }));
+                    current_path.clear();
+                    current_branch.clear();
+                    current_head.clear();
+                    is_detached = false;
+                }
+            } else if let Some(path) = line.strip_prefix("worktree ") {
+                current_path = path.to_string();
+            } else if let Some(head) = line.strip_prefix("HEAD ") {
+                current_head = head.to_string();
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                current_branch = branch.trim_start_matches("refs/heads/").to_string();
+            } else if line == "detached" {
+                is_detached = true;
+            }
+        }
+        if !current_path.is_empty() {
+            worktrees.push(json!({
+                "path": &current_path,
+                "branch": if is_detached { "HEAD" } else { current_branch.as_str() },
+                "head": &current_head,
+                "detached": is_detached,
+                "active": current_path == workspace.as_ref()
+            }));
+        }
+        json!({ "worktrees": worktrees })
+    }
+
+    async fn git_worktree(
+        &self,
+        args: serde_json::Value,
+        working_dir: &Path,
+    ) -> anyhow::Result<ToolResult> {
+        let subcommand = args
+            .get("subcommand")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow::Error::msg("Missing 'subcommand' parameter. Use: list, add, remove, prune")
+            })?;
+
+        match subcommand {
+            "list" => {
+                let output = self
+                    .run_git_read_command(
+                        &["--no-optional-locks", "worktree", "list", "--porcelain"],
+                        working_dir,
+                    )
+                    .await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: serde_json::to_string_pretty(&self.parse_worktree_list(&output))
+                        .unwrap_or_default()
+                        .into(),
+                    error: None,
+                })
+            }
+            "add" => {
+                let worktree_path = args
+                    .get("worktree_path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("Missing 'worktree_path' parameter for worktree add")
+                    })?;
+                self.sanitize_git_args(worktree_path)?;
+                let worktree_path = self.ensure_worktree_add_target_allowed(worktree_path)?;
+                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
+                })?;
+                let branch = args
+                    .get("branch")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let mut git_args = vec!["worktree", "add", worktree_path];
+                if !branch.is_empty() {
+                    self.sanitize_git_args(branch)?;
+                    git_args.push(branch);
+                }
+                self.run_git_command(&git_args, working_dir).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Worktree added at: {worktree_path}").into(),
+                    error: None,
+                })
+            }
+            "remove" => {
+                let worktree_path = args
+                    .get("worktree_path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        anyhow::Error::msg("Missing 'worktree_path' parameter for worktree remove")
+                    })?;
+                self.sanitize_git_args(worktree_path)?;
+                let worktree_path = self.ensure_worktree_remove_target_allowed(worktree_path)?;
+                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
+                })?;
+                self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
+                    .await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Worktree removed: {worktree_path}").into(),
+                    error: None,
+                })
+            }
+            "prune" => {
+                self.run_git_command(&["worktree", "prune"], working_dir)
+                    .await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: "Worktree prune completed".into(),
+                    error: None,
+                })
+            }
+            _ => anyhow::bail!(
+                "Unknown worktree subcommand: {subcommand}. Use: list, add, remove, prune"
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -695,7 +971,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -704,8 +980,13 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree"],
                     "description": "Git operation to perform"
+                },
+                "subcommand": {
+                    "type": "string",
+                    "enum": ["list", "add", "remove", "prune"],
+                    "description": "Worktree subcommand"
                 },
                 "message": {
                     "type": "string",
@@ -717,7 +998,11 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name for the 'checkout' operation"
+                    "description": "Branch name for the 'checkout' operation or 'worktree add' subcommand"
+                },
+                "worktree_path": {
+                    "type": "string",
+                    "description": "Filesystem path for the worktree (for 'worktree add' and 'worktree remove' subcommands). Relative paths resolve under the workspace; absolute paths must stay inside the workspace or configured allowed roots."
                 },
                 "files": {
                     "type": "string",
@@ -844,6 +1129,7 @@ impl Tool for GitOperationsTool {
             "add" => self.git_add(args, &working_dir).await,
             "checkout" => self.git_checkout(args, &working_dir).await,
             "stash" => self.git_stash(args, &working_dir).await,
+            "worktree" => self.git_worktree(args, &working_dir).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1033,19 +1319,23 @@ mod tests {
         assert!(tool.requires_write_access("checkout", &json!({})));
         assert!(tool.requires_write_access("stash", &json!({})));
         assert!(tool.requires_write_access("stash", &json!({"action": "push"})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "add"})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "remove"})));
+        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "prune"})));
 
         assert!(!tool.requires_write_access("status", &json!({})));
         assert!(!tool.requires_write_access("diff", &json!({})));
         assert!(!tool.requires_write_access("log", &json!({})));
         assert!(!tool.requires_write_access("branch", &json!({})));
         assert!(!tool.requires_write_access("stash", &json!({"action": "list"})));
+        assert!(!tool.requires_write_access("worktree", &json!({"subcommand": "list"})));
         assert!(!tool.requires_write_access("status", &json!({"subcommand": "add"})));
     }
 
     #[tokio::test]
-    async fn git_operations_do_not_expose_linked_worktree_lifecycle() {
+    async fn git_operations_preserve_authorized_linked_worktree_lifecycle() {
         let tmp = TempDir::new().unwrap();
-        git_init_no_sign(tmp.path(), &[]);
+        bootstrap_repo(tmp.path(), &[]).await;
         let tool = test_tool(tmp.path());
 
         let schema = tool.parameters_schema();
@@ -1053,22 +1343,40 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(
-            !operations.iter().any(|operation| operation == "worktree"),
-            "the public Git operation schema must not advertise worktree"
+            operations.iter().any(|operation| operation == "worktree"),
+            "the public Git operation schema must advertise worktree"
         );
 
-        let result = tool
-            .execute(json!({"operation": "worktree"}))
+        let linked_worktree = tmp.path().join("linked-worktree");
+        let added = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &linked_worktree
+            }))
             .await
             .unwrap();
-        assert!(!result.success, "worktree must not be dispatched");
+        assert!(added.success, "worktree add failed: {added:?}");
+        assert!(linked_worktree.join(".git").is_file());
+
+        let status = tool
+            .execute(json!({"operation": "status", "path": &linked_worktree}))
+            .await
+            .unwrap();
+        assert!(status.success, "linked worktree status failed: {status:?}");
+
+        let removed = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": &linked_worktree
+            }))
+            .await
+            .unwrap();
+        assert!(removed.success, "worktree remove failed: {removed:?}");
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Unknown operation")),
-            "unexpected worktree rejection: {:?}",
-            result.error
+            !linked_worktree.exists(),
+            "worktree remove must remove the linked worktree"
         );
     }
 
@@ -1559,7 +1867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_operations_rejects_authorized_linked_worktree() {
+    async fn git_operations_rejects_linked_worktree_metadata_outside_the_grant() {
         let workspace = TempDir::new().unwrap();
         let parent_repository = TempDir::new().unwrap();
         let linked_worktree_parent = TempDir::new().unwrap();
@@ -1592,6 +1900,35 @@ mod tests {
                 .is_some_and(|error| error.contains("Not in a Git repository")),
             "linked worktree must fail as not-in-repository: {:?}",
             result.error
+        );
+    }
+
+    #[test]
+    fn linked_worktree_commondir_must_stay_within_an_applicable_grant() {
+        let workspace = TempDir::new().unwrap();
+        let allowed_root = TempDir::new().unwrap();
+        let external_common_dir = TempDir::new().unwrap();
+        let linked_worktree = allowed_root.path().join("linked-worktree");
+        let gitdir = allowed_root.path().join("gitdir");
+        std::fs::create_dir(&linked_worktree).unwrap();
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(
+            linked_worktree.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            gitdir.join("commondir"),
+            format!("{}\n", external_common_dir.path().display()),
+        )
+        .unwrap();
+
+        let linked_worktree = linked_worktree.canonicalize().unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
+        let roots = tool.security.approved_read_roots(&linked_worktree);
+        assert!(
+            !tool.linked_worktree_metadata_is_authorized(&linked_worktree.join(".git"), &roots),
+            "linked-worktree common metadata outside the grant must be rejected"
         );
     }
 
