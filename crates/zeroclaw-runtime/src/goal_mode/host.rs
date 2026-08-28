@@ -4,8 +4,12 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
-use super::{GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation};
+use super::{
+    GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind,
+    GoalWorkingTranscript,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalHostPreflightError {
@@ -42,6 +46,40 @@ impl GoalSessionBinding {
     }
 }
 
+/// One parent turn rebuilt from durable Goal declaration and process-local state.
+///
+/// The request intentionally carries neither controller identity nor provider
+/// configuration. The lease owns its normal session/provider context, while the
+/// execution driver owns admission, accounting, and lifecycle transitions.
+#[derive(Debug)]
+pub struct GoalParentTurn {
+    pub objective: String,
+    pub success_criteria: String,
+    pub turn_kind: GoalTurnKind,
+    pub working_transcript: GoalWorkingTranscript,
+}
+
+/// The parent candidate and the process-local transcript to use for the next turn.
+#[derive(Debug)]
+pub struct GoalParentTurnResult {
+    pub candidate: String,
+    pub working_transcript: GoalWorkingTranscript,
+}
+
+/// An adapter-owned exclusive foreground lease for one Goal execution epoch.
+///
+/// A lease holds the channel/session mechanics that ordinary turns already use.
+/// It is deliberately opaque to Goal control code: adapters do not mutate Goal
+/// lifecycle or accounting, and Goal code does not construct a provider path.
+#[async_trait]
+pub trait GoalSessionLease: Send {
+    async fn run_parent_turn(
+        &mut self,
+        turn: GoalParentTurn,
+        cancellation: CancellationToken,
+    ) -> Result<GoalParentTurnResult>;
+}
+
 #[async_trait]
 pub trait GoalSessionAdapter: Send + Sync {
     fn owns(&self, binding: &GoalSessionBinding) -> bool;
@@ -50,8 +88,11 @@ pub trait GoalSessionAdapter: Send + Sync {
         binding: &GoalSessionBinding,
         request: &GoalExecutionPreflight,
     ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError>;
-    async fn acquire(&self, scope: &GoalExecutionScope, binding: &GoalSessionBinding)
-    -> Result<()>;
+    async fn acquire(
+        &self,
+        scope: &GoalExecutionScope,
+        binding: &GoalSessionBinding,
+    ) -> Result<Box<dyn GoalSessionLease>>;
 }
 
 /// Selects exactly one channel/session implementation for a trusted binding.
@@ -90,7 +131,7 @@ impl GoalExecutionHost {
         &self,
         scope: &GoalExecutionScope,
         binding: &GoalSessionBinding,
-    ) -> Result<()> {
+    ) -> Result<Box<dyn GoalSessionLease>> {
         if scope.session_id != binding.session_id {
             bail!("Goal scope does not match session binding");
         }
@@ -106,6 +147,20 @@ mod tests {
     struct Adapter {
         owns: bool,
     }
+    struct Lease;
+    #[async_trait]
+    impl GoalSessionLease for Lease {
+        async fn run_parent_turn(
+            &mut self,
+            turn: GoalParentTurn,
+            _: CancellationToken,
+        ) -> Result<GoalParentTurnResult> {
+            Ok(GoalParentTurnResult {
+                candidate: "candidate".into(),
+                working_transcript: turn.working_transcript,
+            })
+        }
+    }
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
         fn owns(&self, _: &GoalSessionBinding) -> bool {
@@ -118,8 +173,12 @@ mod tests {
         ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
             Ok(GoalOperationReservation::default())
         }
-        async fn acquire(&self, _: &GoalExecutionScope, _: &GoalSessionBinding) -> Result<()> {
-            Ok(())
+        async fn acquire(
+            &self,
+            _: &GoalExecutionScope,
+            _: &GoalSessionBinding,
+        ) -> Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(Lease))
         }
     }
     fn binding() -> GoalSessionBinding {
@@ -159,5 +218,28 @@ mod tests {
         );
         let one = GoalExecutionHost::new(vec![Arc::new(Adapter { owns: true })]);
         assert!(one.preflight(&binding(), &preflight()).await.is_ok());
+        let scope = GoalExecutionScope {
+            task_id: "t".into(),
+            session_id: "s".into(),
+            binding: binding(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let mut lease = one.acquire(&scope, &binding()).await.unwrap();
+        let result = lease
+            .run_parent_turn(
+                GoalParentTurn {
+                    objective: "o".into(),
+                    success_criteria: "c".into(),
+                    turn_kind: GoalTurnKind::Start,
+                    working_transcript: Default::default(),
+                },
+                scope.cancellation.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.candidate, "candidate");
     }
 }
