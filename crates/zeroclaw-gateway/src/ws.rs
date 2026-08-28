@@ -350,6 +350,11 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // Keep the generation tombstone until this socket exits. A WebSocket
+    // carries its observed generation across idle periods, so reclaiming that
+    // value while it remains connected would let it mistake a later ID reuse
+    // for its original session.
+    let _session_lifecycle_lease = state.session_queue.retain(&session_key).await;
     // DELETE advances this queue-owned value while holding the same queue.
     // This connection can therefore never write into a successor that reuses
     // its caller-selected session ID.

@@ -178,8 +178,9 @@ rpc_type! {
     /// `session/state`, `session/delete`.
     pub struct SessionIdParams {
         pub session_id: String,
-        /// Required only when deleting a reaped durable session. A live
-        /// session already supplies its canonical storage domain.
+        /// Optional storage domain for `session/delete`. A live session
+        /// supplies its canonical domain; an omitted reaped or missing ID
+        /// preserves the legacy idempotent Chat deletion behavior.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub chat_mode: Option<ChatMode>,
     }

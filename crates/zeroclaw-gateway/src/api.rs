@@ -1805,13 +1805,21 @@ pub async fn handle_api_session_message_post(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    if !backend.session_exists(&session_key) {
+    // Bind the durable existence observation and queue incarnation together
+    // before waiting. DELETE publishes invalidation through this same queue
+    // authority only after durable removal, so a queued request cannot adopt a
+    // successor generation after it observed the predecessor.
+    let Some(expected_generation) = state
+        .session_queue
+        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
+        .await
+    else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
+    };
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1833,7 +1841,9 @@ pub async fn handle_api_session_message_post(
 
     // Deletion shares this queue. Re-check after waiting so a queued POST
     // cannot recreate metadata that DELETE removed while it was pending.
-    if !backend.session_exists(&session_key) {
+    if !backend.session_exists(&session_key)
+        || state.session_queue.generation(&session_key).await != expected_generation
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -3522,6 +3532,64 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(!backend.session_exists("gw_operator-1"));
         assert!(backend.load("gw_operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_message_post_does_not_append_to_a_same_id_successor_after_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let response_fut = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "stale queued notification"
+                }))
+                .expect("body should deserialize"),
+            ),
+        );
+        tokio::pin!(response_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err(),
+            "POST should be queued before the lifecycle changes"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        state.session_queue.invalidate("gw_operator-1").await;
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 1, "the successor must remain untouched");
+        assert_eq!(messages[0].content, "successor");
     }
 
     #[test]

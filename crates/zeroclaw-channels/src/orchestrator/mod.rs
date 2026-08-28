@@ -6445,10 +6445,14 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
-    if ctx.prompt_config.channels.session_prompts_enabled
-        && let Some(backend) = ctx.session_store.as_ref()
-    {
-        match backend.list_session_prompts(&history_key) {
+    if ctx.prompt_config.channels.session_prompts_enabled {
+        let prompt_result = match ctx.session_store.as_ref() {
+            Some(backend) => backend.list_session_prompts(&history_key),
+            None => Err(std::io::Error::other(
+                "persistent session prompts are enabled but the session backend is unavailable",
+            )),
+        };
+        match prompt_result {
             Ok(prompts) => {
                 let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
                 if !attachments.is_empty() {
@@ -6491,11 +6495,11 @@ async fn process_channel_message_body(
             }
             Err(error) => {
                 ::zeroclaw_log::record!(
-                    WARN,
+                    ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                    "Session prompt attachments skipped because they could not be loaded"
+                    "Persistent session prompts could not be loaded; refusing to dispatch without them"
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     let message =
@@ -20027,6 +20031,52 @@ BTC is currently around $65,000 based on latest tool output."#
         let reply = sent_messages.last().unwrap();
         assert!(reply.contains("Current session: test-channel_chat-42_alice"));
         assert!(reply.contains("Messages: 1"));
+    }
+
+    #[tokio::test]
+    async fn enabled_session_prompts_without_backend_fail_before_provider_dispatch() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(ModelCaptureModelProvider::default());
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.session_prompts_enabled = true;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = channel_message("test-channel", None);
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            0,
+            "a missing required prompt backend must fail before provider dispatch"
+        );
+        assert!(
+            runtime_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(history_key.as_str())
+                .is_none(),
+            "the failed turn must not leave an orphaned user message in history"
+        );
+        let expected = channel_runtime_cli_string("channel-runtime-session-prompt-load-failed");
+        assert!(
+            channel_impl
+                .sent_messages
+                .lock()
+                .await
+                .iter()
+                .any(|message| message == &format!("r1:{expected}")),
+            "the channel must receive the visible prompt-backend failure"
+        );
     }
 
     #[tokio::test]

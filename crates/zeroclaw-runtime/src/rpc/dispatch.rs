@@ -1121,15 +1121,6 @@ impl RpcDispatcher {
             .acquire(&session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-        // A caller can reuse an RPC ID. Advance the queue incarnation before
-        // installing its successor so work admitted for a predecessor cannot
-        // run against this new session after waiting on the same queue.
-        self.ctx
-            .sessions
-            .session_queue
-            .invalidate(&session_id)
-            .await;
-
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
@@ -1207,6 +1198,13 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
+
+        enum AcpSessionNewLoad {
+            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
         let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &req.agent_alias,
@@ -1233,7 +1231,77 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        self.ctx
+        // Prepare every fallible ACP operation after fallible agent setup, but
+        // before replacing an existing same-ID live session. The queue guard
+        // serializes the eventual map swap; preparation must happen before
+        // that swap so an unavailable or invalid ACP store cannot evict a
+        // healthy Chat predecessor. Conversely, constructing the Agent first
+        // avoids leaving an ACP row behind if setup itself fails.
+        let (prepared_acp, created_acp_store) =
+            if matches!(&chat_mode, crate::rpc::types::ChatMode::Acp) {
+                let store =
+                    self.ctx.acp_session_store.clone().ok_or_else(|| {
+                        rpc_err(INTERNAL_ERROR, "ACP session store is not available")
+                    })?;
+                let loaded = if let Some(data) = preloaded_acp.take() {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                } else {
+                    let store_cloned = store.clone();
+                    let sid = session_id.clone();
+                    let alias = req.agent_alias.clone();
+                    let cwd_owned = cwd.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                        match store_cloned.load_session_for_restore(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
+                        }
+                    })
+                    .await
+                };
+                let prepared = match loaded {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        if data.agent_alias != req.agent_alias {
+                            return Err(rpc_err(
+                                INVALID_PARAMS,
+                                "ACP session belongs to a different agent",
+                            ));
+                        }
+                        AcpSessionNewLoad::Restored(data)
+                    }
+                    Ok(Ok(AcpSessionNewLoad::Created)) => AcpSessionNewLoad::Created,
+                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Ok(Err(error)) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load or create ACP session: {error}"),
+                        ));
+                    }
+                    Err(join) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP session load task failed: {join}"),
+                        ));
+                    }
+                };
+                let created_store =
+                    matches!(&prepared, AcpSessionNewLoad::Created).then_some(store);
+                (Some(prepared), created_store)
+            } else {
+                (None, None)
+            };
+
+        if self
+            .ctx
             .sessions
             .insert(
                 session_id.clone(),
@@ -1241,7 +1309,32 @@ impl RpcDispatcher {
                     .with_owner(self.tui_id.clone()),
             )
             .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+            .is_err()
+        {
+            // The only durable preparation that can create new state is the
+            // ACP Missing -> Created path. Compensate it when map admission
+            // fails, while leaving a pre-existing durable row untouched.
+            if let Some(store) = created_acp_store {
+                let sid = session_id.clone();
+                let cleanup = tokio::task::spawn_blocking(move || store.delete_session(&sid)).await;
+                match cleanup {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to roll back newly created ACP session: {error}"),
+                        ));
+                    }
+                    Err(join) => {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP rollback task failed: {join}"),
+                        ));
+                    }
+                }
+            }
+            return Err(rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"));
+        }
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -1293,64 +1386,14 @@ impl RpcDispatcher {
             }
         }
 
-        enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
-            Created,
-            Killed,
-        }
-
         let mut message_count = 0;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
-                // Reuse the data already loaded for cwd recovery on resume so the
-                // store isn't hit twice; otherwise fall through to the restore-
-                // aware load-or-create path below.
-                let loaded = if let Some(data) = preloaded_acp.take() {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
-                } else {
-                    let Some(ref store) = self.ctx.acp_session_store else {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "ACP session store is not available",
-                        ));
-                    };
-
-                    let store_cloned = store.clone();
-                    let sid = session_id.clone();
-                    let alias = req.agent_alias.clone();
-                    let cwd_owned = cwd.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
-                        match store_cloned.load_session_for_restore(&sid)? {
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
-                                Ok(AcpSessionNewLoad::Created)
-                            }
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
-                                Ok(AcpSessionNewLoad::Killed)
-                            }
-                        }
-                    })
-                    .await
-                };
-                match loaded {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                        if data.agent_alias != req.agent_alias {
-                            if let Some(ref hooks) = self.ctx.hooks {
-                                hooks.fire_session_end(&session_id, "rpc").await;
-                            }
-                            self.ctx.sessions.remove(&session_id).await;
-                            return Err(rpc_err(
-                                INVALID_PARAMS,
-                                "ACP session belongs to a different agent",
-                            ));
-                        }
+                let prepared = prepared_acp.ok_or_else(|| {
+                    rpc_err(INTERNAL_ERROR, "ACP session preparation was not retained")
+                })?;
+                match prepared {
+                    AcpSessionNewLoad::Restored(data) => {
                         message_count = data.messages.len();
                         let seed_event = self
                             .ctx
@@ -1379,47 +1422,9 @@ impl RpcDispatcher {
                             }
                         }
                     }
-                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
-                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
+                    AcpSessionNewLoad::Created => {}
+                    AcpSessionNewLoad::Killed => {
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                            "Failed to load or create ACP session"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to load or create ACP session: {e}"),
-                        ));
-                    }
-                    Err(join) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                            "ACP session load task failed"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("ACP session load task failed: {join}"),
-                        ));
                     }
                 }
             }
@@ -1444,6 +1449,17 @@ impl RpcDispatcher {
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
+
+        // Publish the replacement only after the entire session/new operation
+        // has succeeded.  Failed agent construction or admission must leave
+        // the predecessor's queue incarnation intact; while this guard is
+        // held, no already-admitted predecessor work can run against the new
+        // in-memory session before this invalidation becomes visible.
+        self.ctx
+            .sessions
+            .session_queue
+            .invalidate(&session_id)
+            .await;
 
         to_result(SessionNewResult {
             session_id,
@@ -2691,10 +2707,10 @@ impl RpcDispatcher {
         expected_generation: Option<u64>,
         expected_queue_generation: u64,
     ) -> RpcResult {
-        self.ctx.sessions.cancel_session(&req.session_id);
         // This is the same finalization authority used by prompt turns. Wait
-        // for any accepted turn to finish before deleting its durable row,
-        // then the generation check in the turn path rejects stale writes.
+        // for any accepted turn to finish before deleting its durable row.
+        // Do not cancel it before validation and durable deletion succeed: a
+        // rejected or failed delete must not mutate the still-live session.
         let _guard = self
             .ctx
             .sessions
@@ -2716,11 +2732,6 @@ impl RpcDispatcher {
                 "Session was replaced while deletion was pending",
             ));
         }
-        self.ctx
-            .sessions
-            .session_queue
-            .invalidate(&req.session_id)
-            .await;
         let live_chat_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
         let is_reaped = live_chat_mode.is_none();
         let chat_mode = match live_chat_mode {
@@ -2758,16 +2769,22 @@ impl RpcDispatcher {
         // RPC chat sessions use this canonical persistence key.  Delete it
         // before mutable in-memory state so a storage failure cannot report a
         // successful reset while leaving prompt attachments behind.
-        if should_delete_durable_chat && let Some(ref backend) = self.ctx.session_backend {
-            backend
-                .delete_session(&format!("rpc_{}", req.session_id))
-                .map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to delete persistent session: {error}"),
-                    )
-                })?;
-        }
+        let deleted_durable_chat = if should_delete_durable_chat {
+            if let Some(ref backend) = self.ctx.session_backend {
+                backend
+                    .delete_session(&format!("rpc_{}", req.session_id))
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to delete persistent session: {error}"),
+                        )
+                    })?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -2776,6 +2793,15 @@ impl RpcDispatcher {
                 .unregister_channel("rpc");
         }
         let existed = self.ctx.sessions.remove(&req.session_id).await;
+        // A successful durable delete or live-session removal is the lifecycle
+        // commit point. Only then invalidate holders from this incarnation.
+        if deleted_durable_chat || existed {
+            self.ctx
+                .sessions
+                .session_queue
+                .invalidate(&req.session_id)
+                .await;
+        }
         if existed && let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
         }
@@ -8463,6 +8489,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_session_new_agent_construction_preserves_predecessor_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "new-agent-failure";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("predecessor session/new should succeed");
+        let predecessor_generation = sessions.get_generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "missing-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("unknown agent must fail construction");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
+        assert_eq!(
+            sessions.session_queue.generation(sid).await,
+            predecessor_queue_generation,
+            "a failed replacement must not invalidate the predecessor queue incarnation"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "the predecessor must remain usable after failed construction"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_session_new_at_limit_preserves_predecessor_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(1, queue));
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let ctx =
+            RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let sid = "session-limit-failure";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("predecessor session/new should succeed");
+        let predecessor_generation = sessions.get_generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("replacement must be rejected at the session limit");
+        assert_eq!(error.code, SESSION_LIMIT_REACHED);
+        assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
+        assert_eq!(
+            sessions.session_queue.generation(sid).await,
+            predecessor_queue_generation,
+            "a rejected replacement must not invalidate the predecessor queue incarnation"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "the predecessor must remain usable after a limit rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_acp_session_new_preserves_same_id_chat_predecessor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let ctx =
+            RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let sid = "chat-predecessor-acp-failure";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("chat predecessor session/new should succeed");
+        let predecessor_generation = sessions.get_generation(sid).await;
+        let predecessor_queue_generation = sessions.session_queue.generation(sid).await;
+
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("ACP session/new without its store must fail before replacing Chat");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
+        assert_eq!(
+            sessions.session_queue.generation(sid).await,
+            predecessor_queue_generation,
+            "a failed ACP replacement must not invalidate the Chat predecessor"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "the same-ID Chat predecessor must remain usable after ACP setup fails"
+        );
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat),
+            "the failed ACP request must not replace the predecessor's domain"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_new_acp_session_removes_its_new_durable_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(1, queue));
+        let chat_backend: Arc<dyn SessionBackend> =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "session-limit-holder",
+            }))
+            .await
+            .expect("the only live slot should be occupied by Chat");
+
+        let sid = "rejected-new-acp";
+        let error = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect_err("the second live session must be rejected at the limit");
+        assert_eq!(error.code, SESSION_LIMIT_REACHED);
+        assert!(
+            acp_store.load_session(sid).unwrap().is_none(),
+            "a failed map admission must roll back only the ACP row it created"
+        );
+        assert!(
+            sessions.get_agent("session-limit-holder").await.is_some(),
+            "rollback must not disturb the unrelated live session that consumed the limit"
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_a_reaped_chat_session_removes_its_prompt_attachments() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -8545,6 +8756,90 @@ mod tests {
             error
                 .message
                 .contains("Failed to delete persistent session")
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .session_queue
+                .generation("reaped-chat")
+                .await,
+            0,
+            "a failed durable delete must not publish a lifecycle invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_live_session_delete_preserves_incarnation_and_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let backend: Arc<dyn SessionBackend> = Arc::new(FailingDeleteBackend);
+        let ctx =
+            RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let sid = "live-delete-failure";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+        let generation = sessions.get_generation(sid).await;
+        let queue_generation = sessions.session_queue.generation(sid).await;
+
+        let error = dispatcher
+            .handle_session_delete(&json!({"session_id": sid}))
+            .await
+            .expect_err("storage failure must fail the deletion");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            sessions.session_queue.generation(sid).await,
+            queue_generation
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "failed deletion must leave the live session usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_live_session_delete_mode_preserves_incarnation_and_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "delete-mode-mismatch";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("chat session/new should succeed");
+        let generation = sessions.get_generation(sid).await;
+        let queue_generation = sessions.session_queue.generation(sid).await;
+
+        let error = dispatcher
+            .handle_session_delete(&json!({"session_id": sid, "chat_mode": "acp"}))
+            .await
+            .expect_err("mismatched storage mode must fail deletion");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            sessions.session_queue.generation(sid).await,
+            queue_generation
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "invalid deletion must leave the live session usable"
         );
     }
 
