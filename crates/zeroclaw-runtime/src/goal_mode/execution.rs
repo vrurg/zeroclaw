@@ -563,6 +563,17 @@ fn goal_usage_from_attempt(
         anyhow::bail!("goal usage is invalid");
     }
     let rates = crate::agent::cost::goal_pricing_rates(config, provider_ref, model);
+    if [
+        rates.input_per_mtok,
+        rates.output_per_mtok,
+        rates.cached_input_per_mtok,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|rate| !rate.is_finite() || rate < 0.0)
+    {
+        anyhow::bail!("goal usage resolved invalid pricing");
+    }
     let pricing_available = rates.input_per_mtok.is_some() && rates.output_per_mtok.is_some();
     let mut usage = CostTokenUsage::new_with_cache(
         model,
@@ -705,7 +716,8 @@ fn parse_verifier_response(text: &str) -> anyhow::Result<VerifierOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerifierOutcome, parse_verifier_response};
+    use super::{VerifierOutcome, goal_usage_from_attempt, parse_verifier_response};
+    use zeroclaw_config::schema::Config;
 
     #[test]
     fn verifier_protocol_rejects_unknown_fields_and_invalid_blockers() {
@@ -725,5 +737,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn usage_rejects_missing_zero_and_inconsistent_token_reports() {
+        let config = Config::default();
+        let missing = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(1),
+            cached_input_tokens: None,
+        };
+        assert!(goal_usage_from_attempt(&config, "provider", "model", &missing).is_err());
+        let zero = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_input_tokens: Some(0),
+        };
+        assert!(goal_usage_from_attempt(&config, "provider", "model", &zero).is_err());
+        let inconsistent = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_input_tokens: Some(2),
+        };
+        assert!(goal_usage_from_attempt(&config, "provider", "model", &inconsistent).is_err());
     }
 }
