@@ -3,6 +3,7 @@ use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::pricing::ModelRates;
@@ -222,6 +223,94 @@ pub(crate) trait GoalOperationAccounting: Send + Sync {
 
 tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
+}
+
+/// Durable, payload-free boundary around one Goal-owned tool batch.
+pub(crate) struct GoalToolPhaseFence {
+    goals: Arc<dyn crate::control_plane::GoalTaskRegistry>,
+    task_id: String,
+    session_id: String,
+    epoch: i64,
+    in_flight: AtomicBool,
+}
+
+impl GoalToolPhaseFence {
+    pub(crate) fn new(
+        goals: Arc<dyn crate::control_plane::GoalTaskRegistry>,
+        task_id: String,
+        session_id: String,
+        epoch: i64,
+    ) -> Self {
+        Self {
+            goals,
+            task_id,
+            session_id,
+            epoch,
+            in_flight: AtomicBool::new(false),
+        }
+    }
+
+    async fn begin(&self) -> anyhow::Result<()> {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        match self
+            .goals
+            .begin_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            crate::control_plane::GoalTransitionResult::Applied => Ok(()),
+            crate::control_plane::GoalTransitionResult::Stale
+            | crate::control_plane::GoalTransitionResult::Missing => {
+                self.in_flight.store(false, Ordering::Release);
+                anyhow::bail!("goal tool phase is stale")
+            }
+        }
+    }
+
+    async fn complete(&self) -> anyhow::Result<()> {
+        if !self.in_flight.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self
+            .goals
+            .complete_goal_tool_phase(&self.task_id, &self.session_id, self.epoch)
+            .await?
+        {
+            crate::control_plane::GoalTransitionResult::Applied => {
+                self.in_flight.store(false, Ordering::Release);
+                Ok(())
+            }
+            crate::control_plane::GoalTransitionResult::Stale
+            | crate::control_plane::GoalTransitionResult::Missing => {
+                anyhow::bail!("goal tool phase completion is stale")
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_TOOL_PHASE_FENCE: Option<Arc<GoalToolPhaseFence>>;
+}
+
+pub(crate) async fn begin_goal_tool_phase_if_scoped() -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() {
+        fence.begin().await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn complete_goal_tool_phase_if_scoped() -> anyhow::Result<()> {
+    if let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() {
+        fence.complete().await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn goal_tool_phase_is_scoped() -> bool {
+    GOAL_TOOL_PHASE_FENCE
+        .try_with(|fence| fence.is_some())
+        .unwrap_or(false)
 }
 
 /// Admit an operation only when an enclosing Goal execution owner scoped the

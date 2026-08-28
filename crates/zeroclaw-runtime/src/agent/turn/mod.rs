@@ -1186,8 +1186,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
+        let allow_parallel_execution = parallel_tools
+            && !crate::agent::cost::goal_tool_phase_is_scoped()
+            && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -1205,6 +1206,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        if !executable_calls.is_empty() {
+            crate::agent::cost::begin_goal_tool_phase_if_scoped().await?;
+        }
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -1372,6 +1376,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if !executable_calls.is_empty() {
+            crate::agent::cost::complete_goal_tool_phase_if_scoped().await?;
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);

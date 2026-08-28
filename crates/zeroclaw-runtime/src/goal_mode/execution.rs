@@ -376,6 +376,12 @@ impl GoalExecutionDriver {
         };
         let mut working_transcript = Vec::new();
         let mut turn_kind = scope.turn_kind;
+        let tool_phase_fence = Arc::new(crate::agent::cost::GoalToolPhaseFence::new(
+            Arc::clone(&self.goals),
+            scope.task_id.clone(),
+            scope.session_id.clone(),
+            scope.execution_epoch,
+        ));
         loop {
             if scope.cancellation.is_cancelled() {
                 return;
@@ -384,14 +390,17 @@ impl GoalExecutionDriver {
             let parent = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
                 .scope(
                     Some(Arc::clone(&accountant) as Arc<dyn GoalOperationAccounting>),
-                    lease.run_parent_turn(
-                        GoalParentTurn {
-                            objective: goal.objective.clone(),
-                            success_criteria: goal.success_criteria.clone(),
-                            turn_kind,
-                            working_transcript,
-                        },
-                        scope.cancellation.child_token(),
+                    crate::agent::cost::GOAL_TOOL_PHASE_FENCE.scope(
+                        Some(Arc::clone(&tool_phase_fence)),
+                        lease.run_parent_turn(
+                            GoalParentTurn {
+                                objective: goal.objective.clone(),
+                                success_criteria: goal.success_criteria.clone(),
+                                turn_kind,
+                                working_transcript,
+                            },
+                            scope.cancellation.child_token(),
+                        ),
                     ),
                 )
                 .await;
