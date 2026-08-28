@@ -266,6 +266,61 @@ impl GoalOperationAccountant {
         Ok((state, pricing_complete))
     }
 
+    /// A failed ledger write leaves the provider outcome uncertain. Retain the
+    /// pending operation until that fact is durably visible; returning a raw
+    /// storage error here would let the worker misclassify an admitted spend as
+    /// an ordinary parent failure while the daemon remains alive.
+    async fn retain_outcome_unknown(&self, call_id: &str) -> anyhow::Result<()> {
+        loop {
+            match self
+                .goals
+                .mark_pending_call_outcome_unknown(
+                    &self.scope.task_id,
+                    &self.scope.session_id,
+                    self.scope.execution_epoch,
+                    call_id,
+                )
+                .await
+            {
+                Ok(GoalTransitionResult::Applied) => return Ok(()),
+                Ok(GoalTransitionResult::Stale | GoalTransitionResult::Missing) => {
+                    match self.goals.get_goal_task(&self.scope.task_id).await {
+                        Ok(Some(goal))
+                            if goal.accounting_state == GoalAccountingState::OutcomeUnknown =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(_) => anyhow::bail!(
+                            "goal ledger failure classification was fenced before outcome reconciliation"
+                        ),
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                                "Goal uncertainty reconciliation read failed; retaining operation ownership"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                        "Goal uncertainty classification persistence failed; retaining operation ownership"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn settled_operation_count(&self) -> usize {
         self.settled_operations.load(Ordering::Acquire)
     }
@@ -292,7 +347,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         }
         let (known_tokens, known_cost, cost_pricing_complete) = self.strict_totals().await?;
         if goal.effective_cost_limit_usd.is_some() && !cost_pricing_complete {
-            anyhow::bail!("goal cost pricing is unavailable");
+            return Err(GoalOperationError::PricingUnavailable.into());
         }
         if goal
             .effective_token_limit
@@ -362,21 +417,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         let (state, pricing_complete) = match self.record_attempts(&attempts).await {
             Ok(result) => result,
             Err(error) => {
-                match self
-                    .goals
-                    .mark_pending_call_outcome_unknown(
-                        &self.scope.task_id,
-                        &self.scope.session_id,
-                        self.scope.execution_epoch,
-                        &operation.call_id,
-                    )
-                    .await?
-                {
-                    GoalTransitionResult::Applied => {}
-                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-                        anyhow::bail!("goal ledger failure classification is stale")
-                    }
-                }
+                self.retain_outcome_unknown(&operation.call_id).await?;
                 return Err(
                     anyhow::Error::new(GoalOperationError::AccountingOutcomeUnknown).context(error),
                 );
@@ -1032,10 +1073,14 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use chrono::Utc;
+    use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider};
-    use zeroclaw_config::{cost::CostTracker, schema::Config};
+    use zeroclaw_config::{
+        cost::{CostTracker, TokenUsage as CostTokenUsage},
+        schema::Config,
+    };
     use zeroclaw_providers::{
         ProviderDispatch,
         dispatch::{AccountedChatScope, with_exact_dispatch_route},
@@ -1135,6 +1180,62 @@ mod tests {
         .await;
         assert_eq!(result, GoalTransitionResult::Applied);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn predecessor_quiescence_waits_for_the_shared_final_delivery_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store;
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(Vec::new())),
+            goals,
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap()),
+        ));
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let final_delivery = zeroclaw_spawn::spawn!(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        });
+        driver.workers.lock().await.insert(
+            ("predecessor".into(), 1),
+            Arc::new(super::GoalWorker::new(final_delivery)),
+        );
+        started_rx.await.unwrap();
+
+        let first = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move {
+                driver
+                    .quiesce_terminal_predecessor("predecessor", "session")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !first.is_finished(),
+            "replacement must wait until the final delivery acknowledgement returns"
+        );
+        let second = {
+            let driver = Arc::clone(&driver);
+            zeroclaw_spawn::spawn!(async move {
+                driver
+                    .quiesce_terminal_predecessor("predecessor", "session")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "concurrent replacement must share the predecessor join rather than overtake it"
+        );
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(driver.workers.lock().await.is_empty());
     }
 
     #[test]
@@ -1456,6 +1557,102 @@ mod tests {
             goal.pause_reason,
             Some(crate::control_plane::GoalPauseReason::BudgetExhausted)
         );
+    }
+
+    #[tokio::test]
+    async fn unpriced_cost_limited_admission_returns_the_typed_pricing_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        assert_eq!(
+            goals
+                .create_or_replace_session_goal(
+                    TaskRecord {
+                        id: "goal".into(),
+                        kind: TaskKind::Goal,
+                        agent: "main".into(),
+                        status: TaskStatus::Running,
+                        owner_pid: std::process::id(),
+                        owner_boot_id: "boot".into(),
+                        heartbeat_at: None,
+                        depth: 0,
+                        parent_id: None,
+                        originator_route: Some("route".into()),
+                        delivered: false,
+                        idem_key: None,
+                        principal_id: None,
+                        session_id: Some("session".into()),
+                        execution_epoch: 0,
+                        started_at: Utc::now().to_rfc3339(),
+                        finished_at: None,
+                    },
+                    GoalTaskRecord {
+                        task_id: "goal".into(),
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                        effective_cost_limit_usd: Some(1.0),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let tracker = Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap());
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                CostTokenUsage {
+                    model: "unpriced-model".into(),
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    total_tokens: 1,
+                    cost_usd: 0.0,
+                    pricing_available: false,
+                    timestamp: Utc::now(),
+                },
+                Some("main"),
+                Some("goal".into()),
+            )
+            .unwrap();
+        let accountant = super::GoalOperationAccountant::new(
+            goals,
+            Arc::new(Config::default()),
+            tracker,
+            GoalExecutionScope {
+                task_id: "goal".into(),
+                session_id: "session".into(),
+                binding: GoalSessionBinding::new(
+                    "session".into(),
+                    "main".into(),
+                    "route".into(),
+                    None,
+                )
+                .unwrap(),
+                operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                execution_epoch: 1,
+                turn_kind: GoalTurnKind::Start,
+                cancellation: CancellationToken::new(),
+            },
+            "main".into(),
+        );
+        let error = crate::agent::cost::GoalOperationAccounting::admit(
+            &accountant,
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: "provider".into(),
+                model: "model".into(),
+                temperature: None,
+                thinking: None,
+                messages: vec![zeroclaw_api::model_provider::ChatMessage::user("goal")],
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<super::GoalOperationError>(),
+            Some(super::GoalOperationError::PricingUnavailable)
+        ));
     }
 
     #[tokio::test]
