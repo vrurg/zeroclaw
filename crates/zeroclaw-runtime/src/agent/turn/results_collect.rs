@@ -28,6 +28,40 @@ pub(crate) struct CollectedResults {
     pub(crate) detection_relevant_output: String,
 }
 
+/// Verify that a Goal-owned tool round has one exact, unambiguous result for
+/// every tool call before its durable phase fence can be cleared.
+pub(crate) fn validate_goal_tool_result_pairing(
+    tool_calls: &[ParsedToolCall],
+    individual_results: &[(Option<String>, String)],
+) -> Result<()> {
+    if tool_calls.len() != individual_results.len() {
+        anyhow::bail!("Goal tool round has missing results");
+    }
+    let mut expected = HashSet::with_capacity(tool_calls.len());
+    for call in tool_calls {
+        let Some(id) = call
+            .tool_call_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            anyhow::bail!("Goal tool call has no stable ID");
+        };
+        if !expected.insert(id) {
+            anyhow::bail!("Goal tool round has duplicate call IDs");
+        }
+    }
+    let mut actual = HashSet::with_capacity(individual_results.len());
+    for (id, _) in individual_results {
+        let Some(id) = id.as_deref().filter(|id| !id.trim().is_empty()) else {
+            anyhow::bail!("Goal tool result has no stable ID");
+        };
+        if !actual.insert(id) || !expected.contains(id) {
+            anyhow::bail!("Goal tool result ID does not match its call");
+        }
+    }
+    Ok(())
+}
+
 /// Collect this round's tool results (upstream loop body, results-collection
 /// section): feed the loop detector (Warning/Block append system messages;
 /// Break bails), canonicalize media markers, truncate, append receipts, and
@@ -233,6 +267,56 @@ mod tests {
             receipt: None,
             output_data: None,
         }
+    }
+
+    #[test]
+    fn goal_pairing_rejects_missing_duplicate_and_unknown_result_ids() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "read".into(),
+                arguments: serde_json::Value::Null,
+                tool_call_id: Some("call-a".into()),
+            },
+            ParsedToolCall {
+                name: "write".into(),
+                arguments: serde_json::Value::Null,
+                tool_call_id: Some("call-b".into()),
+            },
+        ];
+        assert!(
+            validate_goal_tool_result_pairing(&calls, &[(Some("call-a".into()), "ok".into())])
+                .is_err()
+        );
+        assert!(
+            validate_goal_tool_result_pairing(
+                &calls,
+                &[
+                    (Some("call-a".into()), "ok".into()),
+                    (Some("call-a".into()), "ok".into()),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_goal_tool_result_pairing(
+                &calls,
+                &[
+                    (Some("call-a".into()), "ok".into()),
+                    (Some("unknown".into()), "ok".into()),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_goal_tool_result_pairing(
+                &calls,
+                &[
+                    (Some("call-a".into()), "ok".into()),
+                    (Some("call-b".into()), "ok".into()),
+                ],
+            )
+            .is_ok()
+        );
     }
 
     /// Run one results-collection pass over `n` `file_read` calls that each use

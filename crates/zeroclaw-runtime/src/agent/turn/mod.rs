@@ -1374,6 +1374,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
         );
 
+        if crate::agent::cost::goal_tool_phase_is_scoped() {
+            results_collect::validate_goal_tool_result_pairing(&tool_calls, &individual_results)?;
+        }
+
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
