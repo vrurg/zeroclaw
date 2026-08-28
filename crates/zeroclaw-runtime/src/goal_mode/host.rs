@@ -5,12 +5,10 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_providers::dispatch::AccountedCallReport;
 
-use super::{
-    GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind,
-    GoalWorkingTranscript,
-};
+use super::{GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalHostPreflightError {
@@ -57,14 +55,14 @@ pub struct GoalParentTurn {
     pub objective: String,
     pub success_criteria: String,
     pub turn_kind: GoalTurnKind,
-    pub working_transcript: GoalWorkingTranscript,
+    pub working_transcript: Vec<ChatMessage>,
 }
 
 /// The parent candidate and the process-local transcript to use for the next turn.
 #[derive(Debug)]
 pub struct GoalParentTurnResult {
     pub candidate: String,
-    pub working_transcript: GoalWorkingTranscript,
+    pub working_transcript: Vec<ChatMessage>,
 }
 
 /// The final result of one accounted parent operation.
@@ -250,7 +248,7 @@ mod tests {
                     objective: "o".into(),
                     success_criteria: "c".into(),
                     turn_kind: GoalTurnKind::Start,
-                    working_transcript: Default::default(),
+                    working_transcript: vec![ChatMessage::user("goal context")],
                 },
                 scope.cancellation.clone(),
             )
@@ -258,5 +256,6 @@ mod tests {
         assert!(outcome.accounting.attempts().is_empty());
         let result = outcome.result.unwrap();
         assert_eq!(result.candidate, "candidate");
+        assert_eq!(result.working_transcript.len(), 1);
     }
 }
