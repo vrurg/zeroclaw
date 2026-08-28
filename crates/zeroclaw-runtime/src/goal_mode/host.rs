@@ -6,7 +6,6 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ChatMessage;
-use zeroclaw_providers::dispatch::AccountedCallReport;
 
 use super::{GoalExecutionPreflight, GoalExecutionScope, GoalOperationReservation, GoalTurnKind};
 
@@ -74,21 +73,6 @@ pub struct GoalVerifierTurn {
     pub candidate: String,
 }
 
-/// The final result of one accounted Goal model operation.
-///
-/// The report belongs to the same high-level operation as `result`, including
-/// ordinary Reliable retry, fallback, and stream recovery. An error result does
-/// not let the caller discard the report: Goal accounting must settle or fail
-/// closed before it decides how to handle the operation failure.
-#[derive(Debug)]
-pub struct GoalOperationOutcome<T> {
-    pub result: Result<T>,
-    pub accounting: AccountedCallReport,
-}
-
-pub type GoalParentTurnOutcome = GoalOperationOutcome<GoalParentTurnResult>;
-pub type GoalVerifierTurnOutcome = GoalOperationOutcome<String>;
-
 /// An adapter-owned exclusive foreground lease for one Goal execution epoch.
 ///
 /// A lease holds the channel/session mechanics that ordinary turns already use.
@@ -100,13 +84,13 @@ pub trait GoalSessionLease: Send {
         &mut self,
         turn: GoalParentTurn,
         cancellation: CancellationToken,
-    ) -> GoalParentTurnOutcome;
+    ) -> Result<GoalParentTurnResult>;
 
     async fn run_verifier(
         &mut self,
         turn: GoalVerifierTurn,
         cancellation: CancellationToken,
-    ) -> GoalVerifierTurnOutcome;
+    ) -> Result<String>;
 }
 
 #[async_trait]
@@ -183,25 +167,19 @@ mod tests {
             &mut self,
             turn: GoalParentTurn,
             _: CancellationToken,
-        ) -> GoalParentTurnOutcome {
-            GoalParentTurnOutcome {
-                result: Ok(GoalParentTurnResult {
-                    candidate: "candidate".into(),
-                    working_transcript: turn.working_transcript,
-                }),
-                accounting: AccountedCallReport::default(),
-            }
+        ) -> Result<GoalParentTurnResult> {
+            Ok(GoalParentTurnResult {
+                candidate: "candidate".into(),
+                working_transcript: turn.working_transcript,
+            })
         }
 
         async fn run_verifier(
             &mut self,
             _: GoalVerifierTurn,
             _: CancellationToken,
-        ) -> GoalVerifierTurnOutcome {
-            GoalVerifierTurnOutcome {
-                result: Ok(r#"{"decision":"complete","reason":"ok"}"#.into()),
-                accounting: AccountedCallReport::default(),
-            }
+        ) -> Result<String> {
+            Ok(r#"{"decision":"complete","reason":"ok"}"#.into())
         }
     }
     #[async_trait]
@@ -271,7 +249,7 @@ mod tests {
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let mut lease = one.acquire(&scope, &binding()).await.unwrap();
-        let outcome = lease
+        let result = lease
             .run_parent_turn(
                 GoalParentTurn {
                     objective: "o".into(),
@@ -281,9 +259,8 @@ mod tests {
                 },
                 scope.cancellation.clone(),
             )
-            .await;
-        assert!(outcome.accounting.attempts().is_empty());
-        let result = outcome.result.unwrap();
+            .await
+            .unwrap();
         assert_eq!(result.candidate, "candidate");
         assert_eq!(result.working_transcript.len(), 1);
         let verifier = lease
@@ -296,6 +273,9 @@ mod tests {
                 scope.cancellation.clone(),
             )
             .await;
-        assert_eq!(verifier.result.unwrap(), r#"{"decision":"complete","reason":"ok"}"#);
+        assert_eq!(
+            verifier.unwrap(),
+            r#"{"decision":"complete","reason":"ok"}"#
+        );
     }
 }
