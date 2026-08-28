@@ -43,6 +43,17 @@ impl ResolvedModelAccess<'_> {
             thinking,
         } = request;
         let sanitized = multimodal::sanitize_audio_markers(messages);
+        crate::agent::cost::admit_goal_operation_if_scoped(
+            crate::agent::cost::GoalOperationRequest {
+                model_provider: self.provider_name.to_string(),
+                model: self.model.to_string(),
+                temperature: self.temperature,
+                thinking,
+                messages: sanitized.to_vec(),
+                tools: tools.map_or_else(Vec::new, ToOwned::to_owned),
+            },
+        )
+        .await?;
         let request = ChatRequest {
             messages: &sanitized,
             tools,
@@ -76,14 +87,23 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-                crate::agent::cost::settle_provider_attempts(
-                    &attempts[..attempts.len().saturating_sub(1)],
-                    None,
-                );
+                if crate::agent::cost::goal_operation_accounting_is_scoped() {
+                    crate::agent::cost::settle_provider_attempts(
+                        attempts,
+                        attempts.len().checked_sub(1),
+                    )
+                    .await?;
+                } else {
+                    crate::agent::cost::settle_provider_attempts(
+                        &attempts[..attempts.len().saturating_sub(1)],
+                        None,
+                    )
+                    .await?;
+                }
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
                 if let Some(usage) = response.usage.as_ref() {
@@ -96,7 +116,7 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None);
+                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                 Err(error)
             }
         }

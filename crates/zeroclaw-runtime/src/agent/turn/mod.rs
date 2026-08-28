@@ -955,7 +955,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None);
+                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1010,7 +1010,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None);
+            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1067,13 +1067,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
-        // Earlier physical leaves are rejected routing/retry work. The final
-        // accepted response remains settled by `record_accepted_chat_response`
-        // so only it updates context-window telemetry.
-        crate::agent::cost::settle_provider_attempts(
-            &attempts[..attempts.len().saturating_sub(1)],
-            None,
-        );
+        // Ordinary turns retain their accepted-leaf telemetry path. A Goal
+        // scope instead settles the complete immutable report here, including
+        // the accepted leaf, before semantic response handling can continue.
+        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            crate::agent::cost::settle_provider_attempts(&attempts, attempts.len().checked_sub(1))
+                .await?;
+        } else {
+            crate::agent::cost::settle_provider_attempts(
+                &attempts[..attempts.len().saturating_sub(1)],
+                None,
+            )
+            .await?;
+        }
         record_accepted_chat_response(
             &ctx,
             served_provider,

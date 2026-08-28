@@ -158,6 +158,19 @@ pub(crate) async fn call_provider(
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
+    crate::agent::cost::admit_goal_operation_if_scoped(crate::agent::cost::GoalOperationRequest {
+        model_provider: ctx.provider_name.to_string(),
+        model: active_model.to_string(),
+        temperature: ctx.temperature,
+        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
+        messages: prepared_messages.to_vec(),
+        tools: request_tools.map_or_else(Vec::new, ToOwned::to_owned),
+    })
+    .await?;
+
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();

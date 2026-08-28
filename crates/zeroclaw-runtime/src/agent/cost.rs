@@ -1,5 +1,6 @@
 use crate::cost::CostTracker;
 use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -188,6 +189,85 @@ tokio::task_local! {
     pub static TOOL_LOOP_TURN_USAGE: Option<Arc<Mutex<TurnUsage>>>;
 }
 
+/// Exact request facts for one Goal-owned provider operation.
+///
+/// This is transient admission input for the ordinary provider loop. It is
+/// neither durable Goal state nor a provider factory, so Reliable routing and
+/// stream recovery remain owned by their existing runtime path.
+#[derive(Clone)]
+pub(crate) struct GoalOperationRequest {
+    pub(crate) model_provider: String,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    pub(crate) messages: Vec<zeroclaw_api::model_provider::ChatMessage>,
+    pub(crate) tools: Vec<crate::tools::ToolSpec>,
+}
+
+/// Private Goal accounting owner installed around an ordinary session turn.
+///
+/// The provider path calls this only at the operation boundary. The owner
+/// therefore admits one logical operation before its first provider poll and
+/// receives the immutable #10144 attempt report exactly once on settlement.
+#[async_trait]
+pub(crate) trait GoalOperationAccounting: Send + Sync {
+    async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
+
+    async fn settle(
+        &self,
+        attempts: Vec<zeroclaw_providers::dispatch::AccountedAttempt>,
+        accepted_attempt: Option<usize>,
+    ) -> anyhow::Result<()>;
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
+}
+
+/// Admit an operation only when an enclosing Goal execution owner scoped the
+/// existing model loop. Ordinary sessions never enter this branch.
+pub(crate) async fn admit_goal_operation_if_scoped(
+    request: GoalOperationRequest,
+) -> anyhow::Result<()> {
+    if request.model_provider.trim().is_empty() || request.model.trim().is_empty() {
+        anyhow::bail!("goal operation is missing its provider route");
+    }
+    if request.temperature.is_some_and(|value| !value.is_finite()) {
+        anyhow::bail!("goal operation has a non-finite temperature");
+    }
+    if request.messages.is_empty()
+        || request
+            .messages
+            .iter()
+            .any(|message| message.role.trim().is_empty())
+    {
+        anyhow::bail!("goal operation has no valid request messages");
+    }
+    if request.tools.iter().any(|tool| tool.name.trim().is_empty()) {
+        anyhow::bail!("goal operation has an invalid tool specification");
+    }
+    if request
+        .thinking
+        .is_some_and(|thinking| thinking.budget_tokens == 0)
+    {
+        anyhow::bail!("goal operation has an invalid thinking budget");
+    }
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        accounting.admit(request).await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn goal_operation_accounting_is_scoped() -> bool {
+    GOAL_OPERATION_ACCOUNTING
+        .try_with(|accounting| accounting.is_some())
+        .unwrap_or(false)
+}
+
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
@@ -249,6 +329,12 @@ pub fn record_tool_loop_cost_usage(
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> Option<(u64, f64)> {
+    // Goal-scoped calls are persisted strictly from the immutable complete
+    // attempt report in `settle_provider_attempts`; recording the accepted
+    // leaf here would duplicate it in the canonical ledger.
+    if goal_operation_accounting_is_scoped() {
+        return None;
+    }
     record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
 }
 
@@ -288,10 +374,17 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub(crate) fn settle_provider_attempts(
+pub(crate) async fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
-) {
+) -> anyhow::Result<()> {
+    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    {
+        return accounting.settle(attempts.to_vec(), accepted_attempt).await;
+    }
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -301,6 +394,7 @@ pub(crate) fn settle_provider_attempts(
             updates_context_window_fill,
         );
     }
+    Ok(())
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -482,6 +576,60 @@ mod tests {
         Mutex::new(HashSet::new())
     }
 
+    #[derive(Default)]
+    struct GoalAccountingRecorder {
+        requests: Mutex<Vec<GoalOperationRequest>>,
+        settlements: Mutex<Vec<(usize, Option<usize>)>>,
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for GoalAccountingRecorder {
+        async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()> {
+            self.requests.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            attempts: Vec<zeroclaw_providers::dispatch::AccountedAttempt>,
+            accepted_attempt: Option<usize>,
+        ) -> anyhow::Result<()> {
+            self.settlements
+                .lock()
+                .push((attempts.len(), accepted_attempt));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_goal_accounting_admits_then_settles_the_operation() {
+        let recorder = Arc::new(GoalAccountingRecorder::default());
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&recorder) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    admit_goal_operation_if_scoped(GoalOperationRequest {
+                        model_provider: "provider.test".into(),
+                        model: "model-test".into(),
+                        temperature: Some(0.2),
+                        thinking: None,
+                        messages: vec![ChatMessage::user("goal")],
+                        tools: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                    settle_provider_attempts(&[], None).await.unwrap();
+                },
+            )
+            .await;
+
+        let requests = recorder.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_provider, "provider.test");
+        assert_eq!(requests[0].messages[0].content, "goal");
+        assert_eq!(recorder.settlements.lock().as_slice(), &[(0, None)]);
+    }
+
     #[tokio::test]
     async fn settlement_uses_exact_attempt_routes_models_and_record_order() {
         let workspace = tempfile::TempDir::new().unwrap();
@@ -556,7 +704,9 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), None);
+                settle_provider_attempts(report.attempts(), None)
+                    .await
+                    .unwrap();
             })
             .await;
 
