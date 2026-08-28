@@ -4,6 +4,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
+use zeroclaw_api::tool::ToolSpec;
 use zeroclaw_providers::ChatMessage;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -243,6 +244,37 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
 }
 
+/// Estimate the provider-neutral input tokens for the concrete request shape.
+///
+/// Native tool schemas are transmitted separately from messages. Convert their
+/// canonical JSON representation with the same four-bytes-per-token heuristic
+/// used for history, then include a small per-tool framing allowance. Text-tool
+/// callers pass `None` because their instructions are already in `messages`.
+pub(crate) fn estimate_model_request_input_tokens(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSpec]>,
+) -> Result<u64> {
+    let message_tokens = u64::try_from(estimate_history_tokens(messages))
+        .map_err(|_| anyhow::anyhow!("model request message estimate exceeds u64"))?;
+
+    tools
+        .unwrap_or_default()
+        .iter()
+        .try_fold(message_tokens, |total, tool| {
+            let serialized = serde_json::to_vec(tool)
+                .map_err(|error| anyhow::Error::new(error).context("serialize native tool spec"))?;
+            let bytes = u64::try_from(serialized.len())
+                .map_err(|_| anyhow::anyhow!("native tool spec length exceeds u64"))?;
+            let tool_tokens = bytes
+                .div_ceil(4)
+                .checked_add(4)
+                .ok_or_else(|| anyhow::anyhow!("native tool token estimate overflows"))?;
+            total
+                .checked_add(tool_tokens)
+                .ok_or_else(|| anyhow::anyhow!("model request token estimate overflows"))
+        })
+}
+
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     history
         .iter()
@@ -432,6 +464,33 @@ pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_model_request_input_counts_messages_and_transmitted_native_tools() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec::new(
+            "weather",
+            "Fetch current weather.",
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        )];
+
+        let message_tokens = u64::try_from(estimate_history_tokens(&messages)).unwrap();
+        let tool_bytes = u64::try_from(serde_json::to_vec(&tools[0]).unwrap().len()).unwrap();
+        let expected = message_tokens + tool_bytes.div_ceil(4) + 4;
+
+        assert_eq!(
+            estimate_model_request_input_tokens(&messages, Some(&tools)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            estimate_model_request_input_tokens(&messages, None).unwrap(),
+            message_tokens
+        );
+        assert_eq!(
+            estimate_model_request_input_tokens(&messages, Some(&[])).unwrap(),
+            message_tokens
+        );
+    }
 
     /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
     #[allow(deprecated)]
