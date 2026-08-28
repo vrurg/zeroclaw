@@ -880,23 +880,31 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             let text = self
                 .chat_with_history(&modified_messages, model, temperature)
                 .await?;
-            return Ok(ChatResponse {
+            let response = ChatResponse {
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
-            });
+            };
+            if response.is_semantically_empty_terminal() {
+                return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+            }
+            return Ok(response);
         }
 
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        if response.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(response)
     }
 
     /// Whether model_provider supports native tool calls over API.
@@ -924,12 +932,16 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-        })
+        };
+        if response.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(response)
     }
 
     /// Whether model_provider supports streaming responses.
@@ -1166,11 +1178,12 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::ModelProvider;
+    use super::{ChatMessage, ChatRequest, ModelProvider, SemanticEmptyTerminalCompletion};
     use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use async_trait::async_trait;
 
     struct NativeAccessorOnlyProvider;
+    struct LegacyTextProvider(&'static str);
 
     impl Attributable for NativeAccessorOnlyProvider {
         fn role(&self) -> Role {
@@ -1179,6 +1192,16 @@ mod capability_tests {
 
         fn alias(&self) -> &str {
             "native_accessor_only"
+        }
+    }
+
+    impl Attributable for LegacyTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "legacy_text"
         }
     }
 
@@ -1199,6 +1222,19 @@ mod capability_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for LegacyTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
     #[test]
     fn model_capabilities_preserve_native_accessor_overrides() {
         let provider = NativeAccessorOnlyProvider;
@@ -1213,6 +1249,41 @@ mod capability_tests {
                 .native_tool_calling,
             "model-aware capability lookup must preserve legacy supports_native_tools overrides"
         );
+    }
+
+    #[tokio::test]
+    async fn default_structured_methods_reject_legacy_semantic_empty_text() {
+        for text in ["", "<think>internal</think>"] {
+            let provider = LegacyTextProvider(text);
+            let messages = [ChatMessage::user("hello")];
+            let request = ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+
+            let error = provider
+                .chat(request, "test", None)
+                .await
+                .expect_err("legacy semantic-empty output must not become a structured success");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+
+            let error = provider
+                .chat_with_tools(&messages, &[], "test", None)
+                .await
+                .expect_err(
+                    "legacy semantic-empty tool output must not become a structured success",
+                );
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+        }
     }
 }
 

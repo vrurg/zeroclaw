@@ -8,7 +8,9 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
     TokenUsage,
 };
-use crate::terminal::{TerminalRecoveryDisposition, terminal_completion_context};
+use crate::terminal::{
+    TerminalRecoveryDisposition, default_terminal_policy, terminal_completion_context,
+};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
@@ -1119,6 +1121,14 @@ fn terminal_recovery_disposition(error: &anyhow::Error) -> Option<TerminalRecove
             zeroclaw_api::model_provider::semantic_empty_terminal_failure(error)
                 .filter(|failure| !failure.is_replayable())
                 .map(|_| TerminalRecoveryDisposition::NoReplay)
+        })
+        // Public provider implementations may return the stable terminal
+        // failure directly instead of the internal policy context. Retain the
+        // conservative default policy rather than treating an already-complete
+        // request as an ordinary transport retry.
+        .or_else(|| {
+            zeroclaw_api::model_provider::terminal_completion_error(error)
+                .map(|reason| default_terminal_policy(reason).recovery())
         })
 }
 
@@ -4029,6 +4039,12 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    /// Emits the stable public terminal failure without the private policy
+    /// context. Reliable must still apply the default terminal policy.
+    struct RawTerminalFailureMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     /// Emits a completed empty outcome that is explicitly ineligible for
     /// retry or fallback because replay could duplicate provider-side work.
     struct NoReplaySemanticEmptyMock {
@@ -4081,6 +4097,15 @@ mod tests {
         )
     }
 
+    fn raw_output_limit_terminal_error() -> anyhow::Error {
+        anyhow::Error::new(
+            zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                None,
+            ),
+        )
+    }
+
     fn no_replay_semantic_empty_error() -> anyhow::Error {
         anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(None),
@@ -4106,6 +4131,34 @@ mod tests {
             } else {
                 Ok(self.response.to_string())
             }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RawTerminalFailureMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(raw_output_limit_terminal_error())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RawTerminalFailureMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RawTerminalFailureMock"
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for EmptyThenTextMock {
@@ -5120,6 +5173,35 @@ mod tests {
         (reliable, primary_calls, fallback_calls)
     }
 
+    fn reliable_with_raw_output_limit_primary()
+    -> (ReliableModelProvider, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(RawTerminalFailureMock {
+                        calls: Arc::clone(&primary_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        (reliable, primary_calls, fallback_calls)
+    }
+
     fn assert_terminal_fallback_calls(primary: &AtomicUsize, fallback: &AtomicUsize) {
         assert_eq!(
             primary.load(Ordering::SeqCst),
@@ -5201,6 +5283,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_recovery_disposition_uses_default_for_raw_terminal_reason() {
+        let error = anyhow::Error::new(
+            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+        );
+
+        assert_eq!(
+            terminal_recovery_disposition(&error),
+            Some(TerminalRecoveryDisposition::NextCandidate)
+        );
+    }
+
     #[tokio::test]
     async fn chat_with_system_terminal_next_candidate_skips_primary_retries() {
         let (reliable, primary, fallback) = reliable_with_output_limit_primary();
@@ -5261,6 +5355,63 @@ mod tests {
             .expect("a later candidate must recover the terminal outcome");
 
         assert_eq!(response.text.as_deref(), Some("recovered"));
+        assert_terminal_fallback_calls(&primary, &fallback);
+    }
+
+    #[tokio::test]
+    async fn raw_terminal_failure_uses_default_policy_in_every_chat_entrypoint() {
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (reliable, primary, fallback) = reliable_with_raw_output_limit_primary();
+        assert_eq!(
+            reliable
+                .chat_with_system(None, "hello", "test", Some(0.0))
+                .await
+                .expect("raw terminal failure must advance"),
+            "recovered"
+        );
+        assert_terminal_fallback_calls(&primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_raw_output_limit_primary();
+        assert_eq!(
+            reliable
+                .chat_with_history(&messages, "test", Some(0.0))
+                .await
+                .expect("raw terminal failure must advance"),
+            "recovered"
+        );
+        assert_terminal_fallback_calls(&primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_raw_output_limit_primary();
+        assert_eq!(
+            reliable
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+                .expect("raw terminal failure must advance")
+                .text
+                .as_deref(),
+            Some("recovered")
+        );
+        assert_terminal_fallback_calls(&primary, &fallback);
+
+        let (reliable, primary, fallback) = reliable_with_raw_output_limit_primary();
+        assert_eq!(
+            reliable
+                .chat_with_tools(&messages, &[], "test", Some(0.0))
+                .await
+                .expect("raw terminal failure must advance")
+                .text
+                .as_deref(),
+            Some("recovered")
+        );
         assert_terminal_fallback_calls(&primary, &fallback);
     }
 

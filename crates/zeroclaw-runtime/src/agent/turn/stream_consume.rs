@@ -86,23 +86,35 @@ pub(crate) async fn consume_provider_streaming_response(
             // fallback even though the user saw no text. Guard so empty text is
             // never counted as visible output.
             if !visible.is_empty() {
-                if event_tx.is_some() || delta_sender.is_some() {
-                    outcome.forwarded_visible_text.push_str(&visible);
-                }
+                let mut delivered_live = false;
                 if let Some(tx) = event_tx {
-                    outcome.forwarded_live_deltas = true;
-                    forward_visible!(@count $count_visible, visible);
-                    let _ = tx
+                    if tx
                         .send(TurnEvent::Chunk {
                             delta: visible.clone(),
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        outcome.forwarded_live_deltas = true;
+                        delivered_live = true;
+                        forward_visible!(@count $count_visible, visible);
+                    }
                 }
                 if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(visible)).await.is_err() {
+                    if tx.send(StreamDelta::Text(visible.clone())).await.is_ok() {
+                        outcome.forwarded_live_deltas = true;
+                        delivered_live = true;
+                    } else {
                         delta_sender = None;
                     }
+                }
+                // This buffer is used only to avoid duplicating successfully
+                // delivered live text on a later successful final response.
+                // It may include mutable drafts; interruption persistence
+                // below uses `forwarded_text`, which records only successful
+                // immutable Chunk events.
+                if delivered_live {
+                    outcome.forwarded_visible_text.push_str(&visible);
                 }
             }
         }};
@@ -156,31 +168,40 @@ pub(crate) async fn consume_provider_streaming_response(
                     zeroclaw_api::model_provider::semantic_empty_terminal_failure(&err)
                 {
                     let usage = outcome.usage.clone().or_else(|| failure.usage.clone());
+                    if visible_event_output {
+                        let failure = if failure.has_pre_executed_tool_activity() {
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(usage)
+                        } else {
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(usage)
+                        };
+                        return Err(StreamInterruptedAfterOutput::semantic_empty(
+                            forwarded_text,
+                            failure,
+                        )
+                        .into());
+                    }
                     if failure.has_pre_executed_tool_activity() {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse { usage }.into());
                     }
                     return Err(StreamSemanticEmptyCompletion {
                         usage,
-                        replayable: failure.is_replayable(),
+                        replayable: failure.is_replayable() && outcome.tool_calls.is_empty(),
                     }
                     .into());
                 }
                 if let Some(failure) =
                     zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
                 {
-                    if visible_event_output || !outcome.forwarded_visible_text.is_empty() {
-                        let partial_text = if forwarded_text.is_empty() {
-                            outcome.forwarded_visible_text.clone()
-                        } else {
-                            forwarded_text
-                        };
+                    if visible_event_output {
                         let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
                             failure.reason,
                             outcome.usage.clone().or(failure.usage),
                         );
-                        return Err(
-                            StreamInterruptedAfterOutput::terminal(partial_text, failure).into(),
-                        );
+                        return Err(StreamInterruptedAfterOutput::terminal(
+                            forwarded_text,
+                            failure,
+                        )
+                        .into());
                     }
                     if outcome.saw_pre_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
@@ -203,6 +224,41 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
 
                 let message = format!("model_provider stream error: {err}");
+                if visible_event_output {
+                    // Preserve only the immutable prefix that the caller
+                    // actually received, even when a client tool call also
+                    // makes replay ineligible.
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamInterruptedAfterOutput::semantic_empty(
+                            forwarded_text,
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(outcome.usage),
+                        )
+                        .into());
+                    }
+                    return Err(StreamInterruptedAfterOutput::transport(
+                        forwarded_text,
+                        message,
+                        outcome.usage,
+                    )
+                    .into());
+                }
+                if !outcome.tool_calls.is_empty() {
+                    // A client tool call has already advanced the turn. This
+                    // defense protects direct or legacy providers that report
+                    // a generic stream error instead of a typed no-replay
+                    // terminal failure after emitting that call.
+                    return Err(StreamTerminalCompletion {
+                        failure: zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason,
+                            outcome.usage,
+                        ),
+                        policy: zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            zeroclaw_providers::TerminalUsageChargeability::Billable,
+                        ),
+                    }
+                    .into());
+                }
                 if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
                     return Err(StreamInterruptedAfterOutput::transport(
                         forwarded_text,
@@ -215,18 +271,6 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamPreExecutedToolsWithoutFinalResponse {
                         usage: outcome.usage,
                     }
-                    .into());
-                }
-                if visible_event_output {
-                    // Persist only what the consumer actually saw
-                    // (`forwarded_text`), never the raw accumulated text —
-                    // that includes guard-withheld protocol fragments and
-                    // suppression-buffered output nobody received.
-                    return Err(StreamInterruptedAfterOutput::transport(
-                        forwarded_text,
-                        message,
-                        outcome.usage,
-                    )
                     .into());
                 }
                 return Err(StreamErrorWithUsage {
@@ -254,15 +298,17 @@ pub(crate) async fn consume_provider_streaming_response(
                     .entry(name.clone())
                     .or_default()
                     .push_back(id.clone());
-                if let Some(tx) = event_tx {
-                    visible_event_output = true;
-                    let _ = tx
+                if let Some(tx) = event_tx
+                    && tx
                         .send(TurnEvent::ToolCall {
                             id,
                             name,
                             args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                {
+                    visible_event_output = true;
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
@@ -271,16 +317,18 @@ pub(crate) async fn consume_provider_streaming_response(
                     .get_mut(&name)
                     .and_then(|ids| ids.pop_front())
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
-                if let Some(tx) = event_tx {
-                    visible_event_output = true;
-                    let _ = tx
+                if let Some(tx) = event_tx
+                    && tx
                         .send(TurnEvent::ToolResult {
                             id,
                             name,
                             output,
                             artifact: None,
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                {
+                    visible_event_output = true;
                 }
             }
             StreamEvent::TextDelta(chunk) => {
@@ -295,13 +343,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
-                    if let Some(tx) = event_tx {
-                        visible_event_output = true;
-                        let _ = tx
+                    if let Some(tx) = event_tx
+                        && tx
                             .send(TurnEvent::Thinking {
                                 delta: reasoning.to_string(),
                             })
-                            .await;
+                            .await
+                            .is_ok()
+                    {
+                        visible_event_output = true;
                     }
                 }
 
@@ -404,8 +454,12 @@ mod tests {
     };
 
     struct ToolThenTextProvider;
+    struct ToolThenGenericErrorProvider;
+    struct SemanticEmptyAfterTextProvider;
 
     struct EmptyStreamProvider;
+    struct ProviderToolThenVisibleFailureProvider;
+    struct TerminalAfterTextProvider;
     struct ReasoningProvider;
     struct CancelAfterUsageProvider {
         cancellation: CancellationToken,
@@ -425,6 +479,34 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenGenericErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolThenGenericErrorProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SemanticEmptyAfterTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SemanticEmptyAfterTextProvider"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for EmptyStreamProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -436,6 +518,34 @@ mod tests {
 
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ProviderToolThenVisibleFailureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ProviderToolThenVisibleFailureProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalAfterTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalAfterTextProvider"
         }
     }
 
@@ -529,6 +639,79 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelProvider for ToolThenGenericErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "noop".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                })),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "stream broke".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptyAfterTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))),
+                Err(zeroclaw_api::model_provider::StreamError::SemanticEmpty(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(None),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
     impl ModelProvider for EmptyStreamProvider {
         async fn chat_with_system(
             &self,
@@ -561,6 +744,87 @@ mod tests {
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ProviderToolThenVisibleFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                })),
+                Ok(StreamEvent::PreExecutedToolCall {
+                    name: "search".to_string(),
+                    args: "{}".to_string(),
+                }),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "visible partial",
+                ))),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "upstream failed".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalAfterTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("internal"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("draft text"))),
+                Err(
+                    zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                        zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                            None,
+                        ),
+                    ),
+                ),
+            ]))
         }
     }
 
@@ -741,6 +1005,166 @@ mod tests {
             err.downcast_ref::<StreamSemanticEmptyCompletion>()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn generic_error_after_client_tool_call_is_no_replay_terminal_failure() {
+        let error = consume_provider_streaming_response(
+            &ToolThenGenericErrorProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("client tool followed by a generic error must not replay");
+
+        let terminal = error
+            .downcast_ref::<StreamTerminalCompletion>()
+            .expect("client-tool boundary must use typed terminal failure");
+        assert_eq!(
+            terminal.failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            terminal.policy.recovery(),
+            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_empty_after_visible_chunk_preserves_no_replay_partial() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &SemanticEmptyAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("visible text must prevent semantic-empty replay");
+
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("immutable output must retain its partial prefix");
+        assert_eq!(interrupted.partial_text, "visible");
+        assert!(
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+                .is_some_and(|failure| !failure.is_replayable())
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TurnEvent::Chunk { delta }) if delta == "visible"
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_tool_failure_after_visible_text_preserves_partial_output() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &ProviderToolThenVisibleFailureProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("provider-tool stream failure must remain non-replayable");
+
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("visible partial output must use the interruption outcome");
+        assert_eq!(interrupted.partial_text, "visible partial");
+        assert_eq!(
+            interrupted.usage().and_then(|usage| usage.output_tokens),
+            Some(5)
+        );
+        assert!(
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+                .is_some_and(|failure| failure.has_pre_executed_tool_activity()),
+            "the partial-output wrapper must retain the no-replay semantic-empty cause"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Chunk { delta } if delta == "visible partial"
+        )));
+    }
+
+    #[tokio::test]
+    async fn draft_only_text_does_not_disable_terminal_recovery() {
+        let (draft_tx, mut draft_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &TerminalAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&draft_tx),
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("the terminal failure must surface");
+
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a mutable draft is not an immutable persisted prefix"
+        );
+        assert!(error.downcast_ref::<StreamTerminalCompletion>().is_some());
+        assert!(matches!(
+            draft_rx.try_recv(),
+            Ok(StreamDelta::Text(text)) if text == "draft text"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_event_send_does_not_create_a_persisted_prefix() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        drop(event_rx);
+        let error = consume_provider_streaming_response(
+            &TerminalAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("the terminal failure must surface");
+
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a failed immutable send cannot become a persisted prefix"
+        );
+        assert!(error.downcast_ref::<StreamTerminalCompletion>().is_some());
     }
 
     #[tokio::test]

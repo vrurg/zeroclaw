@@ -56,6 +56,7 @@ enum StreamInterruptionCause {
         usage: Option<zeroclaw_providers::traits::TokenUsage>,
     },
     Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
+    SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
 }
 
 impl StreamInterruptedAfterOutput {
@@ -80,10 +81,27 @@ impl StreamInterruptedAfterOutput {
         }
     }
 
+    /// Preserve a semantic-empty terminal cause when text was already shown.
+    ///
+    /// This is deliberately distinct from a transport interruption: the
+    /// immutable prefix prevents replay, while the error chain still tells
+    /// delivery and accounting that the provider completed without a final
+    /// response after provider-side work.
+    pub(crate) fn semantic_empty(
+        partial_text: String,
+        failure: zeroclaw_api::model_provider::SemanticEmptyTerminalFailure,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::SemanticEmpty(failure),
+        }
+    }
+
     pub(crate) fn usage(&self) -> Option<&zeroclaw_providers::traits::TokenUsage> {
         match &self.cause {
             StreamInterruptionCause::Transport { usage, .. } => usage.as_ref(),
             StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
+            StreamInterruptionCause::SemanticEmpty(failure) => failure.usage.as_ref(),
         }
     }
 }
@@ -93,6 +111,7 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
         match &self.cause {
             StreamInterruptionCause::Transport { message, .. } => f.write_str(message),
             StreamInterruptionCause::Terminal(failure) => failure.fmt(f),
+            StreamInterruptionCause::SemanticEmpty(failure) => failure.fmt(f),
         }
     }
 }
@@ -102,6 +121,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
         match &self.cause {
             StreamInterruptionCause::Transport { .. } => None,
             StreamInterruptionCause::Terminal(failure) => Some(failure),
+            StreamInterruptionCause::SemanticEmpty(failure) => Some(failure),
         }
     }
 }
