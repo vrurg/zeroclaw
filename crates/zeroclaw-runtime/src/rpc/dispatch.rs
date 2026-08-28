@@ -8081,10 +8081,11 @@ mod tests {
             "the injected fault must fire inside alias-rename persistence"
         );
 
-        let live = dispatcher.ctx.config.read();
-        assert!(!live.agents.contains_key("alpha"));
-        assert!(live.agents.contains_key("beta"));
-        drop(live);
+        {
+            let live = dispatcher.ctx.config.read();
+            assert!(!live.agents.contains_key("alpha"));
+            assert!(live.agents.contains_key("beta"));
+        }
 
         let disk = tokio::fs::read_to_string(&config_path)
             .await
