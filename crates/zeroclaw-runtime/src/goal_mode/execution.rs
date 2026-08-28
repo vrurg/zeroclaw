@@ -431,6 +431,7 @@ impl GoalExecutionDriver {
                     lease.run_verifier(
                         GoalVerifierTurn {
                             objective: goal.objective.clone(),
+                            success_criteria: goal.success_criteria.clone(),
                             candidate: parent.candidate.clone(),
                         },
                         scope.cancellation.child_token(),
@@ -559,6 +560,9 @@ fn goal_usage_from_attempt(
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> anyhow::Result<CostTokenUsage> {
+    if provider_ref.trim().is_empty() || model.trim().is_empty() {
+        anyhow::bail!("goal usage is missing actual provider or model attribution");
+    }
     let input = usage
         .input_tokens
         .context("goal usage is missing input tokens")?;
@@ -838,6 +842,13 @@ mod tests {
             cached_input_tokens: Some(2),
         };
         assert!(goal_usage_from_attempt(&config, "provider", "model", &inconsistent).is_err());
+        let valid = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cached_input_tokens: None,
+        };
+        assert!(goal_usage_from_attempt(&config, "", "model", &valid).is_err());
+        assert!(goal_usage_from_attempt(&config, "provider", "", &valid).is_err());
     }
 
     struct UnaccountedAdapter;

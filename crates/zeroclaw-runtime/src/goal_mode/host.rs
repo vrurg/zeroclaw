@@ -69,6 +69,7 @@ pub struct GoalParentTurnResult {
 #[derive(Debug)]
 pub struct GoalVerifierTurn {
     pub objective: String,
+    pub success_criteria: String,
     pub candidate: String,
 }
 
@@ -274,6 +275,7 @@ mod tests {
             .run_verifier(
                 GoalVerifierTurn {
                     objective: "o".into(),
+                    success_criteria: "c".into(),
                     candidate: result.candidate,
                 },
                 scope.cancellation.clone(),
