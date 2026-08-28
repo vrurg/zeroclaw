@@ -255,7 +255,7 @@ pub(crate) fn estimate_model_request_input_tokens(
     tools: Option<&[ToolSpec]>,
 ) -> Result<u64> {
     let message_tokens = u64::try_from(estimate_history_tokens(messages))
-        .map_err(|_| anyhow::anyhow!("model request message estimate exceeds u64"))?;
+        .map_err(|_| anyhow::Error::msg("model request message estimate exceeds u64"))?;
 
     tools
         .unwrap_or_default()
@@ -264,14 +264,14 @@ pub(crate) fn estimate_model_request_input_tokens(
             let serialized = serde_json::to_vec(tool)
                 .map_err(|error| anyhow::Error::new(error).context("serialize native tool spec"))?;
             let bytes = u64::try_from(serialized.len())
-                .map_err(|_| anyhow::anyhow!("native tool spec length exceeds u64"))?;
+                .map_err(|_| anyhow::Error::msg("native tool spec length exceeds u64"))?;
             let tool_tokens = bytes
                 .div_ceil(4)
                 .checked_add(4)
-                .ok_or_else(|| anyhow::anyhow!("native tool token estimate overflows"))?;
+                .ok_or_else(|| anyhow::Error::msg("native tool token estimate overflows"))?;
             total
                 .checked_add(tool_tokens)
-                .ok_or_else(|| anyhow::anyhow!("model request token estimate overflows"))
+                .ok_or_else(|| anyhow::Error::msg("model request token estimate overflows"))
         })
 }
 

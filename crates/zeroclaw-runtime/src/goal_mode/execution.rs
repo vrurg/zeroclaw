@@ -40,6 +40,9 @@ struct ActiveGoalOperation {
     _permit: OwnedSemaphorePermit,
 }
 
+type GoalWorkerKey = (String, i64);
+type GoalWorkerMap = HashMap<GoalWorkerKey, tokio::task::JoinHandle<()>>;
+
 /// Goal-only controller for one execution epoch's logical provider operations.
 ///
 /// It is installed task-locally around the existing session turn by the Goal
@@ -327,7 +330,7 @@ pub struct GoalExecutionDriver {
     goals: Arc<dyn GoalTaskRegistry>,
     config: Arc<Config>,
     cost_tracker: Arc<CostTracker>,
-    workers: Arc<Mutex<HashMap<(String, i64), tokio::task::JoinHandle<()>>>>,
+    workers: Arc<Mutex<GoalWorkerMap>>,
 }
 
 impl GoalExecutionDriver {

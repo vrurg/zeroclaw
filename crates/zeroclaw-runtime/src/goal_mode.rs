@@ -950,7 +950,7 @@ impl GoalRuntime {
                 ingress.principal_id.clone(),
             )
             .map_err(|_| {
-                GoalRuntimeError::control_plane(anyhow::anyhow!("invalid Goal binding"))
+                GoalRuntimeError::control_plane(anyhow::Error::msg("invalid Goal binding"))
             })?,
             operation_permit: Arc::new(Semaphore::new(1)),
             execution_epoch: epoch,
