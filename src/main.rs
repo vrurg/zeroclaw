@@ -11179,7 +11179,8 @@ mod tests {
     #[tokio::test]
     async fn kernel_agent_provider_construction_resolves_anthropic_oauth_alias() {
         use crate::config::schema::{
-            AliasedAgentConfig, AnthropicModelProviderConfig, AuthMode, ModelProviderConfig,
+            AliasedAgentConfig, AnthropicAuthMode, AnthropicModelProviderConfig,
+            ModelProviderConfig,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -11196,7 +11197,7 @@ mod tests {
                     model: Some("claude-sonnet-4-5".to_string()),
                     ..Default::default()
                 },
-                auth_mode: Some(AuthMode::OAuth),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
             },
         );
         config.agents.insert(
