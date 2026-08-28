@@ -731,7 +731,13 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider};
     use zeroclaw_config::{cost::CostTracker, schema::Config};
+    use zeroclaw_providers::{
+        ProviderDispatch,
+        dispatch::{AccountedChatScope, with_exact_dispatch_route},
+    };
 
     use super::{
         GoalExecutionDriver, VerifierOutcome, goal_usage_from_attempt, parse_verifier_response,
@@ -749,6 +755,44 @@ mod tests {
             },
         },
     };
+
+    struct AccountedLeaf;
+
+    impl Attributable for AccountedLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "accounted-leaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AccountedLeaf {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(2),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
 
     #[test]
     fn verifier_protocol_rejects_unknown_fields_and_invalid_blockers() {
@@ -935,5 +979,120 @@ mod tests {
                 .as_deref(),
             Some("goal_parent_accounting_missing")
         );
+    }
+
+    #[tokio::test]
+    async fn accounted_attempt_clears_pending_and_persists_task_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            goals
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let tracker = Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap());
+        let scope = GoalExecutionScope {
+            task_id: "goal".into(),
+            session_id: "session".into(),
+            binding: GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None)
+                .unwrap(),
+            operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            execution_epoch: 1,
+            turn_kind: GoalTurnKind::Start,
+            cancellation: CancellationToken::new(),
+        };
+        let accountant = Arc::new(super::GoalOperationAccountant::new(
+            goals,
+            Arc::new(Config::default()),
+            Arc::clone(&tracker),
+            scope,
+            "main".into(),
+        ));
+        let messages = vec![zeroclaw_api::model_provider::ChatMessage::user("goal")];
+        crate::agent::cost::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(
+                    Arc::clone(&accountant) as Arc<dyn crate::agent::cost::GoalOperationAccounting>
+                ),
+                async {
+                    crate::agent::cost::admit_goal_operation_if_scoped(
+                        crate::agent::cost::GoalOperationRequest {
+                            model_provider: "provider.test".into(),
+                            model: "model-test".into(),
+                            temperature: None,
+                            thinking: None,
+                            messages: messages.clone(),
+                            tools: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let provider = AccountedLeaf;
+                    let accounting = AccountedChatScope::new();
+                    let response = accounting
+                        .scope(with_exact_dispatch_route(
+                            "provider.test".into(),
+                            "model-test".into(),
+                            ProviderDispatch::from_ref(&provider).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "model-test",
+                                None,
+                            ),
+                        ))
+                        .await;
+                    assert!(response.is_ok());
+                    accounting.mark_logical_success();
+                    let report = accounting.take();
+                    crate::agent::cost::settle_provider_attempts(report.attempts(), Some(0))
+                        .await
+                        .unwrap();
+                },
+            )
+            .await;
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal")
+                .unwrap(),
+            (3, 0.0, false)
+        );
+        let persisted = store.get_goal_task("goal").await.unwrap().unwrap();
+        assert_eq!(
+            persisted.accounting_state,
+            crate::control_plane::GoalAccountingState::Complete
+        );
+        assert!(persisted.pending_call_id.is_none());
+        assert!(persisted.pending_call_epoch.is_none());
     }
 }
