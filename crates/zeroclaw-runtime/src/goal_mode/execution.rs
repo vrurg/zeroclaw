@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounted_attempt_clears_pending_and_persists_task_usage() {
+    async fn accounted_attempts_clear_pending_and_persist_each_task_usage_event() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -1055,26 +1055,44 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                    let provider = AccountedLeaf;
+                    let first = AccountedLeaf;
+                    let second = AccountedLeaf;
                     let accounting = AccountedChatScope::new();
-                    let response = accounting
+                    let first_response = accounting
                         .scope(with_exact_dispatch_route(
-                            "provider.test".into(),
-                            "model-test".into(),
-                            ProviderDispatch::from_ref(&provider).chat(
+                            "provider.first".into(),
+                            "model-a".into(),
+                            ProviderDispatch::from_ref(&first).chat(
                                 ChatRequest {
                                     messages: &messages,
                                     tools: None,
                                     thinking: None,
                                 },
-                                "model-test",
+                                "model-a",
                                 None,
                             ),
                         ))
                         .await;
-                    assert!(response.is_ok());
+                    assert!(first_response.is_ok());
+                    let second_response = accounting
+                        .scope(with_exact_dispatch_route(
+                            "provider.second".into(),
+                            "model-b".into(),
+                            ProviderDispatch::from_ref(&second).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "model-b",
+                                None,
+                            ),
+                        ))
+                        .await;
+                    assert!(second_response.is_ok());
                     accounting.mark_logical_success();
                     let report = accounting.take();
+                    assert_eq!(report.attempts().len(), 2);
                     crate::agent::cost::settle_provider_attempts(report.attempts(), Some(0))
                         .await
                         .unwrap();
@@ -1085,7 +1103,11 @@ mod tests {
             tracker
                 .get_strict_usage_totals_for_task_with_pricing("goal")
                 .unwrap(),
-            (3, 0.0, false)
+            (6, 0.0, false)
+        );
+        assert_eq!(
+            tracker.get_summary_for_task("goal").unwrap().request_count,
+            2
         );
         let persisted = store.get_goal_task("goal").await.unwrap().unwrap();
         assert_eq!(
