@@ -1614,17 +1614,18 @@ mod tests {
             goal.success_criteria,
             "the reported answer meets the stated objective"
         );
-        let launches = executor.launches.lock();
-        assert_eq!(launches.len(), 1);
-        assert_eq!(launches[0].binding.session_id, "session");
-        assert_eq!(launches[0].binding.agent, "main");
-        assert_eq!(launches[0].binding.route, "room");
-        assert_eq!(
-            launches[0].binding.principal_id.as_deref(),
-            Some("principal")
-        );
-        assert_eq!(launches[0].operation_permit.available_permits(), 1);
-        drop(launches);
+        {
+            let launches = executor.launches.lock();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].binding.session_id, "session");
+            assert_eq!(launches[0].binding.agent, "main");
+            assert_eq!(launches[0].binding.route, "room");
+            assert_eq!(
+                launches[0].binding.principal_id.as_deref(),
+                Some("principal")
+            );
+            assert_eq!(launches[0].operation_permit.available_permits(), 1);
+        }
         assert_eq!(
             runtime
                 .submit(ingress(), start_command())
