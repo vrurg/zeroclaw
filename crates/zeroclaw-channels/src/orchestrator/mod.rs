@@ -6457,7 +6457,7 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
-    if ctx.prompt_config.channels.session_prompts_enabled {
+    let session_prompt_attachments = if ctx.prompt_config.channels.session_prompts_enabled {
         let prompt_result = match ctx.session_store.as_ref() {
             Some(backend) => backend.list_session_prompts(&history_key),
             None => Err(std::io::Error::other(
@@ -6465,45 +6465,7 @@ async fn process_channel_message_body(
             )),
         };
         match prompt_result {
-            Ok(prompts) => {
-                let attachments = zeroclaw_infra::session_prompts::render_session_prompts(&prompts);
-                // Attachments are loaded once for this primary channel turn.
-                // Tool mutations intentionally affect the next turn only. The
-                // helper also caps the completed host prompt when this session
-                // has no attachments.
-                let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
-                if append_session_prompts_to_channel_system_prompt(
-                    &mut system_prompt,
-                    &attachments,
-                    max,
-                )
-                .is_err()
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
-                        "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
-                    );
-                    if let Some(channel) = target_channel.as_ref() {
-                        let message = channel_runtime_cli_string(
-                            "channel-runtime-session-prompt-budget-exceeded",
-                        );
-                        let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
-                    }
-                    rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
-                    reconcile_early_ack(
-                        ctx.as_ref(),
-                        &msg,
-                        target_channel.as_ref(),
-                        early_ack_task,
-                        Some("\u{26A0}\u{FE0F}"),
-                    )
-                    .await;
-                    return;
-                }
-            }
+            Ok(prompts) => zeroclaw_infra::session_prompts::render_session_prompts(&prompts),
             Err(error) => {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -6529,7 +6491,9 @@ async fn process_channel_message_body(
                 return;
             }
         }
-    }
+    } else {
+        String::new()
+    };
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -6549,6 +6513,40 @@ async fn process_channel_message_body(
     // user turn instead, matching the CLI shape.
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+    // Attachments are loaded before this turn begins, but appended only after
+    // every host-authored channel addition so they remain a complete trailing
+    // section inside the final provider-bound budget.
+    let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+    if append_session_prompts_to_channel_system_prompt(
+        &mut system_prompt,
+        &session_prompt_attachments,
+        max,
+    )
+    .is_err()
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"max_system_prompt_chars": max})),
+            "Persistent session prompts exceed the system prompt budget; refusing to dispatch without them"
+        );
+        if let Some(channel) = target_channel.as_ref() {
+            let message =
+                channel_runtime_cli_string("channel-runtime-session-prompt-budget-exceeded");
+            let _ = channel.send(&SendMessage::reply_to(&msg, message)).await;
+        }
+        rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+        reconcile_early_ack(
+            ctx.as_ref(),
+            &msg,
+            target_channel.as_ref(),
+            early_ack_task,
+            Some("\u{26A0}\u{FE0F}"),
+        )
+        .await;
+        return;
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -33804,13 +33802,16 @@ Done."#;
     }
 
     #[test]
-    fn channel_session_prompt_attachments_reserve_the_exact_cap() {
+    fn channel_session_prompt_attachments_reserve_the_exact_final_cap() {
         let attachments = "## Session Prompts\n- id: \"task\"; content: \"persisted\"\n";
-        let mut prompt = "host context ".repeat(64);
+        let host_context = "host context ".repeat(64);
+        let peer_map = "Current-channel peer map for agent \"main\"";
+        let thinking_prefix = "Think step by step.";
+        let mut prompt = format!("{thinking_prefix}\n\n{host_context}\n\n{peer_map}");
         let max = prompt.len();
 
         append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
-            .expect("a fitting attachment must reserve host prompt budget");
+            .expect("a fitting attachment must reserve the completed host prompt budget");
 
         assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
         assert!(prompt.contains("content: \"persisted\""));
