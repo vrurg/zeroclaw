@@ -13149,7 +13149,7 @@ Let me check the result."#;
             "Native prompt with effective native specs must not deny tool availability"
         );
         assert!(
-            system_prompt.contains("Use tools when the request requires action"),
+            system_prompt.contains("Use tools when this request needs it"),
             "Native prompt with effective native specs should authorize action tool use"
         );
     }
