@@ -65,17 +65,29 @@ pub struct GoalParentTurnResult {
     pub working_transcript: Vec<ChatMessage>,
 }
 
-/// The final result of one accounted parent operation.
+/// Isolated verifier input. Session history, tools, and transport authority
+/// are intentionally absent from this controller-owned protocol.
+#[derive(Debug)]
+pub struct GoalVerifierTurn {
+    pub objective: String,
+    pub success_criteria: String,
+    pub candidate: String,
+}
+
+/// The final result of one accounted Goal model operation.
 ///
 /// The report belongs to the same high-level operation as `result`, including
 /// ordinary Reliable retry, fallback, and stream recovery. An error result does
 /// not let the caller discard the report: Goal accounting must settle or fail
 /// closed before it decides how to handle the operation failure.
 #[derive(Debug)]
-pub struct GoalParentTurnOutcome {
-    pub result: Result<GoalParentTurnResult>,
+pub struct GoalOperationOutcome<T> {
+    pub result: Result<T>,
     pub accounting: AccountedCallReport,
 }
+
+pub type GoalParentTurnOutcome = GoalOperationOutcome<GoalParentTurnResult>;
+pub type GoalVerifierTurnOutcome = GoalOperationOutcome<String>;
 
 /// An adapter-owned exclusive foreground lease for one Goal execution epoch.
 ///
@@ -89,6 +101,12 @@ pub trait GoalSessionLease: Send {
         turn: GoalParentTurn,
         cancellation: CancellationToken,
     ) -> GoalParentTurnOutcome;
+
+    async fn run_verifier(
+        &mut self,
+        turn: GoalVerifierTurn,
+        cancellation: CancellationToken,
+    ) -> GoalVerifierTurnOutcome;
 }
 
 #[async_trait]
@@ -171,6 +189,17 @@ mod tests {
                     candidate: "candidate".into(),
                     working_transcript: turn.working_transcript,
                 }),
+                accounting: AccountedCallReport::default(),
+            }
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _: GoalVerifierTurn,
+            _: CancellationToken,
+        ) -> GoalVerifierTurnOutcome {
+            GoalVerifierTurnOutcome {
+                result: Ok(r#"{"decision":"complete","reason":"ok"}"#.into()),
                 accounting: AccountedCallReport::default(),
             }
         }
@@ -257,5 +286,16 @@ mod tests {
         let result = outcome.result.unwrap();
         assert_eq!(result.candidate, "candidate");
         assert_eq!(result.working_transcript.len(), 1);
+        let verifier = lease
+            .run_verifier(
+                GoalVerifierTurn {
+                    objective: "o".into(),
+                    success_criteria: "c".into(),
+                    candidate: result.candidate,
+                },
+                scope.cancellation.clone(),
+            )
+            .await;
+        assert_eq!(verifier.result.unwrap(), r#"{"decision":"complete","reason":"ok"}"#);
     }
 }
