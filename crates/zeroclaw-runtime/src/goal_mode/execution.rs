@@ -725,8 +725,30 @@ fn parse_verifier_response(text: &str) -> anyhow::Result<VerifierOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VerifierOutcome, goal_usage_from_attempt, parse_verifier_response};
-    use zeroclaw_config::schema::Config;
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_config::{cost::CostTracker, schema::Config};
+
+    use super::{
+        GoalExecutionDriver, VerifierOutcome, goal_usage_from_attempt, parse_verifier_response,
+    };
+    use crate::{
+        control_plane::{
+            GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, SqliteTaskStore, TaskKind,
+            TaskRecord, TaskStatus,
+        },
+        goal_mode::{
+            GoalExecutionScope, GoalExecutor, GoalOperationReservation, GoalTurnKind,
+            host::{
+                GoalExecutionHost, GoalHostPreflightError, GoalParentTurn, GoalParentTurnResult,
+                GoalSessionAdapter, GoalSessionBinding, GoalSessionLease, GoalVerifierTurn,
+            },
+        },
+    };
 
     #[test]
     fn verifier_protocol_rejects_unknown_fields_and_invalid_blockers() {
@@ -769,5 +791,149 @@ mod tests {
             cached_input_tokens: Some(2),
         };
         assert!(goal_usage_from_attempt(&config, "provider", "model", &inconsistent).is_err());
+    }
+
+    struct UnaccountedAdapter;
+
+    struct UnaccountedLease;
+
+    #[async_trait]
+    impl GoalSessionAdapter for UnaccountedAdapter {
+        fn owns(&self, _: &GoalSessionBinding) -> bool {
+            true
+        }
+
+        async fn preflight(
+            &self,
+            _: &GoalSessionBinding,
+            _: &crate::goal_mode::GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn acquire(
+            &self,
+            _: &GoalExecutionScope,
+            _: &GoalSessionBinding,
+        ) -> Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(UnaccountedLease))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionLease for UnaccountedLease {
+        async fn run_parent_turn(
+            &mut self,
+            turn: GoalParentTurn,
+            _: CancellationToken,
+        ) -> Result<GoalParentTurnResult> {
+            Ok(GoalParentTurnResult {
+                candidate: "unaccounted candidate".into(),
+                working_transcript: turn.working_transcript,
+            })
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _: GoalVerifierTurn,
+            _: CancellationToken,
+        ) -> Result<String> {
+            Ok(r#"{"decision":"complete","reason":"accepted"}"#.into())
+        }
+
+        async fn append_verified_candidate(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unaccounted_parent_output_fails_without_completing_the_goal() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("route".into()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..GoalTaskRecord::default()
+        };
+        assert_eq!(
+            goals
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let host = Arc::new(GoalExecutionHost::new(vec![Arc::new(UnaccountedAdapter)]));
+        let driver = GoalExecutionDriver::new(
+            host,
+            Arc::clone(&goals),
+            Arc::new(Config::default()),
+            Arc::new(CostTracker::new(Default::default(), directory.path()).unwrap()),
+        );
+        let binding =
+            GoalSessionBinding::new("session".into(), "main".into(), "route".into(), None).unwrap();
+        driver
+            .launch(GoalExecutionScope {
+                task_id: "goal".into(),
+                session_id: "session".into(),
+                binding,
+                operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                execution_epoch: 1,
+                turn_kind: GoalTurnKind::Start,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if store
+                    .current_goal_for_session("session")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unaccounted worker must finish");
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal("goal", "session")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("goal_parent_accounting_missing")
+        );
     }
 }
