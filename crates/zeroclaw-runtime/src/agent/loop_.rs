@@ -5906,7 +5906,8 @@ mod tests {
             "<think>internal reasoning</think><eom><|eom|>",
         ]);
         let mut history = vec![ChatMessage::user("return a final answer".to_string())];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = CapturingObserver::default();
 
         let error = run_tool_call_loop(ToolLoop {
