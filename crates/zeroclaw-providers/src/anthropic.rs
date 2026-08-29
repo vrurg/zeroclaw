@@ -1809,7 +1809,8 @@ impl AnthropicModelProvider {
     ) -> bool {
         !saw_server_tool_activity
             && !saw_client_tool_activity
-            && zeroclaw_tool_call_parser::normalize_terminal_display_text(streamed_text).is_empty()
+            && zeroclaw_api::model_provider::normalize_terminal_display_text(streamed_text)
+                .is_empty()
     }
 
     fn streaming_usage(
@@ -1999,7 +2000,7 @@ impl AnthropicModelProvider {
             // text. Native thinking blocks must remain available for provider
             // continuation, but cannot make a reasoning-only terminal outcome
             // look like caller-visible partial output.
-            let replay_safe = zeroclaw_tool_call_parser::normalize_terminal_display_text(
+            let replay_safe = zeroclaw_api::model_provider::normalize_terminal_display_text(
                 parsed.text.as_deref().unwrap_or_default(),
             )
             .is_empty()
@@ -2814,7 +2815,7 @@ impl AnthropicModelProvider {
                         }
                         if saw_server_tool_activity
                             && !saw_client_tool_activity
-                            && zeroclaw_tool_call_parser::normalize_terminal_display_text(
+                            && zeroclaw_api::model_provider::normalize_terminal_display_text(
                                 &streamed_text,
                             )
                             .is_empty()
