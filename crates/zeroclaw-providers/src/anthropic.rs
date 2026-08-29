@@ -2064,6 +2064,30 @@ impl AnthropicModelProvider {
         Ok(parsed)
     }
 
+    /// A native-thinking request has completed at the provider before this
+    /// parser observes a semantic-empty terminal response. Preserve that fact
+    /// on every non-streaming caller so Reliable never replays completed
+    /// thinking work merely because no final display text was produced.
+    fn preserve_native_thinking_no_replay(error: anyhow::Error) -> anyhow::Error {
+        let Some(failure) =
+            error.downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
+        else {
+            return error;
+        };
+
+        if failure.has_pre_executed_tool_activity() {
+            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(
+                failure.usage.clone(),
+            )
+            .into()
+        } else {
+            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(
+                failure.usage.clone(),
+            )
+            .into()
+        }
+    }
+
     /// Resolve thinking parameters for an API request. Returns the effective
     /// temperature (forced to 1.0 when thinking is active), the thinking
     /// config for the request body, and the effective max_tokens (raised to
@@ -3058,6 +3082,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        let native_thinking = thinking_config.is_some();
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -3102,7 +3127,12 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response)?)
+        let parsed = Self::parse_native_response(native_response);
+        if native_thinking {
+            parsed.map_err(Self::preserve_native_thinking_no_replay)
+        } else {
+            parsed
+        }
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3325,7 +3355,9 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
-                match Self::parse_native_response(parsed) {
+                match Self::parse_native_response(parsed)
+                    .map_err(Self::preserve_native_thinking_no_replay)
+                {
                     Ok(response) => Ok(NativeThinkingStreamOutcome::Response(response)),
                     Err(error) => {
                         if let Some(context) = crate::terminal::terminal_completion_context(&error)
@@ -3336,23 +3368,21 @@ impl ModelProvider for AnthropicModelProvider {
                                 context.policy(),
                             );
                         }
-                        if let Some(failure) = error
+                        if error
                             .downcast_ref::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>()
+                            .is_some()
                         {
                             // Native thinking deliberately uses a non-streaming API call to
                             // preserve signed thinking blocks. It has already completed an HTTP
                             // request, so retain a typed semantic-empty outcome but never replay
                             // that direct request as though it were a failed transport stream.
-                            let failure = if failure.has_pre_executed_tool_activity() {
-                                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(
-                                    failure.usage.clone(),
-                                )
-                            } else {
-                                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(
-                                    failure.usage.clone(),
-                                )
-                            };
-                            Ok(NativeThinkingStreamOutcome::SemanticEmpty(failure))
+                            match error.downcast::<zeroclaw_api::model_provider::SemanticEmptyTerminalFailure>() {
+                                Ok(failure) => Ok(NativeThinkingStreamOutcome::SemanticEmpty(failure)),
+                                Err(error) => Err(zeroclaw_api::model_provider::terminal_completion_failure(&error)
+                                    .cloned()
+                                    .map(StreamError::TerminalCompletion)
+                                    .unwrap_or_else(|| StreamError::ModelProvider(error.to_string()))),
+                            }
                         } else {
                             Err(zeroclaw_api::model_provider::terminal_completion_failure(&error)
                                 .cloned()
@@ -5725,7 +5755,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn native_thinking_semantic_empty_stream_emits_usage_then_no_replay_error() {
+    async fn native_thinking_semantic_empty_stream_and_direct_chat_are_no_replay() {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
@@ -5782,7 +5812,6 @@ data: {\"type\":\"message_stop\"}\n\n";
         while let Some(event) = stream.next().await {
             events.push(event);
         }
-        server.abort();
 
         assert!(matches!(
             events.as_slice(),
@@ -5792,6 +5821,32 @@ data: {\"type\":\"message_stop\"}\n\n";
                     && !failure.is_replayable()
                     && !failure.has_pre_executed_tool_activity()
         ));
+
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
+                        budget_tokens: 1_024,
+                    }),
+                },
+                "claude-sonnet-4-5",
+                Some(1.0),
+            )
+            .await
+            .expect_err("direct native-thinking semantic-empty response must fail");
+        let failure = zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+            .expect("direct response keeps the typed semantic-empty failure");
+        assert!(
+            !failure.is_replayable(),
+            "a completed native-thinking request must never be replayed"
+        );
+        assert_eq!(
+            failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+            Some(3)
+        );
+        server.abort();
     }
 
     #[tokio::test]

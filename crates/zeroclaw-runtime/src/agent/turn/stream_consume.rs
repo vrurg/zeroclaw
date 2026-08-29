@@ -434,7 +434,10 @@ pub(crate) async fn consume_provider_streaming_response(
         }
         return Err(StreamSemanticEmptyCompletion {
             usage: outcome.usage,
-            replayable: true,
+            // Reasoning delivered through TurnEvent is already immutable
+            // user-visible progress. A semantic-empty terminal result after
+            // that delivery must not replay the completed provider request.
+            replayable: !visible_event_output,
         }
         .into());
     }
@@ -743,7 +746,10 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("internal"))),
+                Ok(StreamEvent::Final),
+            ]))
         }
     }
 
@@ -1005,6 +1011,37 @@ mod tests {
             err.downcast_ref::<StreamSemanticEmptyCompletion>()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_delivered_to_event_sink_makes_empty_terminal_no_replay() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let err = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("a reasoning-only terminal stream must fail");
+
+        let semantic_empty = err
+            .downcast_ref::<StreamSemanticEmptyCompletion>()
+            .expect("failure stays typed");
+        assert!(
+            !semantic_empty.replayable,
+            "a delivered immutable reasoning event prevents replay"
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent::Thinking { delta }) if delta == "internal"
+        ));
     }
 
     #[tokio::test]
