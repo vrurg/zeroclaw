@@ -1099,7 +1099,7 @@ fn is_empty_completion(resp: &ChatResponse) -> bool {
 }
 
 fn is_empty_text_completion(text: &str) -> bool {
-    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+    zeroclaw_api::model_provider::normalize_terminal_display_text(text).is_empty()
 }
 
 fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
@@ -6093,6 +6093,86 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_string_entrypoints_fall_back_after_marker_only_text() {
+        let system_primary_calls = Arc::new(AtomicUsize::new(0));
+        let system_fallback_calls = Arc::new(AtomicUsize::new(0));
+        let system_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&system_primary_calls),
+                        fail_until_attempt: 0,
+                        response: "<think>internal reasoning</think><eom>",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&system_fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert_eq!(
+            system_provider
+                .chat_with_system(None, "hello", "test", Some(0.0))
+                .await
+                .expect("marker-only text must advance to provider fallback"),
+            "from fallback"
+        );
+        assert_eq!(system_primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(system_fallback_calls.load(Ordering::SeqCst), 1);
+
+        let history_primary_calls = Arc::new(AtomicUsize::new(0));
+        let history_fallback_calls = Arc::new(AtomicUsize::new(0));
+        let history_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&history_primary_calls),
+                        fail_until_attempt: 0,
+                        response: "<|eom|>",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&history_fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        assert_eq!(
+            history_provider
+                .chat_with_history(&messages, "test", Some(0.0))
+                .await
+                .expect("marker-only text must advance to provider fallback"),
+            "from fallback"
+        );
+        assert_eq!(history_primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(history_fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
