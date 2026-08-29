@@ -174,7 +174,7 @@ impl SopCapability for LlmGenerateCapability {
         // reject semantic-empty output before capability success is serialized.
         // A typed adapter-result contract would express this upstream, but that
         // public API change needs a separate compatibility decision.
-        let semantic_text = zeroclaw_api::model_provider::strip_think_tags(&text);
+        let semantic_text = zeroclaw_api::model_provider::normalize_terminal_display_text(&text);
         if semantic_text.is_empty() {
             let error =
                 anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
@@ -523,7 +523,13 @@ mod tests {
 
     #[test]
     fn legacy_adapter_semantic_empty_output_fails_closed() {
-        for output in ["", " \n\t", "<think>internal reasoning</think>"] {
+        for output in [
+            "",
+            " \n\t",
+            "<think>internal reasoning</think>",
+            "<eom>",
+            "<think>internal reasoning</think><eom><|eom|>",
+        ] {
             let adapter = Arc::new(RecordingLlm {
                 calls: Mutex::new(Vec::new()),
                 result: Ok(output.to_string()),
@@ -559,7 +565,9 @@ mod tests {
         assert_eq!(out.output["text"], output);
     }
 
-    struct SemanticEmptyProvider;
+    struct SemanticEmptyProvider {
+        text: &'static str,
+    }
 
     #[async_trait]
     impl ModelProvider for SemanticEmptyProvider {
@@ -580,7 +588,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
-                text: Some("   ".to_string()),
+                text: Some(self.text.to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
@@ -601,7 +609,7 @@ mod tests {
     #[test]
     fn provider_adapter_projects_semantic_empty_as_fluent_terminal_failure() {
         let adapter = ProviderLlmAdapter::with_provider_name(
-            Arc::new(SemanticEmptyProvider),
+            Arc::new(SemanticEmptyProvider { text: "   " }),
             "custom".to_string(),
             "test-model".to_string(),
         );
@@ -617,5 +625,27 @@ mod tests {
 
         assert_eq!(error, expected);
         assert!(!error.contains("provider completed without final text"));
+    }
+
+    #[test]
+    fn provider_adapter_rejects_marker_only_terminal_completion() {
+        for text in ["<eom>", "<think>internal reasoning</think><eom><|eom|>"] {
+            let adapter = ProviderLlmAdapter::with_provider_name(
+                Arc::new(SemanticEmptyProvider { text }),
+                "custom.primary".to_string(),
+                "test-model".to_string(),
+            );
+
+            let error = adapter
+                .generate(None, "summarize")
+                .expect_err("marker-only provider response must fail");
+            let expected = crate::agent::terminal_completion_error_message(
+                &anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion),
+                None,
+            )
+            .expect("semantic-empty failure has a Fluent projection");
+
+            assert_eq!(error, expected, "case {text:?}");
+        }
     }
 }

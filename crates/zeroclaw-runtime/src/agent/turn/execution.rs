@@ -553,7 +553,13 @@ mod run_model_query_tests {
     #[tokio::test]
     async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
         let messages = [ChatMessage::user("hi")];
-        for text in ["", " \n\t", "<think>internal reasoning</think>"] {
+        for text in [
+            "",
+            " \n\t",
+            "<think>internal reasoning</think>",
+            "<eom>",
+            "<think>internal reasoning</think><eom><|eom|>",
+        ] {
             let provider = DirectResponseProvider {
                 response: ChatResponse {
                     text: Some(text.to_string()),

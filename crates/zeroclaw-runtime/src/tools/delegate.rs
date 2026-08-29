@@ -1459,7 +1459,8 @@ impl DelegateTool {
     ) -> ToolResult {
         match result {
             Ok(response)
-                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+                if zeroclaw_api::model_provider::normalize_terminal_display_text(&response)
+                    .is_empty() =>
             {
                 ToolResult {
                     success: false,
@@ -5317,6 +5318,31 @@ mod tests {
         );
         let error = result.error.as_deref().unwrap_or_default();
         assert_eq!(error, invalid_semantic_completion_error("delegate"));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_marker_only_terminal_completion() {
+        for response in ["<eom>", "<think>internal reasoning</think><eom><|eom|>"] {
+            let result = DelegateTool::render_non_agentic_result(
+                "delegate",
+                "test-provider",
+                "test-model",
+                Ok(response.to_string()),
+            );
+
+            assert!(
+                !result.success,
+                "marker-only completion must fail: {response:?}"
+            );
+            assert!(
+                result.output.is_empty(),
+                "failed delegate must not emit output"
+            );
+            assert_eq!(
+                result.error.as_deref(),
+                Some(invalid_semantic_completion_error("delegate").as_str())
+            );
+        }
     }
 
     #[tokio::test]

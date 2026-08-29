@@ -264,7 +264,8 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        normalize_terminal_display_text(self.text_or_empty()).is_empty()
+            && self.tool_calls.is_empty()
     }
 }
 
@@ -290,6 +291,48 @@ pub fn strip_think_tags(text: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+/// Canonical vocabulary of terminal markers emitted by providers that must not
+/// appear in final response text.
+///
+/// Order matters: longer spellings precede shorter ones so suffix matching
+/// prefers the most specific marker.
+pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
+
+/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
+///
+/// Handles stacked markers with arbitrary whitespace between them. Whitespace
+/// before a marker is preserved because it belongs to the response text;
+/// whitespace after a recognized marker is protocol suffix material.
+pub fn strip_trailing_terminal_markers(text: &str) -> String {
+    let mut result = text.to_string();
+
+    loop {
+        let trimmed = result.trim_end();
+        let mut stripped = false;
+        for marker in TERMINAL_MARKERS {
+            if let Some(prefix) = trimmed.strip_suffix(marker) {
+                result = prefix.to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Normalize provider text for final user-visible delivery and terminal policy.
+///
+/// Thinking is opaque provider continuation state rather than final user text,
+/// and trailing terminal markers are protocol metadata. All terminal acceptance
+/// boundaries use this helper so marker-only output cannot become a success.
+pub fn normalize_terminal_display_text(text: &str) -> String {
+    strip_trailing_terminal_markers(&strip_think_tags(text))
 }
 
 /// Request payload for model_provider chat calls.
@@ -1326,6 +1369,51 @@ mod turn_order_tests {
         };
 
         assert!(response.is_semantically_empty_terminal());
+    }
+
+    #[test]
+    fn semantic_empty_terminal_uses_canonical_marker_normalization() {
+        for text in [
+            "<eom>",
+            "<|eom|>",
+            "<think>internal reasoning</think><eom><|eom|>",
+        ] {
+            let response = ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+
+            assert!(
+                response.is_semantically_empty_terminal(),
+                "marker-only display text must fail semantic acceptance: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_empty_terminal_preserves_tool_only_and_visible_marker_suffixed_responses() {
+        let visible = ChatResponse {
+            text: Some("done<eom>".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+        assert!(!visible.is_semantically_empty_terminal());
+
+        let tool_only = ChatResponse {
+            text: Some("<eom>".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        assert!(!tool_only.is_semantically_empty_terminal());
     }
 
     #[test]
