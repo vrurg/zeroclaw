@@ -679,6 +679,7 @@ mod streaming_fallback_tests {
 
     struct TerminalStreamProvider {
         non_stream_calls: AtomicUsize,
+        text_delta: Option<&'static str>,
     }
 
     struct NonStreamingFallbackProvider {
@@ -959,7 +960,13 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![Err(
+            let mut events = Vec::new();
+            if let Some(delta) = self.text_delta {
+                events.push(Ok(StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta(delta),
+                )));
+            }
+            events.push(Err(
                 zeroclaw_api::model_provider::StreamError::TerminalCompletion(
                     zeroclaw_api::model_provider::TerminalCompletionFailure::new(
                         zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
@@ -970,7 +977,8 @@ mod streaming_fallback_tests {
                         }),
                     ),
                 ),
-            )]))
+            ));
+            Box::pin(futures_util::stream::iter(events))
         }
     }
 
@@ -1072,6 +1080,7 @@ mod streaming_fallback_tests {
     async fn single_reliable_terminal_stream_preserves_cause_without_replay() {
         let selected = std::sync::Arc::new(TerminalStreamProvider {
             non_stream_calls: AtomicUsize::new(0),
+            text_delta: None,
         });
         let provider = ReliableModelProvider::new(
             "test",
@@ -1137,6 +1146,7 @@ mod streaming_fallback_tests {
     async fn terminal_stream_recovers_through_non_streaming_candidate() {
         let selected = std::sync::Arc::new(TerminalStreamProvider {
             non_stream_calls: AtomicUsize::new(0),
+            text_delta: None,
         });
         let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
             calls: AtomicUsize::new(0),
@@ -1194,6 +1204,74 @@ mod streaming_fallback_tests {
         .expect("dispatch returns the recovered provider outcome")
         .chat_result
         .expect("a distinct non-streaming candidate can recover the stream");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(selected.non_stream_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn marker_only_terminal_stream_recovers_through_non_streaming_candidate() {
+        let selected = std::sync::Arc::new(TerminalStreamProvider {
+            non_stream_calls: AtomicUsize::new(0),
+            text_delta: Some("<eom><|eom|>"),
+        });
+        let fallback = std::sync::Arc::new(NonStreamingFallbackProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "selected".to_string(),
+                    Box::new(std::sync::Arc::clone(&selected)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(std::sync::Arc::clone(&fallback)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "requested-provider",
+            model: "requested-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let response = call_provider(
+            &ctx,
+            &provider,
+            "requested-provider",
+            "requested-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the recovered provider outcome")
+        .chat_result
+        .expect("marker-only terminal output permits one fallback request");
 
         assert_eq!(response.text.as_deref(), Some("fallback response"));
         assert_eq!(selected.non_stream_calls.load(Ordering::Relaxed), 0);

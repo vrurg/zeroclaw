@@ -92,6 +92,15 @@ pub fn strip_trailing_terminal_markers(text: &str) -> String {
     result
 }
 
+/// Normalize provider text for final user-visible delivery and terminal policy.
+///
+/// Thinking is opaque provider continuation state rather than final user text,
+/// and terminal markers are protocol metadata. Keeping this order here makes
+/// provider terminal policy agree with the runtime display boundary.
+pub fn normalize_terminal_display_text(text: &str) -> String {
+    strip_trailing_terminal_markers(&strip_think_tags(text))
+}
+
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
 /// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
 /// parameters as JSON strings inside the outer arguments payload, which breaks tools
@@ -5482,5 +5491,17 @@ Let me check the result."#;
         assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
         assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
         assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
+    }
+
+    #[test]
+    fn normalize_terminal_display_text_removes_thinking_and_terminal_markers() {
+        assert_eq!(
+            normalize_terminal_display_text("<think>internal</think><eom><|eom|>"),
+            ""
+        );
+        assert_eq!(
+            normalize_terminal_display_text("Answer<think>internal</think><|eom|>"),
+            "Answer"
+        );
     }
 }

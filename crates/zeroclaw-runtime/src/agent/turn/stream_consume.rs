@@ -1467,10 +1467,9 @@ mod tests {
         );
     }
 
-    /// Provider that emits a single marker-only text delta (`<eom>`) and then
-    /// a stream error, with no text ever produced. Used to pin the strict-mode
-    /// fallback eligibility: a marker-only delta yields empty stripped text,
-    /// which must NOT count as visible output.
+    /// Provider that emits a marker-only text delta followed by a typed
+    /// terminal failure. The marker is protocol metadata, not user-visible
+    /// partial output, so the failure must retain pre-output recovery.
     struct MarkerOnlyThenErrorProvider;
 
     impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
@@ -1531,25 +1530,25 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            let events: Vec<StreamResult<StreamEvent>> = vec![
+            let events: Vec<StreamResult<StreamEvent>> =
+                vec![
                 Ok(StreamEvent::TextDelta(StreamChunk::delta("<eom>"))),
-                Err(::zeroclaw_api::model_provider::StreamError::ModelProvider(
-                    "provider exploded after marker-only delta".into(),
+                Err(::zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        None,
+                    ),
                 )),
             ];
             Box::pin(futures_util::stream::iter(events))
         }
     }
 
-    /// Strict-mode marker-only deltas must not count as visible output: if a
-    /// marker-only delta (stripped to empty text) is forwarded as a visible
-    /// Chunk, a later provider error turns the failure into
-    /// `StreamInterruptedAfterOutput`, which disables the non-streaming
-    /// fallback even though the user received no text. The error must instead
-    /// surface as a plain error with an empty visible prefix, keeping the
-    /// pre-output fallback eligible.
+    /// Marker-only deltas must not count as visible output: otherwise a later
+    /// terminal failure becomes `StreamInterruptedAfterOutput`, suppressing
+    /// an allowed fallback even though the user received no text.
     #[tokio::test]
-    async fn strict_marker_only_delta_does_not_disable_fallback_on_provider_error() {
+    async fn marker_only_delta_keeps_terminal_recovery_pre_output() {
         let provider = MarkerOnlyThenErrorProvider;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -1580,20 +1579,23 @@ mod tests {
             "no Chunk event may be forwarded for a marker-only delta: {chunks:?}"
         );
 
-        // The failure must be a plain error, NOT StreamInterruptedAfterOutput
-        // (which would disable the non-streaming fallback despite no visible
-        // text). Asserting the error type is not the interruption type is the
-        // observable fallback-eligibility signal.
-        let err = result.expect_err("provider error must surface");
+        let err = result.expect_err("terminal failure must surface");
         assert!(
             err.downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
                 .is_none(),
-            "a marker-only delta followed by a provider error must stay eligible for the \
-             non-streaming fallback; got StreamInterruptedAfterOutput instead"
+            "a marker-only terminal failure must stay eligible for fallback; \
+             got StreamInterruptedAfterOutput instead"
         );
-        assert!(
-            err.to_string().contains("provider exploded"),
-            "the underlying provider error must be surfaced: {err}"
+        let terminal = err
+            .downcast_ref::<StreamTerminalCompletion>()
+            .expect("marker-only terminal failure must preserve its typed cause");
+        assert_eq!(
+            terminal.failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        );
+        assert_eq!(
+            terminal.policy.recovery(),
+            zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
         );
     }
 

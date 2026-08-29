@@ -1809,7 +1809,7 @@ impl AnthropicModelProvider {
     ) -> bool {
         !saw_server_tool_activity
             && !saw_client_tool_activity
-            && zeroclaw_api::model_provider::strip_think_tags(streamed_text).is_empty()
+            && zeroclaw_tool_call_parser::normalize_terminal_display_text(streamed_text).is_empty()
     }
 
     fn streaming_usage(
@@ -1999,7 +1999,7 @@ impl AnthropicModelProvider {
             // text. Native thinking blocks must remain available for provider
             // continuation, but cannot make a reasoning-only terminal outcome
             // look like caller-visible partial output.
-            let replay_safe = zeroclaw_api::model_provider::strip_think_tags(
+            let replay_safe = zeroclaw_tool_call_parser::normalize_terminal_display_text(
                 parsed.text.as_deref().unwrap_or_default(),
             )
             .is_empty()
@@ -2814,8 +2814,10 @@ impl AnthropicModelProvider {
                         }
                         if saw_server_tool_activity
                             && !saw_client_tool_activity
-                            && zeroclaw_api::model_provider::strip_think_tags(&streamed_text)
-                                .is_empty()
+                            && zeroclaw_tool_call_parser::normalize_terminal_display_text(
+                                &streamed_text,
+                            )
+                            .is_empty()
                         {
                             let _ = tx
                                 .send(Err(StreamError::SemanticEmpty(
@@ -4743,6 +4745,80 @@ data: {\"type\":\"message_stop\"}\n\n";
             context.policy().usage_chargeability(),
             TerminalUsageChargeability::Informational
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_marker_only_terminal_outcomes_use_pre_output_policy() {
+        use std::io::Cursor;
+
+        for (stop_reason, expected_reason, expected_chargeability) in [
+            (
+                "max_tokens",
+                TerminalCompletionError::OutputTokenLimit,
+                TerminalUsageChargeability::Billable,
+            ),
+            (
+                "refusal",
+                TerminalCompletionError::Refusal,
+                TerminalUsageChargeability::Informational,
+            ),
+        ] {
+            let bytes = format!(
+                r#"event: message_start
+data: {{"type":"message_start","message":{{"usage":{{"input_tokens":10}}}}}}
+
+event: content_block_start
+data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text"}}}}
+
+event: content_block_delta
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"<eom><|eom|>"}}}}
+
+event: content_block_stop
+data: {{"type":"content_block_stop","index":0}}
+
+event: message_delta
+data: {{"type":"message_delta","delta":{{"stop_reason":"{stop_reason}"}},"usage":{{"output_tokens":4}}}}
+
+event: message_stop
+data: {{"type":"message_stop"}}
+
+"#
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            let slot = std::sync::Arc::new(crate::terminal::TerminalPolicySlot::default());
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(
+                reader,
+                &tx,
+                Some(slot.clone()),
+            )
+            .await;
+
+            let terminal = loop {
+                let event = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                    .await
+                    .expect("parser must finish")
+                    .expect("terminal failure must be emitted");
+                if let Err(StreamError::TerminalCompletion(failure)) = event {
+                    break failure;
+                }
+            };
+            let contextual = crate::terminal::contextualize_terminal_stream_error(
+                &slot,
+                StreamError::TerminalCompletion(terminal),
+            );
+            let context = crate::terminal::terminal_completion_context(&contextual)
+                .expect("SSE terminal policy must survive stream transport");
+            assert_eq!(context.failure().reason, expected_reason);
+            assert_eq!(
+                context.policy().recovery(),
+                TerminalRecoveryDisposition::NextCandidate
+            );
+            assert_eq!(
+                context.policy().usage_chargeability(),
+                expected_chargeability
+            );
+        }
     }
 
     /// A reader that yields one buffer of bytes, then parks forever — models
@@ -7032,6 +7108,43 @@ data: {\"type\":\"message_stop\"}\n\n";
             context.policy().usage_chargeability(),
             TerminalUsageChargeability::Informational
         );
+    }
+
+    #[test]
+    fn native_marker_only_terminal_outcomes_use_pre_output_policy() {
+        for (stop_reason, expected_reason, expected_chargeability) in [
+            (
+                "max_tokens",
+                TerminalCompletionError::OutputTokenLimit,
+                TerminalUsageChargeability::Billable,
+            ),
+            (
+                "refusal",
+                TerminalCompletionError::Refusal,
+                TerminalUsageChargeability::Informational,
+            ),
+        ] {
+            let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+                "stop_reason": stop_reason,
+                "content": [{"type": "text", "text": "<eom><|eom|>"}],
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            }))
+            .expect("fixture must deserialize");
+
+            let error = AnthropicModelProvider::parse_native_response(response)
+                .expect_err("marker-only terminal response must be incomplete");
+            let context = crate::terminal::terminal_completion_context(&error)
+                .expect("native parser preserves terminal policy");
+            assert_eq!(context.failure().reason, expected_reason);
+            assert_eq!(
+                context.policy().recovery(),
+                TerminalRecoveryDisposition::NextCandidate
+            );
+            assert_eq!(
+                context.policy().usage_chargeability(),
+                expected_chargeability
+            );
+        }
     }
 
     #[test]
