@@ -42,6 +42,35 @@ pub use terminal::{
 
 mod request_payload;
 
+#[cfg(test)]
+pub(crate) static RUNTIME_PROXY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct RuntimeProxyTestGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl RuntimeProxyTestGuard {
+    pub(crate) async fn acquire() -> Self {
+        let guard = RUNTIME_PROXY_TEST_LOCK.lock().await;
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimeProxyTestGuard {
+    fn drop(&mut self) {
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+    }
+}
+
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
@@ -1098,6 +1127,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("xai-", "xai"),
     ("nvapi-", "nvidia"),
     ("KEY-", "telnyx"),
+    ("zcr_", "zerorouter"),
 ];
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
@@ -2037,6 +2067,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
+            ("zerorouter", "ZeroRouter", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2409,6 +2440,17 @@ mod tests {
         assert!(
             !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_zerorouter() {
+        let model_provider = create_model_provider("zerorouter", Some("zcr_test")).unwrap();
+        // ZeroRouter speaks the OpenAI chat-completions wire: Bearer auth +
+        // native tool calling, no .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "ZeroRouter should use OpenAI-compatible native tool calling"
         );
     }
 

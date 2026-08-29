@@ -787,7 +787,7 @@ pub async fn agent_turn(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -850,7 +850,7 @@ async fn agent_turn_with_sop_reassembly(
     config: Option<&zeroclaw_config::schema::Config>,
     model_provider: &dyn ModelProvider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: &scoped::ScopedToolRegistry,
     observer: &dyn Observer,
     provider_name: &str,
     model: &str,
@@ -1413,7 +1413,10 @@ pub async fn run(
             mcp_tool_names,
             ..
         } = assembled;
-        let tools_registry = registry.into_inner();
+        // Keep the sealed registry sealed: the engine's `ResolvedIo.tools_registry`
+        // now takes `&ScopedToolRegistry`, so this local stays a scoped registry
+        // (coerces to `&[Box<dyn Tool>]` at the leaf call sites via `Deref`).
+        let tools_registry = registry;
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -3019,7 +3022,9 @@ pub async fn process_message(
             mcp_tool_names: mcp_tool_names_pm,
             ..
         } = assembled;
-        let tools_registry = registry.into_inner();
+        // Stays sealed: `agent_turn_with_sop_reassembly` now takes
+        // `&ScopedToolRegistry`; leaf uses coerce via `Deref`.
+        let tools_registry = registry;
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -3966,7 +3971,9 @@ mod tests {
             call_arguments,
             None,
             ToolDispatchContext {
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
@@ -4010,7 +4017,9 @@ mod tests {
             serde_json::json!({ "value": "ok" }),
             None,
             ToolDispatchContext {
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
@@ -4060,7 +4069,9 @@ mod tests {
             serde_json::json!({ "value": "ok" }),
             None,
             ToolDispatchContext {
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
@@ -4992,10 +5003,10 @@ mod tests {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "file_write",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("file_write", Arc::clone(&invocations)),
+            )]);
 
         let channel = SourcedDenyChannel { source };
         let approval_mgr = ApprovalManager::for_non_interactive_backchannel(
@@ -5344,7 +5355,8 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let err = run_tool_call_loop(ToolLoop {
@@ -5415,7 +5427,8 @@ mod tests {
             "[IMAGE:data:image/png;base64,{oversized_payload}]"
         ))];
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
             max_images: 4,
@@ -5504,7 +5517,8 @@ mod tests {
             ),
             ChatMessage::user("what is WAL?".to_string()),
         ];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
 
@@ -5594,7 +5608,8 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
@@ -5668,7 +5683,8 @@ mod tests {
                 "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
             ),
         ];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let result = run_tool_call_loop(ToolLoop {
@@ -5739,7 +5755,8 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
@@ -5815,7 +5832,8 @@ mod tests {
         let model_provider = ScriptedModelProvider::from_text_responses(vec!["hello world"]);
 
         let mut history = vec![ChatMessage::user("just text, no images".to_string())];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
@@ -5963,7 +5981,8 @@ mod tests {
             let model_provider =
                 ScriptedModelProvider::from_text_responses(vec!["identical answer"]);
             let mut history = vec![ChatMessage::user("hello".to_string())];
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let observer = NoopObserver;
             let turn_id = uuid::Uuid::new_v4().to_string();
 
@@ -6149,7 +6168,8 @@ mod tests {
         ) -> (String, Vec<(Option<String>, bool)>) {
             let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
             let mut history = vec![ChatMessage::user("what server?".to_string())];
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let observer = RecallCountingObserver::default();
             let turn_id = uuid::Uuid::new_v4().to_string();
 
@@ -6266,7 +6286,8 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         // vision_model_provider set but vision_model is None — the code should
@@ -6347,7 +6368,8 @@ mod tests {
         let mut history = vec![ChatMessage::user(
             "empty marker [IMAGE:] should be ignored".to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
@@ -6422,7 +6444,8 @@ mod tests {
             "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
                 .to_string(),
         )];
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let observer = NoopObserver;
 
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
@@ -6566,7 +6589,7 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(DelayTool::new(
                 "delay_a",
                 200,
@@ -6579,7 +6602,7 @@ mod tests {
                 Arc::clone(&active),
                 Arc::clone(&max_active),
             )),
-        ];
+        ]);
 
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
@@ -6724,9 +6747,10 @@ mod tests {
         let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
         engine.replace_sops_for_test(vec![sop]);
         let engine = Arc::new(Mutex::new(engine));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::SopExecuteTool::new(
-            Arc::clone(&engine),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                crate::tools::SopExecuteTool::new(Arc::clone(&engine)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6877,7 +6901,7 @@ mod tests {
 
         let allowed_invocations = Arc::new(AtomicUsize::new(0));
         let denied_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
             Box::new(CountingTool::new(
                 "allowed_tool",
@@ -6887,7 +6911,7 @@ mod tests {
                 "denied_tool",
                 Arc::clone(&denied_invocations),
             )),
-        ];
+        ]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -6980,7 +7004,7 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(DelayTool::new(
                 "delay_a",
                 10,
@@ -6999,7 +7023,7 @@ mod tests {
                 Arc::clone(&active),
                 Arc::clone(&max_active),
             )),
-        ];
+        ]);
 
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
@@ -7162,7 +7186,7 @@ mod tests {
 
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         let token = CancellationToken::new();
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(CompletesAndSignalsTool {
                 completed_tx: tokio::sync::Mutex::new(Some(completed_tx)),
             }),
@@ -7170,7 +7194,7 @@ mod tests {
                 token: token.clone(),
                 wait_for: tokio::sync::Mutex::new(Some(completed_rx)),
             }),
-        ];
+        ]);
 
         let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
             level: crate::security::AutonomyLevel::Full,
@@ -7282,10 +7306,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
-            "cron_add",
-            Arc::clone(&recorded_args),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                RecordingArgsTool::new("cron_add", Arc::clone(&recorded_args)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7377,10 +7401,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
-            "cron_add",
-            Arc::clone(&recorded_args),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                RecordingArgsTool::new("cron_add", Arc::clone(&recorded_args)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7462,10 +7486,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
-            "cron_add",
-            Arc::clone(&recorded_args),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                RecordingArgsTool::new("cron_add", Arc::clone(&recorded_args)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7555,10 +7579,10 @@ mod tests {
         ]);
 
         let recorded_args = Arc::new(Mutex::new(Vec::new()));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
-            "cron_add",
-            Arc::clone(&recorded_args),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                RecordingArgsTool::new("cron_add", Arc::clone(&recorded_args)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7651,10 +7675,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7750,9 +7774,10 @@ mod tests {
         });
         let runtime: Arc<dyn crate::platform::RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::new());
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(
-            crate::tools::shell::ShellTool::new(security, runtime),
-        )];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                crate::tools::shell::ShellTool::new(security, runtime),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -7843,10 +7868,10 @@ mod tests {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![write_call, "done"]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "file_write",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("file_write", Arc::clone(&invocations)),
+            )]);
 
         let approval_mgr = ApprovalManager::for_non_interactive(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -7957,10 +7982,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "shell",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("shell", Arc::clone(&invocations)),
+            )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
@@ -8059,10 +8084,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "shell",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("shell", Arc::clone(&invocations)),
+            )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
@@ -8161,10 +8186,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "shell",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("shell", Arc::clone(&invocations)),
+            )]);
 
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let channel = ApprovingChannel::new(Arc::clone(&approval_requests));
@@ -8259,10 +8284,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -8357,10 +8382,10 @@ mod tests {
         ]);
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "spawn_subagent",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("spawn_subagent", Arc::clone(&invocations)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -8449,7 +8474,7 @@ mod tests {
 
         let count_invocations = Arc::new(AtomicUsize::new(0));
         let other_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
             Box::new(CountingTool::new(
                 "count_tool",
                 Arc::clone(&count_invocations),
@@ -8458,7 +8483,7 @@ mod tests {
                 "other_tool",
                 Arc::clone(&other_invocations),
             )),
-        ];
+        ]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -8541,10 +8566,10 @@ mod tests {
         .with_native_tool_support();
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -8631,10 +8656,10 @@ mod tests {
             "Recovered answer.",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -8715,10 +8740,10 @@ mod tests {
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a support case JSON object"),
@@ -8797,10 +8822,10 @@ mod tests {
         let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![business_json]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a partial support case JSON object"),
@@ -8882,10 +8907,10 @@ mod tests {
             r#"{"toolcalls":[{"call_id":"call_3","arguments":{"value":"Z"}}]}"#,
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -8966,7 +8991,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![reference_json]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a toolcalls reference JSON object"),
@@ -9048,7 +9074,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let reference_json = r#"{"toolcalls":[{"name":"count_tool","arguments":{"value":"X"}}]}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a toolcalls reference JSON object"),
@@ -9121,7 +9148,8 @@ mod tests {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![schema]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a JSON schema array"),
@@ -9195,7 +9223,8 @@ mod tests {
         let audit_json =
             r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![audit_json]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a tool call audit JSON object"),
@@ -9269,7 +9298,8 @@ mod tests {
         let reference_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = ScriptedModelProvider::from_text_responses(vec![reference_json]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("return a function_call reference JSON object"),
@@ -9345,7 +9375,8 @@ mod tests {
 </tool_call>
 This is an example, not an invocation."#;
         let provider = ScriptedModelProvider::from_text_responses(vec![example]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a tool_call tag example"),
@@ -9422,10 +9453,10 @@ This is an example, not an invocation."#;
 This is an example, not an invocation."#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a registered tool_call fenced example"),
@@ -9516,10 +9547,10 @@ This is an example, not an invocation."#;
 This is an example, not an invocation."#;
         let provider = ScriptedModelProvider::from_text_responses(vec![example]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a registered tool_call tag example"),
@@ -9595,7 +9626,8 @@ This is an example, not an invocation."#;
 Done."#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run without tools"),
@@ -9674,7 +9706,8 @@ Done."#;
 Done."#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run without tools"),
@@ -9751,7 +9784,8 @@ Done."#;
 ```"#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec![leaked, "Recovered answer."]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run without tools"),
@@ -9828,7 +9862,8 @@ Done."#;
 ```
 This is an example, not an invocation."#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a tool_call fenced example"),
@@ -9963,7 +9998,8 @@ This is an example, not an invocation."#;
 ```
 This is an example, not an invocation."#;
         let provider = SplitFencedExampleProvider;
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a split tool_call fenced example"),
@@ -10049,7 +10085,8 @@ This is an example, not an invocation."#;
 ```
 This is an example, not an invocation."#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![example]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("show a JSON tool_calls example"),
@@ -10136,10 +10173,10 @@ This is an example, not an invocation."#;
             "Final answer.",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("use the tool"),
@@ -10248,10 +10285,10 @@ This is an example, not an invocation."#;
         };
 
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -10376,7 +10413,8 @@ This is an example, not an invocation."#;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
             StreamingScriptedModelProvider::from_text_responses(vec!["streamed final answer"]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -10467,10 +10505,10 @@ This is an example, not an invocation."#;
             "done",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -10572,10 +10610,10 @@ This is an example, not an invocation."#;
         );
         let provider = ScriptedModelProvider::from_text_responses(vec![gemini_turn1, "done"]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run tool calls"),
@@ -11466,10 +11504,10 @@ This is an example, not an invocation."#;
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run native tools"),
@@ -11571,10 +11609,10 @@ This is an example, not an invocation."#;
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("narrate then run native tool"),
@@ -11675,10 +11713,10 @@ This is an example, not an invocation."#;
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("run native tool then narrate"),
@@ -11779,10 +11817,10 @@ This is an example, not an invocation."#;
             NativeStreamTurn::Text("done".to_string()),
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("narrate with a guard-buffered tail then run a native tool"),
@@ -11944,7 +11982,8 @@ This is an example, not an invocation."#;
             "default-model".to_string(),
         );
 
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("test-system"),
             ChatMessage::user("say hi"),
@@ -12060,7 +12099,8 @@ This is an example, not an invocation."#;
                 .unwrap()
                 .activate("pixel__get_api_health".into(), activated_tool);
 
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("use the activated MCP tool"),
@@ -12133,7 +12173,8 @@ This is an example, not an invocation."#;
                 .unwrap()
                 .activate("pixel__get_api_health".into(), activated_tool);
 
-            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("do not infer activated tool calls from text"),
@@ -12263,7 +12304,8 @@ This is an example, not an invocation."#;
                 500, // produce 500+ chars of output
                 Arc::clone(&invocations),
             ));
-            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("check"),
@@ -12344,7 +12386,7 @@ This is an example, not an invocation."#;
                 500,
                 Arc::clone(&invocations),
             ));
-            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
             let mut history = vec![
                 ChatMessage::system("test-system"),
                 ChatMessage::user("check"),
@@ -13192,8 +13234,10 @@ Let me check the result."#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
-            vec![Box::new(CountingTool::new("shell", invocations))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("shell", invocations),
+            )]);
 
         let native_tool_specs_present = super::native_tool_specs_present_for_turn(
             &provider,
@@ -13234,8 +13278,10 @@ Let me check the result."#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
-            vec![Box::new(CountingTool::new("shell", invocations))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("shell", invocations),
+            )]);
         let excluded_tools = vec!["shell".to_string()];
 
         let native_tool_specs_present = super::native_tool_specs_present_for_turn(
@@ -13301,10 +13347,10 @@ Let me check the result."#;
         let provider =
             ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
-            "browser__navigate",
-            invocations,
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("browser__navigate", invocations),
+            )]);
         let mcp_tool_names = mcp_set(&["browser__navigate"]);
         let groups = vec![ToolFilterGroup {
             mode: ToolFilterGroupMode::Dynamic,
@@ -14366,10 +14412,13 @@ Let me check the result."#;
             "I could not execute that command.",
         ]);
 
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(FailingTool::new(
-            "failing_shell",
-            "Command not allowed by security policy: rm -rf /",
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                FailingTool::new(
+                    "failing_shell",
+                    "Command not allowed by security policy: rm -rf /",
+                ),
+            )]);
 
         let mut history = vec![
             ChatMessage::system("test-system"),
@@ -14572,7 +14621,8 @@ Let me check the result."#;
                             model: "mock-model",
                             temperature: Some(0.0),
                         },
-                        tools_registry: &[],
+                        tools_registry:
+                            &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
                         observer: &observer,
                         silent: true,
                         approval: None,
@@ -14675,6 +14725,7 @@ Let me check the result."#;
             ChatMessage::assistant("earlier answer"),
             ChatMessage::user("current question"),
         ];
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -14689,7 +14740,7 @@ Let me check the result."#;
                             model: "test-model",
                             temperature: Some(0.0),
                         },
-                        tools_registry: &[],
+                        tools_registry: &tools_registry,
                         observer: &observer,
                         silent: true,
                         approval: None,
@@ -14805,7 +14856,9 @@ Let me check the result."#;
                     model: "mock-model",
                     temperature: Some(0.0),
                 },
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 observer: &observer,
                 silent: true,
                 approval: None,
@@ -14924,7 +14977,8 @@ Let me check the result."#;
                             model: "mock-model",
                             temperature: Some(0.0),
                         },
-                        tools_registry: &[],
+                        tools_registry:
+                            &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
                         observer: &observer,
                         silent: true,
                         approval: None,
@@ -15016,7 +15070,9 @@ Let me check the result."#;
                     model: "mock-model",
                     temperature: Some(0.0),
                 },
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 observer: &observer,
                 silent: true,
                 approval: None,
@@ -15105,7 +15161,9 @@ Let me check the result."#;
                     model: "claude-opus-4-8",
                     temperature: Some(0.0),
                 },
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 observer: &observer,
                 silent: true,
                 approval: None,
@@ -15357,6 +15415,109 @@ Let me check the result."#;
             after, before,
             "budget-exceeded fork must not make a recorded provider call"
         );
+    }
+
+    /// Real-boundary regression: `maybe_run_skill_review` builds its own
+    /// fork history from the `history` argument and, after the fork's tool
+    /// loop returns, reads it back for the summary. The fork's tool loop can
+    /// trim that working history IN PLACE mid-fork (via the reported-token-
+    /// budget path in `turn/mod.rs::enforce_reported_budget`, which runs
+    /// right after a tool round is appended). A bulk seed history plus a
+    /// tiny `max_context_tokens` against a huge scripted reported-token
+    /// count forces exactly that: the fork's working history shrinks below
+    /// the length it had before the loop ran. Reaching the end of this
+    /// `.await` without panicking is the assertion — the old code captured
+    /// that pre-loop length and sliced the (now shorter) history with it,
+    /// which panics with a slice-out-of-range message.
+    #[tokio::test]
+    async fn skill_review_fork_survives_history_trim_without_panic() {
+        use crate::observability::noop::NoopObserver;
+
+        // Three big user/assistant pairs plus one completed tool call (so
+        // `should_trigger` at threshold 1 fires). The old code captured
+        // `history.len()` == 8 here as `fork_start_len` before the fork's
+        // loop ran.
+        let big = "x".repeat(2000);
+        let history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2".to_string()),
+            ChatMessage::user(format!("turn3 {big}")),
+            ChatMessage::assistant("a3".to_string()),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ok".to_string(),
+            },
+        ];
+
+        // Turn 1: one native tool call against a real review tool, reporting
+        // vastly more input tokens than the fork's configured budget so
+        // `enforce_reported_budget` trims the fork's working history in
+        // place right after the tool round lands. Turn 2: a plain
+        // final-text response that ends the fork.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "skills_list".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000_000),
+                        output_tokens: Some(10),
+                        cached_input_tokens: None,
+                    }),
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("Nothing to save.".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        crate::skills::review::maybe_run_skill_review(
+            None,
+            workspace.path().to_path_buf(),
+            review_config,
+            false,
+            history,
+            Vec::new(),
+            &model_provider,
+            "mock-provider",
+            "mock-model",
+            &observer,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            // max_context_tokens: tiny against the scripted 1_000_000
+            // reported input tokens, so the tool round trips the
+            // reported-budget trim mid-fork.
+            100,
+            None,
+            None, // agent_alias — no parent alias in the review-fork test fixture
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -16461,10 +16622,10 @@ Let me check the result."#;
             "done",
         ]);
 
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -16540,10 +16701,10 @@ Let me check the result."#;
             "done",
         ]);
         let invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&invocations),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
@@ -16597,7 +16758,8 @@ Let me check the result."#;
     #[tokio::test]
     async fn agent_turn_brackets_turn_with_agent_start_and_agent_end() {
         let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let capturing = Arc::new(CapturingObserver::default());
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
@@ -16667,7 +16829,8 @@ Let me check the result."#;
     async fn agent_turn_uses_the_pre_minted_turn_id_on_its_bracket() {
         // Harness mirrors agent_turn_brackets_turn_with_agent_start_and_agent_end.
         let model_provider = ScriptedModelProvider::from_text_responses(vec!["done"]);
-        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let capturing = Arc::new(CapturingObserver::default());
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
