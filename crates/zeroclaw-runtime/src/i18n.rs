@@ -749,8 +749,12 @@ mod tests {
                 "Anthropic recovery hint in {locale} must retain its executable command: {hint:?}"
             );
             assert!(
-                hint.contains("auth_mode"),
-                "Anthropic recovery hint in {locale} must retain its OAuth configuration step: {hint:?}"
+                hint.contains("auth_mode = \"oauth\""),
+                "Anthropic recovery hint in {locale} must retain its exact OAuth configuration step: {hint:?}"
+            );
+            assert!(
+                hint.contains("--model-provider anthropic --profile"),
+                "Anthropic recovery hint in {locale} must retain its complete profile command: {hint:?}"
             );
         }
     }

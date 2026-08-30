@@ -546,7 +546,7 @@ cli-quickstart-auth-codex-import-prompt = 发现已有的 Codex 登录 (~/.codex
 cli-quickstart-auth-codex-skip-hint = {"  "}稍后完成：zeroclaw auth login --model-provider openai-codex
 cli-quickstart-auth-anthropic-prompt = 现在为 Anthropic 提供方 `{$alias}` 运行 `claude setup-token` 吗？
 cli-quickstart-auth-anthropic-token-prompt = 粘贴 `claude setup-token` 生成的令牌
-cli-quickstart-auth-anthropic-skip-hint = {"  "}稍后完成：claude setup-token，然后运行 zeroclaw auth setup-token --model-provider anthropic --profile {$alias}，并设置 providers.models.anthropic.{$alias}.auth_mode = "oauth"
+cli-quickstart-auth-anthropic-skip-hint = {"  "}Quickstart 未写入。若要稍后完成，请重新运行 Quickstart 以创建 {$alias}，然后运行 claude setup-token、zeroclaw auth setup-token --model-provider anthropic --profile {$alias}，并设置 providers.models.anthropic.{$alias}.auth_mode = "oauth"
 cli-quickstart-auth-failed = {"  "}身份验证设置未完成：{$error}
 cli-quickstart-model-field-missing-warning = 警告：架构没有为 `{$provider}` 生成 `model` 字段 — 将退回到手动输入。请报告此问题。
 cli-quickstart-model-id-for = {$name} 的模型 ID
