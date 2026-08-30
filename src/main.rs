@@ -7975,7 +7975,9 @@ async fn collect_anthropic_setup_token_inline(alias: &str) -> Result<Option<Stri
     let skip_hint = ta(
         "cli-quickstart-auth-anthropic-skip-hint",
         &[("alias", alias)],
-        "  Finish later with: claude setup-token",
+        &format!(
+            "  Quickstart was not written. Rerun Quickstart and choose `setup_token` to finish Anthropic setup for {alias}."
+        ),
     );
     let approved = Confirm::new()
         .with_prompt(prompt)

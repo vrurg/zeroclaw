@@ -748,6 +748,13 @@ mod tests {
                 hint.contains("setup_token"),
                 "Anthropic recovery hint in {locale} must direct the user to select setup_token when rerunning Quickstart: {hint:?}"
             );
+            assert!(
+                !hint.contains("zeroclaw auth")
+                    && !hint.contains("paste-token")
+                    && !hint.contains("--auth-kind")
+                    && !hint.contains("claude setup-token"),
+                "Anthropic recovery hint in {locale} must not advertise a post-hoc credential setup path: {hint:?}"
+            );
         }
     }
 

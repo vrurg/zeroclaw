@@ -544,7 +544,7 @@ cli-quickstart-openai-auth-mode-label = Authentification
 cli-quickstart-openai-auth-mode-help = Choisissez `codex` pour utiliser un profil d'authentification par abonnement ChatGPT/Codex. Si vous êtes déjà connecté avec le CLI Codex, exécutez `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json` ; sinon exécutez `zeroclaw auth login --model-provider openai-codex`.
 cli-quickstart-anthropic-auth-mode-label = Authentification
 cli-quickstart-anthropic-auth-mode-help = Choisissez `api_key` pour une clé Anthropic Console, ou `setup_token` pour enregistrer un jeton de `claude setup-token` dans le profil d'authentification lié à l'alias, avec `auth_mode = "oauth"`.
-cli-quickstart-anthropic-api-key-help = Collez une clé d'API Anthropic Console. Avec `setup_token`, collez ici le jeton généré par `claude setup-token` ; Quickstart l'enregistre dans le profil d'authentification lié à l'alias.
+cli-quickstart-anthropic-api-key-help = Collez une clé d'API Anthropic Console. Pour utiliser Claude Max, exécutez d'abord `claude setup-token`, puis choisissez `setup_token`.
 cli-quickstart-auth-codex-prompt = Se connecter à OpenAI Codex avec votre compte ChatGPT maintenant ?
 cli-quickstart-auth-codex-import-prompt = Connexion Codex existante trouvée (~/.codex/auth.json) — l'importer maintenant ?
 cli-quickstart-auth-codex-skip-hint = {"  "}Terminez plus tard avec : zeroclaw auth login --model-provider openai-codex

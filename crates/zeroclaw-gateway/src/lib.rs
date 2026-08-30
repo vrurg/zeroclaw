@@ -5186,7 +5186,7 @@ path = "{trigger_path}"
         config.save().await.unwrap();
 
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
         let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
@@ -5292,7 +5292,14 @@ path = "{trigger_path}"
             "production router must persist the matching stored profile"
         );
 
-        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), reload_rx.changed())
+            .await
+            .expect("Quickstart must signal supervised reload")
+            .expect("reload sender must stay connected until it signals");
+        assert!(
+            *reload_rx.borrow(),
+            "Quickstart must request a supervised daemon reload"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("gateway must shut down")
