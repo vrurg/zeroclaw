@@ -552,8 +552,10 @@ fn elide_image_data(content: &str) -> String {
 }
 
 pub(crate) fn scrub_for_export(content: &str) -> String {
+    let without_attachments =
+        crate::agent::prompt::redact_session_prompt_attachments_for_export(content);
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
-        &elide_image_data(content),
+        &elide_image_data(&without_attachments),
     ))
 }
 

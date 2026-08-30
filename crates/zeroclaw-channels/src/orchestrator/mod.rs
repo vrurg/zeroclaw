@@ -2434,6 +2434,29 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .collect()
 }
 
+/// Persistent-prompt mutation arguments are private provider context. Retained
+/// channel history must not turn them into a later transcript/API export.
+fn redact_sensitive_session_prompt_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut omit_tool_result = false;
+    messages
+        .into_iter()
+        .filter(|message| {
+            if message.role == "assistant"
+                && zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+                    .iter()
+                    .any(|name| message.content.contains(name))
+            {
+                omit_tool_result = true;
+                return false;
+            }
+            if message.role == "tool" && std::mem::take(&mut omit_tool_result) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -7573,7 +7596,9 @@ async fn process_channel_message_body(
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
                 // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                let tool_messages = redact_sensitive_session_prompt_tool_messages(
+                    extract_current_turn_tool_messages(&history),
+                );
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
@@ -34358,6 +34383,31 @@ Done."#;
 
         let tool_msgs = extract_current_turn_tool_messages(&history);
         assert_eq!(tool_msgs.len(), 4);
+    }
+
+    #[test]
+    fn retained_tool_history_omits_session_prompt_mutations() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"session_prompt_set","arguments":"private marker"}]}"#,
+            ),
+            ChatMessage::tool("prompt saved"),
+            ChatMessage::assistant(r#"{"tool_call":"shell"}"#),
+            ChatMessage::tool("shell result"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages);
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .all(|message| !message.content.contains("private marker"))
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|message| message.content.contains("shell"))
+        );
     }
 
     #[test]

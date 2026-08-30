@@ -5,6 +5,7 @@ use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
 use chrono::{Datelike, Local};
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -12,6 +13,22 @@ use zeroclaw_config::schema::IdentityConfig;
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
 pub(crate) const SYSTEM_PROMPT_TRUNCATION_MARKER: &str =
     "\n\n[System prompt truncated to fit context budget]\n";
+const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omitted from export]";
+const SESSION_PROMPTS_SECTION_PREFIX: &str = "\n\n## Session Prompts\n";
+
+/// Return an observability-safe view of a host system prompt.
+///
+/// Session-prompt attachments are appended as the final host-owned section.
+/// They are provider input, not diagnostic, hook, or telemetry content.
+pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<'_, str> {
+    let Some(start) = prompt.find(SESSION_PROMPTS_SECTION_PREFIX) else {
+        return Cow::Borrowed(prompt);
+    };
+    Cow::Owned(format!(
+        "{}{SESSION_PROMPTS_EXPORT_MARKER}",
+        &prompt[..start]
+    ))
+}
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
@@ -420,6 +437,16 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
+
+    #[test]
+    fn export_view_omits_trailing_session_prompt_attachments() {
+        let raw =
+            "host context\n\n## Session Prompts\n- id: \"task\"; content: \"private marker\"\n";
+        let redacted = redact_session_prompt_attachments_for_export(raw);
+        assert!(!redacted.contains("private marker"));
+        assert!(redacted.contains("host context"));
+        assert!(redacted.contains("omitted from export"));
+    }
 
     #[test]
     fn attachments_fail_closed_before_host_safety_context_is_truncated() {

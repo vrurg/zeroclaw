@@ -11,6 +11,7 @@ use super::outcome::{
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
 use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::prompt::redact_session_prompt_attachments_for_export;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -75,7 +76,12 @@ pub(crate) async fn announce_llm_request(
             let rendered: Vec<::serde_json::Value> = request_messages
                 .iter()
                 .map(|m| {
-                    ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
+                    let content = if m.role == "system" {
+                        redact_session_prompt_attachments_for_export(&m.content)
+                    } else {
+                        std::borrow::Cow::Borrowed(m.content.as_str())
+                    };
+                    ::serde_json::json!({"role": m.role.as_str(), "content": content})
                 })
                 .collect();
             let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
@@ -109,7 +115,18 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        hooks.fire_llm_input(request_messages, active_model).await;
+        let export_messages: Vec<ChatMessage> = request_messages
+            .iter()
+            .map(|message| ChatMessage {
+                role: message.role.clone(),
+                content: if message.role == "system" {
+                    redact_session_prompt_attachments_for_export(&message.content).into_owned()
+                } else {
+                    message.content.clone()
+                },
+            })
+            .collect();
+        hooks.fire_llm_input(&export_messages, active_model).await;
     }
 
     llm_started_at
@@ -527,6 +544,7 @@ mod payload_capture_tests {
     // redacts the value, preserving only its first 4 chars. The unique secret
     // tail below must NOT survive into the captured payload.
     const SECRET_TAIL: &str = "ABCDEF1234567890SECRET";
+    const SESSION_PROMPT_MARKER: &str = "session-prompt-private-marker";
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
@@ -544,7 +562,9 @@ mod payload_capture_tests {
         let pacing = PacingConfig::default();
         let provider = StubProvider;
         let history = vec![
-            ChatMessage::system("You are a helpful assistant."),
+            ChatMessage::system(format!(
+                "You are a helpful assistant.\n\n## Session Prompts\n- id: \"task\"; content: \"{SESSION_PROMPT_MARKER}\"\n"
+            )),
             ChatMessage::user(format!("deploy with api_key: sk-{SECRET_TAIL} please")),
         ];
 
@@ -566,6 +586,10 @@ mod payload_capture_tests {
         assert!(
             !request_messages.contains(SECRET_TAIL),
             "captured payload must not contain the raw secret; got: {request_messages}"
+        );
+        assert!(
+            !request_messages.contains(SESSION_PROMPT_MARKER),
+            "captured payload must not contain session-prompt content; got: {request_messages}"
         );
         assert_eq!(
             attrs
