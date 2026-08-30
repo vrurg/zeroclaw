@@ -14,14 +14,17 @@ pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversat
 pub(crate) const SYSTEM_PROMPT_TRUNCATION_MARKER: &str =
     "\n\n[System prompt truncated to fit context budget]\n";
 const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omitted from export]";
-const SESSION_PROMPTS_SECTION_PREFIX: &str = "\n\n## Session Prompts\n";
 
 /// Return an observability-safe view of a host system prompt.
 ///
 /// Session-prompt attachments are appended as the final host-owned section.
 /// They are provider input, not diagnostic, hook, or telemetry content.
 pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<'_, str> {
-    let Some(start) = prompt.find(SESSION_PROMPTS_SECTION_PREFIX) else {
+    let section_prefix = format!(
+        "\n\n{}",
+        zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+    );
+    let Some(start) = prompt.find(&section_prefix) else {
         return Cow::Borrowed(prompt);
     };
     Cow::Owned(format!(

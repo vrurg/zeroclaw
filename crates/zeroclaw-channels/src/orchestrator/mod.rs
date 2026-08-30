@@ -2437,7 +2437,7 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 /// Persistent-prompt mutation arguments are private provider context. Retained
 /// channel history must not turn them into a later transcript/API export.
 fn redact_sensitive_session_prompt_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut omit_tool_result = false;
+    let mut omit_tool_batch = false;
     messages
         .into_iter()
         .filter(|message| {
@@ -2446,10 +2446,13 @@ fn redact_sensitive_session_prompt_tool_messages(messages: Vec<ChatMessage>) -> 
                     .iter()
                     .any(|name| message.content.contains(name))
             {
-                omit_tool_result = true;
+                omit_tool_batch = true;
                 return false;
             }
-            if message.role == "tool" && std::mem::take(&mut omit_tool_result) {
+            if message.role == "assistant" {
+                omit_tool_batch = false;
+            }
+            if message.role == "tool" && omit_tool_batch {
                 return false;
             }
             true
@@ -34408,6 +34411,18 @@ Done."#;
                 .iter()
                 .any(|message| message.content.contains("shell"))
         );
+    }
+
+    #[test]
+    fn retained_tool_history_omits_every_result_from_a_mixed_sensitive_batch() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"shell"},{"name":"session_prompt_list"}]}"#,
+            ),
+            ChatMessage::tool("shell result"),
+            ChatMessage::tool("private marker from list"),
+        ];
+        assert!(redact_sensitive_session_prompt_tool_messages(messages).is_empty());
     }
 
     #[test]
