@@ -905,6 +905,7 @@ cli-alias-owned-cascaded = 所有状態をカスケードしました: memory {$
 cli-alias-owned-repointed = 所有状態を再ポイントしました: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
 cli-alias-warn-workspace-move = 警告: ワークスペースの移動に失敗しました: {$error}
 cli-alias-warn = 警告: {$warning}
+cli-config-patch-warning-pre-existing-validation = 警告: {$path} は無効なままのレガシープロバイダーエイリアスであり、個別に修復する必要があります。
 cli-alias-deleted = {$section}.{$alias} を削除しました（{$count} 件の参照を除去しました）
 cli-alias-delete-refused-header = 拒否されました: {$count} 件のハード参照が削除をブロックしています:
 cli-alias-delete-refused-hint = 削除が拒否されました — 先にハード参照を解決してください

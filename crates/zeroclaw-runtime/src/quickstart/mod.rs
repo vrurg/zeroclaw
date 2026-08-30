@@ -113,13 +113,10 @@ impl QuickstartConfigState {
     ) -> Result<QuickstartApplyOutcome, Vec<QuickstartError>> {
         let _transaction_guard = Arc::clone(&self.write_lock).lock_owned().await;
         if admit_reload && self.reload_admitted.load(Ordering::Acquire) {
-            return Err(vec![QuickstartError::for_surface(
-                None,
+            return Err(vec![QuickstartError::new(
                 QuickstartStep::Agent,
                 "reload",
                 "Quickstart is waiting for the daemon to reload after a previous successful submission",
-                "cli-quickstart-error-reload-pending",
-                &[],
             )]);
         }
         let mut working = self.config.read().clone();

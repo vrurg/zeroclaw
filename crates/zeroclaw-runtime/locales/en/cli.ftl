@@ -1043,6 +1043,7 @@ cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron
 cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
 cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
 cli-alias-warn = warning: {$warning}
+cli-config-patch-warning-pre-existing-validation = warning: {$path} is a legacy provider alias that remains invalid and must be repaired separately.
 cli-alias-deleted = deleted {$section}.{$alias} (scrubbed {$count} reference(s))
 cli-alias-delete-refused-header = refused: {$count} hard reference(s) block the delete:
 cli-alias-delete-refused-hint = delete refused — resolve the hard references first

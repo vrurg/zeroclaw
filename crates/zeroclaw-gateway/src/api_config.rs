@@ -348,38 +348,22 @@ fn lookup_prop_field(
 fn scoped_validate(
     working: &zeroclaw_config::schema::Config,
 ) -> Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError> {
-    if let Err(e) = working.validate() {
-        let api_err = ConfigApiError::from_validation(e);
-        let err_path = api_err.path.as_deref().unwrap_or("");
-        let touches_dirty = !err_path.is_empty()
-            && working.dirty_paths.iter().any(|d| {
-                err_path == d.as_str()
-                    || err_path.starts_with(&format!("{d}."))
-                    || d.starts_with(&format!("{err_path}."))
-            });
-        if touches_dirty || err_path.is_empty() {
-            return Err(api_err);
-        }
+    let warnings = working
+        .validate_for_config_repair()
+        .map_err(ConfigApiError::from_validation)?;
+    for warning in &warnings {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"path": err_path})),
+                .with_attrs(::serde_json::json!({"path": warning.path})),
             &format!(
-                "validate() failed on a path outside this PATCH's dirty set; saving anyway and \
-             surfacing as a warning: {}",
-                api_err.message
+                "saving a config repair while retaining an unrelated legacy provider alias with `:`: {}",
+                warning.path
             )
         );
-        return Ok(vec![
-            zeroclaw_config::validation_warnings::ValidationWarning::new(
-                "pre_existing_validation_error",
-                api_err.message,
-                err_path.to_string(),
-            ),
-        ]);
     }
-    Ok(Vec::new())
+    Ok(warnings)
 }
 
 /// Save `new_config` to disk, then install it as the live config.

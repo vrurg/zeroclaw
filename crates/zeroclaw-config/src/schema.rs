@@ -21169,6 +21169,13 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.validate_allowing_legacy_colon_aliases(&std::collections::HashSet::new())
+    }
+
+    fn validate_allowing_legacy_colon_aliases(
+        &self,
+        allowed_legacy_colon_alias_paths: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
 
         // TOML deserialization inserts provider aliases directly into their
@@ -21176,10 +21183,11 @@ impl Config {
         // API grammar, but reject ':' because it is an auth-profile-id
         // separator and can change credential ownership.
         for (family, alias, _) in self.providers.models.iter_entries() {
-            if alias.contains(':') {
+            let path = format!("providers.models.{family}.{alias}");
+            if alias.contains(':') && !allowed_legacy_colon_alias_paths.contains(&path) {
                 validation_bail!(
                     InvalidFormat,
-                    format!("providers.models.{family}.{alias}"),
+                    path,
                     "provider alias `{alias}` must not contain ':'"
                 );
             }
@@ -22949,6 +22957,77 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Validate a configuration mutation while allowing an unrelated legacy
+    /// provider alias that the current mutation grammar deliberately rejects.
+    ///
+    /// This is intentionally narrow: only the colon-name check is waived for
+    /// untouched aliases. The provider entries stay in the validation graph,
+    /// so agents and routes that already reference them continue to resolve.
+    /// All dirty paths and every other configuration invariant remain subject
+    /// to [`Self::validate`].
+    /// Replace this compatibility bridge when configuration validation and
+    /// warning transport are centralized.
+    pub fn validate_for_config_repair(
+        &self,
+    ) -> Result<Vec<crate::validation_warnings::ValidationWarning>> {
+        let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
+            .providers
+            .models
+            .iter_entries()
+            .filter_map(|(family, alias, _)| {
+                let path = format!("providers.models.{family}.{alias}");
+                let touches_dirty = self.dirty_paths.iter().any(|dirty| {
+                    dirty == &path
+                        || dirty.starts_with(&format!("{path}."))
+                        || path.starts_with(&format!("{dirty}."))
+                });
+                // OAuth aliases participate in profile ownership, so they are
+                // never grandfathered by this static-credential bridge.
+                let is_legacy_static_alias = family == "anthropic"
+                    && self
+                        .providers
+                        .models
+                        .anthropic
+                        .get(alias)
+                        .is_some_and(|provider| provider.auth_mode.is_none());
+                // Do not allow a config-patch request to create a new direct
+                // reference to a colon alias. Existing references are safe to
+                // retain while another field is repaired because their paths
+                // are not dirty.
+                let alias_reference = format!("{family}.{alias}");
+                let dirty_path_references_alias = self.dirty_paths.iter().any(|dirty| {
+                    self.get_prop(dirty).is_ok_and(|value| {
+                        value == alias_reference
+                            || serde_json::from_str::<Vec<String>>(&value).is_ok_and(|references| {
+                                references
+                                    .iter()
+                                    .any(|reference| reference == &alias_reference)
+                            })
+                    })
+                });
+                (alias.contains(':')
+                    && is_legacy_static_alias
+                    && !touches_dirty
+                    && !dirty_path_references_alias)
+                    .then_some(path)
+            })
+            .collect();
+        self.validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)?;
+        let mut excluded_legacy_alias_paths: Vec<_> =
+            excluded_legacy_alias_paths.into_iter().collect();
+        excluded_legacy_alias_paths.sort();
+        Ok(excluded_legacy_alias_paths
+            .into_iter()
+            .map(|path| {
+                crate::validation_warnings::ValidationWarning::new(
+                    "pre_existing_validation_error",
+                    "unrelated legacy provider alias contains `:` and must be repaired separately",
+                    path,
+                )
+            })
+            .collect())
     }
 
     pub fn mark_dirty(&mut self, path: &str) {
@@ -43293,6 +43372,96 @@ model_provider = \"ollama.default\"
             .expect_err("provider aliases must not contain the profile-id separator");
         assert!(error.to_string().contains("must not contain ':'"));
         assert!(error.to_string().contains("subscription:other-provider"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_allows_only_untouched_static_colon_aliases() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "legacy:subscription".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated repair may retain a static legacy alias");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "pre_existing_validation_error");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.anthropic.legacy:subscription"
+        );
+
+        let mut oauth_config = Config::default();
+        oauth_config.providers.models.anthropic.insert(
+            "oauth:subscription".into(),
+            AnthropicModelProviderConfig {
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        oauth_config.mark_dirty("gateway.host");
+        let error = oauth_config
+            .validate_for_config_repair()
+            .expect_err("OAuth aliases must retain the colon validation");
+        assert!(error.to_string().contains("oauth:subscription"));
+
+        let mut non_anthropic_config = Config::default();
+        non_anthropic_config
+            .providers
+            .models
+            .custom
+            .insert("legacy:custom".into(), CustomModelProviderConfig::default());
+        non_anthropic_config.mark_dirty("gateway.host");
+        let error = non_anthropic_config
+            .validate_for_config_repair()
+            .expect_err("only Anthropic static aliases may use the repair bridge");
+        assert!(error.to_string().contains("legacy:custom"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_dirty_reference_to_legacy_colon_alias() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "legacy:subscription".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+        config.agents.insert(
+            "researcher".into(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.legacy:subscription".into(),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("agents.researcher.model_provider");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a patch may not create a colon-alias reference");
+        assert!(error.to_string().contains("legacy:subscription"));
+
+        let mut fallback_config = Config::default();
+        fallback_config.providers.models.anthropic.insert(
+            "legacy:subscription".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+        fallback_config.providers.models.anthropic.insert(
+            "primary".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    fallback: vec!["anthropic.legacy:subscription".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        fallback_config.mark_dirty("providers.models.anthropic.primary.fallback");
+
+        let error = fallback_config
+            .validate_for_config_repair()
+            .expect_err("a patch may not add a colon alias to a fallback list");
+        assert!(error.to_string().contains("legacy:subscription"));
     }
 
     #[::core::prelude::v1::test]

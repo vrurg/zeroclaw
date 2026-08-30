@@ -214,7 +214,11 @@ fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::
 
 fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let output = run_cli_patch_output(config_dir, patch_doc);
-    assert!(output.status.success(), "patch should succeed");
+    assert!(
+        output.status.success(),
+        "patch should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         output.stderr.is_empty(),
         "successful --json patch should not emit stderr: {}",
@@ -226,11 +230,10 @@ fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serd
 }
 
 #[cfg(feature = "gateway")]
-async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
-    let config = Config {
-        config_path: config_dir.join("config.toml"),
-        ..Config::default()
-    };
+async fn run_http_patch_with_config(
+    config: Config,
+    patch_doc: &[u8],
+) -> (axum::http::StatusCode, serde_json::Value) {
     config.save().await.expect("save initial config");
 
     let app = Router::new()
@@ -248,11 +251,64 @@ async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde
         .await
         .expect("http patch response");
 
-    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read response body");
-    serde_json::from_slice(&body).expect("http body should be JSON error envelope")
+    (
+        status,
+        serde_json::from_slice(&body).expect("http body should be JSON error envelope"),
+    )
+}
+
+#[cfg(feature = "gateway")]
+async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
+    let config = Config {
+        config_path: config_dir.join("config.toml"),
+        ..Config::default()
+    };
+    let (status, body) = run_http_patch_with_config(config, patch_doc).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    body
+}
+
+fn legacy_colon_alias_config(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config.risk_profiles.insert(
+        "default".into(),
+        zeroclaw_config::schema::RiskProfileConfig::default(),
+    );
+    config.runtime_profiles.insert(
+        "default".into(),
+        zeroclaw_config::schema::RuntimeProfileConfig::default(),
+    );
+    config.providers.models.anthropic.insert(
+        "legacy:subscription".into(),
+        zeroclaw_config::schema::AnthropicModelProviderConfig {
+            base: zeroclaw_config::schema::ModelProviderConfig {
+                model: Some("claude-opus-4-6".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    config.agents.insert(
+        "researcher".into(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: "anthropic.legacy:subscription".into(),
+            risk_profile: "default".into(),
+            runtime_profile: "default".into(),
+            ..Default::default()
+        },
+    );
+    let raw = toml::to_string(&config).expect("serialize legacy invalid-alias fixture");
+    std::fs::write(config_dir.join("config.toml"), raw)
+        .expect("write legacy invalid-alias fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
 }
 
 #[test]
@@ -272,6 +328,124 @@ fn config_patch_json_success_emits_envelope_and_persists_change() {
         std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
     let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
     assert_eq!(parsed.gateway.host, "127.0.0.2");
+}
+
+#[test]
+fn config_patch_repairs_another_path_when_a_legacy_colon_alias_is_invalid() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = legacy_colon_alias_config(config_dir.path());
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    assert!(
+        saved.contains("[providers.models.anthropic.\"legacy:subscription\"]"),
+        "an unrelated legacy alias must remain available for an explicit later repair: {saved}"
+    );
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    let warnings = envelope["warnings"]
+        .as_array()
+        .expect("repair warning array");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["code"], "pre_existing_validation_error");
+    assert_eq!(
+        warnings[0]["path"],
+        "providers.models.anthropic.legacy:subscription"
+    );
+}
+
+#[test]
+fn config_patch_human_success_reports_retained_legacy_alias_warning() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = legacy_colon_alias_config(config_dir.path());
+
+    let output = run_cli_patch_output_human(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert!(
+        output.status.success(),
+        "human patch should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("providers.models.anthropic.legacy:subscription"),
+        "human success must retain the repair warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_repairs_referenced_legacy_colon_alias_with_warning() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        legacy_colon_alias_config(config_dir.path()),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["saved"], true);
+    assert_eq!(envelope["results"][0]["path"], "gateway.host");
+    assert!(
+        envelope["warnings"].as_array().is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| warning["path"] == "providers.models.anthropic.legacy:subscription")
+        }),
+        "the repair response must identify the retained legacy alias: {envelope}"
+    );
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    assert_eq!(
+        parsed.agents["researcher"].model_provider, "anthropic.legacy:subscription",
+        "the referenced legacy alias must stay present for its existing agent"
+    );
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_rejects_dirty_validation_hidden_by_legacy_colon_alias() {
+    let patch_doc = br#"[{"op":"replace","path":"/gateway/host","value":""}]"#;
+    let cli_config_dir = tempfile::tempdir().expect("temp cli config dir");
+    let http_config_dir = tempfile::tempdir().expect("temp http config dir");
+
+    let _ = legacy_colon_alias_config(cli_config_dir.path());
+    let cli_envelope = run_cli_patch(cli_config_dir.path(), patch_doc);
+    let (status, http_envelope) =
+        run_http_patch_with_config(legacy_colon_alias_config(http_config_dir.path()), patch_doc)
+            .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    for field in ["code", "path"] {
+        assert_eq!(
+            cli_envelope[field], http_envelope[field],
+            "CLI and HTTP mismatch on `{field}`:\nCLI:  {cli_envelope}\nHTTP: {http_envelope}",
+        );
+    }
+    assert_eq!(cli_envelope["code"], "required_field_empty");
+    assert_eq!(cli_envelope["path"], "gateway.host");
+
+    for config_dir in [&cli_config_dir, &http_config_dir] {
+        let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+            .expect("read rejected-patch config");
+        let parsed: Config = toml::from_str(&saved).expect("rejected-patch config parses");
+        assert!(
+            !parsed.gateway.host.is_empty(),
+            "a rejected dirty validation must not persist an empty gateway host: {saved}"
+        );
+    }
 }
 
 #[cfg(feature = "gateway")]

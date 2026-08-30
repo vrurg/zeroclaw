@@ -905,6 +905,7 @@ cli-alias-owned-cascaded = estado propio en cascada: memoria {$memory} · cron {
 cli-alias-owned-repointed = estado propio reapuntado: memoria {$memory} · cron {$cron} · acp {$acp} · sesiones {$sessions}
 cli-alias-warn-workspace-move = advertencia: falló el movimiento del workspace: {$error}
 cli-alias-warn = advertencia: {$warning}
+cli-config-patch-warning-pre-existing-validation = advertencia: {$path} es un alias heredado de proveedor que sigue sin ser válido y debe repararse por separado.
 cli-alias-deleted = eliminado {$section}.{$alias} (depuradas {$count} referencia(s))
 cli-alias-delete-refused-header = rechazado: {$count} referencia(s) fuerte(s) bloquean la eliminación:
 cli-alias-delete-refused-hint = eliminación rechazada — resuelva primero las referencias fuertes

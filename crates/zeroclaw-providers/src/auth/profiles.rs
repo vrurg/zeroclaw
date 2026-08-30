@@ -19,6 +19,7 @@ const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
 
 type DirectorySyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type DirectoryPermissionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 type FileSyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +591,27 @@ impl AuthProfilesStore {
         F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
         G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
     {
+        self.write_persisted_locked_with_operations(
+            persisted,
+            sync_temp_file,
+            sync_parent_directory,
+            |parent| Box::pin(set_owner_only_directory_permissions(parent)),
+        )
+        .await
+    }
+
+    async fn write_persisted_locked_with_operations<F, G, H>(
+        &self,
+        persisted: &PersistedAuthProfiles,
+        sync_temp_file: F,
+        sync_parent_directory: G,
+        set_parent_permissions: H,
+    ) -> Result<ProfileSaveOutcome>
+    where
+        F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
+        G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+        H: for<'a> FnOnce(&'a Path) -> DirectoryPermissionFuture<'a>,
+    {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
                 format!(
@@ -597,7 +619,18 @@ impl AuthProfilesStore {
                     parent.display()
                 )
             })?;
-            set_owner_only_directory_permissions(parent).await?;
+            if let Err(err) = set_parent_permissions(parent).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "path": parent.display().to_string(),
+                            "error": err.to_string(),
+                        })),
+                    "Could not set owner-only auth-profile directory permissions; continuing with the owner-only profile file"
+                );
+            }
         }
 
         let json =
@@ -909,6 +942,8 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -997,6 +1032,43 @@ mod tests {
                 & 0o777,
             0o600,
             "replaced auth-profile store must inherit owner-only temporary-file permissions"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_write_tolerates_parent_permission_tightening_failure() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = AuthProfilesStore::new(&state_dir, false);
+        let outcome = store
+            .write_persisted_locked_with_operations(
+                &PersistedAuthProfiles::default(),
+                |file| {
+                    Box::pin(async move {
+                        let mode = file.metadata().await?.permissions().mode() & 0o777;
+                        assert_eq!(mode, 0o600, "temporary profile store must be owner-only");
+                        Ok(())
+                    })
+                },
+                |parent| Box::pin(sync_directory(parent)),
+                |_| Box::pin(async { anyhow::bail!("synthetic chmod failure") }),
+            )
+            .await
+            .expect("directory chmod failure must not prevent profile persistence");
+
+        assert!(matches!(outcome, ProfileSaveOutcome::Durable));
+        assert_eq!(
+            std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "committed profile store must remain owner-only after chmod failure"
         );
     }
 

@@ -275,6 +275,53 @@ where
     anyhow::bail!("{}", human.into())
 }
 
+/// Per-patch validation must reject every dirty-path error, while a
+/// resiliently loaded legacy colon alias elsewhere must not make the
+/// configuration impossible to repair through the CLI.  The config-owned
+/// compatibility bridge is deliberately narrow until validation and warning
+/// transport are centralized.
+fn config_patch_scoped_validate(
+    config: &Config,
+) -> std::result::Result<Vec<zeroclaw_config::validation_warnings::ValidationWarning>, ConfigApiError>
+{
+    let warnings = config
+        .validate_for_config_repair()
+        .map_err(ConfigApiError::from_validation)?;
+    for warning in &warnings {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"path": warning.path})),
+            &format!(
+                "saving a config repair while retaining an unrelated legacy provider alias with `:`: {}",
+                warning.path
+            )
+        );
+    }
+    Ok(warnings)
+}
+
+fn config_patch_human_warning(
+    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
+) -> String {
+    match warning.code.as_str() {
+        "pre_existing_validation_error" => ta(
+            "cli-config-patch-warning-pre-existing-validation",
+            &[("path", &warning.path)],
+            &format!(
+                "Warning: {} is a legacy provider alias that remains invalid and must be repaired separately.",
+                warning.path
+            ),
+        ),
+        _ => ta(
+            "cli-alias-warn",
+            &[("warning", &warning.message)],
+            &warning.message,
+        ),
+    }
+}
+
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s
         .parse()
@@ -6698,14 +6745,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     results.push(result_entry);
                 }
 
-                if let Err(err) = config.validate() {
-                    let api_err = ConfigApiError::from_validation(err);
-                    let human = format!(
-                        "validation failed after applying patch \u{2014} no changes saved: {}",
-                        api_err.message
-                    );
-                    config_patch_fail_json_or_human(json, api_err, human)?;
-                }
+                let scoped_validation_warnings = match config_patch_scoped_validate(&config) {
+                    Ok(warnings) => warnings,
+                    Err(api_err) => {
+                        let human = format!(
+                            "validation failed after applying patch \u{2014} no changes saved: {}",
+                            api_err.message
+                        );
+                        config_patch_fail_json_or_human(json, api_err, human)?
+                    }
+                };
                 Box::pin(config.save_dirty()).await?;
 
                 // Report the withheld tool when this patch is what enabled the
@@ -6721,7 +6770,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
 
                 if json {
-                    let body = serde_json::json!({"saved": true, "results": results});
+                    let mut body = serde_json::json!({"saved": true, "results": results});
+                    if !scoped_validation_warnings.is_empty() {
+                        body["warnings"] = serde_json::to_value(scoped_validation_warnings)?;
+                    }
                     println!("{}", serde_json::to_string_pretty(&body)?);
                 } else {
                     println!(
@@ -6746,6 +6798,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 .unwrap_or_else(|| "null".to_string());
                             println!("  {op:<8} {path} = {value}");
                         }
+                    }
+                    for warning in &scoped_validation_warnings {
+                        eprintln!("{}", config_patch_human_warning(warning));
                     }
                 }
                 Ok(())
