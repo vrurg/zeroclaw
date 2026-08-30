@@ -1790,6 +1790,13 @@ impl RpcClient {
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
+        Self::with_rpc_transport(outbound, Transport::Local)
+    }
+
+    /// Test-only constructor that also controls the transport-specific payload
+    /// encoding used by callers such as attachment dispatch.
+    #[cfg(test)]
+    pub fn with_rpc_transport(outbound: Arc<RpcOutbound>, transport: Transport) -> Self {
         let (notif_tx, _) = tokio::sync::broadcast::channel(1);
         let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -1803,7 +1810,7 @@ impl RpcClient {
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
-            transport: Transport::Local,
+            transport,
             commands: Vec::new(),
         }
     }

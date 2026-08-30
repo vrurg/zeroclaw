@@ -2692,9 +2692,44 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_delta" => {
-                    let stop_reason_value = event.get("delta").and_then(|d| d.get("stop_reason"));
-                    let stop_reason = stop_reason_value.and_then(serde_json::Value::as_str);
-                    if let Some(stop_reason) = stop_reason {
+                    let delta = event.get("delta");
+                    let delta_is_object = delta.is_some_and(serde_json::Value::is_object);
+                    let stop_reason_value = delta.and_then(|delta| delta.get("stop_reason"));
+                    let stop_reason = delta_is_object
+                        .then_some(stop_reason_value)
+                        .flatten()
+                        .and_then(serde_json::Value::as_str);
+                    if !delta_is_object {
+                        // A message_delta without its object envelope is not a
+                        // usage-only observation. Do not let an earlier clean
+                        // stop reason turn malformed terminal framing into Final.
+                        terminal_completion_error
+                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                        if last_stop_reason.is_none() {
+                            last_stop_reason = Some("invalid_delta_envelope".to_string());
+                        }
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "delta_type": match delta {
+                                    None => "missing",
+                                    Some(serde_json::Value::Null) => "null",
+                                    Some(serde_json::Value::Bool(_)) => "boolean",
+                                    Some(serde_json::Value::Number(_)) => "number",
+                                    Some(serde_json::Value::String(_)) => "string",
+                                    Some(serde_json::Value::Array(_)) => "array",
+                                    Some(serde_json::Value::Object(_)) => "object",
+                                },
+                            })),
+                            "stream: malformed message_delta envelope; stream remains non-final"
+                        );
+                    } else if let Some(stop_reason) = stop_reason {
                         if let Some(first_stop_reason) = last_stop_reason.as_deref() {
                             if first_stop_reason != stop_reason {
                                 if terminal_completion_error.is_none() {
@@ -4223,6 +4258,20 @@ event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":{\"unexpected\":true}},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+        assert_non_string_stop_reason_is_rejected(bytes).await;
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_malformed_message_delta_after_end_turn() {
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":7,\"usage\":{\"output_tokens\":5}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
 

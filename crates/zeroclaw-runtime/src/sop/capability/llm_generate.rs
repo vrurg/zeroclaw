@@ -174,8 +174,8 @@ impl SopCapability for LlmGenerateCapability {
         // reject semantic-empty output before capability success is serialized.
         // A typed adapter-result contract would express this upstream, but that
         // public API change needs a separate compatibility decision.
-        let semantic_text = zeroclaw_api::model_provider::normalize_terminal_display_text(&text);
-        if semantic_text.is_empty() {
+        let text = zeroclaw_api::model_provider::normalize_terminal_display_text(&text);
+        if text.is_empty() {
             let error =
                 anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
             let message = crate::agent::terminal_completion_error_message(&error, None)
@@ -522,6 +522,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_adapter_contract_uses_the_typed_default() {
+        let adapter = RecordingLlm {
+            calls: Mutex::new(Vec::new()),
+            result: Err("legacy provider error".into()),
+        };
+
+        let error = adapter
+            .generate_typed(None, "prompt")
+            .expect_err("the default must retain legacy adapter compatibility");
+
+        assert_eq!(error.to_string(), "legacy provider error");
+    }
+
+    #[test]
     fn legacy_adapter_semantic_empty_output_fails_closed() {
         for output in [
             "",
@@ -550,8 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_adapter_keeps_valid_output_byte_for_byte() {
-        let output = " <think>internal reasoning</think> final ";
+    fn legacy_adapter_normalizes_successful_terminal_output() {
+        let output = "<think>internal reasoning</think>final<eom><|eom|>";
         let adapter = Arc::new(RecordingLlm {
             calls: Mutex::new(Vec::new()),
             result: Ok(output.to_string()),
@@ -562,7 +576,7 @@ mod tests {
             .execute(ctx(), json!({"instruction": "summarize"}))
             .expect("capability result");
         assert!(out.success);
-        assert_eq!(out.output["text"], output);
+        assert_eq!(out.output["text"], "final");
     }
 
     struct SemanticEmptyProvider {
@@ -647,5 +661,18 @@ mod tests {
 
             assert_eq!(error, expected, "case {text:?}");
         }
+    }
+
+    #[test]
+    fn provider_adapter_bridge_preserves_terminal_error_type() {
+        let adapter =
+            ProviderLlmAdapter::new(Arc::new(SemanticEmptyProvider { text: "" }), "test".into());
+        let error = adapter
+            .generate_typed(None, "prompt")
+            .expect_err("the provider's typed terminal error must survive the bridge");
+
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
     }
 }

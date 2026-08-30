@@ -181,7 +181,11 @@ pub(crate) async fn consume_provider_streaming_response(
                         .into());
                     }
                     if failure.has_pre_executed_tool_activity() {
-                        return Err(StreamPreExecutedToolsWithoutFinalResponse { usage }.into());
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage,
+                            cause: None,
+                        }
+                        .into());
                     }
                     return Err(StreamSemanticEmptyCompletion {
                         usage,
@@ -206,6 +210,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     if outcome.saw_pre_executed_tool_activity {
                         return Err(StreamPreExecutedToolsWithoutFinalResponse {
                             usage: outcome.usage.clone().or(failure.usage.clone()),
+                            cause: None,
                         }
                         .into());
                     }
@@ -224,6 +229,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
 
                 let message = format!("model_provider stream error: {err}");
+                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
                     // Preserve only the immutable prefix that the caller
                     // actually received, even when a client tool call also
@@ -235,10 +241,13 @@ pub(crate) async fn consume_provider_streaming_response(
                         )
                         .into());
                     }
-                    return Err(StreamInterruptedAfterOutput::transport(
+                    return Err(StreamInterruptedAfterOutput::reliable_provider(
                         forwarded_text,
                         message,
                         outcome.usage,
+                        zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                            &provider_error,
+                        ),
                     )
                     .into());
                 }
@@ -270,6 +279,11 @@ pub(crate) async fn consume_provider_streaming_response(
                 if outcome.saw_pre_executed_tool_activity {
                     return Err(StreamPreExecutedToolsWithoutFinalResponse {
                         usage: outcome.usage,
+                        cause: Some(
+                            zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                                &provider_error,
+                            ),
+                        ),
                     }
                     .into());
                 }
@@ -429,6 +443,7 @@ pub(crate) async fn consume_provider_streaming_response(
         if outcome.saw_pre_executed_tool_activity {
             return Err(StreamPreExecutedToolsWithoutFinalResponse {
                 usage: outcome.usage,
+                cause: None,
             }
             .into());
         }

@@ -57,6 +57,11 @@ enum StreamInterruptionCause {
     },
     Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
     SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
+    ReliableProvider {
+        message: String,
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+        failure: zeroclaw_providers::ReliableProviderTerminalFailure,
+    },
 }
 
 impl StreamInterruptedAfterOutput {
@@ -97,11 +102,30 @@ impl StreamInterruptedAfterOutput {
         }
     }
 
+    /// Preserve an already-classified Reliable cause after visible output.
+    /// The partial response still prevents replay.
+    pub(crate) fn reliable_provider(
+        partial_text: String,
+        message: String,
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+        failure: zeroclaw_providers::ReliableProviderTerminalFailure,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::ReliableProvider {
+                message,
+                usage,
+                failure,
+            },
+        }
+    }
+
     pub(crate) fn usage(&self) -> Option<&zeroclaw_providers::traits::TokenUsage> {
         match &self.cause {
             StreamInterruptionCause::Transport { usage, .. } => usage.as_ref(),
             StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
             StreamInterruptionCause::SemanticEmpty(failure) => failure.usage.as_ref(),
+            StreamInterruptionCause::ReliableProvider { usage, .. } => usage.as_ref(),
         }
     }
 }
@@ -112,6 +136,7 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
             StreamInterruptionCause::Transport { message, .. } => f.write_str(message),
             StreamInterruptionCause::Terminal(failure) => failure.fmt(f),
             StreamInterruptionCause::SemanticEmpty(failure) => failure.fmt(f),
+            StreamInterruptionCause::ReliableProvider { message, .. } => f.write_str(message),
         }
     }
 }
@@ -122,6 +147,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
             StreamInterruptionCause::Transport { .. } => None,
             StreamInterruptionCause::Terminal(failure) => Some(failure),
             StreamInterruptionCause::SemanticEmpty(failure) => Some(failure),
+            StreamInterruptionCause::ReliableProvider { failure, .. } => Some(failure),
         }
     }
 }
@@ -153,6 +179,11 @@ impl std::error::Error for StreamTerminalCompletion {
 #[derive(Debug)]
 pub(crate) struct StreamPreExecutedToolsWithoutFinalResponse {
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    /// A generic provider stream failure can carry a typed Reliable cause. Keep
+    /// it through the no-replay boundary so delivery retains the established
+    /// provider-specific error category instead of degrading to a generic
+    /// provider-tools message.
+    pub(crate) cause: Option<zeroclaw_providers::ReliableProviderTerminalFailure>,
 }
 
 impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
@@ -161,7 +192,13 @@ impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
     }
 }
 
-impl std::error::Error for StreamPreExecutedToolsWithoutFinalResponse {}
+impl std::error::Error for StreamPreExecutedToolsWithoutFinalResponse {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// A completed stream that contains neither final text nor native tool calls.
 /// Its reported usage survives the error boundary so retries and fallback do
@@ -223,23 +260,97 @@ pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
 
 /// Render the canonical user-facing failure at a delivery boundary.
 pub fn semantic_empty_terminal_completion_message(agent_name: Option<&str>) -> String {
-    match agent_name {
-        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
-            "cli-delegate-error-invalid-semantic-completion",
-            &[("agent_name", agent_name)],
-        ),
-        None => crate::i18n::get_required_cli_string("cli-agent-error-invalid-semantic-completion"),
+    semantic_empty_terminal_completion_message_with_renderer(agent_name, render_cli_string)
+}
+
+type CliStringRenderer = fn(&str, &[(&str, &str)]) -> String;
+
+fn render_cli_string(key: &str, args: &[(&str, &str)]) -> String {
+    if args.is_empty() {
+        crate::i18n::get_required_cli_string(key)
+    } else {
+        crate::i18n::get_required_cli_string_with_args(key, args)
     }
 }
 
-fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -> String {
+fn semantic_empty_terminal_completion_message_with_renderer(
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> String {
     match agent_name {
-        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+        Some(agent_name) => render(
+            "cli-delegate-error-invalid-semantic-completion",
+            &[("agent_name", agent_name)],
+        ),
+        None => render("cli-agent-error-invalid-semantic-completion", &[]),
+    }
+}
+
+fn pre_executed_tools_without_final_response_message(
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> String {
+    match agent_name {
+        Some(agent_name) => render(
             "cli-delegate-error-incomplete-after-provider-tools",
             &[("agent_name", agent_name)],
         ),
-        None => {
-            crate::i18n::get_required_cli_string("cli-agent-error-incomplete-after-provider-tools")
+        None => render("cli-agent-error-incomplete-after-provider-tools", &[]),
+    }
+}
+
+fn reliable_provider_terminal_failure_message_with_renderer(
+    failure: &zeroclaw_providers::ReliableProviderTerminalFailure,
+    render: CliStringRenderer,
+) -> String {
+    use zeroclaw_providers::ReliableProviderTerminalFailureKind;
+
+    match failure.kind() {
+        ReliableProviderTerminalFailureKind::ContextWindow => {
+            render("cli-agent-error-provider-context-window", &[])
+        }
+        ReliableProviderTerminalFailureKind::CredentialsMissing => match failure.provider() {
+            Some(provider) => render(
+                "cli-agent-error-provider-credentials-missing-named",
+                &[("provider", provider)],
+            ),
+            None => render("cli-agent-error-provider-credentials-missing", &[]),
+        },
+        ReliableProviderTerminalFailureKind::Authentication => match failure.provider() {
+            Some(provider) => render(
+                "cli-agent-error-provider-authentication-named",
+                &[("provider", provider)],
+            ),
+            None => render("cli-agent-error-provider-authentication", &[]),
+        },
+        ReliableProviderTerminalFailureKind::RateLimited => {
+            render("cli-agent-error-provider-rate-limited", &[])
+        }
+        ReliableProviderTerminalFailureKind::ProviderServer => {
+            render("cli-agent-error-provider-server", &[])
+        }
+        ReliableProviderTerminalFailureKind::ModelNotFound => {
+            render("cli-agent-error-provider-model-not-found", &[])
+        }
+        ReliableProviderTerminalFailureKind::ClientRequest => {
+            render("cli-agent-error-provider-client-request", &[])
+        }
+        ReliableProviderTerminalFailureKind::Connection => match failure.endpoint() {
+            Some(endpoint) if failure.endpoint_is_local() => render(
+                "cli-agent-error-provider-connection-local",
+                &[("endpoint", endpoint)],
+            ),
+            Some(endpoint) => render(
+                "cli-agent-error-provider-connection-remote",
+                &[("endpoint", endpoint)],
+            ),
+            None => render("cli-agent-error-provider-connection", &[]),
+        },
+        ReliableProviderTerminalFailureKind::Timeout => {
+            render("cli-agent-error-provider-timeout", &[])
+        }
+        ReliableProviderTerminalFailureKind::Other => {
+            render("cli-agent-error-provider-generic", &[])
         }
     }
 }
@@ -284,22 +395,51 @@ pub fn terminal_completion_error_message(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
+    terminal_completion_error_message_with_renderer(err, agent_name, render_cli_string)
+}
+
+fn terminal_completion_error_message_with_renderer(
+    err: &anyhow::Error,
+    agent_name: Option<&str>,
+    render: CliStringRenderer,
+) -> Option<String> {
     if zeroclaw_api::model_provider::semantic_empty_terminal_failure(err)
         .is_some_and(|failure| failure.has_pre_executed_tool_activity())
     {
         return Some(pre_executed_tools_without_final_response_message(
-            agent_name,
+            agent_name, render,
         ));
     }
     if is_semantic_empty_terminal_completion(err) {
-        return Some(semantic_empty_terminal_completion_message(agent_name));
+        return Some(semantic_empty_terminal_completion_message_with_renderer(
+            agent_name, render,
+        ));
     }
     if let Some(reason) = zeroclaw_api::model_provider::terminal_completion_error(err) {
         return Some(terminal_reason_message(reason, agent_name));
     }
+    if let Some(failure) = err.chain().find_map(|source| {
+        source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+    }) {
+        return Some(reliable_provider_terminal_failure_message_with_renderer(
+            failure, render,
+        ));
+    }
     err.chain()
         .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
-        .then(|| pre_executed_tools_without_final_response_message(agent_name))
+        .then(|| pre_executed_tools_without_final_response_message(agent_name, render))
+}
+
+#[cfg(test)]
+fn terminal_completion_error_message_in_english(
+    err: &anyhow::Error,
+    agent_name: Option<&str>,
+) -> Option<String> {
+    terminal_completion_error_message_with_renderer(
+        err,
+        agent_name,
+        crate::i18n::get_english_cli_string_with_args,
+    )
 }
 
 #[derive(Debug)]
@@ -417,7 +557,10 @@ mod tests {
             usage: None,
             replayable: true,
         };
-        let provider_tools = StreamPreExecutedToolsWithoutFinalResponse { usage: None };
+        let provider_tools = StreamPreExecutedToolsWithoutFinalResponse {
+            usage: None,
+            cause: None,
+        };
 
         assert_eq!(
             direct.to_string(),
@@ -438,7 +581,7 @@ mod tests {
         let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
         assert!(is_semantic_empty_terminal_completion(&error));
         assert_eq!(
-            terminal_completion_error_message(&error, None),
+            terminal_completion_error_message_in_english(&error, None),
             Some("The model provider returned an invalid semantic completion.".to_string())
         );
     }
@@ -491,6 +634,144 @@ mod tests {
     }
 
     #[test]
+    fn reliable_provider_cause_uses_localized_delivery_without_retry_envelope() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let diagnostic = "All model providers/models failed after 3 failure event(s). Events: \
+                          event 1 (retry 1/3): retryable";
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            diagnostic.to_string(),
+        ));
+
+        assert_eq!(error.to_string(), diagnostic);
+        assert_eq!(
+            terminal_completion_error_message_in_english(&error, None),
+            Some(
+                "The local model server at http://127.0.0.1:11434/v1/chat/completions is \
+                 unavailable. Start it or update the endpoint."
+                    .to_string()
+            )
+        );
+        assert!(
+            !terminal_completion_error_message_in_english(&error, None)
+                .expect("typed provider failure must project")
+                .contains("All model providers/models failed")
+        );
+    }
+
+    #[test]
+    fn reliable_provider_cause_distinguishes_remote_endpoint_guidance() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("https://api.example.com/v1/chat/completions".to_string()),
+            "All model providers/models failed after 1 failure event(s).".to_string(),
+        ));
+
+        assert_eq!(
+            terminal_completion_error_message_in_english(&error, None),
+            Some(
+                "Cannot reach the model provider at https://api.example.com/v1/chat/completions. \
+                 Check network access or choose another provider."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reliable_context_window_cause_uses_concise_delivery_message() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::ContextWindow,
+            None,
+            "Request exceeds model context window. Failed after 1 failure event(s).".to_string(),
+        ));
+
+        assert_eq!(
+            terminal_completion_error_message_in_english(&error, None),
+            Some(
+                "The request is too large for the selected model. Reduce the conversation or choose \
+                 a model with a larger context window."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reliable_provider_failure_kinds_use_their_fluent_messages() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let cases = [
+            (
+                ReliableProviderTerminalFailureKind::ContextWindow,
+                "cli-agent-error-provider-context-window",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::CredentialsMissing,
+                "cli-agent-error-provider-credentials-missing",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Authentication,
+                "cli-agent-error-provider-authentication",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::RateLimited,
+                "cli-agent-error-provider-rate-limited",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ProviderServer,
+                "cli-agent-error-provider-server",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ModelNotFound,
+                "cli-agent-error-provider-model-not-found",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ClientRequest,
+                "cli-agent-error-provider-client-request",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Connection,
+                "cli-agent-error-provider-connection",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Timeout,
+                "cli-agent-error-provider-timeout",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Other,
+                "cli-agent-error-provider-generic",
+            ),
+        ];
+
+        for (kind, key) in cases {
+            let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                kind,
+                None,
+                "All model providers/models failed after 1 failure event(s).".to_string(),
+            ));
+
+            assert_eq!(
+                terminal_completion_error_message_in_english(&error, None),
+                Some(crate::i18n::get_english_cli_string_with_args(key, &[])),
+                "{kind:?} must use its dedicated Fluent message"
+            );
+        }
+    }
+
+    #[test]
     fn streamed_terminal_reason_uses_fluent_delivery_projection() {
         use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
 
@@ -511,6 +792,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "response incomplete: output token limit reached"
+        );
+    }
+
+    #[test]
+    fn reliable_provider_credentials_messages_include_configured_provider() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let missing = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::CredentialsMissing,
+                None,
+                "full retry diagnostic".to_string(),
+            )
+            .with_provider("custom.truefoundry"),
+        );
+        let rejected = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Authentication,
+                None,
+                "full retry diagnostic".to_string(),
+            )
+            .with_provider("custom.truefoundry"),
+        );
+
+        assert_eq!(
+            terminal_completion_error_message_in_english(&missing, None),
+            Some(
+                "The model provider custom.truefoundry has no configured credentials. Add its API key or choose another provider."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            terminal_completion_error_message_in_english(&rejected, None),
+            Some(
+                "The model provider custom.truefoundry rejected its credentials. Check the configured credentials."
+                    .to_string()
+            )
         );
     }
 
