@@ -334,7 +334,7 @@ impl GitOperationsTool {
             .args(args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
-        self.configure_git_environment(command.as_std_mut());
+        self.configure_git_environment(command.as_std_mut(), working_dir, true);
         let output = command.output().await?;
 
         if !output.status.success() {
@@ -359,7 +359,7 @@ impl GitOperationsTool {
             .args(args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
-        self.configure_git_environment(command.as_std_mut());
+        self.configure_git_environment(command.as_std_mut(), working_dir, false);
         let output = command.output().await?;
 
         if !output.status.success() {
@@ -370,7 +370,12 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    fn configure_git_environment(&self, command: &mut std::process::Command) {
+    fn configure_git_environment(
+        &self,
+        command: &mut std::process::Command,
+        working_dir: &Path,
+        requires_write_access: bool,
+    ) {
         for name in [
             "GIT_DIR",
             "GIT_COMMON_DIR",
@@ -397,6 +402,21 @@ impl GitOperationsTool {
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat");
+        if self.security.workspace_only {
+            let authorized_roots = if requires_write_access {
+                self.security.approved_write_roots(working_dir)
+            } else {
+                self.security.approved_read_roots(working_dir)
+            };
+            if let Some(root) = authorized_roots
+                .iter()
+                .filter(|root| working_dir.starts_with(root))
+                .min_by_key(|root| root.components().count())
+                .and_then(|root| root.parent())
+            {
+                command.env("GIT_CEILING_DIRECTORIES", root);
+            }
+        }
     }
 
     async fn git_status(
@@ -1389,7 +1409,7 @@ mod tests {
             .env("GIT_COMMON_DIR", "/outside/common")
             .env("GIT_CONFIG_COUNT", "1");
 
-        tool.configure_git_environment(&mut command);
+        tool.configure_git_environment(&mut command, tmp.path(), false);
 
         for name in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"] {
             assert!(
@@ -2106,6 +2126,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn git_operations_rejects_invalid_git_directory_before_parent_repository() {
+        let workspace = TempDir::new().unwrap();
+        let parent_repository = TempDir::new().unwrap();
+        git_init_no_sign(parent_repository.path(), &[]);
+        let allowed_child = parent_repository.path().join("allowed-child");
+        std::fs::create_dir_all(allowed_child.join(".git")).unwrap();
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_child.clone());
+
+        let result = tool
+            .execute(json!({"operation": "status", "path": &allowed_child}))
+            .await;
+        assert!(
+            matches!(&result, Err(_) | Ok(ToolResult { success: false, .. })),
+            "an invalid child .git directory must not fall through to its parent repository: {result:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn git_operations_rejects_git_symlink_to_parent_repository() {
@@ -2673,6 +2711,29 @@ mod tests {
         assert!(
             error.contains("initialize") || error.contains("init"),
             "error should mention initializing a repository, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_discovery_reports_authorization_boundary_for_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let result = test_tool(tmp.path())
+            .execute(json!({"operation": "status"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "an empty workspace is not a Git repository"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("authorized roots"),
+            "bounded discovery must identify its boundary: {error}"
+        );
+        assert!(
+            !error.contains("initialize a repository"),
+            "bounded discovery must not suggest initializing a nested repository: {error}"
         );
     }
 }
