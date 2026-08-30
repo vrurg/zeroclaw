@@ -748,6 +748,10 @@ mod tests {
                 hint.contains("zeroclaw auth setup-token"),
                 "Anthropic recovery hint in {locale} must retain its executable command: {hint:?}"
             );
+            assert!(
+                hint.contains("auth_mode"),
+                "Anthropic recovery hint in {locale} must retain its OAuth configuration step: {hint:?}"
+            );
         }
     }
 
