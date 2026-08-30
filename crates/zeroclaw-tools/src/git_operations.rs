@@ -246,6 +246,16 @@ impl GitOperationsTool {
             anyhow::Error::msg("Worktree path must include a final path component")
         })?;
         let parent = parent.canonicalize().map_err(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "parent": parent.display().to_string(),
+                        "error": error.to_string(),
+                    })),
+                "git_operations: cannot resolve worktree parent"
+            );
             anyhow::Error::msg(format!(
                 "Cannot resolve worktree parent '{}': {error}",
                 parent.display()
@@ -253,6 +263,13 @@ impl GitOperationsTool {
         })?;
         let target = parent.join(name);
         if !self.security.is_resolved_path_allowed(&target) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree add target is not authorized"
+            );
             anyhow::bail!(
                 "Worktree path '{}' resolves outside the workspace or allowed roots",
                 raw_path
@@ -264,12 +281,29 @@ impl GitOperationsTool {
     fn ensure_worktree_remove_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
         let candidate = self.candidate_path(raw_path)?;
         let resolved = candidate.canonicalize().map_err(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "raw_path": raw_path,
+                        "error": error.to_string(),
+                    })),
+                "git_operations: cannot resolve worktree path"
+            );
             anyhow::Error::msg(format!(
                 "Cannot resolve worktree path '{}': {error}",
                 raw_path
             ))
         })?;
         if !self.security.is_resolved_path_allowed(&resolved) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree remove target is not authorized"
+            );
             anyhow::bail!(
                 "Worktree path '{}' resolves outside the workspace or allowed roots",
                 raw_path
@@ -1461,6 +1495,27 @@ mod tests {
     }
 
     #[test]
+    fn worktree_targets_reject_paths_outside_authorized_roots() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.ensure_worktree_add_target_allowed(
+                outside.path().join("new-worktree").to_str().unwrap()
+            )
+            .is_err()
+        );
+
+        let existing = outside.path().join("old-worktree");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(
+            tool.ensure_worktree_remove_target_allowed(existing.to_str().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn git_commands_clear_ambient_repository_overrides() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
@@ -2099,6 +2154,27 @@ mod tests {
                 result.error
             );
         }
+
+        let write = tool
+            .execute(json!({
+                "operation": "add",
+                "path": write_only_root.path(),
+                "paths": "new-file"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !write.success,
+            "write-classified Git operations must not access a write-only root"
+        );
+        assert!(
+            write
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Invalid path")),
+            "write must fail during authorization: {:?}",
+            write.error
+        );
     }
 
     #[tokio::test]
