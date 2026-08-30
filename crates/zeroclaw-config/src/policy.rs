@@ -3222,12 +3222,13 @@ impl SecurityPolicy {
         self.approved_roots(resolved, true)
     }
 
-    /// Return the first canonical bounded root that authorizes reading
+    /// Return the first canonical configured root that authorizes reading
     /// `resolved`.
     ///
-    /// This compatibility accessor preserves the existing single-boundary
-    /// contract for handle-bound callers. Parent-resource discovery must use
-    /// [`Self::approved_read_roots`] instead.
+    /// This compatibility accessor intentionally ignores `workspace_only` to
+    /// preserve the existing configured-root contract for handle-bound callers.
+    /// It is not the first value from [`Self::approved_read_roots`];
+    /// parent-resource discovery must use that plural accessor instead.
     pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
         self.configured_approved_roots(resolved, true)
             .into_iter()

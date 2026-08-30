@@ -84,35 +84,41 @@ impl GitOperationsTool {
         authorized_roots: &[PathBuf],
         requires_write_access: bool,
     ) -> bool {
+        let discovery_is_unbounded = !self.security.workspace_only;
         let mut current_dir = working_dir;
         loop {
             let git_metadata = current_dir.join(".git");
             if let Ok(metadata) = std::fs::symlink_metadata(&git_metadata) {
-                let current_dir_is_authorized = authorized_roots.is_empty()
+                let current_dir_is_authorized = discovery_is_unbounded
                     || authorized_roots
                         .iter()
                         .any(|root| current_dir.starts_with(root));
-                if metadata.file_type().is_dir()
-                    && current_dir_is_authorized
-                    && self.metadata_directory_is_authorized(&git_metadata, requires_write_access)
-                {
-                    return true;
+                // Git binds to the first `.git` entry it discovers. A rejected
+                // entry must therefore deny the operation rather than allowing
+                // discovery to continue to an ancestor repository.
+                if metadata.file_type().is_dir() {
+                    return current_dir_is_authorized
+                        && self.metadata_directory_is_authorized(
+                            &git_metadata,
+                            requires_write_access,
+                        );
                 }
-                if metadata.file_type().is_file()
-                    && current_dir_is_authorized
-                    && self.metadata_path_is_authorized(&git_metadata, requires_write_access)
-                    && self.linked_worktree_metadata_is_authorized(
-                        &git_metadata,
-                        requires_write_access,
-                    )
-                {
-                    return true;
+                if metadata.file_type().is_file() {
+                    return current_dir_is_authorized
+                        && self.metadata_path_is_authorized(&git_metadata, requires_write_access)
+                        && self.linked_worktree_metadata_is_authorized(
+                            &git_metadata,
+                            requires_write_access,
+                        );
                 }
+                // A `.git` symlink or other non-regular entry is not an
+                // acceptable metadata boundary and must not fall through.
+                return false;
             }
             let Some(parent) = current_dir.parent() else {
                 return false;
             };
-            if !authorized_roots.is_empty()
+            if !discovery_is_unbounded
                 && !authorized_roots.iter().any(|root| parent.starts_with(root))
             {
                 return false;
@@ -156,6 +162,11 @@ impl GitOperationsTool {
         }
 
         let commondir_file = gitdir.join("commondir");
+        if !commondir_file.exists() {
+            // A gitfile without `commondir` is a submodule-style indirection,
+            // whose gitdir was independently authorized above.
+            return true;
+        }
         if !std::fs::symlink_metadata(&commondir_file)
             .is_ok_and(|metadata| metadata.file_type().is_file())
         {
@@ -289,7 +300,12 @@ impl GitOperationsTool {
                 }
                 resolved
             }
-            _ => self.workspace_dir.clone(),
+            _ => self.workspace_dir.canonicalize().map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "Cannot resolve Git workspace '{}': {error}",
+                    self.workspace_dir.display()
+                ))
+            })?,
         };
         Ok(base)
     }
@@ -1667,7 +1683,7 @@ mod tests {
         let tool = test_tool(tmp.path());
 
         let result = tool.resolve_working_dir(None, false).unwrap();
-        assert_eq!(result, tmp.path().to_path_buf());
+        assert_eq!(result, tmp.path().canonicalize().unwrap());
     }
 
     #[test]
@@ -1676,7 +1692,7 @@ mod tests {
         let tool = test_tool(tmp.path());
 
         let result = tool.resolve_working_dir(Some(""), false).unwrap();
-        assert_eq!(result, tmp.path().to_path_buf());
+        assert_eq!(result, tmp.path().canonicalize().unwrap());
     }
 
     #[test]
@@ -2005,6 +2021,55 @@ mod tests {
                 .is_some_and(|error| error.contains("Not in a Git repository")),
             "linked worktree must fail as not-in-repository: {:?}",
             result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_rejected_gitfile_before_an_authorized_parent() {
+        let workspace = TempDir::new().unwrap();
+        let external_repository = TempDir::new().unwrap();
+        bootstrap_repo(workspace.path(), &[]).await;
+        bootstrap_repo(external_repository.path(), &[]).await;
+        let child = workspace.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                external_repository.path().join(".git").display()
+            ),
+        )
+        .unwrap();
+        let tool = test_tool(workspace.path());
+
+        let result = tool
+            .execute(json!({"operation": "status", "path": &child}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a rejected gitfile must not fall through to an authorized parent: {result:?}"
+        );
+    }
+
+    #[test]
+    fn gitfile_without_commondir_is_authorized_as_a_submodule_boundary() {
+        let workspace = TempDir::new().unwrap();
+        let submodule = workspace.path().join("submodule");
+        let gitdir = workspace.path().join("gitdir");
+        std::fs::create_dir(&submodule).unwrap();
+        std::fs::create_dir(&gitdir).unwrap();
+        std::fs::write(
+            submodule.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let tool = test_tool(workspace.path());
+
+        assert!(
+            tool.linked_worktree_metadata_is_authorized(&submodule.join(".git"), false),
+            "an independently authorized submodule gitdir must not require commondir"
         );
     }
 
