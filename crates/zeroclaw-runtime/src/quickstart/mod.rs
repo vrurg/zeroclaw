@@ -75,6 +75,7 @@ impl QuickstartConfigState {
     /// Apply and commit one Quickstart submission while owning the shared
     /// config transaction. The lock is acquired before cloning and held until
     /// the persisted working copy replaces the shared live state.
+    #[cfg(test)]
     pub async fn apply(
         &self,
         submission: BuilderSubmission,

@@ -760,7 +760,10 @@ mod tests {
             let token_placement_marker = match locale {
                 "en" => "here",
                 "es" => "aquí",
-                "fr" => "ici",
+                // The removed French wording was "collez ici". Keep the
+                // boundary so unrelated words such as "officiel" do not
+                // satisfy this regression guard.
+                "fr" => " ici",
                 "ja" => "ここ",
                 "zh-CN" => "这里",
                 _ => unreachable!("committed locale registry contains only built-in locales"),

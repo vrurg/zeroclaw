@@ -97,22 +97,6 @@ pub struct AnthropicModelProvider {
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
 }
 
-impl Clone for AnthropicModelProvider {
-    fn clone(&self) -> Self {
-        Self {
-            alias: self.alias.clone(),
-            credential: self.credential.clone(),
-            auth_service: self.auth_service.clone(),
-            base_url: self.base_url.clone(),
-            max_tokens: self.max_tokens,
-            timeout_secs: self.timeout_secs,
-            // The memo is bounded, provider-instance-local optimization state,
-            // not provider configuration. A clone starts with an empty cache.
-            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedAnthropicCredential {
     token: String,
