@@ -275,9 +275,8 @@ impl GitOperationsTool {
         Ok(resolved)
     }
 
-    /// Resolve a user-provided path authorized for the requested Git operation.
-    /// Returns the workspace_dir if no path is provided.
-    /// Rejects paths that escape the workspace via traversal.
+    /// Resolve an explicit path through the security policy, or return the
+    /// policy's canonical workspace directory when no path is provided.
     fn resolve_working_dir(
         &self,
         path: Option<&str>,
@@ -1687,23 +1686,29 @@ mod tests {
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security);
 
-        let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
-        // Branch listing must not be blocked by read-only autonomy
-        let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error_msg.contains("read-only") && !error_msg.contains("higher autonomy"),
-            "branch listing should not be blocked in read-only mode, got: {error_msg}"
-        );
+        for args in [
+            json!({"operation": "branch"}),
+            json!({"operation": "worktree", "subcommand": "list"}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(
+                result.success,
+                "read-only Git operation must execute under ReadOnly autonomy: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
+        let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security);

@@ -18,7 +18,7 @@ Each agent's effective `SecurityPolicy` is built by `SecurityPolicy::for_agent(c
    - `Write` / `ReadWrite` → sibling's workspace lands in the read-write allowlist.
 4. If `[agents.<alias>.workspace.unrestricted_filesystem]` is `true`, flip `workspace_only` off.
 
-The read-only allowlist is honored by `file_read` (and other read-side tools); the read-write allowlist gates `file_write`, `file_edit`, `git_operations`, and the shell tool's path-touching invocations. POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are always readable so shell idioms keep working without per-agent config.
+The read-only allowlist is honored by `file_read` and other read-side tools, including read-classified `git_operations` commands. The read-write allowlist gates `file_write`, `file_edit`, write-classified `git_operations` commands, and the shell tool's path-touching invocations. POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are always readable so shell idioms keep working without per-agent config.
 
 SubAgent spawns enforce the rule that a child cannot escalate beyond its parent. The validator's full axis list and the budget-sharing behavior are documented at [Delegation → Permission inheritance](./delegation.md#permission-inheritance).
 
