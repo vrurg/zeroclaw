@@ -3099,6 +3099,12 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if is_null_device(resolved) {
+            return true;
+        }
         // Keep the target in the same filesystem namespace as every policy
         // prefix, even when a caller supplies an absolute but not yet fully
         // resolved spelling. Failure to resolve (for example, a symlink cycle)
@@ -3177,7 +3183,7 @@ impl SecurityPolicy {
         false
     }
 
-    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+    fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
         let mut approved_roots = Vec::new();
         for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -3196,6 +3202,18 @@ impl SecurityPolicy {
         approved_roots
     }
 
+    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        // A non-workspace-only policy authorizes paths outside every configured
+        // root (subject to the ordinary forbidden-path checks). It therefore
+        // has no bounded discovery root; callers may continue searching for a
+        // parent-owned resource. The compatibility accessor below retains the
+        // configured-root result for handle-bound file delivery.
+        if !self.workspace_only {
+            return Vec::new();
+        }
+        self.configured_approved_roots(resolved, include_read_only)
+    }
+
     /// Return every canonical bounded root that authorizes reading `resolved`.
     ///
     /// A path can be covered by overlapping grants, such as a workspace nested
@@ -3210,14 +3228,17 @@ impl SecurityPolicy {
         self.approved_roots(resolved, true)
     }
 
-    /// Return the first canonical bounded root that authorizes reading
+    /// Return the first canonical configured root that authorizes reading
     /// `resolved`.
     ///
-    /// This compatibility accessor preserves the existing single-boundary
-    /// contract for handle-bound callers. Parent-resource discovery must use
-    /// [`Self::approved_read_roots`] instead.
+    /// This compatibility accessor intentionally ignores `workspace_only` to
+    /// preserve the existing configured-root contract for handle-bound callers.
+    /// It is not the first value from [`Self::approved_read_roots`];
+    /// parent-resource discovery must use that plural accessor instead.
     pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
-        self.approved_read_roots(resolved).into_iter().next()
+        self.configured_approved_roots(resolved, true)
+            .into_iter()
+            .next()
     }
 
     /// Return every canonical bounded root that authorizes writing `resolved`.
@@ -3231,6 +3252,12 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if is_null_device(resolved) {
+            return true;
+        }
         // See `is_resolved_path_readable`: authorization compares the target,
         // allow roots, and forbidden entries only after the same resolution
         // step, and fails closed when no trustworthy target can be produced.
@@ -3238,10 +3265,6 @@ impl SecurityPolicy {
             return false;
         };
         let resolved = resolved_path.as_path();
-
-        if is_null_device(resolved) {
-            return true;
-        }
 
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -7989,6 +8012,23 @@ mod tests {
                 .approved_read_roots(&outside_canon.join("x"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unrestricted_policy_has_no_discovery_boundary_but_preserves_handle_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = workspace.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let path = workspace_canon.join("nested").join("file.txt");
+
+        assert!(policy.approved_read_roots(&path).is_empty());
+        assert!(policy.approved_write_roots(&path).is_empty());
+        assert_eq!(policy.approved_read_root(&path), Some(workspace_canon));
     }
 
     #[test]
