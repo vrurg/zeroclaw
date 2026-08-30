@@ -1676,24 +1676,27 @@ mod tests {
         assert!(worktrees.success, "worktree list failed: {worktrees:?}");
         let worktrees: serde_json::Value = serde_json::from_str(&worktrees.output.to_string())
             .expect("worktree list output must be JSON");
-        let main_worktree = tmp.path().canonicalize().unwrap();
-        let linked_worktree = linked_worktree.canonicalize().unwrap();
-        assert!(
-            worktrees["worktrees"]
-                .as_array()
-                .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
-                    == linked_worktree.to_string_lossy().as_ref()
-                    && entry["active"] == true)),
-            "the requested linked worktree must be active: {worktrees}"
-        );
-        assert!(
-            worktrees["worktrees"]
-                .as_array()
-                .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
-                    == main_worktree.to_string_lossy().as_ref()
-                    && entry["active"] == false)),
-            "only the deepest matching worktree may be active: {worktrees}"
-        );
+        #[cfg(unix)]
+        {
+            let main_worktree = tmp.path().canonicalize().unwrap();
+            let linked_worktree = linked_worktree.canonicalize().unwrap();
+            assert!(
+                worktrees["worktrees"]
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
+                        == linked_worktree.to_string_lossy().as_ref()
+                        && entry["active"] == true)),
+                "the requested linked worktree must be active: {worktrees}"
+            );
+            assert!(
+                worktrees["worktrees"]
+                    .as_array()
+                    .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
+                        == main_worktree.to_string_lossy().as_ref()
+                        && entry["active"] == false)),
+                "only the deepest matching worktree may be active: {worktrees}"
+            );
+        }
 
         let status = tool
             .execute(json!({"operation": "status", "path": &linked_worktree}))
@@ -2956,7 +2959,7 @@ mod tests {
         );
 
         let error = result.error.as_deref().unwrap_or("");
-        let path_display = tmp.path().display().to_string();
+        let path_display = tmp.path().canonicalize().unwrap().display().to_string();
 
         // The error message must include the resolved working directory
         // path so the user can see where the tool was looking.
@@ -2976,9 +2979,10 @@ mod tests {
     async fn bounded_discovery_reports_authorization_boundary_for_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let tool = test_tool(tmp.path());
-        let roots = tool.security.approved_read_roots(tmp.path());
+        let workspace = tmp.path().canonicalize().unwrap();
+        let roots = tool.security.approved_read_roots(&workspace);
         assert_eq!(
-            tool.has_repository_within_authorized_roots(tmp.path(), &roots, false),
+            tool.has_repository_within_authorized_roots(&workspace, &roots, false),
             RepositoryAuthorization::DiscoveryBoundaryReached,
             "the default policy must distinguish its authorization boundary from an unbounded search"
         );
@@ -2990,7 +2994,7 @@ mod tests {
         );
         let error = result.error.as_deref().unwrap_or_default();
         assert!(
-            error.contains(&tmp.path().display().to_string()),
+            error.contains(&workspace.display().to_string()),
             "the boundary diagnostic must include the requested path: {error}"
         );
         assert!(
