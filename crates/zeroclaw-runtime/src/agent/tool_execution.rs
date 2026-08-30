@@ -475,10 +475,7 @@ pub(crate) async fn execute_one_tool(
 /// explicit `session_prompt_list` response. Do not route it through generic
 /// observer, receipt, stream, or telemetry paths.
 pub(crate) fn is_sensitive_session_prompt_tool(call_name: &str) -> bool {
-    matches!(
-        call_name,
-        "session_prompt_list" | "session_prompt_set" | "session_prompt_delete"
-    )
+    zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&call_name)
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────

@@ -1559,8 +1559,6 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-        self.ctx.sessions.session_queue.invalidate(sid).await;
-
         let chat_mode = self
             .ctx
             .sessions
@@ -1620,6 +1618,7 @@ impl RpcDispatcher {
 
         let killed = self.ctx.sessions.kill_session(sid).await;
         if killed {
+            self.ctx.sessions.session_queue.invalidate(sid).await;
             if let Some(ref hooks) = self.ctx.hooks {
                 hooks.fire_session_end(sid, "rpc").await;
             }
@@ -1649,13 +1648,29 @@ impl RpcDispatcher {
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh
     /// prompt recovers to a working session instead of hanging. Returns the
-    /// live agent on success; returns `None` for missing, killed, or unreadable
-    /// durable state.
+    /// live agent on success, `None` for missing, killed, or unreadable durable
+    /// state, and an RPC error when lifecycle admission cannot acquire its queue.
     async fn rehydrate_reaped_session(
         &self,
         sid: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
-        let store = self.ctx.acp_session_store.clone()?;
+    ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
+        // Rehydration installs a live session, so it is a lifecycle operation
+        // rather than a read-only durable lookup. Serialize the complete
+        // load/build/install sequence with session/new and deletion; otherwise
+        // a late durable load can overwrite a same-ID successor.
+        let _session_guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if let Some((agent, _, _)) = self.ctx.sessions.admission_snapshot(sid).await {
+            return Ok(Some(agent));
+        }
+        let Some(store) = self.ctx.acp_session_store.clone() else {
+            return Ok(None);
+        };
         let sid_owned = sid.to_string();
         let loaded =
             tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
@@ -1669,7 +1684,7 @@ impl RpcDispatcher {
                         .with_outcome(::zeroclaw_log::EventOutcome::Success),
                     "session/prompt: refusing to rehydrate admin-killed ACP session"
                 );
-                return None;
+                return Ok(None);
             }
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -1683,9 +1698,11 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: failed to query ACP killed marker before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
-            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing)) => {
+                return Ok(None);
+            }
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1698,7 +1715,7 @@ impl RpcDispatcher {
                         })),
                     "session/prompt: ACP killed-marker query task failed before rehydrate"
                 );
-                return None;
+                return Ok(None);
             }
         };
 
@@ -1710,7 +1727,7 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let Ok(mut agent) = crate::agent::agent::Agent::from_live_config_with_tui_env(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -1721,7 +1738,9 @@ impl RpcDispatcher {
             self.ctx.sop_audit.clone(),
         )
         .await
-        .ok()?;
+        else {
+            return Ok(None);
+        };
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -1736,7 +1755,8 @@ impl RpcDispatcher {
         agent.channel_handles().register_channel("rpc", approval_ch);
 
         let message_count = data.messages.len();
-        self.ctx
+        if self
+            .ctx
             .sessions
             .insert(
                 sid.to_string(),
@@ -1749,7 +1769,10 @@ impl RpcDispatcher {
                 .with_owner(self.tui_id.clone()),
             )
             .await
-            .ok()?;
+            .is_err()
+        {
+            return Ok(None);
+        }
         let seed_event = self
             .ctx
             .sessions
@@ -1771,7 +1794,7 @@ impl RpcDispatcher {
             "rehydrated reaped session from durable store; turn continues on a working session"
         );
 
-        self.ctx.sessions.get_agent(sid).await
+        Ok(self.ctx.sessions.get_agent(sid).await)
     }
 
     async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
@@ -1793,7 +1816,7 @@ impl RpcDispatcher {
             .await
         {
             Some(snapshot) => snapshot,
-            None => match self.rehydrate_reaped_session(sid).await {
+            None => match self.rehydrate_reaped_session(sid).await? {
                 Some(_) => self
                     .ctx
                     .sessions
@@ -2690,6 +2713,45 @@ impl RpcDispatcher {
             .session_queue
             .generation(&req.session_id)
             .await;
+        // The first PR owns only Chat deletion. Reject ACP before triggering a
+        // cancellation so an unsupported lifecycle request cannot disrupt a
+        // durable ACP session or present an in-memory-only success result.
+        let observed_mode = self.ctx.sessions.chat_mode(&req.session_id).await;
+        match observed_mode.as_ref() {
+            Some(mode)
+                if req
+                    .chat_mode
+                    .as_ref()
+                    .is_some_and(|requested| requested != mode) =>
+            {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "The requested session storage domain does not match the live session",
+                ));
+            }
+            Some(crate::rpc::types::ChatMode::Acp) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "ACP sessions cannot be deleted through the Chat session lifecycle",
+                ));
+            }
+            None if matches!(req.chat_mode, Some(crate::rpc::types::ChatMode::Acp)) => {
+                return Err(rpc_err(
+                    SESSION_NOT_FOUND,
+                    "A reaped ACP session cannot be deleted through the Chat session lifecycle",
+                ));
+            }
+            _ => {}
+        }
+        // Deletion must terminate an admitted turn before waiting for its
+        // queue permit. Bind cancellation to the captured session generation
+        // so it cannot target a same-ID successor created meanwhile.
+        if let Some(generation) = expected_generation {
+            self.ctx
+                .sessions
+                .cancel_session_at_generation(&req.session_id, generation)
+                .await;
+        }
         self.handle_session_delete_at_generation(
             req,
             expected_generation,
@@ -2707,10 +2769,9 @@ impl RpcDispatcher {
         expected_generation: Option<u64>,
         expected_queue_generation: u64,
     ) -> RpcResult {
-        // This is the same finalization authority used by prompt turns. Wait
-        // for any accepted turn to finish before deleting its durable row.
-        // Do not cancel it before validation and durable deletion succeed: a
-        // rejected or failed delete must not mutate the still-live session.
+        // This is the same finalization authority used by prompt turns. The
+        // entrypoint has already cancelled the captured live incarnation, so
+        // waiting here observes its finalization before deleting durable state.
         let _guard = self
             .ctx
             .sessions
@@ -2759,10 +2820,14 @@ impl RpcDispatcher {
         // A raw RPC ID is not a storage-domain discriminator. Never inspect
         // the ACP store to infer one: Chat and ACP IDs may collide. The first
         // PR owns durable Chat deletion; ACP lifecycle remains its own store.
-        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) && is_reaped {
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             return Err(rpc_err(
-                SESSION_NOT_FOUND,
-                "A reaped ACP session cannot be deleted through the Chat session lifecycle",
+                if is_reaped {
+                    SESSION_NOT_FOUND
+                } else {
+                    INVALID_PARAMS
+                },
+                "ACP sessions cannot be deleted through the Chat session lifecycle",
             ));
         }
         let should_delete_durable_chat = matches!(chat_mode, crate::rpc::types::ChatMode::Chat);
@@ -8044,6 +8109,19 @@ mod tests {
     ) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        make_persistence_test_dispatcher_with_queue(config, data_dir, queue)
+    }
+
+    fn make_persistence_test_dispatcher_with_queue(
+        config: zeroclaw_config::schema::Config,
+        data_dir: &std::path::Path,
+        queue: Arc<zeroclaw_infra::session_queue::SessionActorQueue>,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    ) {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let chat_backend =
             Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
@@ -8385,7 +8463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_an_acp_session_does_not_delete_a_colliding_chat_session() {
+    async fn deleting_an_acp_session_is_rejected_without_touching_a_colliding_chat_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -8407,10 +8485,11 @@ mod tests {
             .set_session_prompt(&format!("rpc_{sid}"), "task", "chat context")
             .unwrap();
 
-        dispatcher
+        let error = dispatcher
             .handle_session_delete(&json!({"session_id": sid}))
             .await
-            .expect("ACP session/delete should succeed");
+            .expect_err("the Chat lifecycle must reject ACP deletion");
+        assert_eq!(error.code, INVALID_PARAMS);
 
         assert_eq!(
             chat_backend
@@ -8812,6 +8891,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_session_delete_cancels_the_captured_turn_before_finalization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "delete-cancels-turn";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("chat session/new should succeed");
+        let token = tokio_util::sync::CancellationToken::new();
+        sessions.register_cancel_token(sid, token.clone());
+
+        dispatcher
+            .handle_session_delete(&json!({"session_id": sid}))
+            .await
+            .expect("Chat session/delete should complete");
+
+        assert!(
+            token.is_cancelled(),
+            "delete must cancel the captured in-flight turn before removal"
+        );
+        assert!(sessions.get_agent(sid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_kill_of_a_missing_session_does_not_advance_queue_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "missing-kill";
+
+        let error = dispatcher
+            .handle_session_kill(&json!({"session_id": sid}))
+            .await
+            .expect_err("missing session kill must fail");
+
+        assert_eq!(error.code, SESSION_NOT_FOUND);
+        assert_eq!(sessions.session_queue.generation(sid).await, 0);
+    }
+
+    #[tokio::test]
     async fn invalid_live_session_delete_mode_preserves_incarnation_and_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -8843,6 +8970,33 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "invalid deletion must leave the live session usable"
         );
+    }
+
+    #[tokio::test]
+    async fn live_acp_session_delete_is_rejected_without_removing_durable_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "live-acp-delete";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("ACP session/new should succeed");
+
+        let error = dispatcher
+            .handle_session_delete(&json!({"session_id": sid}))
+            .await
+            .expect_err("Chat lifecycle must not report a live ACP deletion");
+
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(sessions.get_agent(sid).await.is_some());
+        assert!(acp_store.load_session(sid).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -8987,7 +9141,10 @@ mod tests {
             "post-reap the session must be absent from memory"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("rehydration admission should not be busy");
         assert!(
             recovered.is_some(),
             "a reaped session with a live durable row must rehydrate to a \
@@ -8997,6 +9154,33 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydrate_queue_admission_failure_is_reported_as_session_busy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            0, 10, 60,
+        ));
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher_with_queue(config, &data_dir, queue);
+        let sid = "acp-rehydrate-queue-full";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/acp-workspace")
+            .expect("durable ACP session must exist before rehydration");
+
+        let err = match dispatcher.rehydrate_reaped_session(sid).await {
+            Err(err) => err,
+            Ok(_) => panic!("queue admission failure must not masquerade as a missing session"),
+        };
+        assert_eq!(err.code, SESSION_BUSY);
+        assert!(
+            err.message.contains("queue full"),
+            "busy error must preserve the queue-admission cause: {}",
+            err.message
         );
     }
 
@@ -9069,6 +9253,7 @@ mod tests {
         let recovered = dispatcher
             .rehydrate_reaped_session(sid)
             .await
+            .expect("rehydration admission should not be busy")
             .expect("a reaped ACP session must rehydrate to a working agent");
 
         let agent = recovered.lock().await;
@@ -9079,6 +9264,42 @@ mod tests {
                 "rehydrated ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rehydrate_never_replaces_an_existing_same_id_live_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "rehydrate-successor";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": sid,
+            }))
+            .await
+            .expect("Chat successor should be live");
+        let successor = sessions.get_agent(sid).await.expect("live successor");
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/acp-workspace")
+            .expect("colliding ACP durable row");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("rehydration admission should not be busy")
+            .expect("existing live session should win rehydration admission");
+
+        assert!(
+            Arc::ptr_eq(&recovered, &successor),
+            "rehydration must not replace a same-ID live successor"
+        );
+        assert!(matches!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        ));
     }
 
     #[tokio::test]
@@ -9123,7 +9344,10 @@ mod tests {
             "session/kill must preserve durable history"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("rehydration admission should not be busy");
         assert!(
             recovered.is_none(),
             "admin-killed ACP sessions must stay killed instead of rehydrating \
@@ -12077,9 +12301,18 @@ mod tests {
             .expect("openai.test-provider slot exists")
             .model = Some("old-model".into());
 
-        // Replace the session via ACP rehydration while the stale refresh
-        // is paused. This installs a same-ID successor via SessionStore::insert.
-        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        // Model a genuinely reaped RPC session before rehydrating it. A live
+        // session must win rehydration admission; removing this instance makes
+        // the following ACP restoration a real same-ID successor instead.
+        assert!(sessions.remove(&session_id).await);
+
+        // Replace the reaped session via ACP rehydration while the stale
+        // refresh is paused. This installs a same-ID successor via
+        // SessionStore::insert.
+        let rehydrated = dispatcher
+            .rehydrate_reaped_session(&session_id)
+            .await
+            .expect("rehydration admission should not be busy");
         assert!(
             rehydrated.is_some(),
             "ACP rehydration must install the same-ID successor"

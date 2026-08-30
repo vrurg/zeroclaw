@@ -1,11 +1,12 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionMetadata, SessionPromptBudget, SessionQuery,
+    SessionState,
 };
 use crate::session_prompts::{
     MAX_SESSION_PROMPTS, MAX_SESSION_PROMPTS_BYTES, SessionPrompt, SessionPromptSetOutcome,
-    validate_prompt, validate_prompt_id,
+    render_session_prompts, validate_prompt, validate_prompt_id,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -799,6 +800,16 @@ impl SessionBackend for SqliteSessionBackend {
         id: &str,
         content: &str,
     ) -> std::io::Result<SessionPromptSetOutcome> {
+        self.set_session_prompt_with_budget(session_key, id, content, None)
+    }
+
+    fn set_session_prompt_with_budget(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+        budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
         let (id, content) = validate_prompt(id, content)?;
         let mut conn = self.conn.lock();
         let transaction = conn.transaction().map_err(std::io::Error::other)?;
@@ -839,6 +850,40 @@ impl SessionBackend for SqliteSessionBackend {
                 std::io::ErrorKind::InvalidInput,
                 "session prompt aggregate limit reached",
             ));
+        }
+        if let Some(budget) = budget {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT prompt_id, content, updated_at FROM session_prompts \
+                     WHERE session_key = ?1 ORDER BY prompt_id ASC",
+                )
+                .map_err(std::io::Error::other)?;
+            let mut proposed = statement
+                .query_map(params![session_key], |row| {
+                    Ok(SessionPrompt {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                })
+                .map_err(std::io::Error::other)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(std::io::Error::other)?;
+            match proposed.iter_mut().find(|prompt| prompt.id == id) {
+                Some(prompt) => prompt.content.clone_from(&content),
+                None => proposed.push(SessionPrompt {
+                    id: id.clone(),
+                    content: content.clone(),
+                    updated_at: now.clone(),
+                }),
+            }
+            proposed.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            if !budget.permits(&render_session_prompts(&proposed)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "session prompt collection exceeds the current prompt budget",
+                ));
+            }
         }
         transaction.execute(
             "INSERT INTO session_prompts (session_key, prompt_id, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(session_key, prompt_id) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
@@ -1559,7 +1604,7 @@ mod tests {
     use super::*;
     use crate::session_prompts::MAX_SESSION_PROMPT_BYTES;
     use crate::session_store::SessionStore;
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
 
@@ -1677,6 +1722,53 @@ mod tests {
             backend.list_session_prompts("session").unwrap()[3].content,
             "é".repeat(MAX_SESSION_PROMPT_BYTES / 2)
         );
+    }
+
+    #[test]
+    fn session_prompt_budget_admission_is_atomic_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        let content = "keep the current task";
+        let one_prompt = render_session_prompts(&[SessionPrompt {
+            id: "first".to_string(),
+            content: content.to_string(),
+            updated_at: String::new(),
+        }]);
+        let budget = SessionPromptBudget::new(0, one_prompt.len() + 2);
+        let start = Arc::new(Barrier::new(3));
+
+        std::thread::scope(|scope| {
+            let first_backend = Arc::clone(&backend);
+            let first_start = Arc::clone(&start);
+            let first = scope.spawn(move || {
+                first_start.wait();
+                first_backend.set_session_prompt_with_budget(
+                    "session",
+                    "first",
+                    content,
+                    Some(budget),
+                )
+            });
+            let second_backend = Arc::clone(&backend);
+            let second_start = Arc::clone(&start);
+            let second = scope.spawn(move || {
+                second_start.wait();
+                second_backend.set_session_prompt_with_budget(
+                    "session",
+                    "second",
+                    content,
+                    Some(budget),
+                )
+            });
+
+            start.wait();
+            let successes = [first.join().unwrap(), second.join().unwrap()]
+                .into_iter()
+                .filter(std::result::Result::is_ok)
+                .count();
+            assert_eq!(successes, 1);
+        });
+        assert_eq!(backend.list_session_prompts("session").unwrap().len(), 1);
     }
 
     #[test]

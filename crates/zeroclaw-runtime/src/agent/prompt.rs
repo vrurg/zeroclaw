@@ -48,8 +48,10 @@ pub(crate) fn truncate_system_prompt_to_budget(prompt: &mut String, max_chars: u
 /// Reserve a finite system-prompt budget for mandatory session attachments.
 ///
 /// Attachments are durable session context, so callers must never silently
-/// omit them. When a finite budget leaves room for the attachment section,
-/// truncate only the host-authored prefix and append the complete section.
+/// omit them. A finite budget may truncate a prompt without attachments, but
+/// an attachment-bearing turn must retain the complete host prompt: dropping
+/// its tail could remove safety or runtime policy while retaining mutable
+/// session context.
 pub fn append_required_session_prompt_attachments(
     prompt: &mut String,
     attachments: &str,
@@ -61,17 +63,12 @@ pub fn append_required_session_prompt_attachments(
     }
 
     let attachment_len = attachments.len().saturating_add(2);
-    if max_chars > 0 && attachment_len >= max_chars {
+    let total_len = prompt.len().saturating_add(attachment_len);
+    if max_chars > 0 && total_len > max_chars {
         anyhow::bail!(
-            "Persistent session prompts exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
+            "Persistent session prompts and required host context exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
         );
     }
-    let host_budget = if max_chars == 0 {
-        0
-    } else {
-        max_chars - attachment_len
-    };
-    truncate_system_prompt_to_budget(prompt, host_budget);
     prompt.push_str("\n\n");
     prompt.push_str(attachments);
     Ok(())
@@ -423,6 +420,40 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
+
+    #[test]
+    fn attachments_fail_closed_before_host_safety_context_is_truncated() {
+        let mut prompt =
+            "## Identity\n\ntrusted host context\n\n## Safety\n\nmandatory policy".to_string();
+        let original = prompt.clone();
+        let attachments = "## Session Prompts\n\n[task] persistent instruction";
+        let error = append_required_session_prompt_attachments(
+            &mut prompt,
+            attachments,
+            original.len() + attachments.len() + 1,
+        )
+        .expect_err("one-byte overflow must fail instead of truncating host policy");
+
+        assert!(error.to_string().contains("required host context"));
+        assert_eq!(
+            prompt, original,
+            "failed composition must preserve the host prompt"
+        );
+    }
+
+    #[test]
+    fn attachments_append_after_the_complete_host_prompt_when_they_fit() {
+        let mut prompt = "## Safety\n\nmandatory policy".to_string();
+        let attachments = "## Session Prompts\n\n[task] persistent instruction";
+        let budget = prompt.len() + 2 + attachments.len();
+
+        append_required_session_prompt_attachments(&mut prompt, attachments, budget).unwrap();
+
+        assert_eq!(
+            prompt,
+            format!("## Safety\n\nmandatory policy\n\n{attachments}")
+        );
+    }
 
     zeroclaw_api::mock_tool_attribution!(TestTool);
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);

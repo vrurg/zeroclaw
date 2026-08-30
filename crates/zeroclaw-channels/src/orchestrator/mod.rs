@@ -6521,6 +6521,8 @@ async fn process_channel_message_body(
     // every host-authored channel addition so they remain a complete trailing
     // section inside the final provider-bound budget.
     let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+    let session_prompt_budget =
+        zeroclaw_infra::session_backend::SessionPromptBudget::new(system_prompt.len(), max);
     if append_session_prompts_to_channel_system_prompt(
         &mut system_prompt,
         &session_prompt_attachments,
@@ -7182,6 +7184,8 @@ async fn process_channel_message_body(
                         .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
                     tool_loop,
                 );
+            let tool_loop = zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
+                .scope(Some(session_prompt_budget), tool_loop);
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
@@ -8690,9 +8694,21 @@ async fn run_message_dispatch_loop(
             continue;
         }
 
+        // `/new` is a lifecycle command, not user content. Drop an older
+        // bucket and bypass debouncing so it reaches the reset barrier intact.
+        // Reporting or flushing discarded pending content is separate channel-debounce
+        // UX policy, not part of the session-prompt reset contract.
+        let new_session_command = matches!(
+            parse_runtime_command(&msg.channel, &msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        if msg.channel != "cli" && new_session_command {
+            ctx.debouncer.discard(&conversation_history_key(&msg)).await;
+        }
+
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
+        let msg = if msg.channel != "cli" && !new_session_command {
             let debounce_key = conversation_history_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -18845,6 +18861,7 @@ BTC is currently around $65,000 based on latest tool output."#
     struct DelayedHistoryCaptureModelProvider {
         delay: Duration,
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        started: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait::async_trait]
@@ -18874,6 +18891,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 calls.push(snapshot);
                 calls.len()
             };
+            if let Some(started) = &self.started {
+                started.notify_one();
+            }
             tokio::time::sleep(self.delay).await;
             Ok(format!("response-{call_index}"))
         }
@@ -22516,10 +22536,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let first_turn_started = Arc::new(tokio::sync::Notify::new());
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: Some(Arc::clone(&first_turn_started)),
         });
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.debounce_ms = 50;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -22556,7 +22580,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -22588,7 +22612,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
+                Duration::from_millis(50),
             )),
             receipt_generator: None,
             show_receipts_in_response: false,
@@ -22618,7 +22642,10 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Do not race a wall clock: wait until the first turn has really
+            // started, then leave the next ordinary message pending when
+            // `/new` reaches the lifecycle barrier.
+            first_turn_started.notified().await;
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-2".to_string(),
                 sender: "alice".to_string(),
@@ -22635,7 +22662,6 @@ BTC is currently around $65,000 based on latest tool output."#
             })
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(40)).await;
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-3".to_string(),
                 sender: "alice".to_string(),
@@ -22691,7 +22717,7 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 3);
+        assert_eq!(sent_messages.len(), 2);
         assert!(
             sent_messages
                 .iter()
@@ -22706,8 +22732,8 @@ BTC is currently around $65,000 based on latest tool output."#
             .calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        assert_eq!(calls.len(), 4);
-        for successor_call in &calls[2..] {
+        assert_eq!(calls.len(), 2);
+        for successor_call in &calls[1..] {
             assert!(
                 !successor_call.iter().any(|(role, content)| {
                     role == "user"
@@ -22718,14 +22744,14 @@ BTC is currently around $65,000 based on latest tool output."#
             );
         }
         assert!(
-            calls[2..]
+            calls[1..]
                 .iter()
                 .any(|call| call.iter().any(|(role, content)| {
                     role == "user" && content.contains("first fresh successor")
                 }))
         );
         assert!(
-            calls[2..]
+            calls[1..]
                 .iter()
                 .any(|call| call.iter().any(|(role, content)| {
                     role == "user" && content.contains("second fresh successor")
@@ -22744,6 +22770,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -22905,6 +22932,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
             delay: Duration::from_millis(250),
             calls: std::sync::Mutex::new(Vec::new()),
+            started: None,
         });
 
         let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
@@ -33966,7 +33994,7 @@ Done."#;
         let peer_map = "Current-channel peer map for agent \"main\"";
         let thinking_prefix = "Think step by step.";
         let mut prompt = format!("{thinking_prefix}\n\n{host_context}\n\n{peer_map}");
-        let max = prompt.len();
+        let max = prompt.len() + "\n\n".len() + attachments.len();
 
         append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
             .expect("a fitting attachment must reserve the completed host prompt budget");

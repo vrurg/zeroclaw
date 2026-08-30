@@ -1905,14 +1905,23 @@ pub async fn handle_api_session_delete(
     };
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let Some(expected_generation) = state
+        .session_queue
+        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
+        .await
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    };
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
-        token.cancel();
+    // Do not remove the token before finalization: the active turn owns that
+    // registration and will clean it up. Cancellation is bound to the queue
+    // incarnation captured above, so a stale DELETE cannot affect a same-ID
+    // successor that has registered its own token.
+    if cancel_gateway_turn_at_generation(&state, &session_key, expected_generation) {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1941,6 +1950,16 @@ pub async fn handle_api_session_delete(
         }
     };
 
+    if !backend.session_exists(&session_key)
+        || state.session_queue.generation(&session_key).await != expected_generation
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
     match backend.delete_session(&session_key) {
         Ok(true) => {
             // Invalidate every already-connected holder only after durable
@@ -1960,6 +1979,30 @@ pub async fn handle_api_session_delete(
         )
             .into_response(),
     }
+}
+
+/// Cancel the active gateway turn only when it belongs to `expected_generation`.
+///
+/// Gateway session IDs are reusable after deletion. The cancellation registry
+/// must therefore carry the same incarnation boundary as the session queue;
+/// otherwise a delayed DELETE can abort a replacement session's turn.
+fn cancel_gateway_turn_at_generation(
+    state: &AppState,
+    session_key: &str,
+    expected_generation: u64,
+) -> bool {
+    let token = state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .get(session_key)
+        .filter(|(generation, _)| *generation == expected_generation)
+        .map(|(_, token)| token.clone());
+    let Some(token) = token else {
+        return false;
+    };
+    token.cancel();
+    true
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -2110,7 +2153,7 @@ pub async fn handle_api_session_abort(
             .lock()
             .expect("cancel_tokens lock poisoned");
         let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
-        let token = tokens.get(&session_key).cloned();
+        let token = tokens.get(&session_key).map(|(_, token)| token.clone());
         (session_key, token)
     };
 
@@ -3592,6 +3635,91 @@ pub(crate) mod tests {
         assert_eq!(messages[0].content, "successor");
     }
 
+    #[tokio::test]
+    async fn session_delete_does_not_remove_a_same_id_successor_after_queue_wait() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire("gw_operator-1").await.unwrap();
+
+        let delete_fut = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        );
+        tokio::pin!(delete_fut);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete_fut)
+                .await
+                .is_err(),
+            "DELETE should be queued behind the lifecycle guard"
+        );
+        assert!(backend.delete_session("gw_operator-1").unwrap());
+        state.session_queue.invalidate("gw_operator-1").await;
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), delete_fut)
+            .await
+            .expect("queued DELETE should finish")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 1, "the successor must remain intact");
+        assert_eq!(messages[0].content, "successor");
+    }
+
+    #[tokio::test]
+    async fn stale_session_delete_cannot_cancel_a_same_id_successor_turn() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1";
+        let predecessor_generation = 4;
+        let successor_generation = predecessor_generation + 1;
+        let successor_token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                session_key.to_string(),
+                (successor_generation, successor_token.clone()),
+            );
+
+        assert!(
+            !cancel_gateway_turn_at_generation(&state, session_key, predecessor_generation),
+            "a stale DELETE must not find the successor token"
+        );
+        assert!(
+            !successor_token.is_cancelled(),
+            "a stale DELETE must not cancel the same-ID successor"
+        );
+
+        assert!(cancel_gateway_turn_at_generation(
+            &state,
+            session_key,
+            successor_generation
+        ));
+        assert!(successor_token.is_cancelled());
+    }
+
     #[test]
     fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
         let none = |_key: &str| false;
@@ -3653,7 +3781,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(session_key.clone(), token.clone());
+            .insert(session_key.clone(), (0, token.clone()));
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -3677,7 +3805,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_operator-1".to_string(), token.clone());
+            .insert("gw_operator-1".to_string(), (0, token.clone()));
 
         let response = handle_api_session_abort(
             State(state),
@@ -3701,7 +3829,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team_alpha".to_string(), token.clone());
+            .insert("gw_team_alpha".to_string(), (0, token.clone()));
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
         // Treating "_" as "already a full key" would miss this cancel token.

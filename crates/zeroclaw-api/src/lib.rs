@@ -23,6 +23,14 @@ pub mod session_keys;
 pub mod tool;
 pub mod vad;
 
+/// Reserved names for tools that manage durable session-prompt attachments.
+/// Every policy and presentation boundary must use this single vocabulary.
+pub const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
+    "session_prompt_list",
+    "session_prompt_set",
+    "session_prompt_delete",
+];
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.

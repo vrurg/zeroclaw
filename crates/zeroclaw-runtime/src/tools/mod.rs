@@ -118,14 +118,7 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
-/// Reserved even while the optional native implementations are disabled: a
-/// plugin must never acquire a sensitive session-prompt name and accidentally
-/// receive its approval/redaction treatment.
-pub(crate) const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
-    "session_prompt_list",
-    "session_prompt_set",
-    "session_prompt_delete",
-];
+pub(crate) use zeroclaw_api::SESSION_PROMPT_TOOL_NAMES;
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};

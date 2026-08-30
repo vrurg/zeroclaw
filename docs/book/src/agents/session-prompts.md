@@ -37,6 +37,21 @@ The current chat session receives three tools when the feature is enabled:
 `[a-z][a-z0-9_.-]{0,63}`. A session may hold at most four attachments; each
 content value is at most 2 KiB and their combined content is at most 8 KiB.
 
+When `max_system_prompt_chars` is finite, `session_prompt_set` first checks
+the proposed rendered collection against the largest host prompt that the
+current primary turn prepares. It rejects a collection that would not fit,
+without writing it; the collection read, check, and update occur in one SQLite
+transaction. This is best-effort admission, not the dispatch authority:
+configuration or other turn inputs can still change after the snapshot is
+computed. In that case, ZeroClaw fails the affected turn before provider
+dispatch rather than dropping attachments or truncating host context.
+
+If that final check fails, the affected session cannot use its tools to repair
+the collection because the turn never starts. Remove the attachment with the
+session management API or reset the session; raising
+`max_system_prompt_chars` is an alternative when the host-prompt limit is
+intentionally too small.
+
 Changes take effect on the next top-level turn. The runtime appends a dedicated
 `## Session Prompts` section to the host-built system prompt. Entries are JSON
 encoded and marked as session continuity context; they cannot override system,

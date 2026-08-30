@@ -550,11 +550,13 @@ pub struct AppState {
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
     /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
-    /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled).
+    /// Key is session_key (e.g. `gw_<session_id>`); each value is bound to the
+    /// queue incarnation that admitted the turn. Entries are inserted before
+    /// each turn and removed after completion (normal or cancelled).
     pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
+        >,
     >,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).

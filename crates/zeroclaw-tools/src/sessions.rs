@@ -9,7 +9,7 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_infra::session_prompts::SessionPromptSetOutcome;
+use zeroclaw_infra::session_prompts::{SessionPromptSetOutcome, validate_prompt};
 
 static SESSION_PROMPT_LIST_DESCRIPTION: OnceLock<String> = OnceLock::new();
 static SESSION_PROMPT_SET_DESCRIPTION: OnceLock<String> = OnceLock::new();
@@ -62,6 +62,13 @@ fn current_session_backend() -> Result<Arc<dyn SessionBackend>, ToolResult> {
                 "tool-session-prompt-error-no-backend",
             )),
         })
+}
+
+fn current_session_prompt_budget() -> Option<zeroclaw_infra::session_backend::SessionPromptBudget> {
+    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// Validate that a session ID is non-empty and contains at least one
@@ -686,12 +693,30 @@ impl Tool for SessionPromptSetTool {
             Ok(backend) => backend,
             Err(result) => return Ok(result),
         };
-        match backend.set_session_prompt(&key, id, content) {
+        let (id, content) = match validate_prompt(id, content) {
+            Ok(values) => values,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(session_prompt_tool_msg_with_args(
+                        "tool-session-prompt-error-set",
+                        &[("err", &error.to_string())],
+                    )),
+                });
+            }
+        };
+        match backend.set_session_prompt_with_budget(
+            &key,
+            &id,
+            &content,
+            current_session_prompt_budget(),
+        ) {
             Ok(SessionPromptSetOutcome::Created) => Ok(ToolResult {
                 success: true,
                 output: session_prompt_tool_msg_with_args(
                     "tool-session-prompt-set-created",
-                    &[("id", id)],
+                    &[("id", &id)],
                 )
                 .into(),
                 error: None,
@@ -700,7 +725,7 @@ impl Tool for SessionPromptSetTool {
                 success: true,
                 output: session_prompt_tool_msg_with_args(
                     "tool-session-prompt-set-updated",
-                    &[("id", id)],
+                    &[("id", &id)],
                 )
                 .into(),
                 error: None,
@@ -1059,6 +1084,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::ChatMessage;
     use zeroclaw_infra::session_backend::SessionMetadata;
+    use zeroclaw_infra::session_prompts::render_session_prompts;
     use zeroclaw_infra::session_store::SessionStore;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -1626,6 +1652,49 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(backend.list_session_prompts("first").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_set_rejects_an_over_budget_collection_without_writing() {
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        backend
+            .set_session_prompt("first", "task", "keep current")
+            .unwrap();
+        let current = render_session_prompts(&backend.list_session_prompts("first").unwrap());
+        let host_prompt_bytes = 100;
+        let budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+            host_prompt_bytes,
+            host_prompt_bytes + current.len() + 2,
+        );
+
+        let set = SessionPromptSetTool::new(test_security());
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(
+                true,
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                    Some(zeroclaw_infra::session_backend::ScopedSessionBackend(
+                        backend.clone(),
+                    )),
+                    zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                        Some(budget),
+                        zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                            Some("first".to_string()),
+                            set.execute(json!({"id": "task", "content": "would make the collection too large"})),
+                        ),
+                    ),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.is_some(), "rejection must report a tool error");
+        let prompts = backend.list_session_prompts("first").unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, "keep current");
     }
 
     #[tokio::test]

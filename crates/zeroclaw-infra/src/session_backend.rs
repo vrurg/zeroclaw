@@ -6,25 +6,56 @@ use std::sync::Arc;
 use zeroclaw_api::model_provider::ChatMessage;
 
 /// Task-local transport wrapper for the canonical session backend.
-///
-/// `Arc<dyn SessionBackend>` predates the trait's `Send + Sync` supertraits,
-/// so the auto traits are erased from that object spelling. The wrapper is
-/// sound because every `SessionBackend` implementation must satisfy those
-/// supertraits by the trait declaration below.
 #[derive(Clone)]
 pub struct ScopedSessionBackend(pub Arc<dyn SessionBackend>);
-
-// SAFETY: `SessionBackend` has `Send + Sync` supertraits, so every value that
-// can inhabit this trait object is safe to transfer between task workers.
-unsafe impl Send for ScopedSessionBackend {}
-// SAFETY: `SessionBackend` has `Send + Sync` supertraits, so shared access to
-// this wrapper preserves the synchronization contract of its implementation.
-unsafe impl Sync for ScopedSessionBackend {}
 
 tokio::task_local! {
     /// Canonical durable chat backend for the active primary turn. Session
     /// prompt tools use this instead of opening an independent SQLite handle.
     pub static TOOL_LOOP_SESSION_BACKEND: Option<ScopedSessionBackend>;
+}
+
+/// Ephemeral prompt-budget snapshot for the active primary turn.
+///
+/// The runtime/channel owner derives this immediately before the tool loop
+/// from its complete host-authored prompt, before session attachments are
+/// appended. It is advisory admission evidence only: final prompt assembly
+/// remains the authoritative fail-closed guard because later turn state can
+/// still change the host prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPromptBudget {
+    host_prompt_bytes: usize,
+    max_system_prompt_chars: usize,
+}
+
+impl SessionPromptBudget {
+    pub fn new(host_prompt_bytes: usize, max_system_prompt_chars: usize) -> Self {
+        Self {
+            host_prompt_bytes,
+            max_system_prompt_chars,
+        }
+    }
+
+    /// Whether one completely rendered attachment section fits the current
+    /// primary-turn prompt. A zero limit is the existing unlimited setting.
+    pub fn permits(&self, rendered_attachments: &str) -> bool {
+        self.max_system_prompt_chars == 0
+            || self
+                .host_prompt_bytes
+                .saturating_add(if rendered_attachments.is_empty() {
+                    0
+                } else {
+                    rendered_attachments.len().saturating_add(2)
+                })
+                <= self.max_system_prompt_chars
+    }
+}
+
+tokio::task_local! {
+    /// Best-effort admission snapshot for session-prompt mutations in the
+    /// active primary turn. It is intentionally absent from unsupported and
+    /// auxiliary calls.
+    pub static TOOL_LOOP_SESSION_PROMPT_BUDGET: Option<SessionPromptBudget>;
 }
 
 /// Metadata about a persisted session.
@@ -110,6 +141,27 @@ pub trait SessionBackend: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "session prompts require SQLite persistence",
         ))
+    }
+
+    /// Atomically validate a proposed attachment collection against the
+    /// primary turn's best-effort budget before persisting it.
+    ///
+    /// SQLite is the only supported durable prompt backend. Backends that do
+    /// not implement this operation must not silently skip budget admission.
+    fn set_session_prompt_with_budget(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+        budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        if budget.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "session prompt budget admission requires SQLite persistence",
+            ));
+        }
+        self.set_session_prompt(session_key, id, content)
     }
 
     fn delete_session_prompt(&self, _session_key: &str, _id: &str) -> std::io::Result<bool> {
@@ -339,5 +391,20 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn session_prompt_budget_counts_the_attachment_separator() {
+        let budget = SessionPromptBudget::new(10, 16);
+        assert!(budget.permits("tail"));
+        assert!(
+            !budget.permits("tail!"),
+            "the two newlines separating a non-empty attachment tail must count"
+        );
+    }
+
+    #[test]
+    fn unlimited_session_prompt_budget_permits_any_rendered_tail() {
+        assert!(SessionPromptBudget::new(usize::MAX, 0).permits("tail"));
     }
 }

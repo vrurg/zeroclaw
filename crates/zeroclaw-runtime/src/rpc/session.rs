@@ -664,6 +664,26 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    /// Cancel an in-flight turn only if `id` still names the observed live
+    /// session incarnation. Lifecycle callers use this before waiting on the
+    /// per-session queue, so a queued delete cannot cancel a same-ID successor.
+    pub async fn cancel_session_at_generation(&self, id: &str, expected_generation: u64) -> bool {
+        let sessions = self.sessions.lock().await;
+        if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
+            return false;
+        }
+        self.record_cancel_cause(id, CancelCause::ClientRpc);
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, token)| {
+                token.cancel();
+                true
+            })
+            .unwrap_or(false)
+    }
+
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
     pub fn has_inflight_turn(&self, id: &str) -> bool {
         self.cancel_tokens

@@ -16,6 +16,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,30 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// names in observability while interactive tools still route correctly —
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
+
+/// Scope the durable-session capability and its best-effort prompt-budget
+/// snapshot around one WebSocket primary turn. Keeping this together prevents
+/// the WebSocket transport from silently diverging from RPC/channel admission.
+async fn scope_websocket_session_prompt_context<T>(
+    session_prompt_tools_allowed: bool,
+    session_backend: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    session_prompt_budget: Option<zeroclaw_infra::session_backend::SessionPromptBudget>,
+    session_key: Option<String>,
+    future: impl Future<Output = T>,
+) -> T {
+    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        .scope(
+            session_prompt_tools_allowed,
+            zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
+                session_backend.map(zeroclaw_infra::session_backend::ScopedSessionBackend),
+                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_PROMPT_BUDGET.scope(
+                    session_prompt_budget,
+                    zeroclaw_runtime::agent::loop_::scope_session_key(session_key, future),
+                ),
+            ),
+        )
+        .await
+}
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -640,6 +665,7 @@ async fn handle_socket(
                         &content,
                         &session_key,
                         &session_id,
+                        session_generation,
                         auth_subject.as_deref(),
                     )
                     .await;
@@ -822,7 +848,8 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
-                        auth_subject.as_deref(),
+                    session_generation,
+                    auth_subject.as_deref(),
                 )
                 .await;
             }
@@ -1026,6 +1053,7 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
+    session_generation: u64,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
@@ -1073,6 +1101,22 @@ async fn process_chat_message(
     // Refresh once before the primary turn. Changes made by a prompt tool in
     // this turn are deliberately picked up only by the next turn.
     agent.set_session_prompt_attachments(attachments);
+
+    // Derive the best-effort admission snapshot before this function marks a
+    // turn running or publishes its cancellation handle. A construction error
+    // must therefore leave no partially started WebSocket turn behind.
+    let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
+    let session_prompt_budget = if session_prompt_tools_allowed {
+        match agent.session_prompt_budget() {
+            Ok(budget) => Some(budget),
+            Err(error) => {
+                let _ = send_ws_turn_failure(sender, &error, None).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
@@ -1123,7 +1167,10 @@ async fn process_chat_message(
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
+            .insert(
+                session_key.to_string(),
+                (session_generation, cancel_token.clone()),
+            );
     }
 
     // Channel for streaming turn events from the agent.
@@ -1132,7 +1179,6 @@ async fn process_chat_message(
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
     let canonical_session_backend = state.session_backend.clone();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
@@ -1145,32 +1191,27 @@ async fn process_chat_message(
             model = %turn_model,
             channel = WS_CHANNEL_KEY,
         );
-        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-            .scope(
-                session_prompt_tools_allowed,
-                zeroclaw_infra::session_backend::TOOL_LOOP_SESSION_BACKEND.scope(
-                    canonical_session_backend
-                        .map(zeroclaw_infra::session_backend::ScopedSessionBackend),
-                    zeroclaw_runtime::agent::loop_::scope_session_key(
-                        Some(session_key_owned.clone()),
-                        zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
-                            turn_usage.clone(),
-                            zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                                cost_tracking_context.clone(),
-                                agent
-                                    .turn_streamed_with_steering_state(
-                                        &content_owned,
-                                        event_tx,
-                                        Some(cancel_token.clone()),
-                                        Some(&mut steering_rx),
-                                    )
-                                    .instrument(span),
-                            ),
-                        ),
-                    ),
+        scope_websocket_session_prompt_context(
+            session_prompt_tools_allowed,
+            canonical_session_backend,
+            session_prompt_budget,
+            Some(session_key_owned.clone()),
+            zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+                turn_usage.clone(),
+                zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    cost_tracking_context.clone(),
+                    agent
+                        .turn_streamed_with_steering_state(
+                            &content_owned,
+                            event_tx,
+                            Some(cancel_token.clone()),
+                            Some(&mut steering_rx),
+                        )
+                        .instrument(span),
                 ),
-            )
-            .await
+            ),
+        )
+        .await
     };
 
     // Drive both futures concurrently: the agent turn produces events
@@ -1384,11 +1425,16 @@ async fn process_chat_message(
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
-        state
+        let mut cancel_tokens = state
             .cancel_tokens
             .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
+            .expect("cancel_tokens lock poisoned");
+        if cancel_tokens
+            .get(session_key)
+            .is_some_and(|(generation, _)| *generation == session_generation)
+        {
+            cancel_tokens.remove(session_key);
+        }
     }
 
     // Check if this turn was cancelled. `turn_streamed` propagates
@@ -1693,6 +1739,58 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[tokio::test]
+    async fn websocket_session_prompt_context_rejects_an_over_budget_write() {
+        use serde_json::json;
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_infra::{
+            session_backend::SessionBackend, session_prompts::render_session_prompts,
+            session_sqlite::SqliteSessionBackend,
+        };
+        use zeroclaw_runtime::tools::SessionPromptSetTool;
+
+        let temp = tempfile::TempDir::new().expect("temporary SQLite backend");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(temp.path()).expect("session backend"));
+        backend
+            .set_session_prompt("gw-budget", "task", "keep current")
+            .expect("initial prompt");
+        let rendered = render_session_prompts(
+            &backend
+                .list_session_prompts("gw-budget")
+                .expect("initial prompt list"),
+        );
+        let host_bytes = 100;
+        let budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+            host_bytes,
+            host_bytes + 2 + rendered.len(),
+        );
+
+        let result = scope_websocket_session_prompt_context(
+            true,
+            Some(backend.clone()),
+            Some(budget),
+            Some("gw-budget".to_string()),
+            SessionPromptSetTool::new(Arc::new(zeroclaw_config::policy::SecurityPolicy::default()))
+                .execute(json!({
+                    "id": "task",
+                    "content": "this replacement exceeds the current WebSocket turn budget"
+                })),
+        )
+        .await
+        .expect("tool execution");
+
+        assert!(
+            !result.success,
+            "WebSocket must reject an over-budget write"
+        );
+        let prompts = backend
+            .list_session_prompts("gw-budget")
+            .expect("prompt list after rejection");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content, "keep current");
+    }
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {

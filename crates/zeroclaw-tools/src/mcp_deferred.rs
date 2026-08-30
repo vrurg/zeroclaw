@@ -199,10 +199,7 @@ impl ActivatedToolSet {
         // Native session-prompt operations have unqualified names. Do not
         // resolve a deferred MCP suffix onto them: the runtime associates
         // those names with special approval and redaction rules.
-        if matches!(
-            name,
-            "session_prompt_list" | "session_prompt_set" | "session_prompt_delete"
-        ) {
+        if zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&name) {
             return None;
         }
         if let Some(tool) = self.get(name) {
