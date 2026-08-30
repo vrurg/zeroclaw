@@ -4460,7 +4460,7 @@ impl RpcDispatcher {
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
             match guard
-                .resolve_via_broker(&req.run_id, decision, principal)
+                .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
             {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
@@ -6739,7 +6739,9 @@ mod tests {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -9177,7 +9179,9 @@ mod tests {
 
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(scoped)
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -10580,7 +10584,9 @@ mod tests {
         // dispatcher sees a live session.
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
