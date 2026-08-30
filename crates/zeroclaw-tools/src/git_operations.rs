@@ -538,12 +538,14 @@ impl GitOperationsTool {
                 );
                 anyhow::bail!("Git discovery ceiling cannot represent non-Unicode authorized root");
             };
-            return Ok(PathBuf::from(
+            Ok(PathBuf::from(
                 Self::strip_windows_verbatim_prefix(root).into_owned(),
-            ));
+            ))
         }
         #[cfg(not(windows))]
-        Ok(root.to_path_buf())
+        {
+            Ok(root.to_path_buf())
+        }
     }
 
     /// Convert Windows `canonicalize` output back to the spelling Git uses for
