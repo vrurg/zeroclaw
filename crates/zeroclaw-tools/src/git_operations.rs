@@ -877,6 +877,8 @@ impl GitOperationsTool {
         let mut current_head = String::new();
         let mut is_detached = false;
         let active_worktree = active_worktree.to_string_lossy();
+        let is_active_worktree =
+            |worktree: &str| Path::new(active_worktree.as_ref()).starts_with(Path::new(worktree));
 
         for line in output.lines().map(str::trim) {
             if line.is_empty() {
@@ -886,7 +888,7 @@ impl GitOperationsTool {
                         "branch": if is_detached { "HEAD" } else { &current_branch },
                         "head": &current_head,
                         "detached": is_detached,
-                        "active": current_path == active_worktree.as_ref()
+                        "active": is_active_worktree(&current_path)
                     }));
                     current_path.clear();
                     current_branch.clear();
@@ -909,7 +911,7 @@ impl GitOperationsTool {
                 "branch": if is_detached { "HEAD" } else { current_branch.as_str() },
                 "head": &current_head,
                 "detached": is_detached,
-                "active": current_path == active_worktree.as_ref()
+                "active": is_active_worktree(&current_path)
             }));
         }
         json!({ "worktrees": worktrees })
@@ -1123,26 +1125,27 @@ impl Tool for GitOperationsTool {
             &authorized_roots,
             requires_write_access,
         );
-        if repository_authorization != RepositoryAuthorization::Authorized {
+        let error_key = match repository_authorization {
+            RepositoryAuthorization::Authorized => None,
+            RepositoryAuthorization::NotFound => Some("tool-git-operations-error-not-in-repo"),
+            RepositoryAuthorization::Denied => {
+                let path_display = working_dir.display().to_string();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "path": path_display,
+                            "operation": operation,
+                            "requires_write_access": requires_write_access,
+                        })),
+                    "git_operations: repository metadata is not authorized"
+                );
+                Some("tool-git-operations-error-repository-not-authorized")
+            }
+        };
+        if let Some(error_key) = error_key {
             let path_display = working_dir.display().to_string();
-            let error_key = match repository_authorization {
-                RepositoryAuthorization::Authorized => unreachable!(),
-                RepositoryAuthorization::NotFound => "tool-git-operations-error-not-in-repo",
-                RepositoryAuthorization::Denied => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "path": path_display,
-                                "operation": operation,
-                                "requires_write_access": requires_write_access,
-                            })),
-                        "git_operations: repository metadata is not authorized"
-                    );
-                    "tool-git-operations-error-repository-not-authorized"
-                }
-            };
             let error_msg = crate::i18n::get_required_tool_string_with_args(
                 error_key,
                 &[("path", &path_display)],
@@ -1426,12 +1429,14 @@ mod tests {
             .unwrap();
         assert!(added.success, "worktree add failed: {added:?}");
         assert!(linked_worktree.join(".git").is_file());
+        let linked_worktree_subdir = linked_worktree.join("nested");
+        std::fs::create_dir(&linked_worktree_subdir).unwrap();
 
         let worktrees = tool
             .execute(json!({
                 "operation": "worktree",
                 "subcommand": "list",
-                "path": &linked_worktree
+                "path": &linked_worktree_subdir
             }))
             .await
             .unwrap();
