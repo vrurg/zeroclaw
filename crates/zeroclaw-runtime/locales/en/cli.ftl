@@ -674,7 +674,6 @@ cli-quickstart-step-agent = Agent
 cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
 cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
 cli-quickstart-error-persist-config = failed to persist config: {$err}
-cli-quickstart-error-reload-pending = Quickstart is waiting for the daemon to reload after a previous successful submission
 cli-quickstart-warning = WARNING: {$message}
 cli-quickstart-warning-config-durability = Quickstart completed, but config durability could not be confirmed: {$err}
 cli-quickstart-warning-anthropic-profile-durability = Quickstart completed, but Anthropic credential durability could not be confirmed: {$err}

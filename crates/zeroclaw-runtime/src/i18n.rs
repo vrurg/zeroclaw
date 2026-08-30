@@ -718,13 +718,7 @@ mod tests {
 
     #[test]
     fn anthropic_setup_token_recovery_is_available_in_every_builtin_locale() {
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
+        for (source, locale) in committed_locale_sources() {
             for key in [
                 "cli-quickstart-error-anthropic-setup-token-required",
                 "cli-quickstart-error-anthropic-setup-token-store",
@@ -754,6 +748,26 @@ mod tests {
                     && !hint.contains("--auth-kind")
                     && !hint.contains("claude setup-token"),
                 "Anthropic recovery hint in {locale} must not advertise a post-hoc credential setup path: {hint:?}"
+            );
+
+            let api_key_help =
+                format_ftl_message(source, locale, "cli-quickstart-anthropic-api-key-help", &[])
+                    .unwrap_or_else(|| panic!("Anthropic API-key help must format in {locale}"));
+            assert!(
+                api_key_help.contains("setup_token") && api_key_help.contains("claude setup-token"),
+                "Anthropic API-key help in {locale} must direct Claude Max users to choose setup_token after claude setup-token: {api_key_help:?}"
+            );
+            let token_placement_marker = match locale {
+                "en" => "here",
+                "es" => "aquí",
+                "fr" => "ici",
+                "ja" => "ここ",
+                "zh-CN" => "这里",
+                _ => unreachable!("committed locale registry contains only built-in locales"),
+            };
+            assert!(
+                !api_key_help.contains(token_placement_marker),
+                "Anthropic API-key help in {locale} must not tell users to paste a setup token into the API-key field: {api_key_help:?}"
             );
         }
     }
