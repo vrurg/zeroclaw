@@ -2174,7 +2174,13 @@ mod tests {
             .unwrap();
         assert!(status.success(), "linked worktree setup must succeed");
         std::fs::write(linked_worktree.join("new-file"), "content").unwrap();
-        let index_path = main_repository.path().join(".git/index");
+        let gitdir = std::fs::read_to_string(linked_worktree.join(".git"))
+            .unwrap()
+            .strip_prefix("gitdir: ")
+            .unwrap()
+            .trim()
+            .to_owned();
+        let index_path = PathBuf::from(gitdir).join("index");
         let index_before = std::fs::read(&index_path).unwrap();
         let tool = test_tool_with_allowed_and_read_only_roots(
             workspace.path(),
@@ -2198,7 +2204,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&index_path).unwrap(),
             index_before,
-            "rejected linked-worktree mutation must not change the shared index"
+            "rejected linked-worktree mutation must not change its index"
         );
     }
 
