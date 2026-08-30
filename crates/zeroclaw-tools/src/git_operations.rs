@@ -334,7 +334,7 @@ impl GitOperationsTool {
             .args(args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
-        self.configure_git_environment(command.as_std_mut(), working_dir, true);
+        self.configure_git_environment(command.as_std_mut(), working_dir, true)?;
         let output = command.output().await?;
 
         if !output.status.success() {
@@ -359,7 +359,7 @@ impl GitOperationsTool {
             .args(args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
-        self.configure_git_environment(command.as_std_mut(), working_dir, false);
+        self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
         let output = command.output().await?;
 
         if !output.status.success() {
@@ -375,7 +375,7 @@ impl GitOperationsTool {
         command: &mut std::process::Command,
         working_dir: &Path,
         requires_write_access: bool,
-    ) {
+    ) -> anyhow::Result<()> {
         for name in [
             "GIT_DIR",
             "GIT_COMMON_DIR",
@@ -414,9 +414,20 @@ impl GitOperationsTool {
                 .min_by_key(|root| root.components().count())
                 .and_then(|root| root.parent())
             {
+                // Git parses this variable as a platform-separated path list.
+                // A separator in an authorized path would make Git discard or
+                // misinterpret the ceiling, reopening parent discovery.
+                let path_separator = if cfg!(windows) { ';' } else { ':' };
+                if root.as_os_str().to_string_lossy().contains(path_separator) {
+                    anyhow::bail!(
+                        "Git discovery ceiling cannot represent authorized root '{}'",
+                        root.display()
+                    );
+                }
                 command.env("GIT_CEILING_DIRECTORIES", root);
             }
         }
+        Ok(())
     }
 
     async fn git_status(
@@ -1409,7 +1420,8 @@ mod tests {
             .env("GIT_COMMON_DIR", "/outside/common")
             .env("GIT_CONFIG_COUNT", "1");
 
-        tool.configure_git_environment(&mut command, tmp.path(), false);
+        tool.configure_git_environment(&mut command, tmp.path(), false)
+            .unwrap();
 
         for name in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"] {
             assert!(
@@ -2138,9 +2150,53 @@ mod tests {
         let result = tool
             .execute(json!({"operation": "status", "path": &allowed_child}))
             .await;
+        let error = match result {
+            Ok(result) => {
+                assert!(
+                    !result.success,
+                    "an invalid child .git directory must not fall through to its parent repository: {result:?}"
+                );
+                result.error.unwrap_or_default()
+            }
+            Err(error) => error.to_string(),
+        };
         assert!(
-            matches!(&result, Err(_) | Ok(ToolResult { success: false, .. })),
-            "an invalid child .git directory must not fall through to its parent repository: {result:?}"
+            error.contains("not a git repository"),
+            "the ceiling must make Git reject the invalid child repository: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_commands_reject_unrepresentable_discovery_ceilings() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent:with-colon");
+        let allowed_root = parent.join("allowed-root");
+        std::fs::create_dir_all(&allowed_root).unwrap();
+        let allowed_root = allowed_root.canonicalize().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: allowed_root.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security);
+        let mut command = std::process::Command::new("git");
+
+        let error = tool
+            .configure_git_environment(&mut command, &allowed_root, false)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent authorized root"),
+            "an unrepresentable Git ceiling must fail closed: {error}"
+        );
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_CEILING_DIRECTORIES" && value.is_some()),
+            "a failed ceiling must not leave Git discovery unbounded"
         );
     }
 
@@ -2702,25 +2758,24 @@ mod tests {
             "error should contain the working directory path '{path_display}', got: {error}"
         );
 
-        // The error message must include recovery guidance keywords
-        // that tell the user how to resolve the issue.
         assert!(
-            error.contains("worktree") || error.contains("work tree") || error.contains("path"),
-            "error should contain a recovery keyword (worktree/work tree/path), got: {error}"
-        );
-        assert!(
-            error.contains("initialize") || error.contains("init"),
-            "error should mention initializing a repository, got: {error}"
+            include_str!("../locales/en/tools.ftl")
+                .contains("tool-git-operations-error-not-in-repo = Not in a Git repository"),
+            "the canonical English not-in-repository diagnostic must retain its recovery guidance"
         );
     }
 
     #[tokio::test]
     async fn bounded_discovery_reports_authorization_boundary_for_empty_workspace() {
         let tmp = TempDir::new().unwrap();
-        let result = test_tool(tmp.path())
-            .execute(json!({"operation": "status"}))
-            .await
-            .unwrap();
+        let tool = test_tool(tmp.path());
+        let roots = tool.security.approved_read_roots(tmp.path());
+        assert_eq!(
+            tool.has_repository_within_authorized_roots(tmp.path(), &roots, false),
+            RepositoryAuthorization::DiscoveryBoundaryReached,
+            "the default policy must distinguish its authorization boundary from an unbounded search"
+        );
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
 
         assert!(
             !result.success,
@@ -2728,12 +2783,13 @@ mod tests {
         );
         let error = result.error.as_deref().unwrap_or_default();
         assert!(
-            error.contains("authorized roots"),
-            "bounded discovery must identify its boundary: {error}"
+            error.contains(&tmp.path().display().to_string()),
+            "the boundary diagnostic must include the requested path: {error}"
         );
         assert!(
-            !error.contains("initialize a repository"),
-            "bounded discovery must not suggest initializing a nested repository: {error}"
+            include_str!("../locales/en/tools.ftl")
+                .contains("tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots"),
+            "the canonical English boundary diagnostic must remain distinct from the not-in-repository message"
         );
     }
 }
