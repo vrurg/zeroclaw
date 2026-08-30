@@ -16,6 +16,7 @@ pub struct GitOperationsTool {
 enum RepositoryAuthorization {
     Authorized,
     NotFound,
+    DiscoveryBoundaryReached,
     Denied,
 }
 
@@ -131,7 +132,7 @@ impl GitOperationsTool {
             if !discovery_is_unbounded
                 && !authorized_roots.iter().any(|root| parent.starts_with(root))
             {
-                return RepositoryAuthorization::NotFound;
+                return RepositoryAuthorization::DiscoveryBoundaryReached;
             }
             current_dir = parent;
         }
@@ -1160,6 +1161,12 @@ impl Tool for GitOperationsTool {
         let error_key = match repository_authorization {
             RepositoryAuthorization::Authorized => None,
             RepositoryAuthorization::NotFound => Some("tool-git-operations-error-not-in-repo"),
+            // Do not inspect beyond the authorization boundary to learn whether
+            // a parent repository exists. The caller must choose a repository
+            // whose metadata is reachable within the applicable grant.
+            RepositoryAuthorization::DiscoveryBoundaryReached => {
+                Some("tool-git-operations-error-repository-outside-authorized-roots")
+            }
             RepositoryAuthorization::Denied => {
                 let path_display = working_dir.display().to_string();
                 ::zeroclaw_log::record!(
@@ -2087,6 +2094,15 @@ mod tests {
                 !result.success,
                 "parent repository must not be usable through an allowed child: {result:?}"
             );
+            let error = result.error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains("authorized roots"),
+                "bounded discovery must identify the authorization boundary: {error}"
+            );
+            assert!(
+                !error.contains("initialize a repository"),
+                "bounded discovery must not suggest initializing a nested repository: {error}"
+            );
         }
     }
 
@@ -2622,7 +2638,14 @@ mod tests {
     async fn non_repository_error_includes_path_context_and_recovery_hint() {
         let tmp = TempDir::new().unwrap();
         // Do NOT git-init the temp dir — we want a non-repository path.
-        let tool = test_tool(tmp.path());
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security);
 
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
 
