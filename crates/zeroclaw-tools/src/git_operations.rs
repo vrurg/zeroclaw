@@ -10,7 +10,6 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Provides safe, parsed git operations with JSON output.
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
-    workspace_dir: std::path::PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,11 +20,8 @@ enum RepositoryAuthorization {
 }
 
 impl GitOperationsTool {
-    pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
-        Self {
-            security,
-            workspace_dir,
-        }
+    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+        Self { security }
     }
 
     /// Sanitize git arguments to prevent injection attacks
@@ -171,20 +167,25 @@ impl GitOperationsTool {
         let Ok(gitdir) = gitdir.canonicalize() else {
             return false;
         };
-        if !self.metadata_directory_is_authorized(&gitdir, requires_write_access) {
+        // A gitfile without `commondir` is a submodule-style indirection.
+        // `metadata_directory_is_authorized` checks the gitdir itself and,
+        // when present, its linked-worktree common directory.
+        self.metadata_directory_is_authorized(&gitdir, requires_write_access)
+    }
+
+    fn metadata_directory_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
+        if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+            || !self.metadata_path_is_authorized(path, requires_write_access)
+        {
             return false;
         }
 
-        let commondir_file = gitdir.join("commondir");
-        if !commondir_file.exists() {
-            // A gitfile without `commondir` is a submodule-style indirection,
-            // whose gitdir was independently authorized above.
-            return true;
-        }
-        if !std::fs::symlink_metadata(&commondir_file)
-            .is_ok_and(|metadata| metadata.file_type().is_file())
-        {
-            return false;
+        let commondir_file = path.join("commondir");
+        match std::fs::symlink_metadata(&commondir_file) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+            Ok(metadata) if !metadata.file_type().is_file() => return false,
+            Ok(_) => {}
         }
         let Ok(commondir) = std::fs::read_to_string(&commondir_file) else {
             return false;
@@ -197,7 +198,7 @@ impl GitOperationsTool {
         let commondir = if commondir.is_absolute() {
             commondir.to_path_buf()
         } else {
-            gitdir.join(commondir)
+            path.join(commondir)
         };
         if !std::fs::symlink_metadata(&commondir)
             .is_ok_and(|metadata| metadata.file_type().is_dir())
@@ -207,12 +208,7 @@ impl GitOperationsTool {
         let Ok(commondir) = commondir.canonicalize() else {
             return false;
         };
-        self.metadata_directory_is_authorized(&commondir, requires_write_access)
-    }
-
-    fn metadata_directory_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
-            && self.metadata_path_is_authorized(path, requires_write_access)
+        self.metadata_path_is_authorized(&commondir, requires_write_access)
     }
 
     fn metadata_path_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
@@ -234,7 +230,7 @@ impl GitOperationsTool {
         Ok(if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.workspace_dir.join(path)
+            self.security.workspace_dir.join(path)
         })
     }
 
@@ -292,7 +288,7 @@ impl GitOperationsTool {
                 let candidate = if std::path::Path::new(p).is_absolute() {
                     std::path::PathBuf::from(p)
                 } else {
-                    self.workspace_dir.join(p)
+                    self.security.workspace_dir.join(p)
                 };
                 let resolved = candidate.canonicalize().map_err(|e| {
                     ::zeroclaw_log::record!(
@@ -314,12 +310,16 @@ impl GitOperationsTool {
                 }
                 resolved
             }
-            _ => self.workspace_dir.canonicalize().map_err(|error| {
-                anyhow::Error::msg(format!(
-                    "Cannot resolve Git workspace '{}': {error}",
-                    self.workspace_dir.display()
-                ))
-            })?,
+            _ => self
+                .security
+                .workspace_dir
+                .canonicalize()
+                .map_err(|error| {
+                    anyhow::Error::msg(format!(
+                        "Cannot resolve Git workspace '{}': {error}",
+                        self.security.workspace_dir.display()
+                    ))
+                })?,
         };
         Ok(base)
     }
@@ -329,13 +329,13 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("git")
+        let mut command = tokio::process::Command::new("git");
+        command
             .args(args)
             .current_dir(working_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await?;
+            .stdin(std::process::Stdio::null());
+        self.configure_git_environment(command.as_std_mut());
+        let output = command.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -353,15 +353,14 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("git")
+        let mut command = tokio::process::Command::new("git");
+        command
             .args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat"])
             .args(args)
             .current_dir(working_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_PAGER", "cat")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await?;
+            .stdin(std::process::Stdio::null());
+        self.configure_git_environment(command.as_std_mut());
+        let output = command.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -369,6 +368,35 @@ impl GitOperationsTool {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn configure_git_environment(&self, command: &mut std::process::Command) {
+        for name in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_INDEX_VERSION",
+            "GIT_ATTR_SOURCE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_EXTERNAL_DIFF",
+        ] {
+            command.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_"))
+        {
+            command.env_remove(name);
+        }
+        command
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat");
     }
 
     async fn git_status(
@@ -876,23 +904,15 @@ impl GitOperationsTool {
         let mut current_branch = String::new();
         let mut current_head = String::new();
         let mut is_detached = false;
-        let active_worktree = active_worktree.to_string_lossy();
-        let is_active_worktree =
-            |worktree: &str| Path::new(active_worktree.as_ref()).starts_with(Path::new(worktree));
-
         for line in output.lines().map(str::trim) {
             if line.is_empty() {
                 if !current_path.is_empty() {
-                    worktrees.push(json!({
-                        "path": &current_path,
-                        "branch": if is_detached { "HEAD" } else { &current_branch },
-                        "head": &current_head,
-                        "detached": is_detached,
-                        "active": is_active_worktree(&current_path)
-                    }));
-                    current_path.clear();
-                    current_branch.clear();
-                    current_head.clear();
+                    worktrees.push((
+                        std::mem::take(&mut current_path),
+                        std::mem::take(&mut current_branch),
+                        std::mem::take(&mut current_head),
+                        is_detached,
+                    ));
                     is_detached = false;
                 }
             } else if let Some(path) = line.strip_prefix("worktree ") {
@@ -906,14 +926,27 @@ impl GitOperationsTool {
             }
         }
         if !current_path.is_empty() {
-            worktrees.push(json!({
-                "path": &current_path,
-                "branch": if is_detached { "HEAD" } else { current_branch.as_str() },
-                "head": &current_head,
-                "detached": is_detached,
-                "active": is_active_worktree(&current_path)
-            }));
+            worktrees.push((current_path, current_branch, current_head, is_detached));
         }
+        let active_index = worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, (path, ..))| active_worktree.starts_with(Path::new(path)))
+            .max_by_key(|(_, (path, ..))| Path::new(path).components().count())
+            .map(|(index, _)| index);
+        let worktrees = worktrees
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, branch, head, detached))| {
+                json!({
+                    "path": path,
+                    "branch": if detached { "HEAD" } else { &branch },
+                    "head": head,
+                    "detached": detached,
+                    "active": active_index == Some(index)
+                })
+            })
+            .collect::<Vec<_>>();
         json!({ "worktrees": worktrees })
     }
 
@@ -1222,7 +1255,7 @@ mod tests {
             workspace_dir: dir.to_path_buf(),
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     /// Initialise a git repo for tests with commit/tag signing disabled and a
@@ -1264,7 +1297,7 @@ mod tests {
             allowed_roots,
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     fn test_tool_with_read_only_root(
@@ -1277,7 +1310,7 @@ mod tests {
             allowed_roots_read_only: vec![read_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     fn test_tool_with_allowed_and_read_only_roots(
@@ -1292,7 +1325,7 @@ mod tests {
             allowed_roots_read_only: vec![read_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     fn test_tool_with_write_only_root(
@@ -1305,7 +1338,7 @@ mod tests {
             allowed_roots_write_only: vec![write_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security, dir.to_path_buf())
+        GitOperationsTool::new(security)
     }
 
     #[test]
@@ -1338,6 +1371,34 @@ mod tests {
         // Exact `-c` flag (config injection)
         assert!(tool.sanitize_git_args("-c core.sshCommand=evil").is_err());
         assert!(tool.sanitize_git_args("-c=core.pager=less").is_err());
+    }
+
+    #[test]
+    fn git_commands_clear_ambient_repository_overrides() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+        let mut command = std::process::Command::new("git");
+        command
+            .env("GIT_DIR", "/outside/repository")
+            .env("GIT_COMMON_DIR", "/outside/common")
+            .env("GIT_CONFIG_COUNT", "1");
+
+        tool.configure_git_environment(&mut command);
+
+        for name in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == name && value.is_none()),
+                "{name} must be removed before Git runs"
+            );
+        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == Some("0".as_ref())),
+            "Git must remain non-interactive"
+        );
     }
 
     #[test]
@@ -1443,6 +1504,7 @@ mod tests {
         assert!(worktrees.success, "worktree list failed: {worktrees:?}");
         let worktrees: serde_json::Value = serde_json::from_str(&worktrees.output.to_string())
             .expect("worktree list output must be JSON");
+        let main_worktree = tmp.path().canonicalize().unwrap();
         let linked_worktree = linked_worktree.canonicalize().unwrap();
         assert!(
             worktrees["worktrees"]
@@ -1451,6 +1513,14 @@ mod tests {
                     == linked_worktree.to_string_lossy().as_ref()
                     && entry["active"] == true)),
             "the requested linked worktree must be active: {worktrees}"
+        );
+        assert!(
+            worktrees["worktrees"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
+                    == main_worktree.to_string_lossy().as_ref()
+                    && entry["active"] == false)),
+            "only the deepest matching worktree may be active: {worktrees}"
         );
 
         let status = tool
@@ -1530,7 +1600,7 @@ mod tests {
             forbidden_paths: Vec::new(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, workspace);
+        let tool = GitOperationsTool::new(security);
 
         let status = tool.execute(json!({"operation": "status"})).await.unwrap();
         assert!(
@@ -1552,7 +1622,7 @@ mod tests {
             forbidden_paths: vec![repository.path().display().to_string()],
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, workspace);
+        let tool = GitOperationsTool::new(security);
 
         let status = tool.execute(json!({"operation": "status"})).await.unwrap();
         assert!(
@@ -1593,7 +1663,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         let result = tool
             .execute(json!({"operation": "commit", "message": "test"}))
@@ -1619,7 +1689,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
         // Branch listing must not be blocked by read-only autonomy
@@ -1632,12 +1702,11 @@ mod tests {
 
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
-        let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
@@ -2157,6 +2226,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn git_operations_rejects_directory_metadata_with_an_unauthorized_commondir() {
+        let workspace = TempDir::new().unwrap();
+        let external_repository = TempDir::new().unwrap();
+        bootstrap_repo(workspace.path(), &[]).await;
+        bootstrap_repo(external_repository.path(), &[]).await;
+        std::fs::write(
+            workspace.path().join(".git/commondir"),
+            format!("{}\n", external_repository.path().join(".git").display()),
+        )
+        .unwrap();
+        let tool = test_tool(workspace.path());
+
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+
+        assert!(
+            !result.success,
+            "directory metadata with an unauthorized commondir must fail closed: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not authorized")),
+            "unauthorized commondir must report an authorization denial: {:?}",
+            result.error
+        );
+    }
+
     #[test]
     fn gitfile_without_commondir_is_authorized_as_a_submodule_boundary() {
         let workspace = TempDir::new().unwrap();
@@ -2491,7 +2589,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+        let tool = GitOperationsTool::new(security);
 
         let result = tool
             .execute(json!({"operation": "add", "paths": "a.txt b.txt"}))
