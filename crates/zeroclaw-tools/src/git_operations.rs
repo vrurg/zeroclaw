@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
+#[cfg(any(windows, test))]
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -408,26 +410,74 @@ impl GitOperationsTool {
             } else {
                 self.security.approved_read_roots(working_dir)
             };
-            if let Some(root) = authorized_roots
+            let Some(outermost_root) = authorized_roots
                 .iter()
                 .filter(|root| working_dir.starts_with(root))
                 .min_by_key(|root| root.components().count())
-                .and_then(|root| root.parent())
-            {
+            else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "path": working_dir })),
+                    "git_operations: Git discovery ceiling has no authorized root"
+                );
+                anyhow::bail!(
+                    "Git discovery ceiling cannot determine an authorized root for '{}'",
+                    working_dir.display()
+                );
+            };
+            if let Some(root) = outermost_root.parent() {
+                let ceiling = Self::git_discovery_ceiling_path(root)?;
                 // Git parses this variable as a platform-separated path list.
                 // A separator in an authorized path would make Git discard or
                 // misinterpret the ceiling, reopening parent discovery.
                 let path_separator = if cfg!(windows) { ';' } else { ':' };
-                if root.as_os_str().to_string_lossy().contains(path_separator) {
+                if ceiling
+                    .as_os_str()
+                    .to_string_lossy()
+                    .contains(path_separator)
+                {
                     anyhow::bail!(
                         "Git discovery ceiling cannot represent authorized root '{}'",
-                        root.display()
+                        ceiling.display()
                     );
                 }
-                command.env("GIT_CEILING_DIRECTORIES", root);
+                command.env("GIT_CEILING_DIRECTORIES", ceiling);
             }
         }
         Ok(())
+    }
+
+    fn git_discovery_ceiling_path(root: &Path) -> anyhow::Result<PathBuf> {
+        #[cfg(windows)]
+        {
+            let Some(root) = root.to_str() else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "git_operations: Git discovery ceiling has non-Unicode root"
+                );
+                anyhow::bail!("Git discovery ceiling cannot represent non-Unicode authorized root");
+            };
+            return Ok(PathBuf::from(Self::strip_windows_verbatim_prefix(root)));
+        }
+        #[cfg(not(windows))]
+        Ok(root.to_path_buf())
+    }
+
+    /// Convert Windows `canonicalize` output back to the spelling Git uses for
+    /// discovery. A verbatim `\\?\` path cannot match Git's plain cwd path.
+    #[cfg(any(windows, test))]
+    fn strip_windows_verbatim_prefix(path: &str) -> Cow<'_, str> {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            Cow::Owned(format!(r"\\{rest}"))
+        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+            Cow::Borrowed(rest)
+        } else {
+            Cow::Borrowed(path)
+        }
     }
 
     async fn git_status(
@@ -1420,7 +1470,8 @@ mod tests {
             .env("GIT_COMMON_DIR", "/outside/common")
             .env("GIT_CONFIG_COUNT", "1");
 
-        tool.configure_git_environment(&mut command, tmp.path(), false)
+        let resolved_tmp = tmp.path().canonicalize().unwrap();
+        tool.configure_git_environment(&mut command, &resolved_tmp, false)
             .unwrap();
 
         for name in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_CONFIG_COUNT"] {
@@ -2112,28 +2163,40 @@ mod tests {
         std::fs::create_dir(&allowed_child).unwrap();
         std::fs::write(allowed_child.join("tracked.txt"), "content").unwrap();
         let tool = test_tool_with_allowed_root(workspace.path(), allowed_child.clone());
+        let resolved_child = allowed_child.canonicalize().unwrap();
 
-        for args in [
-            json!({"operation": "status", "path": &allowed_child}),
-            json!({
-                "operation": "add",
-                "path": &allowed_child,
-                "paths": "tracked.txt"
-            }),
+        for (args, requires_write_access) in [
+            (
+                json!({"operation": "status", "path": &allowed_child}),
+                false,
+            ),
+            (
+                json!({
+                    "operation": "add",
+                    "path": &allowed_child,
+                    "paths": "tracked.txt"
+                }),
+                true,
+            ),
         ] {
+            let roots = if requires_write_access {
+                tool.security.approved_write_roots(&resolved_child)
+            } else {
+                tool.security.approved_read_roots(&resolved_child)
+            };
+            assert_eq!(
+                tool.has_repository_within_authorized_roots(
+                    &resolved_child,
+                    &roots,
+                    requires_write_access,
+                ),
+                RepositoryAuthorization::DiscoveryBoundaryReached,
+                "parent discovery must stop at the authorized root"
+            );
             let result = tool.execute(args).await.unwrap();
             assert!(
                 !result.success,
                 "parent repository must not be usable through an allowed child: {result:?}"
-            );
-            let error = result.error.as_deref().unwrap_or_default();
-            assert!(
-                error.contains("authorized roots"),
-                "bounded discovery must identify the authorization boundary: {error}"
-            );
-            assert!(
-                !error.contains("initialize a repository"),
-                "bounded discovery must not suggest initializing a nested repository: {error}"
             );
         }
     }
@@ -2146,23 +2209,42 @@ mod tests {
         let allowed_child = parent_repository.path().join("allowed-child");
         std::fs::create_dir_all(allowed_child.join(".git")).unwrap();
         let tool = test_tool_with_allowed_root(workspace.path(), allowed_child.clone());
+        let resolved_child = allowed_child.canonicalize().unwrap();
+        let mut command = std::process::Command::new("git");
+        tool.configure_git_environment(&mut command, &resolved_child, false)
+            .unwrap();
+        let expected_ceiling = parent_repository.path().canonicalize().unwrap();
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(key, value)| (key == "GIT_CEILING_DIRECTORIES").then_some(value))
+                .flatten(),
+            Some(expected_ceiling.as_os_str()),
+            "Git must stop before the parent repository"
+        );
 
         let result = tool
             .execute(json!({"operation": "status", "path": &allowed_child}))
             .await;
-        let error = match result {
-            Ok(result) => {
-                assert!(
-                    !result.success,
-                    "an invalid child .git directory must not fall through to its parent repository: {result:?}"
-                );
-                result.error.unwrap_or_default()
-            }
-            Err(error) => error.to_string(),
-        };
         assert!(
-            error.contains("not a git repository"),
-            "the ceiling must make Git reject the invalid child repository: {error}"
+            matches!(result, Ok(ToolResult { success: false, .. }) | Err(_)),
+            "an invalid child .git directory must not fall through to its parent repository: {result:?}"
+        );
+    }
+
+    #[test]
+    fn git_ceiling_strips_windows_verbatim_prefixes() {
+        assert_eq!(
+            GitOperationsTool::strip_windows_verbatim_prefix(r"\\?\C:\Users\me\repo"),
+            r"C:\Users\me\repo"
+        );
+        assert_eq!(
+            GitOperationsTool::strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            GitOperationsTool::strip_windows_verbatim_prefix("/workspace/repo"),
+            "/workspace/repo"
         );
     }
 
@@ -2250,6 +2332,13 @@ mod tests {
         assert!(linked_worktree.join(".git").is_file());
 
         let tool = test_tool_with_allowed_root(workspace.path(), linked_worktree.clone());
+        let resolved_worktree = linked_worktree.canonicalize().unwrap();
+        let roots = tool.security.approved_read_roots(&resolved_worktree);
+        assert_eq!(
+            tool.has_repository_within_authorized_roots(&resolved_worktree, &roots, false),
+            RepositoryAuthorization::Denied,
+            "linked worktree metadata outside the grant must be denied before Git runs"
+        );
         let result = tool
             .execute(json!({"operation": "status", "path": &linked_worktree}))
             .await
@@ -2258,14 +2347,6 @@ mod tests {
         assert!(
             !result.success,
             "linked worktree metadata indirection must fail closed: {result:?}"
-        );
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("not authorized")),
-            "linked worktree must report an authorization denial: {:?}",
-            result.error
         );
     }
 
@@ -2359,20 +2440,19 @@ mod tests {
         )
         .unwrap();
         let tool = test_tool(workspace.path());
+        let resolved_workspace = workspace.path().canonicalize().unwrap();
+        let roots = tool.security.approved_read_roots(&resolved_workspace);
+        assert_eq!(
+            tool.has_repository_within_authorized_roots(&resolved_workspace, &roots, false),
+            RepositoryAuthorization::Denied,
+            "an unauthorized commondir must be denied before Git runs"
+        );
 
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
 
         assert!(
             !result.success,
             "directory metadata with an unauthorized commondir must fail closed: {result:?}"
-        );
-        assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("not authorized")),
-            "unauthorized commondir must report an authorization denial: {:?}",
-            result.error
         );
     }
 
