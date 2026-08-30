@@ -3177,7 +3177,7 @@ impl SecurityPolicy {
         false
     }
 
-    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+    fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
         let mut approved_roots = Vec::new();
         for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -3194,6 +3194,18 @@ impl SecurityPolicy {
             }
         }
         approved_roots
+    }
+
+    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        // A non-workspace-only policy authorizes paths outside every configured
+        // root (subject to the ordinary forbidden-path checks). It therefore
+        // has no bounded discovery root; callers may continue searching for a
+        // parent-owned resource. The compatibility accessor below retains the
+        // configured-root result for handle-bound file delivery.
+        if !self.workspace_only {
+            return Vec::new();
+        }
+        self.configured_approved_roots(resolved, include_read_only)
     }
 
     /// Return every canonical bounded root that authorizes reading `resolved`.
@@ -3217,7 +3229,9 @@ impl SecurityPolicy {
     /// contract for handle-bound callers. Parent-resource discovery must use
     /// [`Self::approved_read_roots`] instead.
     pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
-        self.approved_read_roots(resolved).into_iter().next()
+        self.configured_approved_roots(resolved, true)
+            .into_iter()
+            .next()
     }
 
     /// Return every canonical bounded root that authorizes writing `resolved`.
@@ -7988,6 +8002,23 @@ mod tests {
                 .approved_read_roots(&outside_canon.join("x"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unrestricted_policy_has_no_discovery_boundary_but_preserves_handle_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = workspace.path().canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let path = workspace_canon.join("nested").join("file.txt");
+
+        assert!(policy.approved_read_roots(&path).is_empty());
+        assert!(policy.approved_write_roots(&path).is_empty());
+        assert_eq!(policy.approved_read_root(&path), Some(workspace_canon));
     }
 
     #[test]

@@ -76,11 +76,13 @@ impl GitOperationsTool {
     /// requested path.
     /// Linked worktrees use a `.git` file that points at a per-worktree Git
     /// directory, which then points at a common Git directory. Both indirection
-    /// targets must be physical directories within the same applicable grants.
+    /// targets must be physical and independently authorized for the requested
+    /// operation.
     fn has_repository_within_authorized_roots(
         &self,
         working_dir: &Path,
         authorized_roots: &[PathBuf],
+        requires_write_access: bool,
     ) -> bool {
         let mut current_dir = working_dir;
         loop {
@@ -90,12 +92,19 @@ impl GitOperationsTool {
                     || authorized_roots
                         .iter()
                         .any(|root| current_dir.starts_with(root));
-                if metadata.file_type().is_dir() && current_dir_is_authorized {
+                if metadata.file_type().is_dir()
+                    && current_dir_is_authorized
+                    && self.metadata_directory_is_authorized(&git_metadata, requires_write_access)
+                {
                     return true;
                 }
                 if metadata.file_type().is_file()
                     && current_dir_is_authorized
-                    && self.linked_worktree_metadata_is_authorized(&git_metadata, authorized_roots)
+                    && self.metadata_path_is_authorized(&git_metadata, requires_write_access)
+                    && self.linked_worktree_metadata_is_authorized(
+                        &git_metadata,
+                        requires_write_access,
+                    )
                 {
                     return true;
                 }
@@ -115,7 +124,7 @@ impl GitOperationsTool {
     fn linked_worktree_metadata_is_authorized(
         &self,
         git_file: &Path,
-        authorized_roots: &[PathBuf],
+        requires_write_access: bool,
     ) -> bool {
         let Ok(contents) = std::fs::read_to_string(git_file) else {
             return false;
@@ -142,7 +151,7 @@ impl GitOperationsTool {
         let Ok(gitdir) = gitdir.canonicalize() else {
             return false;
         };
-        if !Self::is_physical_directory_within_roots(&gitdir, authorized_roots) {
+        if !self.metadata_directory_is_authorized(&gitdir, requires_write_access) {
             return false;
         }
 
@@ -173,13 +182,17 @@ impl GitOperationsTool {
         let Ok(commondir) = commondir.canonicalize() else {
             return false;
         };
-        Self::is_physical_directory_within_roots(&commondir, authorized_roots)
+        self.metadata_directory_is_authorized(&commondir, requires_write_access)
     }
 
-    fn is_physical_directory_within_roots(path: &Path, authorized_roots: &[PathBuf]) -> bool {
+    fn metadata_directory_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
         std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
-            && (authorized_roots.is_empty()
-                || authorized_roots.iter().any(|root| path.starts_with(root)))
+            && self.metadata_path_is_authorized(path, requires_write_access)
+    }
+
+    fn metadata_path_is_authorized(&self, path: &Path, requires_write_access: bool) -> bool {
+        self.security.is_resolved_path_readable(path)
+            && (!requires_write_access || self.security.is_resolved_path_allowed(path))
     }
 
     fn candidate_path(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
@@ -1073,7 +1086,11 @@ impl Tool for GitOperationsTool {
         } else {
             self.security.approved_read_roots(&working_dir)
         };
-        if !self.has_repository_within_authorized_roots(&working_dir, &authorized_roots) {
+        if !self.has_repository_within_authorized_roots(
+            &working_dir,
+            &authorized_roots,
+            requires_write_access,
+        ) {
             let path_display = working_dir.display().to_string();
             let error_msg = crate::i18n::get_required_tool_string_with_args(
                 "tool-git-operations-error-not-in-repo",
@@ -1381,6 +1398,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_operations_preserve_linked_worktree_lifecycle_across_authorized_roots() {
+        let workspace = TempDir::new().unwrap();
+        let allowed_root = TempDir::new().unwrap();
+        bootstrap_repo(workspace.path(), &[]).await;
+        let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
+        let linked_worktree = allowed_root.path().join("linked-worktree");
+
+        let added = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &linked_worktree
+            }))
+            .await
+            .unwrap();
+        assert!(added.success, "worktree add failed: {added:?}");
+        assert!(linked_worktree.join(".git").is_file());
+
+        let status = tool
+            .execute(json!({"operation": "status", "path": &linked_worktree}))
+            .await
+            .unwrap();
+        assert!(
+            status.success,
+            "linked worktree status across authorized roots failed: {status:?}"
+        );
+
+        let removed = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "remove",
+                "worktree_path": &linked_worktree
+            }))
+            .await
+            .unwrap();
+        assert!(removed.success, "worktree remove failed: {removed:?}");
+        assert!(
+            !linked_worktree.exists(),
+            "worktree remove must remove the separately authorized linked worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_discover_parent_repository_when_policy_is_unrestricted() {
+        let repository = TempDir::new().unwrap();
+        let workspace = repository.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, workspace);
+
+        let status = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            status.success,
+            "unrestricted policy must discover its parent repository: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_reject_forbidden_parent_repository_when_policy_is_unrestricted() {
+        let repository = TempDir::new().unwrap();
+        let workspace = repository.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec![repository.path().display().to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, workspace);
+
+        let status = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            !status.success,
+            "unrestricted policy must still reject a forbidden parent repository: {status:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn git_credential_op_fails_fast_without_terminal_prompt() {
         let tmp = TempDir::new().unwrap();
         git_init_no_sign(tmp.path(), &[]);
@@ -1409,6 +1513,7 @@ mod tests {
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
@@ -1925,9 +2030,8 @@ mod tests {
 
         let linked_worktree = linked_worktree.canonicalize().unwrap();
         let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
-        let roots = tool.security.approved_read_roots(&linked_worktree);
         assert!(
-            !tool.linked_worktree_metadata_is_authorized(&linked_worktree.join(".git"), &roots),
+            !tool.linked_worktree_metadata_is_authorized(&linked_worktree.join(".git"), false),
             "linked-worktree common metadata outside the grant must be rejected"
         );
     }
