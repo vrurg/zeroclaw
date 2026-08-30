@@ -745,16 +745,8 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("Anthropic recovery hint must format in {locale}"));
             assert!(
-                hint.contains("zeroclaw auth setup-token"),
-                "Anthropic recovery hint in {locale} must retain its executable command: {hint:?}"
-            );
-            assert!(
-                hint.contains("auth_mode = \"oauth\""),
-                "Anthropic recovery hint in {locale} must retain its exact OAuth configuration step: {hint:?}"
-            );
-            assert!(
-                hint.contains("--model-provider anthropic --profile"),
-                "Anthropic recovery hint in {locale} must retain its complete profile command: {hint:?}"
+                hint.contains("setup_token"),
+                "Anthropic recovery hint in {locale} must direct the user to select setup_token when rerunning Quickstart: {hint:?}"
             );
         }
     }

@@ -547,7 +547,7 @@ cli-quickstart-auth-codex-import-prompt = Se encontró un inicio de sesión exis
 cli-quickstart-auth-codex-skip-hint = {"  "}Termina más tarde con: zeroclaw auth login --model-provider openai-codex
 cli-quickstart-auth-anthropic-prompt = ¿Ejecutar `claude setup-token` para el proveedor de Anthropic `{$alias}` ahora?
 cli-quickstart-auth-anthropic-token-prompt = Pega el token de `claude setup-token`
-cli-quickstart-auth-anthropic-skip-hint = {"  "}Quickstart no se escribió. Para terminar más tarde, vuelve a ejecutar Quickstart para crear {$alias}; luego ejecuta `claude setup-token`, `zeroclaw auth setup-token --model-provider anthropic --profile {$alias}` y configura `providers.models.anthropic.{$alias}.auth_mode = "oauth"`.
+cli-quickstart-auth-anthropic-skip-hint = {"  "}Quickstart no se escribió. Vuelve a ejecutar Quickstart y elige `setup_token` para completar la configuración de Anthropic para {$alias}.
 cli-quickstart-auth-failed = {"  "}La configuración de autenticación no se completó: {$error}
 cli-quickstart-model-field-missing-warning = ADVERTENCIA: el esquema no produjo un campo `model` para `{$provider}` — se usará entrada manual. Informa de esto.
 cli-quickstart-model-id-for = ID de modelo para {$name}
