@@ -239,10 +239,24 @@ impl GitOperationsTool {
 
     fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
         let candidate = self.candidate_path(raw_path)?;
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| anyhow::Error::msg("Worktree path must have a parent directory"))?;
+        let parent = candidate.parent().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree path has no parent"
+            );
+            anyhow::Error::msg("Worktree path must have a parent directory")
+        })?;
         let name = candidate.file_name().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
+                "git_operations: worktree path has no file name"
+            );
             anyhow::Error::msg("Worktree path must include a final path component")
         })?;
         let parent = parent.canonicalize().map_err(|error| {
@@ -495,7 +509,9 @@ impl GitOperationsTool {
                 );
                 anyhow::bail!("Git discovery ceiling cannot represent non-Unicode authorized root");
             };
-            return Ok(PathBuf::from(Self::strip_windows_verbatim_prefix(root)));
+            return Ok(PathBuf::from(
+                Self::strip_windows_verbatim_prefix(root).into_owned(),
+            ));
         }
         #[cfg(not(windows))]
         Ok(root.to_path_buf())
@@ -1105,6 +1121,12 @@ impl GitOperationsTool {
                 self.sanitize_git_args(worktree_path)?;
                 let worktree_path = self.ensure_worktree_add_target_allowed(worktree_path)?;
                 let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "git_operations: worktree path is not valid UTF-8"
+                    );
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
                 let branch = args
@@ -1133,6 +1155,12 @@ impl GitOperationsTool {
                 self.sanitize_git_args(worktree_path)?;
                 let worktree_path = self.ensure_worktree_remove_target_allowed(worktree_path)?;
                 let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "git_operations: worktree path is not valid UTF-8"
+                    );
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
                 self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
@@ -2278,6 +2306,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_operations_rejects_parent_repository_above_workspace() {
+        let parent_repository = TempDir::new().unwrap();
+        git_init_no_sign(parent_repository.path(), &[]);
+        let workspace = parent_repository.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let tool = test_tool(&workspace);
+
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            !result.success,
+            "parent repository must not escape workspace"
+        );
+        assert!(
+            result.error.as_deref().is_some_and(|error| error
+                .contains("No Git repository is reachable within the authorized roots")),
+            "the default-policy escape must use the bounded diagnostic: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn git_operations_rejects_invalid_git_directory_before_parent_repository() {
         let workspace = TempDir::new().unwrap();
         let parent_repository = TempDir::new().unwrap();
@@ -2289,7 +2337,10 @@ mod tests {
         let mut command = std::process::Command::new("git");
         tool.configure_git_environment(&mut command, &resolved_child, false)
             .unwrap();
-        let expected_ceiling = parent_repository.path().canonicalize().unwrap();
+        let expected_ceiling = GitOperationsTool::git_discovery_ceiling_path(
+            &parent_repository.path().canonicalize().unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             command
                 .get_envs()
