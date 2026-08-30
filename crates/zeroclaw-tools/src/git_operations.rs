@@ -13,6 +13,13 @@ pub struct GitOperationsTool {
     workspace_dir: std::path::PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepositoryAuthorization {
+    Authorized,
+    NotFound,
+    Denied,
+}
+
 impl GitOperationsTool {
     pub fn new(security: Arc<SecurityPolicy>, workspace_dir: std::path::PathBuf) -> Self {
         Self {
@@ -83,7 +90,7 @@ impl GitOperationsTool {
         working_dir: &Path,
         authorized_roots: &[PathBuf],
         requires_write_access: bool,
-    ) -> bool {
+    ) -> RepositoryAuthorization {
         let discovery_is_unbounded = !self.security.workspace_only;
         let mut current_dir = working_dir;
         loop {
@@ -97,31 +104,38 @@ impl GitOperationsTool {
                 // entry must therefore deny the operation rather than allowing
                 // discovery to continue to an ancestor repository.
                 if metadata.file_type().is_dir() {
-                    return current_dir_is_authorized
-                        && self.metadata_directory_is_authorized(
-                            &git_metadata,
-                            requires_write_access,
-                        );
+                    return if current_dir_is_authorized
+                        && self
+                            .metadata_directory_is_authorized(&git_metadata, requires_write_access)
+                    {
+                        RepositoryAuthorization::Authorized
+                    } else {
+                        RepositoryAuthorization::Denied
+                    };
                 }
                 if metadata.file_type().is_file() {
-                    return current_dir_is_authorized
+                    return if current_dir_is_authorized
                         && self.metadata_path_is_authorized(&git_metadata, requires_write_access)
                         && self.linked_worktree_metadata_is_authorized(
                             &git_metadata,
                             requires_write_access,
-                        );
+                        ) {
+                        RepositoryAuthorization::Authorized
+                    } else {
+                        RepositoryAuthorization::Denied
+                    };
                 }
                 // A `.git` symlink or other non-regular entry is not an
                 // acceptable metadata boundary and must not fall through.
-                return false;
+                return RepositoryAuthorization::Denied;
             }
             let Some(parent) = current_dir.parent() else {
-                return false;
+                return RepositoryAuthorization::NotFound;
             };
             if !discovery_is_unbounded
                 && !authorized_roots.iter().any(|root| parent.starts_with(root))
             {
-                return false;
+                return RepositoryAuthorization::NotFound;
             }
             current_dir = parent;
         }
@@ -856,13 +870,13 @@ impl GitOperationsTool {
         }
     }
 
-    fn parse_worktree_list(&self, output: &str) -> serde_json::Value {
+    fn parse_worktree_list(&self, output: &str, active_worktree: &Path) -> serde_json::Value {
         let mut worktrees = Vec::new();
         let mut current_path = String::new();
         let mut current_branch = String::new();
         let mut current_head = String::new();
         let mut is_detached = false;
-        let workspace = self.workspace_dir.to_string_lossy();
+        let active_worktree = active_worktree.to_string_lossy();
 
         for line in output.lines().map(str::trim) {
             if line.is_empty() {
@@ -872,7 +886,7 @@ impl GitOperationsTool {
                         "branch": if is_detached { "HEAD" } else { &current_branch },
                         "head": &current_head,
                         "detached": is_detached,
-                        "active": current_path == workspace.as_ref()
+                        "active": current_path == active_worktree.as_ref()
                     }));
                     current_path.clear();
                     current_branch.clear();
@@ -895,7 +909,7 @@ impl GitOperationsTool {
                 "branch": if is_detached { "HEAD" } else { current_branch.as_str() },
                 "head": &current_head,
                 "detached": is_detached,
-                "active": current_path == workspace.as_ref()
+                "active": current_path == active_worktree.as_ref()
             }));
         }
         json!({ "worktrees": worktrees })
@@ -923,9 +937,11 @@ impl GitOperationsTool {
                     .await?;
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&self.parse_worktree_list(&output))
-                        .unwrap_or_default()
-                        .into(),
+                    output: serde_json::to_string_pretty(
+                        &self.parse_worktree_list(&output, working_dir),
+                    )
+                    .unwrap_or_default()
+                    .into(),
                     error: None,
                 })
             }
@@ -1102,14 +1118,33 @@ impl Tool for GitOperationsTool {
         } else {
             self.security.approved_read_roots(&working_dir)
         };
-        if !self.has_repository_within_authorized_roots(
+        let repository_authorization = self.has_repository_within_authorized_roots(
             &working_dir,
             &authorized_roots,
             requires_write_access,
-        ) {
+        );
+        if repository_authorization != RepositoryAuthorization::Authorized {
             let path_display = working_dir.display().to_string();
+            let error_key = match repository_authorization {
+                RepositoryAuthorization::Authorized => unreachable!(),
+                RepositoryAuthorization::NotFound => "tool-git-operations-error-not-in-repo",
+                RepositoryAuthorization::Denied => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "path": path_display,
+                                "operation": operation,
+                                "requires_write_access": requires_write_access,
+                            })),
+                        "git_operations: repository metadata is not authorized"
+                    );
+                    "tool-git-operations-error-repository-not-authorized"
+                }
+            };
             let error_msg = crate::i18n::get_required_tool_string_with_args(
-                "tool-git-operations-error-not-in-repo",
+                error_key,
                 &[("path", &path_display)],
             );
             return Ok(ToolResult {
@@ -1391,6 +1426,27 @@ mod tests {
             .unwrap();
         assert!(added.success, "worktree add failed: {added:?}");
         assert!(linked_worktree.join(".git").is_file());
+
+        let worktrees = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "list",
+                "path": &linked_worktree
+            }))
+            .await
+            .unwrap();
+        assert!(worktrees.success, "worktree list failed: {worktrees:?}");
+        let worktrees: serde_json::Value = serde_json::from_str(&worktrees.output.to_string())
+            .expect("worktree list output must be JSON");
+        let linked_worktree = linked_worktree.canonicalize().unwrap();
+        assert!(
+            worktrees["worktrees"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
+                    == linked_worktree.to_string_lossy().as_ref()
+                    && entry["active"] == true)),
+            "the requested linked worktree must be active: {worktrees}"
+        );
 
         let status = tool
             .execute(json!({"operation": "status", "path": &linked_worktree}))
@@ -2018,9 +2074,52 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("Not in a Git repository")),
-            "linked worktree must fail as not-in-repository: {:?}",
+                .is_some_and(|error| error.contains("not authorized")),
+            "linked worktree must report an authorization denial: {:?}",
             result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_do_not_mutate_linked_worktree_common_dir_via_read_only_grant() {
+        let workspace = TempDir::new().unwrap();
+        let main_repository = TempDir::new().unwrap();
+        let linked_worktree_parent = TempDir::new().unwrap();
+        bootstrap_repo(main_repository.path(), &[]).await;
+        let linked_worktree = linked_worktree_parent.path().join("linked-worktree");
+        let status = std::process::Command::new("git")
+            .args(["worktree", "add", "--detach"])
+            .arg(&linked_worktree)
+            .current_dir(main_repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "linked worktree setup must succeed");
+        std::fs::write(linked_worktree.join("new-file"), "content").unwrap();
+        let index_path = main_repository.path().join(".git/index");
+        let index_before = std::fs::read(&index_path).unwrap();
+        let tool = test_tool_with_allowed_and_read_only_roots(
+            workspace.path(),
+            linked_worktree.clone(),
+            main_repository.path().to_path_buf(),
+        );
+
+        let result = tool
+            .execute(json!({
+                "operation": "add",
+                "path": &linked_worktree,
+                "paths": "new-file"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a read-only common directory must not authorize linked-worktree mutation: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&index_path).unwrap(),
+            index_before,
+            "rejected linked-worktree mutation must not change the shared index"
         );
     }
 
