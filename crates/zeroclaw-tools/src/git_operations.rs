@@ -1676,6 +1676,11 @@ mod tests {
         assert!(worktrees.success, "worktree list failed: {worktrees:?}");
         let worktrees: serde_json::Value = serde_json::from_str(&worktrees.output.to_string())
             .expect("worktree list output must be JSON");
+        assert_eq!(
+            worktrees["worktrees"].as_array().map(Vec::len),
+            Some(2),
+            "worktree list must include the main and linked worktrees: {worktrees}"
+        );
         #[cfg(unix)]
         {
             let main_worktree = tmp.path().canonicalize().unwrap();
