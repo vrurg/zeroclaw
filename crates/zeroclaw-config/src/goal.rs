@@ -175,6 +175,71 @@ mod tests {
     }
 
     #[test]
+    fn toml_round_trip_preserves_zero_as_an_explicit_unlimited_default() {
+        let source = r#"
+            enabled = true
+            default_token_limit = 0
+            default_cost_limit_usd = 0.0
+
+            [verifier]
+            model_provider = "openai.default"
+            model = "gpt-test"
+        "#;
+        let config: GoalConfig = toml::from_str(source).expect("Goal config parses");
+        assert_eq!(config.default_token_limit, Some(0));
+        assert_eq!(config.default_cost_limit_usd, Some(0.0));
+        assert_eq!(
+            config.effective_limits(),
+            Ok(GoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: None,
+            })
+        );
+
+        let encoded = toml::to_string(&config).expect("Goal config serializes");
+        let decoded: GoalConfig = toml::from_str(&encoded).expect("serialized Goal config parses");
+        assert_eq!(decoded.default_token_limit, Some(0));
+        assert_eq!(decoded.default_cost_limit_usd, Some(0.0));
+        assert_eq!(decoded.verifier.model_provider.as_str(), "openai.default");
+        assert_eq!(decoded.verifier.model.as_deref(), Some("gpt-test"));
+    }
+
+    #[test]
+    fn enabled_config_rejects_incomplete_or_malformed_verifier_inputs() {
+        let base = GoalConfig {
+            enabled: true,
+            default_token_limit: Some(0),
+            default_cost_limit_usd: Some(0.0),
+            verifier: GoalVerifierConfig {
+                model_provider: ModelProviderRef::new("openai.default"),
+                model: None,
+            },
+        };
+        assert!(base.validate().is_ok());
+
+        let mut missing_provider = base.clone();
+        missing_provider.verifier.model_provider = ModelProviderRef::default();
+        assert_eq!(
+            missing_provider.validate(),
+            Err(GoalConfigError::MissingVerifierProvider)
+        );
+
+        let mut empty_model = base.clone();
+        empty_model.verifier.model = Some("  \u{2003}".into());
+        assert_eq!(
+            empty_model.validate(),
+            Err(GoalConfigError::EmptyVerifierModel)
+        );
+
+        let mut non_finite_cost = base;
+        non_finite_cost.default_cost_limit_usd = Some(f64::NAN);
+        assert_eq!(
+            non_finite_cost.validate(),
+            Err(GoalConfigError::InvalidCostLimit)
+        );
+    }
+
+    #[test]
     fn enabled_goal_verifier_must_resolve_through_existing_provider_config() {
         let config: Config = toml::from_str(
             r#"

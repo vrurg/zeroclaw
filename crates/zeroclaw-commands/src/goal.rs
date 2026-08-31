@@ -55,11 +55,13 @@ pub fn parse_goal_command(
     content: &str,
     _surface: CommandSurface,
 ) -> Result<GoalCommand, GoalCommandParseError> {
-    let (token, rest) = split_token(content.trim());
+    // Preserve the opaque start-objective payload. Only command grammar owns
+    // leading whitespace before `/goal` and between command tokens.
+    let (token, rest) = split_token(content.trim_start());
     if !token.eq_ignore_ascii_case("/goal") {
         return Err(GoalCommandParseError::NotGoalCommand);
     }
-    let (subcommand, arguments) = split_token(rest.trim());
+    let (subcommand, arguments) = split_token(rest.trim_start());
     if subcommand.is_empty() {
         return Err(GoalCommandParseError::MissingSubcommand);
     }
@@ -94,7 +96,14 @@ fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
     };
     let (flags, objective) = arguments.split_at(delimiter);
     let objective = &objective[2..];
-    let objective = objective.trim_start();
+    // The delimiter needs one whitespace separator before an objective. Consume
+    // precisely that separator, retaining every other payload byte verbatim.
+    let separator_len = objective
+        .chars()
+        .next()
+        .filter(|character| character.is_whitespace())
+        .map_or(0, char::len_utf8);
+    let objective = &objective[separator_len..];
     if objective.trim().is_empty() {
         return Err(GoalCommandParseError::MissingObjective);
     }
@@ -155,10 +164,13 @@ fn parse_overrides(flags: &str) -> Result<GoalBudgetOverrides, GoalCommandParseE
                 if result.token_limit.is_some() {
                     return Err(GoalCommandParseError::DuplicateFlag("--tokens"));
                 }
-                result.token_limit =
-                    Some(value.parse().map_err(|_| {
-                        GoalCommandParseError::InvalidTokenLimit(value.to_string())
-                    })?);
+                let value: u64 = value
+                    .parse()
+                    .map_err(|_| GoalCommandParseError::InvalidTokenLimit(value.to_string()))?;
+                if value > i64::MAX as u64 {
+                    return Err(GoalCommandParseError::InvalidTokenLimit(value.to_string()));
+                }
+                result.token_limit = Some(value);
             }
             "--cost-usd" => {
                 if result.cost_limit_usd.is_some() {
@@ -231,6 +243,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_limits_and_control_commands_without_transport_policy() {
+        let surface = CommandSurface::Channel;
+        let cases = [
+            (
+                "\t/GOAL\tstart\t--tokens\t9223372036854775807\t--cost-usd\t-0\t--\tfinish",
+                GoalCommand::Start {
+                    overrides: GoalBudgetOverrides {
+                        token_limit: Some(i64::MAX as u64),
+                        cost_limit_usd: Some(-0.0),
+                    },
+                    objective: "finish".into(),
+                },
+            ),
+            ("/goal budget", GoalCommand::Budget { set: None }),
+            (
+                "/goal budget set --tokens 0",
+                GoalCommand::Budget {
+                    set: Some(GoalBudgetOverrides {
+                        token_limit: Some(0),
+                        cost_limit_usd: None,
+                    }),
+                },
+            ),
+            (
+                "/goal budget set --cost-usd 2.5",
+                GoalCommand::Budget {
+                    set: Some(GoalBudgetOverrides {
+                        token_limit: None,
+                        cost_limit_usd: Some(2.5),
+                    }),
+                },
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(parse_goal_command(input, surface), Ok(expected), "{input}");
+        }
+    }
+
+    #[test]
     fn rejects_retired_or_ambiguous_syntax() {
         let surface = CommandSurface::Channel;
         for command in [
@@ -246,5 +298,46 @@ mod tests {
         ] {
             assert!(parse_goal_command(command, surface).is_err(), "{command}");
         }
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_malformed_limit_forms() {
+        let surface = CommandSurface::Channel;
+        let cases = [
+            "/goal start --tokens 9223372036854775808 -- objective",
+            "/goal start --tokens 18446744073709551616 -- objective",
+            "/goal start --cost-usd NaN -- objective",
+            "/goal start --cost-usd inf -- objective",
+            "/goal start --cost-usd -inf -- objective",
+            "/goal start --cost-usd -0.1 -- objective",
+            "/goal start --tokens=1 -- objective",
+            "/goal start --cost-usd=1 -- objective",
+            "/goal start --tokens 1 --tokens 2 -- objective",
+            "/goal start --cost-usd 1 --cost-usd 2 -- objective",
+            "/goal start --tokens -- objective",
+            "/goal budget set --tokens 1 extra",
+            "/goal budget set --tokens=1",
+        ];
+
+        for input in cases {
+            assert!(parse_goal_command(input, surface).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn preserves_the_exact_objective_payload_after_the_delimiter() {
+        let surface = CommandSurface::Channel;
+        let command = "/goal start --  \u{2003}finish -- exactly\u{2002}";
+
+        assert_eq!(
+            parse_goal_command(command, surface),
+            Ok(GoalCommand::Start {
+                overrides: GoalBudgetOverrides {
+                    token_limit: None,
+                    cost_limit_usd: None,
+                },
+                objective: " \u{2003}finish -- exactly\u{2002}".into(),
+            })
+        );
     }
 }
