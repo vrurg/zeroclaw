@@ -632,6 +632,13 @@ pub struct Config {
     #[group = "Agent"]
     pub verifiable_intent: VerifiableIntentConfig,
 
+    /// Experimental Goal Mode admission inputs (`[goal]`). Config-visible only:
+    /// no runtime path consumes this section until the controller stage.
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: crate::goal::GoalConfig,
+
     /// Claude Code tool configuration (`[claude_code]`).
     #[serde(default)]
     #[nested]
@@ -19278,6 +19285,7 @@ impl Default for Config {
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
@@ -28275,6 +28283,7 @@ auto_save = true
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
@@ -29233,6 +29242,7 @@ default_temperature = 0.7
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),

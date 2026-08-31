@@ -1,5 +1,7 @@
 //! Shared built-in channel slash command catalogue.
 
+pub mod goal;
+
 use serde::Serialize;
 
 /// User-facing surface where a command can be advertised or accepted.
