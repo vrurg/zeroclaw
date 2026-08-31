@@ -360,7 +360,8 @@ pub trait GoalTaskRegistry: Send + Sync {
         goal: GoalTaskRecord,
     ) -> anyhow::Result<GoalTransitionResult>;
 
-    /// Fence a running Goal and persist its resumable pause state.
+    /// Fence a running Goal. A clean tool phase persists a resumable pause;
+    /// an in-flight, unpaired tool phase fails the Goal closed instead.
     async fn pause_session_goal(
         &self,
         task_id: &str,
