@@ -325,6 +325,8 @@ zc-quickstart-modal-action-save = 保存
 zc-quickstart-modal-type-prefix = タイプ:
 zc-quickstart-field-label-alias = エイリアス
 zc-quickstart-field-help-alias = このプロバイダーインスタンスの一意の識別子です。設定にすでに同じエイリアスが存在する場合は「default」から変更してください。
+zc-quickstart-anthropic-setup-token-label = セットアップトークン
+zc-quickstart-anthropic-setup-token-help = `claude setup-token` のトークンを貼り付けます。ZeroClaw はこのエイリアスの Anthropic 認証プロファイルに保存し、`auth_mode = "oauth"` を設定します。
 zc-quickstart-model-loading = { $provider } のモデルを読み込み中...
 zc-quickstart-model-retrying = { $provider } のモデルカタログを再試行中...
 zc-quickstart-model-catalog-empty = カタログを利用できません - モデル名を入力してください

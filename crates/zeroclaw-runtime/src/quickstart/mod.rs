@@ -507,14 +507,7 @@ pub async fn apply_with_surface_outcome(
                 Ok(staged) => staged,
                 Err(err) => {
                     *config = original_config.clone();
-                    return Err(vec![QuickstartError::for_surface(
-                        Some(&ctx),
-                        QuickstartStep::ModelProvider,
-                        "api_key",
-                        format!("failed to store onboarding credential: {err}"),
-                        "cli-quickstart-error-anthropic-setup-token-store",
-                        &[],
-                    )]);
+                    return Err(vec![onboarding_credential_store_error(&ctx, err)]);
                 }
             }
         }
@@ -613,6 +606,18 @@ pub async fn apply_with_surface_outcome(
         agent: applied,
         warnings,
     })
+}
+
+fn onboarding_credential_store_error(ctx: &RunCtx, err: anyhow::Error) -> QuickstartError {
+    let detail = format!("{err:#}");
+    QuickstartError::for_surface(
+        Some(ctx),
+        QuickstartStep::ModelProvider,
+        "api_key",
+        format!("failed to store onboarding credential: {detail}"),
+        "cli-quickstart-error-anthropic-setup-token-store",
+        &[("err", &detail)],
+    )
 }
 
 async fn reconcile_config_save_outcome(
@@ -2618,6 +2623,20 @@ mod tests {
         SelectorChoice,
     };
     use zeroclaw_config::schema::Config;
+
+    #[test]
+    fn onboarding_credential_store_error_preserves_the_full_error_chain_for_cli() {
+        let err = anyhow::Error::msg("synthetic profile-store root cause")
+            .context("synthetic credential persistence failure");
+        let error = onboarding_credential_store_error(&RunCtx::new(Surface::Cli), err);
+
+        assert!(
+            error
+                .message
+                .contains("synthetic credential persistence failure")
+        );
+        assert!(error.message.contains("synthetic profile-store root cause"));
+    }
 
     #[test]
     fn channel_type_options_cover_every_schema_channel() {

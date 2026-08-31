@@ -2875,6 +2875,41 @@ fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
         })
 }
 
+fn field_form_uses_anthropic_setup_token_auth(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form.type_key.trim().eq_ignore_ascii_case("anthropic")
+        && form.fields.iter().any(|row| {
+            row.descriptor.key == "auth_mode" && row.buf.trim().eq_ignore_ascii_case("setup_token")
+        })
+}
+
+const ANTHROPIC_SETUP_TOKEN_LABEL_KEY: &str = "zc-quickstart-anthropic-setup-token-label";
+const ANTHROPIC_SETUP_TOKEN_HELP_KEY: &str = "zc-quickstart-anthropic-setup-token-help";
+
+fn field_form_row_translation_override(
+    form: &FieldFormModal,
+    row: &FieldFormRow,
+) -> Option<(&'static str, &'static str)> {
+    (field_form_uses_anthropic_setup_token_auth(form) && row.descriptor.key == "api_key").then_some(
+        (
+            ANTHROPIC_SETUP_TOKEN_LABEL_KEY,
+            ANTHROPIC_SETUP_TOKEN_HELP_KEY,
+        ),
+    )
+}
+
+fn field_form_row_label(form: &FieldFormModal, row: &FieldFormRow) -> String {
+    field_form_row_translation_override(form, row)
+        .map(|(label, _)| crate::i18n::t(label))
+        .unwrap_or_else(|| row.descriptor.label.clone())
+}
+
+fn field_form_row_help(form: &FieldFormModal, row: &FieldFormRow) -> String {
+    field_form_row_translation_override(form, row)
+        .map(|(_, help)| crate::i18n::t(help))
+        .unwrap_or_else(|| row.descriptor.help.clone())
+}
+
 fn field_form_row_visible(form: &FieldFormModal, index: usize) -> bool {
     let Some(row) = form.fields.get(index) else {
         return false;
@@ -3075,7 +3110,7 @@ fn draw_modal(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
-                    Span::styled(format!("{:14}", row.descriptor.label), label_style),
+                    Span::styled(format!("{:14}", field_form_row_label(f, row)), label_style),
                     Span::styled("  ", Style::default()),
                     Span::styled(if is_enum { "‹ " } else { "" }, theme::accent_style()),
                     Span::styled(display, value_style),
@@ -3093,12 +3128,12 @@ fn draw_modal(
             let header_lines: Vec<Line> = f
                 .fields
                 .get(f.cursor)
-                .map(|row| row.descriptor.help.as_str())
+                .map(|row| field_form_row_help(f, row))
                 .filter(|h| !h.is_empty())
                 .map(|h| {
                     vec![
                         Line::from(Span::styled(
-                            h.to_string(),
+                            h,
                             theme::dim_style().add_modifier(Modifier::ITALIC),
                         )),
                         Line::from(""),
@@ -4273,6 +4308,56 @@ mod tests {
             .map(|index| form.fields[index].descriptor.key.as_str())
             .collect();
         assert_eq!(keys, vec!["alias", "model", "auth_mode", "api_key"]);
+    }
+
+    #[test]
+    fn anthropic_setup_token_auth_relabels_api_key_row_in_tui_form() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "auth_mode".into(),
+                label: "Authentication".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::Enum,
+                is_secret: false,
+                enum_variants: Some(vec!["api_key".into(), "setup_token".into()]),
+                required: true,
+                default: Some("setup_token".into()),
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "Anthropic Console API key".into(),
+                help: "Paste an Anthropic Console API key.".into(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+        ];
+        let form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "anthropic".into(),
+            alias: "subscription".into(),
+            model_catalog_state: ModelCatalogState::Empty,
+            model_catalog_attempts: 0,
+            fields: build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None),
+            cursor: 1,
+        };
+
+        let api_key = form
+            .fields
+            .iter()
+            .find(|row| row.descriptor.key == "api_key")
+            .expect("api_key row");
+        assert!(field_form_uses_anthropic_setup_token_auth(&form));
+        assert_eq!(
+            field_form_row_translation_override(&form, api_key),
+            Some((
+                ANTHROPIC_SETUP_TOKEN_LABEL_KEY,
+                ANTHROPIC_SETUP_TOKEN_HELP_KEY
+            )),
+            "setup-token mode must select its dedicated translated label and help"
+        );
     }
 
     #[test]

@@ -325,6 +325,8 @@ zc-quickstart-modal-action-save = 保存
 zc-quickstart-modal-type-prefix = 类型：
 zc-quickstart-field-label-alias = 别名
 zc-quickstart-field-help-alias = 此提供方实例的唯一标识符。如果您的配置中已存在使用该别名的实例，请将其从 "default" 改为其他值。
+zc-quickstart-anthropic-setup-token-label = 设置令牌
+zc-quickstart-anthropic-setup-token-help = 粘贴 `claude setup-token` 的令牌。ZeroClaw 会将其存储在此别名的 Anthropic 认证配置文件中，并设置 `auth_mode = "oauth"`。
 zc-quickstart-model-loading = 正在加载 { $provider } 的模型...
 zc-quickstart-model-retrying = 正在重试加载 { $provider } 的模型目录...
 zc-quickstart-model-catalog-empty = 目录不可用 - 输入模型名称

@@ -18,8 +18,16 @@ const LOCK_FILENAME: &str = "auth-profiles.lock";
 const LOCK_WAIT_MS: u64 = 50;
 const LOCK_TIMEOUT_MS: u64 = 10_000;
 
+/// Test-only, one-shot post-rename failure injection. It is keyed by the
+/// profile-store path so concurrent test stores cannot consume each other's
+/// fault. The hook belongs in the common writer funnel, which both direct
+/// profile mutations and staged onboarding writes use.
+#[cfg(test)]
+static FAIL_POST_RENAME_SYNC_FOR_PATHS: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 type DirectorySyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
-type DirectoryPermissionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+type PathPermissionFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 type FileSyncFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,10 +167,12 @@ pub enum ProfileSaveOutcome {
 }
 
 impl ProfileSaveOutcome {
-    fn into_result(self) -> Result<()> {
+    fn into_legacy_result(self) -> Result<()> {
         match self {
-            Self::Durable => Ok(()),
-            Self::CommittedWithDurabilityWarning(err) => Err(err),
+            // A rename has already made the replacement visible. Legacy
+            // callers have no warning channel, so treating this as a failed
+            // write would invite compensating writes against committed state.
+            Self::Durable | Self::CommittedWithDurabilityWarning(_) => Ok(()),
         }
     }
 }
@@ -193,7 +203,13 @@ pub struct AuthProfilesStore {
     path: PathBuf,
     lock_path: PathBuf,
     secret_store: SecretStore,
+    #[cfg(test)]
+    parent_preparation_override: Option<fn(&Path) -> Result<()>>,
 }
+
+/// Proof that this store's parent directory has been prepared for an
+/// operation that can create local key material or profile files.
+struct PreparedProfileDirectory;
 
 impl AuthProfilesStore {
     pub fn new(state_dir: &Path, encrypt_secrets: bool) -> Self {
@@ -201,6 +217,8 @@ impl AuthProfilesStore {
             path: state_dir.join(PROFILES_FILENAME),
             lock_path: state_dir.join(LOCK_FILENAME),
             secret_store: SecretStore::new(state_dir, encrypt_secrets),
+            #[cfg(test)]
+            parent_preparation_override: None,
         }
     }
 
@@ -363,38 +381,23 @@ impl AuthProfilesStore {
 
     async fn load_locked(&self) -> Result<AuthProfilesData> {
         let mut persisted = self.read_persisted_locked().await?;
+        // Decrypting local encrypted values can initialize `.secret_key` only
+        // when it is absent. Verify the parent before that side effect, but do
+        // not turn ordinary credential reads into directory-mutating checks.
+        if self.secret_store.needs_key_initialization() && persisted.uses_local_secret_key() {
+            self.prepare_profile_directory_for_persistence().await?;
+        }
         let mut migrated = false;
 
         let mut profiles = BTreeMap::new();
         for (id, p) in &mut persisted.profiles {
-            let (access_token, access_migrated) =
-                self.decrypt_optional(p.access_token.as_deref())?;
-            let (refresh_token, refresh_migrated) =
-                self.decrypt_optional(p.refresh_token.as_deref())?;
-            let (id_token, id_migrated) = self.decrypt_optional(p.id_token.as_deref())?;
-            let (token, token_migrated) = self.decrypt_optional(p.token.as_deref())?;
-
-            if let Some(value) = access_migrated {
-                p.access_token = Some(value);
-                migrated = true;
-            }
-            if let Some(value) = refresh_migrated {
-                p.refresh_token = Some(value);
-                migrated = true;
-            }
-            if let Some(value) = id_migrated {
-                p.id_token = Some(value);
-                migrated = true;
-            }
-            if let Some(value) = token_migrated {
-                p.token = Some(value);
-                migrated = true;
-            }
+            let decrypted = p.decrypt_credentials(&self.secret_store)?;
+            migrated |= decrypted.migrated;
 
             let kind = parse_profile_kind(&p.kind)?;
             let token_set = match kind {
                 AuthProfileKind::OAuth => {
-                    let access = access_token.ok_or_else(|| {
+                    let access = decrypted.access_token.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -412,8 +415,8 @@ impl AuthProfilesStore {
                     })?;
                     Some(TokenSet {
                         access_token: access,
-                        refresh_token,
-                        id_token,
+                        refresh_token: decrypted.refresh_token,
+                        id_token: decrypted.id_token,
                         expires_at: parse_optional_datetime(p.expires_at.as_deref())?,
                         token_type: p.token_type.clone(),
                         scope: p.scope.clone(),
@@ -432,7 +435,7 @@ impl AuthProfilesStore {
                     account_id: p.account_id.clone(),
                     workspace_id: p.workspace_id.clone(),
                     token_set,
-                    token,
+                    token: decrypted.token,
                     metadata: p.metadata.clone(),
                     created_at: parse_datetime_with_fallback(&p.created_at),
                     updated_at: parse_datetime_with_fallback(&p.updated_at),
@@ -441,9 +444,7 @@ impl AuthProfilesStore {
         }
 
         if migrated {
-            self.write_persisted_locked(&persisted)
-                .await?
-                .into_result()?;
+            self.acknowledge_legacy_save_outcome(self.write_persisted_locked(&persisted).await?)?;
         }
 
         Ok(AuthProfilesData {
@@ -455,13 +456,31 @@ impl AuthProfilesStore {
     }
 
     async fn save_locked(&self, data: &AuthProfilesData) -> Result<()> {
-        self.save_locked_with_outcome(data).await?.into_result()
+        self.acknowledge_legacy_save_outcome(self.save_locked_with_outcome(data).await?)
+    }
+
+    fn acknowledge_legacy_save_outcome(&self, outcome: ProfileSaveOutcome) -> Result<()> {
+        if let ProfileSaveOutcome::CommittedWithDurabilityWarning(_) = &outcome {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": self.path.display().to_string()})),
+                "auth profile replacement committed, but directory durability could not be confirmed"
+            );
+        }
+        outcome.into_legacy_result()
     }
 
     async fn save_locked_with_outcome(
         &self,
         data: &AuthProfilesData,
     ) -> Result<ProfileSaveOutcome> {
+        // Encryption can initialize `.secret_key`; establish the parent
+        // directory's integrity before that side effect, not merely before the
+        // eventual profile-file rename.
+        let prepared = self.prepare_profile_directory_for_persistence().await?;
+
         let mut persisted = PersistedAuthProfiles {
             schema_version: CURRENT_SCHEMA_VERSION,
             updated_at: data.updated_at.to_rfc3339(),
@@ -507,7 +526,31 @@ impl AuthProfilesStore {
             );
         }
 
-        self.write_persisted_locked(&persisted).await
+        self.write_persisted_locked_after_parent_prepared(&persisted, prepared)
+            .await
+    }
+
+    /// Prepare the directory that holds both encrypted profile data and key
+    /// material. This must run before serialization or encryption: the latter
+    /// may initialize `.secret_key` as a persistent side effect.
+    async fn prepare_profile_directory_for_persistence(&self) -> Result<PreparedProfileDirectory> {
+        if let Some(parent) = self.path.parent() {
+            #[cfg(test)]
+            if let Some(prepare_parent) = self.parent_preparation_override {
+                prepare_parent(parent)?;
+                return Ok(PreparedProfileDirectory);
+            }
+
+            fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "Failed to create auth profile directory at {}",
+                    parent.display()
+                )
+            })?;
+            set_owner_only_directory_permissions(parent).await?;
+        }
+
+        Ok(PreparedProfileDirectory)
     }
 
     async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
@@ -559,6 +602,28 @@ impl AuthProfilesStore {
         .await
     }
 
+    /// Persist after the caller has prepared the parent before encrypting
+    /// credentials. The capability prevents a second directory mutation.
+    async fn write_persisted_locked_after_parent_prepared(
+        &self,
+        persisted: &PersistedAuthProfiles,
+        _prepared: PreparedProfileDirectory,
+    ) -> Result<ProfileSaveOutcome> {
+        self.write_persisted_locked_with_sync_and_prepared_parent(
+            persisted,
+            |file| {
+                Box::pin(async move {
+                    file.sync_all()
+                        .await
+                        .context("Failed to fsync temporary auth profile file")
+                })
+            },
+            |parent_dir| Box::pin(sync_directory(parent_dir)),
+            true,
+        )
+        .await
+    }
+
     async fn write_persisted_locked_with_directory_sync<F>(
         &self,
         persisted: &PersistedAuthProfiles,
@@ -591,46 +656,60 @@ impl AuthProfilesStore {
         F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
         G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
     {
+        self.write_persisted_locked_with_sync_and_prepared_parent(
+            persisted,
+            sync_temp_file,
+            sync_parent_directory,
+            false,
+        )
+        .await
+    }
+
+    async fn write_persisted_locked_with_sync_and_prepared_parent<F, G>(
+        &self,
+        persisted: &PersistedAuthProfiles,
+        sync_temp_file: F,
+        sync_parent_directory: G,
+        parent_prepared: bool,
+    ) -> Result<ProfileSaveOutcome>
+    where
+        F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
+        G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
+    {
         self.write_persisted_locked_with_operations(
             persisted,
             sync_temp_file,
             sync_parent_directory,
             |parent| Box::pin(set_owner_only_directory_permissions(parent)),
+            |file| Box::pin(set_owner_only_file_permissions(file)),
+            parent_prepared,
         )
         .await
     }
 
-    async fn write_persisted_locked_with_operations<F, G, H>(
+    async fn write_persisted_locked_with_operations<F, G, H, I>(
         &self,
         persisted: &PersistedAuthProfiles,
         sync_temp_file: F,
         sync_parent_directory: G,
         set_parent_permissions: H,
+        set_file_permissions: I,
+        parent_prepared: bool,
     ) -> Result<ProfileSaveOutcome>
     where
         F: for<'a> FnOnce(&'a tokio::fs::File) -> FileSyncFuture<'a>,
         G: for<'a> FnOnce(&'a Path) -> DirectorySyncFuture<'a>,
-        H: for<'a> FnOnce(&'a Path) -> DirectoryPermissionFuture<'a>,
+        H: for<'a> FnOnce(&'a Path) -> PathPermissionFuture<'a>,
+        I: for<'a> FnOnce(&'a Path) -> PathPermissionFuture<'a>,
     {
-        if let Some(parent) = self.path.parent() {
+        if !parent_prepared && let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
                 format!(
                     "Failed to create auth profile directory at {}",
                     parent.display()
                 )
             })?;
-            if let Err(err) = set_parent_permissions(parent).await {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "path": parent.display().to_string(),
-                            "error": err.to_string(),
-                        })),
-                    "Could not set owner-only auth-profile directory permissions; continuing with the owner-only profile file"
-                );
-            }
+            set_parent_permissions(parent).await?;
         }
 
         let json =
@@ -654,7 +733,11 @@ impl AuthProfilesStore {
                     tmp_path.display()
                 )
             })?;
-        set_owner_only_file_permissions(&tmp_path).await?;
+        if let Err(err) = set_file_permissions(&tmp_path).await {
+            drop(temp_file);
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(err);
+        }
 
         if let Err(err) = temp_file.write_all(&json).await {
             drop(temp_file);
@@ -678,7 +761,19 @@ impl AuthProfilesStore {
             });
         }
 
-        match sync_parent_directory(self.path.parent().expect("profile path has a parent")).await {
+        let parent_dir = self.path.parent().expect("profile path has a parent");
+        #[cfg(test)]
+        let post_rename_sync = if take_post_rename_sync_failure_for_test(&self.path) {
+            Err(anyhow::Error::msg(
+                "synthetic post-rename auth-profile directory sync failure",
+            ))
+        } else {
+            sync_parent_directory(parent_dir).await
+        };
+        #[cfg(not(test))]
+        let post_rename_sync = sync_parent_directory(parent_dir).await;
+
+        match post_rename_sync {
             Ok(()) => Ok(ProfileSaveOutcome::Durable),
             Err(err) => Ok(ProfileSaveOutcome::CommittedWithDurabilityWarning(err)),
         }
@@ -688,16 +783,6 @@ impl AuthProfilesStore {
         match value {
             Some(value) if !value.is_empty() => self.secret_store.encrypt(value).map(Some),
             Some(_) | None => Ok(None),
-        }
-    }
-
-    fn decrypt_optional(&self, value: Option<&str>) -> Result<(Option<String>, Option<String>)> {
-        match value {
-            Some(value) if !value.is_empty() => {
-                let (plaintext, migrated) = self.secret_store.decrypt_and_migrate(value)?;
-                Ok((Some(plaintext), migrated))
-            }
-            Some(_) | None => Ok((None, None)),
         }
     }
 
@@ -772,9 +857,40 @@ impl AuthProfilesStore {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn arm_post_rename_sync_failure_for_test(profile_store_path: &Path) {
+    FAIL_POST_RENAME_SYNC_FOR_PATHS
+        .lock()
+        .expect("post-rename failure injection lock")
+        .push(profile_store_path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn post_rename_sync_failure_armed(profile_store_path: &Path) -> bool {
+    FAIL_POST_RENAME_SYNC_FOR_PATHS
+        .lock()
+        .expect("post-rename failure injection lock")
+        .iter()
+        .any(|path| path == profile_store_path)
+}
+
+#[cfg(test)]
+fn take_post_rename_sync_failure_for_test(profile_store_path: &Path) -> bool {
+    let mut armed = FAIL_POST_RENAME_SYNC_FOR_PATHS
+        .lock()
+        .expect("post-rename failure injection lock");
+    if let Some(index) = armed.iter().position(|path| path == profile_store_path) {
+        armed.swap_remove(index);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(unix)]
 async fn set_owner_only_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .await
         .with_context(|| {
@@ -782,7 +898,45 @@ async fn set_owner_only_directory_permissions(path: &Path) -> Result<()> {
                 "Failed to set owner-only auth-profile directory permissions: {}",
                 path.display()
             )
-        })
+        })?;
+
+    let metadata = fs::metadata(path).await.with_context(|| {
+        format!(
+            "Failed to verify auth-profile directory permissions: {}",
+            path.display()
+        )
+    })?;
+    ensure_owner_only_directory_permissions(
+        path,
+        metadata.permissions().mode(),
+        metadata.uid(),
+        nix::unistd::geteuid().as_raw(),
+    )
+}
+
+#[cfg(unix)]
+fn ensure_owner_only_directory_permissions(
+    path: &Path,
+    mode: u32,
+    owner_uid: u32,
+    effective_uid: u32,
+) -> Result<()> {
+    if owner_uid != effective_uid {
+        anyhow::bail!(
+            "Auth-profile directory is not owned by the effective daemon user after tightening: {} (owner uid {owner_uid}, effective uid {effective_uid})",
+            path.display()
+        );
+    }
+
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "Auth-profile directory permissions remain broader than owner-only after tightening: {} (mode {:o})",
+            path.display(),
+            mode & 0o777
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -871,6 +1025,94 @@ struct PersistedAuthProfile {
     updated_at: String,
     #[serde(default)]
     metadata: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+enum PersistedCredentialField {
+    AccessToken,
+    RefreshToken,
+    IdToken,
+    Token,
+}
+
+#[derive(Default)]
+struct DecryptedPersistedCredentials {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    token: Option<String>,
+    migrated: bool,
+}
+
+impl PersistedAuthProfile {
+    /// The persisted credential fields. Keeping the field inventory here makes
+    /// the key-provisioning preflight and decryption path evolve together.
+    fn credential_fields(&self) -> [(PersistedCredentialField, &Option<String>); 4] {
+        [
+            (PersistedCredentialField::AccessToken, &self.access_token),
+            (PersistedCredentialField::RefreshToken, &self.refresh_token),
+            (PersistedCredentialField::IdToken, &self.id_token),
+            (PersistedCredentialField::Token, &self.token),
+        ]
+    }
+
+    fn credential_fields_mut(&mut self) -> [(PersistedCredentialField, &mut Option<String>); 4] {
+        [
+            (
+                PersistedCredentialField::AccessToken,
+                &mut self.access_token,
+            ),
+            (
+                PersistedCredentialField::RefreshToken,
+                &mut self.refresh_token,
+            ),
+            (PersistedCredentialField::IdToken, &mut self.id_token),
+            (PersistedCredentialField::Token, &mut self.token),
+        ]
+    }
+
+    fn uses_local_secret_key(&self) -> bool {
+        self.credential_fields()
+            .into_iter()
+            .filter_map(|(_, value)| value.as_deref())
+            .any(|value| value.starts_with("enc2:") || SecretStore::needs_migration(value))
+    }
+
+    fn decrypt_credentials(
+        &mut self,
+        secret_store: &SecretStore,
+    ) -> Result<DecryptedPersistedCredentials> {
+        let mut decrypted = DecryptedPersistedCredentials::default();
+
+        for (field, value) in self.credential_fields_mut() {
+            let Some(stored) = value.as_deref().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let (plaintext, migrated) = secret_store.decrypt_and_migrate(stored)?;
+            if let Some(migrated) = migrated {
+                *value = Some(migrated);
+                decrypted.migrated = true;
+            }
+            match field {
+                PersistedCredentialField::AccessToken => decrypted.access_token = Some(plaintext),
+                PersistedCredentialField::RefreshToken => decrypted.refresh_token = Some(plaintext),
+                PersistedCredentialField::IdToken => decrypted.id_token = Some(plaintext),
+                PersistedCredentialField::Token => decrypted.token = Some(plaintext),
+            }
+        }
+
+        Ok(decrypted)
+    }
+}
+
+impl PersistedAuthProfiles {
+    /// Whether loading one of these profiles can provision local key material
+    /// through `SecretStore::decrypt_and_migrate`.
+    fn uses_local_secret_key(&self) -> bool {
+        self.profiles
+            .values()
+            .any(PersistedAuthProfile::uses_local_secret_key)
+    }
 }
 
 fn default_schema_version() -> u32 {
@@ -992,8 +1234,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn profile_write_uses_owner_only_permissions_for_parent_and_replaced_store() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -1037,39 +1277,104 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn profile_write_tolerates_parent_permission_tightening_failure() {
+    async fn profile_write_rejects_unsafe_parent_when_permission_tightening_fails() {
         let tmp = TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
-        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
 
         let store = AuthProfilesStore::new(&state_dir, false);
-        let outcome = store
+        let err = store
             .write_persisted_locked_with_operations(
                 &PersistedAuthProfiles::default(),
-                |file| {
-                    Box::pin(async move {
-                        let mode = file.metadata().await?.permissions().mode() & 0o777;
-                        assert_eq!(mode, 0o600, "temporary profile store must be owner-only");
-                        Ok(())
-                    })
-                },
-                |parent| Box::pin(sync_directory(parent)),
+                |_| Box::pin(async { panic!("unsafe parent must prevent temporary-file sync") }),
+                |_| Box::pin(async { panic!("unsafe parent must prevent directory sync") }),
                 |_| Box::pin(async { anyhow::bail!("synthetic chmod failure") }),
+                |_| {
+                    Box::pin(async { panic!("unsafe parent must prevent temporary-file creation") })
+                },
+                false,
             )
             .await
-            .expect("directory chmod failure must not prevent profile persistence");
+            .expect_err("unsafe auth-profile parent must fail before profile persistence");
 
-        assert!(matches!(outcome, ProfileSaveOutcome::Durable));
+        assert!(err.to_string().contains("synthetic chmod failure"));
         assert_eq!(
-            std::fs::metadata(store.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600,
-            "committed profile store must remain owner-only after chmod failure"
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "failed permission tightening must not hide the unsafe parent"
         );
+        assert!(
+            !store.path().exists(),
+            "unsafe auth-profile parent must fail before committing the profile store"
+        );
+        assert!(
+            std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+            "unsafe auth-profile parent must fail before creating a temporary profile file"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_write_removes_temp_file_when_file_permission_tightening_fails() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let store = AuthProfilesStore::new(&state_dir, false);
+
+        let err = store
+            .write_persisted_locked_with_operations(
+                &PersistedAuthProfiles::default(),
+                |_| {
+                    Box::pin(async {
+                        panic!("file-permission failure must prevent temporary-file sync")
+                    })
+                },
+                |_| {
+                    Box::pin(async {
+                        panic!("file-permission failure must prevent directory sync")
+                    })
+                },
+                |parent| Box::pin(set_owner_only_directory_permissions(parent)),
+                |_| Box::pin(async { anyhow::bail!("synthetic file chmod failure") }),
+                false,
+            )
+            .await
+            .expect_err("temporary-file permission failure must fail the write");
+
+        assert!(err.to_string().contains("synthetic file chmod failure"));
+        assert!(
+            !store.path().exists(),
+            "temporary-file permission failure must not commit the profile store"
+        );
+        assert!(
+            std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+            "temporary-file permission failure must remove the temporary profile file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_directory_permissions_reject_broader_mode_after_chmod() {
+        let path = Path::new("/synthetic/auth-profile-directory");
+        let err = ensure_owner_only_directory_permissions(path, 0o777, 501, 501)
+            .expect_err("a chmod no-op must not be treated as owner-only enforcement");
+
+        assert!(err.to_string().contains("remain broader than owner-only"));
+        assert!(err.to_string().contains("777"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_directory_permissions_rejects_non_owner_after_chmod() {
+        let path = Path::new("/synthetic/auth-profile-directory");
+        let err = ensure_owner_only_directory_permissions(path, 0o700, 501, 502)
+            .expect_err("a mode-safe directory owned by another account must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("not owned by the effective daemon user")
+        );
+        assert!(err.to_string().contains("owner uid 501"));
+        assert!(err.to_string().contains("effective uid 502"));
     }
 
     #[test]
@@ -1159,6 +1464,173 @@ mod tests {
         assert!(raw.contains("enc2:"));
         assert!(!raw.contains("refresh-123"));
         assert!(!raw.contains("access-123"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encrypted_public_upsert_rejects_unsafe_parent_before_key_creation() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override =
+            Some(|_| anyhow::bail!("synthetic parent-integrity failure"));
+
+        let err = store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "test-token".into()),
+                false,
+            )
+            .await
+            .expect_err("public encrypted upsert must fail before key creation");
+
+        assert!(
+            err.to_string()
+                .contains("synthetic parent-integrity failure"),
+            "the public write must surface the integrity failure"
+        );
+        assert!(
+            !state_dir.join(".secret_key").exists(),
+            "a failed parent integrity check must not create encryption key material"
+        );
+        assert!(
+            !store.path().exists(),
+            "a failed parent integrity check must not persist an auth profile"
+        );
+        assert!(
+            std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+            "the public write must leave no lock, key, or profile residue"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encrypted_profile_load_rejects_unsafe_parent_before_key_creation() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let seed_store = AuthProfilesStore::new(&state_dir, true);
+        seed_store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "test-token".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        std::fs::remove_file(state_dir.join(".secret_key")).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override =
+            Some(|_| anyhow::bail!("synthetic parent-integrity failure"));
+
+        let err = store
+            .load()
+            .await
+            .expect_err("encrypted profile load must fail before key creation");
+
+        assert!(
+            err.to_string()
+                .contains("synthetic parent-integrity failure"),
+            "the encrypted load must surface the integrity failure"
+        );
+        assert!(
+            !state_dir.join(".secret_key").exists(),
+            "an unsafe encrypted-profile load must not create replacement key material"
+        );
+        assert!(
+            store.path().exists(),
+            "the failed load must leave the existing encrypted profile untouched"
+        );
+        assert!(
+            !state_dir.join(LOCK_FILENAME).exists(),
+            "the failed load must release its profile lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encrypted_profile_load_with_existing_key_skips_key_provisioning_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let seed_store = AuthProfilesStore::new(&state_dir, true);
+        seed_store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "test-token".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            state_dir.join(".secret_key").is_file(),
+            "the encrypted seed must create the local key before the read-path check"
+        );
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override =
+            Some(|_| panic!("an initialized key must not run the key-provisioning preflight"));
+
+        let loaded = store
+            .load()
+            .await
+            .expect("encrypted profile load with an initialized key must not prepare its parent");
+        assert_eq!(
+            loaded
+                .profiles
+                .get(&profile_id("anthropic", "subscription"))
+                .and_then(|profile| profile.token.as_deref()),
+            Some("test-token")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plaintext_profile_load_skips_key_provisioning_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let plaintext_store = AuthProfilesStore::new(&state_dir, false);
+        plaintext_store
+            .upsert_profile(
+                AuthProfile::new_token("anthropic", "subscription", "test-token".into()),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override =
+            Some(|_| panic!("plaintext profile load must not prepare a key-material parent"));
+
+        let loaded = store
+            .load()
+            .await
+            .expect("plaintext profile load must not run key-provisioning preflight");
+        assert_eq!(
+            loaded
+                .profiles
+                .get(&profile_id("anthropic", "subscription"))
+                .and_then(|profile| profile.token.as_deref()),
+            Some("test-token")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_profile_load_skips_key_provisioning_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mut store = AuthProfilesStore::new(&state_dir, true);
+        store.parent_preparation_override =
+            Some(|_| panic!("empty profile load must not prepare a key-material parent"));
+
+        let loaded = store
+            .load()
+            .await
+            .expect("empty profile load must not run key-provisioning preflight");
+        assert!(loaded.profiles.is_empty());
     }
 
     #[tokio::test]

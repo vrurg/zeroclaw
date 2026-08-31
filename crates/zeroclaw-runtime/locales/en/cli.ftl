@@ -623,7 +623,7 @@ cli-quickstart-alias-for = Alias for {$name}
 cli-quickstart-openai-auth-mode-label = Authentication
 cli-quickstart-openai-auth-mode-help = Choose `codex` to use a ChatGPT/Codex subscription auth profile. If you already signed in with the Codex CLI, run `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json`; otherwise run `zeroclaw auth login --model-provider openai-codex`.
 cli-quickstart-anthropic-auth-mode-label = Authentication
-cli-quickstart-anthropic-auth-mode-help = Choose `api_key` for an Anthropic Console key, or `setup_token` to store a Claude Max token from `claude setup-token` in an Anthropic auth profile.
+cli-quickstart-anthropic-auth-mode-help = Choose `api_key` for an Anthropic Console key, or `setup_token` to store a Claude Max token from `claude setup-token` in an Anthropic auth profile with `auth_mode = "oauth"`.
 cli-quickstart-anthropic-api-key-help = Paste an Anthropic Console API key. To use Claude Max, first run `claude setup-token`, then choose `setup_token`.
 cli-quickstart-auth-codex-prompt = Sign in to OpenAI Codex with your ChatGPT account now?
 cli-quickstart-auth-codex-import-prompt = Found an existing Codex login (~/.codex/auth.json) — import it now?
@@ -684,7 +684,7 @@ cli-quickstart-error-unknown-provider-type = unknown model provider type `{$prov
 cli-quickstart-error-unknown-openai-auth-mode = unknown OpenAI auth mode `{$mode}` — pick `api_key` or `codex`
 cli-quickstart-error-unknown-anthropic-auth-mode = unknown Anthropic auth mode `{$mode}` — pick `api_key` or `setup_token`
 cli-quickstart-error-anthropic-setup-token-required = Anthropic setup-token authentication requires a setup token
-cli-quickstart-error-anthropic-setup-token-store = failed to store Anthropic setup token
+cli-quickstart-error-anthropic-setup-token-store = failed to store Anthropic setup token: {$err}
 cli-quickstart-error-alias-exists = alias `{$alias}` already exists
 cli-quickstart-error-no-profile = no `{$alias}` profile configured
 cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`

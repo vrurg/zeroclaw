@@ -687,8 +687,11 @@ impl ConfigSaveOutcome {
     /// distinguish an uncommitted write from a post-rename warning.
     pub fn into_legacy_result(self) -> Result<()> {
         match self {
-            Self::Durable => Ok(()),
-            Self::CommittedWithDurabilityWarning(err) => Err(err),
+            // A legacy caller cannot recover a pre-rename outcome from this
+            // result.  Once rename succeeded, returning `Err` prompts many
+            // existing callers to restore state that is already visible on
+            // disk.  Callers that need the warning must use the outcome API.
+            Self::Durable | Self::CommittedWithDurabilityWarning(_) => Ok(()),
         }
     }
 }
@@ -1003,8 +1006,8 @@ pub struct ModelProviderConfig {
 // that support multiple auth flows additionally carry an `auth_mode` field.
 //
 // Pattern reference for adding a new family:
-// - Single-endpoint family with no extras: see `AnthropicModelProviderConfig`
-// - Family with extras: see `OpenAIModelProviderConfig`
+// - Single-endpoint family with no extras: see `GroqModelProviderConfig`
+// - Family with extras: see `AnthropicModelProviderConfig` or `OpenAIModelProviderConfig`
 // - Family with computed-endpoint template: see `AzureModelProviderConfig`
 // - Multi-region family with a required `endpoint` field: see `MoonshotModelProviderConfig`
 //
@@ -23303,26 +23306,7 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
-        let original_dirty_paths = self.dirty_paths.clone();
-        let outcome = self.save_dirty_with_outcome().await?;
-        self.apply_legacy_save_dirty_outcome(original_dirty_paths, outcome)
-    }
-
-    fn apply_legacy_save_dirty_outcome(
-        &mut self,
-        original_dirty_paths: std::collections::HashSet<String>,
-        outcome: ConfigSaveOutcome,
-    ) -> Result<()> {
-        match outcome {
-            ConfigSaveOutcome::Durable => Ok(()),
-            ConfigSaveOutcome::CommittedWithDurabilityWarning(err) => {
-                // Preserve the legacy retry contract: `save_dirty()` reports
-                // this as an error, so callers must retain their dirty paths
-                // rather than receiving a silent no-op on retry.
-                self.dirty_paths = original_dirty_paths;
-                Err(err)
-            }
-        }
+        self.save_dirty_with_outcome().await?.into_legacy_result()
     }
 
     /// Incrementally save dirty paths and report whether a post-rename
@@ -28928,23 +28912,12 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
-    async fn legacy_save_dirty_keeps_retry_paths_after_committed_warning() {
-        let mut config = Config::default();
-        let original_dirty_paths =
-            std::collections::HashSet::from(["agents.bot.model_provider".to_string()]);
-        config.dirty_paths.clear();
-
-        let err = config
-            .apply_legacy_save_dirty_outcome(
-                original_dirty_paths.clone(),
-                ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::Error::msg(
-                    "injected directory sync failure",
-                )),
-            )
-            .expect_err("legacy save_dirty must retain its error contract");
-
-        assert!(err.to_string().contains("injected directory sync failure"));
-        assert_eq!(config.dirty_paths, original_dirty_paths);
+    async fn legacy_save_result_accepts_committed_warning() {
+        ConfigSaveOutcome::CommittedWithDurabilityWarning(anyhow::Error::msg(
+            "injected directory sync failure",
+        ))
+        .into_legacy_result()
+        .expect("a post-rename warning is already committed for legacy callers");
     }
 
     #[tokio::test]

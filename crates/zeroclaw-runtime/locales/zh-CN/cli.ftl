@@ -539,7 +539,7 @@ cli-quickstart-alias-for = {$name} 的别名
 cli-quickstart-openai-auth-mode-label = 身份验证
 cli-quickstart-openai-auth-mode-help = 选择 `codex` 以使用 ChatGPT/Codex 订阅身份验证配置文件。如果你已通过 Codex CLI 登录，请运行 `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json`；否则请运行 `zeroclaw auth login --model-provider openai-codex`。
 cli-quickstart-anthropic-auth-mode-label = 身份验证
-cli-quickstart-anthropic-auth-mode-help = 如需 Anthropic Console 密钥，请选择 `api_key`；如需通过 `claude setup-token` 为 Claude Max 创建并存储令牌配置文件，请选择 `setup_token`。
+cli-quickstart-anthropic-auth-mode-help = 如需 Anthropic Console 密钥，请选择 `api_key`；如需通过 `claude setup-token` 为 Claude Max 创建并存储令牌配置文件，请选择 `setup_token`，并设置 `auth_mode = "oauth"`。
 cli-quickstart-anthropic-api-key-help = 粘贴 Anthropic Console API 密钥。要使用 Claude Max，请先运行 `claude setup-token`，然后选择 `setup_token`。
 cli-quickstart-auth-codex-prompt = 现在使用你的 ChatGPT 账户登录 OpenAI Codex 吗？
 cli-quickstart-auth-codex-import-prompt = 发现已有的 Codex 登录 (~/.codex/auth.json) — 现在导入吗？
@@ -599,7 +599,7 @@ cli-quickstart-error-unknown-provider-type = 未知模型提供方类型 `{$prov
 cli-quickstart-error-unknown-openai-auth-mode = 未知的 OpenAI 身份验证模式 `{$mode}` — 请选择 `api_key` 或 `codex`
 cli-quickstart-error-unknown-anthropic-auth-mode = 未知的 Anthropic 身份验证模式 `{$mode}` — 请选择 `api_key` 或 `setup_token`
 cli-quickstart-error-anthropic-setup-token-required = Anthropic setup-token 身份验证需要设置令牌
-cli-quickstart-error-anthropic-setup-token-store = 无法保存 Anthropic 设置令牌
+cli-quickstart-error-anthropic-setup-token-store = 无法保存 Anthropic 设置令牌：{$err}
 cli-quickstart-error-alias-exists = 别名 `{$alias}` 已存在
 cli-quickstart-error-no-profile = 未配置 `{$alias}` 配置文件
 cli-quickstart-error-unknown-risk-preset = 未知风险预设 `{$preset}`

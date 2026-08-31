@@ -389,6 +389,8 @@ zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
+zc-quickstart-anthropic-setup-token-label = Setup token
+zc-quickstart-anthropic-setup-token-help = Paste the token from `claude setup-token`. ZeroClaw will store it in the Anthropic auth profile for this alias and set `auth_mode = "oauth"`.
 zc-quickstart-model-loading = Loading models for { $provider }...
 zc-quickstart-model-retrying = Retrying model catalog for { $provider }...
 zc-quickstart-model-catalog-empty = catalog unavailable - type a model name

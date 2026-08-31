@@ -63,6 +63,8 @@ Schema-mirror env overrides win at startup. They replace the in-memory credentia
 
 `zeroclaw quickstart` writes credentials to the secrets store by default. Configs you commit should not contain inline keys. For ecosystem-default names you already export in your shell (`$ANTHROPIC_API_KEY`, `$OPENROUTER_API_KEY`, …), the [env-vars reference](../reference/env-vars.md#bridging-ecosystem-default-env-vars) shows the one-line bash expansions that point a schema-mirror name at the existing value.
 
+On Unix, auth-profile persistence requires the config directory (by default `~/.zeroclaw`) to be owned by the daemon's effective user and owner-only (`0700`). ZeroClaw enforces and verifies both properties before it creates, rotates, migrates, or otherwise persists an auth profile, and before decrypting an encrypted profile only when a missing local key would have to be recreated, because a writable directory or one controlled by another local account could let that account replace a credential file despite the file itself being `0600`. This can tighten an existing looser mode on the config directory. If it cannot enforce and verify both properties, make the directory containing `config.toml` owned by the daemon user and run `chmod 700 <config-directory>`, or use `--config-dir` to select a directory on a filesystem that supports those ownership and permission semantics.
+
 ## OAuth and subscription auth
 
 Several providers accept OAuth or subscription-style tokens instead of raw API keys. Get the token from the vendor's own dashboard or CLI flow, then drop it into the alias entry the same way you would an API key:

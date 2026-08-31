@@ -356,6 +356,31 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_setup_token_messages_format_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            for key in [
+                "zc-quickstart-anthropic-setup-token-label",
+                "zc-quickstart-anthropic-setup-token-help",
+            ] {
+                let rendered = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(
+                    !rendered.trim().is_empty(),
+                    "{key} must not be empty for {locale}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),

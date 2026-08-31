@@ -1927,7 +1927,10 @@ impl AuthProviderFlow for XaiFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::profiles::{AuthProfile, AuthProfileKind};
+    use crate::auth::profiles::{
+        AuthProfile, AuthProfileKind, arm_post_rename_sync_failure_for_test,
+        post_rename_sync_failure_armed,
+    };
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -1940,6 +1943,41 @@ mod tests {
         assert_eq!(normalize_model_provider("codex").unwrap(), "openai-codex");
         assert_eq!(normalize_model_provider("claude").unwrap(), "anthropic");
         assert_eq!(normalize_model_provider("openai").unwrap(), "openai");
+    }
+
+    #[tokio::test]
+    async fn storing_a_model_provider_token_succeeds_after_committed_sync_warning() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        let profile_store_path = auth.store.path().to_path_buf();
+        arm_post_rename_sync_failure_for_test(&profile_store_path);
+
+        auth.store_model_provider_token(
+            "anthropic",
+            "subscription",
+            "test-token",
+            HashMap::new(),
+            true,
+        )
+        .await
+        .expect("a post-rename warning must not report the committed profile as failed");
+        assert!(
+            !post_rename_sync_failure_armed(&profile_store_path),
+            "the public write must consume the post-rename fault injection"
+        );
+
+        let profiles = auth
+            .load_profiles()
+            .await
+            .expect("the committed profile must remain readable");
+        assert!(profiles.profiles.contains_key("anthropic:subscription"));
+        assert_eq!(
+            profiles
+                .active_profiles
+                .get("anthropic")
+                .map(String::as_str),
+            Some("anthropic:subscription")
+        );
     }
 
     #[test]

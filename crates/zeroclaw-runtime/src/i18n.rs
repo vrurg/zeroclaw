@@ -719,16 +719,28 @@ mod tests {
     #[test]
     fn anthropic_setup_token_recovery_is_available_in_every_builtin_locale() {
         for (source, locale) in committed_locale_sources() {
-            for key in [
-                "cli-quickstart-error-anthropic-setup-token-required",
-                "cli-quickstart-error-anthropic-setup-token-store",
+            for (key, args) in [
+                (
+                    "cli-quickstart-error-anthropic-setup-token-required",
+                    &[][..],
+                ),
+                (
+                    "cli-quickstart-error-anthropic-setup-token-store",
+                    &[("err", "synthetic auth-profile write failure")][..],
+                ),
             ] {
-                let value = format_ftl_message(source, locale, key, &[])
+                let value = format_ftl_message(source, locale, key, args)
                     .unwrap_or_else(|| panic!("{key} must format in {locale}"));
                 assert!(
                     !value.trim().is_empty(),
                     "{key} in {locale} must provide a user-visible error"
                 );
+                if key == "cli-quickstart-error-anthropic-setup-token-store" {
+                    assert!(
+                        value.contains("synthetic auth-profile write failure"),
+                        "{key} in {locale} must preserve the actionable failure detail"
+                    );
+                }
             }
 
             let hint = format_ftl_message(
@@ -758,7 +770,9 @@ mod tests {
                 "Anthropic API-key help in {locale} must direct Claude Max users to choose setup_token after claude setup-token: {api_key_help:?}"
             );
             let token_placement_marker = match locale {
-                "en" => "here",
+                // Keep a word boundary for English too: unrelated words such
+                // as "there" must not satisfy the regression guard.
+                "en" => " here",
                 "es" => "aquí",
                 // The removed French wording was "collez ici". Keep the
                 // boundary so unrelated words such as "officiel" do not

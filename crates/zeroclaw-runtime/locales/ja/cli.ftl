@@ -540,7 +540,7 @@ cli-quickstart-alias-for = {$name} のエイリアス
 cli-quickstart-openai-auth-mode-label = 認証
 cli-quickstart-openai-auth-mode-help = ChatGPT/Codex サブスクリプションの認証プロファイルを使用する場合は `codex` を選択してください。Codex CLI で既にサインイン済みの場合は `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json` を実行し、そうでない場合は `zeroclaw auth login --model-provider openai-codex` を実行してください。
 cli-quickstart-anthropic-auth-mode-label = 認証
-cli-quickstart-anthropic-auth-mode-help = Anthropic Console のキーには `api_key` を選択し、`claude setup-token` で Claude Max のトークンを認証プロファイルに保存する場合は `setup_token` を選択してください。
+cli-quickstart-anthropic-auth-mode-help = Anthropic Console のキーには `api_key` を選択し、`claude setup-token` で Claude Max のトークンを認証プロファイルに保存する場合は `setup_token` を選択して `auth_mode = "oauth"` を設定してください。
 cli-quickstart-anthropic-api-key-help = Anthropic Console の API キーを貼り付けてください。Claude Max を使うには、最初に `claude setup-token` を実行してから `setup_token` を選択してください。
 cli-quickstart-auth-codex-prompt = 今すぐ ChatGPT アカウントで OpenAI Codex にサインインしますか？
 cli-quickstart-auth-codex-import-prompt = 既存の Codex ログイン (~/.codex/auth.json) が見つかりました — 今すぐインポートしますか？
@@ -600,7 +600,7 @@ cli-quickstart-error-unknown-provider-type = 不明なモデルプロバイダ�
 cli-quickstart-error-unknown-openai-auth-mode = 不明な OpenAI 認証モード `{$mode}` — `api_key` または `codex` を選択してください
 cli-quickstart-error-unknown-anthropic-auth-mode = 不明な Anthropic 認証モード `{$mode}` — `api_key` または `setup_token` を選択してください
 cli-quickstart-error-anthropic-setup-token-required = Anthropic の setup-token 認証にはセットアップトークンが必要です
-cli-quickstart-error-anthropic-setup-token-store = Anthropic のセットアップトークンを保存できませんでした
+cli-quickstart-error-anthropic-setup-token-store = Anthropic のセットアップトークンを保存できませんでした: {$err}
 cli-quickstart-error-alias-exists = エイリアス `{$alias}` は既に存在します
 cli-quickstart-error-no-profile = プロファイル `{$alias}` は設定されていません
 cli-quickstart-error-unknown-risk-preset = 不明なリスクプリセット `{$preset}`
