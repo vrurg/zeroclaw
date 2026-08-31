@@ -17,6 +17,7 @@ pub enum GoalConfigError {
     MissingTokenLimit,
     MissingCostLimit,
     MissingVerifierProvider,
+    TokenLimitOutOfRange,
     InvalidCostLimit,
     EmptyVerifierModel,
 }
@@ -53,6 +54,12 @@ impl GoalConfig {
     /// Validate syntax and enabled-only required fields without adding a new
     /// credential or provider-resolution path.
     pub fn validate(&self) -> Result<(), GoalConfigError> {
+        if self
+            .default_token_limit
+            .is_some_and(|value| value > i64::MAX as u64)
+        {
+            return Err(GoalConfigError::TokenLimitOutOfRange);
+        }
         if self
             .default_cost_limit_usd
             .is_some_and(|value| !value.is_finite() || value < 0.0)
@@ -111,6 +118,14 @@ mod tests {
             }
             .validate(),
             Err(GoalConfigError::InvalidCostLimit)
+        );
+        assert_eq!(
+            GoalConfig {
+                default_token_limit: Some(i64::MAX as u64 + 1),
+                ..GoalConfig::default()
+            }
+            .validate(),
+            Err(GoalConfigError::TokenLimitOutOfRange)
         );
     }
 

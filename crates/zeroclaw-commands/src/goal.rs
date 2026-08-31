@@ -53,12 +53,10 @@ pub enum GoalCommandParseError {
 
 pub fn parse_goal_command(
     content: &str,
-    surface: CommandSurface,
+    _surface: CommandSurface,
 ) -> Result<GoalCommand, GoalCommandParseError> {
     let (token, rest) = split_token(content.trim());
-    if !matches!(surface, CommandSurface::Channel | CommandSurface::Tui)
-        || !token.eq_ignore_ascii_case("/goal")
-    {
+    if !token.eq_ignore_ascii_case("/goal") {
         return Err(GoalCommandParseError::NotGoalCommand);
     }
     let (subcommand, arguments) = split_token(rest.trim());
