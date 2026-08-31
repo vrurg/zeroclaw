@@ -22434,9 +22434,27 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
-        self.goal
-            .validate()
-            .map_err(|error| anyhow::anyhow!("invalid goal configuration: {error:?}"))?;
+        if let Err(error) = self.goal.validate() {
+            anyhow::bail!("invalid goal configuration: {error:?}");
+        }
+        if self.goal.enabled {
+            let verifier = self.goal.verifier.model_provider.as_str();
+            let Some((provider_type, provider_alias)) = verifier.split_once('.') else {
+                anyhow::bail!(
+                    "goal.verifier.model_provider must be a configured <type>.<alias> reference"
+                );
+            };
+            if self
+                .providers
+                .models
+                .find(provider_type, provider_alias)
+                .is_none()
+            {
+                anyhow::bail!(
+                    "goal.verifier.model_provider '{verifier}' does not resolve in providers.models"
+                );
+            }
+        }
 
         // Skills — extra registries
         {

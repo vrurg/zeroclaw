@@ -101,6 +101,7 @@ impl GoalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Config;
 
     #[test]
     fn disabled_config_is_optional_but_rejects_malformed_supplied_values() {
@@ -170,6 +171,46 @@ mod tests {
                 token_limit: Some(42),
                 cost_limit_usd: Some(1.5)
             })
+        );
+    }
+
+    #[test]
+    fn enabled_goal_verifier_must_resolve_through_existing_provider_config() {
+        let config: Config = toml::from_str(
+            r#"
+                [goal]
+                enabled = true
+                default_token_limit = 0
+                default_cost_limit_usd = 0.0
+
+                [goal.verifier]
+                model_provider = "openai.default"
+
+                [providers.models.openai.default]
+                model = "gpt-test"
+            "#,
+        )
+        .expect("configuration parses");
+        assert!(config.validate().is_ok());
+
+        let unresolved: Config = toml::from_str(
+            r#"
+                [goal]
+                enabled = true
+                default_token_limit = 0
+                default_cost_limit_usd = 0.0
+
+                [goal.verifier]
+                model_provider = "openai.missing"
+            "#,
+        )
+        .expect("configuration parses");
+        assert!(
+            unresolved
+                .validate()
+                .expect_err("unresolved verifier must fail")
+                .to_string()
+                .contains("goal.verifier.model_provider")
         );
     }
 }
