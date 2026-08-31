@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::authority::is_authoritative;
 use super::task_registry::{
@@ -13,7 +13,7 @@ use super::task_registry::{
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 8;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 10;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -86,6 +86,8 @@ impl SqliteTaskStore {
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
+                 session_id      TEXT,
+                 execution_epoch INTEGER NOT NULL DEFAULT 0,
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
@@ -120,6 +122,23 @@ impl SqliteTaskStore {
     /// Admin enumeration — delete this agent's records (alias-delete cascade).
     pub fn delete_by_agent(&self, agent: &str) -> Result<u64> {
         let conn = self.conn.lock();
+        let has_session_goal: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM tasks
+                      WHERE agent = ?1 AND kind = 'goal'
+                        AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+                 )",
+                params![agent],
+                |row| row.get(0),
+            )
+            .context("classify session-bound Goal agent deletion")?;
+        if has_session_goal {
+            anyhow::bail!(
+                "session-bound Goal tasks require guarded GoalTaskRegistry disposal; \
+                 generic agent deletion is unavailable"
+            );
+        }
         let n = conn
             .execute("DELETE FROM tasks WHERE agent = ?1", params![agent])
             .context("delete tasks by agent")?;
@@ -131,9 +150,21 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    goal::migrate_schema(conn, version)?;
-    if version < 8 {
-        conn.execute_batch(
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("begin control-plane schema migration")?;
+    add_column_if_missing(
+        &tx,
+        "tasks",
+        "session_id",
+        "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+    )?;
+    add_column_if_missing(
+        &tx,
+        "tasks",
+        "execution_epoch",
+        "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    )?;
+    tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
                  task_id          TEXT PRIMARY KEY
                                   REFERENCES tasks(id) ON DELETE CASCADE,
@@ -146,11 +177,16 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
                  terminal_error   TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
-                ON terminal_settlement_intents(owner_pid, owner_boot_id);
-             PRAGMA user_version = 8;",
+                ON terminal_settlement_intents(owner_pid, owner_boot_id);",
         )
-        .context("apply control-plane schema v8")?;
-    }
+        .context("ensure terminal settlement schema")?;
+    // Version 8 existed both as upstream terminal-settlement schema and as a
+    // provisional Goal schema. Reapply Goal's additive migration structurally
+    // instead of inferring object presence from the ambiguous user_version.
+    goal::migrate_schema(&tx, 0)?;
+    tx.execute_batch(&format!("PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"))
+        .context("mark final control-plane schema version")?;
+    tx.commit().context("commit control-plane schema migration")?;
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -239,6 +275,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -528,9 +566,9 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             parent_id, originator_route, delivered, idem_key, principal_id, session_id,
+             execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -546,11 +584,39 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
     )
     .context("insert task record")?;
+    Ok(())
+}
+
+/// Generic task lifecycle APIs predate Goal epoch fencing. They remain valid
+/// for unrelated and legacy rows but must not mutate a session-bound Goal.
+fn reject_session_bound_goal_mutation(
+    conn: &Connection,
+    task_id: &str,
+    operation: &str,
+) -> Result<()> {
+    let session_bound: bool = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL
+               AND length(trim(session_id)) > 0
+               FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("classify generic task lifecycle mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!(
+            "session-bound Goal tasks require guarded GoalTaskRegistry APIs; {operation} is unavailable"
+        );
+    }
     Ok(())
 }
 
@@ -695,6 +761,9 @@ fn claim_task_owner_record(
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
         let conn = self.conn.lock();
+        if rec.kind == TaskKind::Goal {
+            anyhow::bail!("Goal tasks require the session-bound GoalTaskRegistry admission API");
+        }
         insert_task_record(&conn, rec)?;
         Ok(())
     }
@@ -702,6 +771,7 @@ impl TaskRegistry for SqliteTaskStore {
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "heartbeat")?;
         // Only the heart-beating owner refreshes; prevents a stale boot from
         // resurrecting liveness it does not own.
         conn.execute(
@@ -721,6 +791,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<()> {
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "status update")?;
         update_task_status_record(&conn, id, status, output, error)?;
         Ok(())
     }
@@ -733,6 +804,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "terminal transition")?;
         Ok(transition_task_terminal_record(&mut conn, id, status, output, error)? == 1)
     }
 
@@ -746,6 +818,7 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "owner-checked terminal transition")?;
         Ok(transition_task_terminal_if_owner_record(
             &mut conn,
             id,
@@ -800,6 +873,7 @@ impl TaskRegistry for SqliteTaskStore {
 
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "owner claim")?;
         let tx = conn.transaction().context("begin task owner claim")?;
         tx.execute(
             "DELETE FROM terminal_settlement_intents
@@ -871,6 +945,9 @@ impl TaskRegistry for SqliteTaskStore {
             .context("reconcile: load task")?
         };
         let Some(rec) = rec else { return Ok(false) };
+        if rec.kind == TaskKind::Goal {
+            return Ok(false);
+        }
         // Never reclaim a terminal record, and never one a live owner still holds.
         if rec.status.is_terminal() || !is_authoritative(&rec) {
             return Ok(false);
@@ -913,6 +990,7 @@ impl TaskRegistry for SqliteTaskStore {
     ) -> Result<bool> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, id, "timeout reconciliation")?;
         let tx = conn
             .transaction()
             .context("reconcile: begin timeout transition")?;
