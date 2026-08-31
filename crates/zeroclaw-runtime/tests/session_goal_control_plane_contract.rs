@@ -434,7 +434,7 @@ async fn guarded_transitions_fence_stale_epochs_and_terminal_replacement() {
 }
 
 #[tokio::test]
-async fn pausing_an_in_flight_tool_phase_fences_it_and_leaves_the_goal_resumable() {
+async fn pausing_an_in_flight_tool_phase_fails_closed_and_cannot_resume() {
     let store = SqliteTaskStore::new_in_memory().expect("initialize store");
     assert_eq!(
         store
@@ -477,12 +477,28 @@ async fn pausing_an_in_flight_tool_phase_fences_it_and_leaves_the_goal_resumable
             .expect("stale tool completion is fenced"),
         GoalTransitionResult::Stale
     );
+    let task = store
+        .current_goal_for_session("tool-pause-session")
+        .await
+        .expect("read fenced Goal")
+        .expect("Goal remains auditable");
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.execution_epoch, 2);
+    assert_eq!(
+        store
+            .get_goal_task("tool-pause")
+            .await
+            .expect("read fenced Goal extension")
+            .expect("Goal extension remains auditable")
+            .tool_phase,
+        GoalToolPhase::InFlight
+    );
     assert_eq!(
         store
             .resume_session_goal("tool-pause", "tool-pause-session", 2, 2, "boot-new")
             .await
             .expect("resume paused Goal"),
-        GoalTransitionResult::Applied
+        GoalTransitionResult::Stale
     );
 }
 
