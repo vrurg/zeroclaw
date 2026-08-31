@@ -516,4 +516,53 @@ mod tests {
             TaskStatus::Running
         );
     }
+
+    #[tokio::test]
+    async fn sweep_leaves_session_bound_goals_to_the_goal_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot-NEW".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            ..GoalTaskRecord::default()
+        };
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+
+        let db = dir.path().join("control_plane.db");
+        Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET heartbeat_at = ?1 WHERE id = 'goal'",
+                [(Utc::now() - chrono::Duration::seconds(99_999)).to_rfc3339()],
+            )
+            .unwrap();
+
+        sweep(&store, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            store.get("goal").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+    }
 }
