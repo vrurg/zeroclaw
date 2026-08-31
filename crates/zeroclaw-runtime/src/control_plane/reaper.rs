@@ -20,7 +20,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::authority::{is_authoritative, is_authoritative_owner};
-use super::task_registry::{TaskRegistry, TaskStatus, TerminalSettlementIntent};
+use super::task_registry::{TaskKind, TaskRegistry, TaskStatus, TerminalSettlementIntent};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -213,6 +213,12 @@ pub async fn sweep(
     let _ = recover_terminal_settlements(store).await?;
     let now = Utc::now();
     for rec in store.list_running().await? {
+        // Goal restart policy is fenced by GoalTaskRegistry. Generic task
+        // reaping must not turn an interrupted goal into Lost before the
+        // goal-specific recovery owner can classify its pending operation.
+        if rec.kind == TaskKind::Goal {
+            continue;
+        }
         if rec.owner_boot_id != boot_id {
             // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
             let _ = store.reconcile_lost(&rec.id, boot_id).await?;
