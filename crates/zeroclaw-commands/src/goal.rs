@@ -1,90 +1,78 @@
-//! Transport-neutral `/goal` subcommand grammar.
-//!
-//! This parser produces data only. It establishes no authority: surface
-//! eligibility, operator opt-in, agent eligibility, principal trust, session
-//! binding, and lifecycle are decided by the runtime goal controller.
+//! Transport-neutral, strict `/goal` command grammar.
 
-use crate::{BuiltinCommandId, CommandSurface, parse_command_token};
+use crate::CommandSurface;
 
-/// Maximum objective or resume-note length in characters, not bytes.
-pub const MAX_GOAL_TEXT_CHARS: usize = 4096;
+pub const MAX_GOAL_OBJECTIVE_CHARS: usize = 4096;
 
-/// Parsed `/goal` subcommand without lifecycle or authority semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Some(0)` is explicit unlimited; `None` means omitted from this command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalBudgetOverrides {
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+}
+
+impl GoalBudgetOverrides {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.token_limit.is_none() && self.cost_limit_usd.is_none()
+    }
+}
+
+/// A parsed command contains no authority, route, task, or lifecycle facts.
+#[derive(Debug, Clone, PartialEq)]
 pub enum GoalCommand {
-    /// Start a Goal with the durable objective text.
-    Start { objective: String },
-    /// Parse the currently advertised objective amendment syntax without
-    /// assigning it controller semantics.
-    Objective { objective: String },
-    /// Read the current Goal status.
+    Start {
+        overrides: GoalBudgetOverrides,
+        objective: String,
+    },
     Status,
-    /// Read the current Goal budget projection.
-    Budget,
-    /// Pause the current Goal.
+    Budget {
+        set: Option<GoalBudgetOverrides>,
+    },
     Pause,
-    /// Resume the current Goal, optionally carrying the advertised note.
-    Resume { note: Option<String> },
-    /// Cancel the current Goal.
+    Resume,
     Cancel,
-    /// Read Goal command help.
     Help,
 }
 
-/// Typed failure while parsing a `/goal` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoalCommandParseError {
-    /// Input is not `/goal` on the supplied surface.
     NotGoalCommand,
-    /// `/goal` has no subcommand.
     MissingSubcommand,
-    /// The echoed subcommand is not part of the advertised grammar.
     UnknownSubcommand(String),
-    /// `start` or `objective` has no objective text.
-    MissingObjective(&'static str),
-    /// An argument-free subcommand was given trailing text.
+    MissingObjectiveDelimiter,
+    MissingObjective,
+    MissingFlagValue(&'static str),
+    InvalidTokenLimit(String),
+    InvalidCostLimit(String),
+    DuplicateFlag(&'static str),
+    UnknownFlag(String),
     UnexpectedArguments(&'static str),
-    /// Objective or note exceeds [`MAX_GOAL_TEXT_CHARS`].
     TextTooLong { max: usize },
 }
 
-/// Parse a raw command string for the supplied catalogue surface.
 pub fn parse_goal_command(
     content: &str,
     surface: CommandSurface,
 ) -> Result<GoalCommand, GoalCommandParseError> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
+    let (token, rest) = split_token(content.trim());
+    if !matches!(surface, CommandSurface::Channel | CommandSurface::Tui)
+        || !token.eq_ignore_ascii_case("/goal")
+    {
         return Err(GoalCommandParseError::NotGoalCommand);
     }
-
-    let (token, rest) = split_token(trimmed);
-    let Some(parsed) = parse_command_token(token, surface) else {
-        return Err(GoalCommandParseError::NotGoalCommand);
-    };
-    if parsed.command.id != BuiltinCommandId::Goal {
-        return Err(GoalCommandParseError::NotGoalCommand);
-    }
-
-    let rest = rest.trim();
-    if rest.is_empty() {
+    let (subcommand, arguments) = split_token(rest.trim());
+    if subcommand.is_empty() {
         return Err(GoalCommandParseError::MissingSubcommand);
     }
-
-    let (subcommand, arguments) = split_token(rest);
-    let arguments = arguments.trim();
     match subcommand.to_ascii_lowercase().as_str() {
-        "start" => {
-            parse_objective(arguments, "start").map(|objective| GoalCommand::Start { objective })
-        }
-        "objective" => parse_objective(arguments, "objective")
-            .map(|objective| GoalCommand::Objective { objective }),
-        "status" => parse_argument_free(arguments, "status", GoalCommand::Status),
-        "budget" => parse_argument_free(arguments, "budget", GoalCommand::Budget),
-        "pause" => parse_argument_free(arguments, "pause", GoalCommand::Pause),
-        "resume" => parse_resume(arguments),
-        "cancel" => parse_argument_free(arguments, "cancel", GoalCommand::Cancel),
-        "help" => parse_argument_free(arguments, "help", GoalCommand::Help),
+        "start" => parse_start(arguments),
+        "status" => argument_free(arguments, "status", GoalCommand::Status),
+        "budget" => parse_budget(arguments),
+        "pause" => argument_free(arguments, "pause", GoalCommand::Pause),
+        "resume" => argument_free(arguments, "resume", GoalCommand::Resume),
+        "cancel" => argument_free(arguments, "cancel", GoalCommand::Cancel),
+        "help" => argument_free(arguments, "help", GoalCommand::Help),
         _ => Err(GoalCommandParseError::UnknownSubcommand(
             subcommand.to_ascii_lowercase(),
         )),
@@ -94,220 +82,171 @@ pub fn parse_goal_command(
 fn split_token(input: &str) -> (&str, &str) {
     input
         .split_once(char::is_whitespace)
-        .map_or((input, ""), |(token, rest)| (token, rest))
+        .map_or((input, ""), |(a, b)| (a, b))
 }
 
-fn parse_objective(
-    arguments: &str,
-    subcommand: &'static str,
-) -> Result<String, GoalCommandParseError> {
-    if arguments.is_empty() {
-        return Err(GoalCommandParseError::MissingObjective(subcommand));
+fn parse_start(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
+    let Some(delimiter) = arguments.match_indices("--").find_map(|(index, _)| {
+        let before = arguments[..index].chars().next_back();
+        let after = arguments[index + 2..].chars().next();
+        (before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace))
+            .then_some(index)
+    }) else {
+        return Err(GoalCommandParseError::MissingObjectiveDelimiter);
+    };
+    let (flags, objective) = arguments.split_at(delimiter);
+    let objective = &objective[2..];
+    let objective = objective.trim_start();
+    if objective.trim().is_empty() {
+        return Err(GoalCommandParseError::MissingObjective);
     }
-    parse_bounded_text(arguments)
+    if objective.chars().count() > MAX_GOAL_OBJECTIVE_CHARS {
+        return Err(GoalCommandParseError::TextTooLong {
+            max: MAX_GOAL_OBJECTIVE_CHARS,
+        });
+    }
+    Ok(GoalCommand::Start {
+        overrides: parse_overrides(flags)?,
+        objective: objective.to_string(),
+    })
 }
 
-fn parse_argument_free(
+fn parse_budget(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
+    let (subcommand, flags) = split_token(arguments.trim());
+    if subcommand.is_empty() {
+        return Ok(GoalCommand::Budget { set: None });
+    }
+    if !subcommand.eq_ignore_ascii_case("set") {
+        return Err(GoalCommandParseError::UnexpectedArguments("budget"));
+    }
+    let overrides = parse_overrides(flags)?;
+    if overrides.is_empty() {
+        return Err(GoalCommandParseError::UnexpectedArguments("budget set"));
+    }
+    Ok(GoalCommand::Budget {
+        set: Some(overrides),
+    })
+}
+
+fn argument_free(
     arguments: &str,
-    subcommand: &'static str,
+    name: &'static str,
     command: GoalCommand,
 ) -> Result<GoalCommand, GoalCommandParseError> {
-    if arguments.is_empty() {
+    if arguments.trim().is_empty() {
         Ok(command)
     } else {
-        Err(GoalCommandParseError::UnexpectedArguments(subcommand))
+        Err(GoalCommandParseError::UnexpectedArguments(name))
     }
 }
 
-fn parse_resume(arguments: &str) -> Result<GoalCommand, GoalCommandParseError> {
-    if arguments.is_empty() {
-        Ok(GoalCommand::Resume { note: None })
-    } else {
-        parse_bounded_text(arguments).map(|note| GoalCommand::Resume { note: Some(note) })
+fn parse_overrides(flags: &str) -> Result<GoalBudgetOverrides, GoalCommandParseError> {
+    let mut result = GoalBudgetOverrides {
+        token_limit: None,
+        cost_limit_usd: None,
+    };
+    let mut words = flags.split_whitespace();
+    while let Some(flag) = words.next() {
+        let value = words.next().ok_or_else(|| match flag {
+            "--tokens" => GoalCommandParseError::MissingFlagValue("--tokens"),
+            "--cost-usd" => GoalCommandParseError::MissingFlagValue("--cost-usd"),
+            _ => GoalCommandParseError::UnknownFlag(flag.to_string()),
+        })?;
+        match flag {
+            "--tokens" => {
+                if result.token_limit.is_some() {
+                    return Err(GoalCommandParseError::DuplicateFlag("--tokens"));
+                }
+                result.token_limit =
+                    Some(value.parse().map_err(|_| {
+                        GoalCommandParseError::InvalidTokenLimit(value.to_string())
+                    })?);
+            }
+            "--cost-usd" => {
+                if result.cost_limit_usd.is_some() {
+                    return Err(GoalCommandParseError::DuplicateFlag("--cost-usd"));
+                }
+                let value: f64 = value
+                    .parse()
+                    .map_err(|_| GoalCommandParseError::InvalidCostLimit(value.to_string()))?;
+                if !value.is_finite() || value < 0.0 {
+                    return Err(GoalCommandParseError::InvalidCostLimit(value.to_string()));
+                }
+                result.cost_limit_usd = Some(value);
+            }
+            _ => return Err(GoalCommandParseError::UnknownFlag(flag.to_string())),
+        }
     }
-}
-
-fn parse_bounded_text(arguments: &str) -> Result<String, GoalCommandParseError> {
-    if arguments.chars().count() > MAX_GOAL_TEXT_CHARS {
-        Err(GoalCommandParseError::TextTooLong {
-            max: MAX_GOAL_TEXT_CHARS,
-        })
-    } else {
-        Ok(arguments.to_string())
-    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GoalCommand, GoalCommandParseError, MAX_GOAL_TEXT_CHARS, parse_goal_command};
+    use super::*;
     use crate::CommandSurface;
 
     #[test]
-    fn parses_start_objective_after_catalogue_resolution() {
+    fn parses_fixed_v1_grammar() {
+        let surface = CommandSurface::Channel;
         assert_eq!(
-            parse_goal_command(
-                "/goal start keep the interior  spaces",
-                CommandSurface::Channel
-            ),
+            parse_goal_command("/goal start -- objective", surface),
             Ok(GoalCommand::Start {
-                objective: "keep the interior  spaces".to_string(),
+                overrides: GoalBudgetOverrides {
+                    token_limit: None,
+                    cost_limit_usd: None
+                },
+                objective: "objective".into()
             })
         );
-    }
-
-    #[test]
-    fn parser_inherits_catalogue_token_normalization() {
         assert_eq!(
             parse_goal_command(
-                " /GOAL@zeroclaw_bot START Preserve Case ",
-                CommandSurface::Channel
+                "/goal start --tokens 0 --cost-usd 1.5 -- objective",
+                surface
             ),
             Ok(GoalCommand::Start {
-                objective: "Preserve Case".to_string(),
+                overrides: GoalBudgetOverrides {
+                    token_limit: Some(0),
+                    cost_limit_usd: Some(1.5)
+                },
+                objective: "objective".into()
             })
         );
-    }
-
-    #[test]
-    fn parse_rejects_goal_on_tui_and_web_surfaces() {
-        for surface in [CommandSurface::Tui, CommandSurface::Web] {
-            assert_eq!(
-                parse_goal_command("/goal status", surface),
-                Err(GoalCommandParseError::NotGoalCommand)
-            );
+        assert_eq!(
+            parse_goal_command("/goal budget set --tokens 9", surface),
+            Ok(GoalCommand::Budget {
+                set: Some(GoalBudgetOverrides {
+                    token_limit: Some(9),
+                    cost_limit_usd: None
+                })
+            })
+        );
+        for command in [
+            "/goal status",
+            "/goal budget",
+            "/goal pause",
+            "/goal resume",
+            "/goal cancel",
+            "/goal help",
+        ] {
+            assert!(parse_goal_command(command, surface).is_ok(), "{command}");
         }
     }
 
     #[test]
-    fn parser_rejects_non_goal_and_missing_subcommand_inputs() {
-        assert_eq!(
-            parse_goal_command("", CommandSurface::Channel),
-            Err(GoalCommandParseError::NotGoalCommand)
-        );
-        assert_eq!(
-            parse_goal_command("/help", CommandSurface::Channel),
-            Err(GoalCommandParseError::NotGoalCommand)
-        );
-        assert_eq!(
-            parse_goal_command("/goalx start x", CommandSurface::Channel),
-            Err(GoalCommandParseError::NotGoalCommand)
-        );
-        assert_eq!(
-            parse_goal_command("/goal", CommandSurface::Channel),
-            Err(GoalCommandParseError::MissingSubcommand)
-        );
-    }
-
-    #[test]
-    fn parser_accepts_all_advertised_subcommands() {
+    fn rejects_retired_or_ambiguous_syntax() {
         let surface = CommandSurface::Channel;
-        assert_eq!(
-            parse_goal_command("/goal status", surface),
-            Ok(GoalCommand::Status)
-        );
-        assert_eq!(
-            parse_goal_command("/goal budget", surface),
-            Ok(GoalCommand::Budget)
-        );
-        assert_eq!(
-            parse_goal_command("/goal pause", surface),
-            Ok(GoalCommand::Pause)
-        );
-        assert_eq!(
-            parse_goal_command("/goal resume", surface),
-            Ok(GoalCommand::Resume { note: None })
-        );
-        assert_eq!(
-            parse_goal_command("/goal resume maintenance complete", surface),
-            Ok(GoalCommand::Resume {
-                note: Some("maintenance complete".to_string()),
-            })
-        );
-        assert_eq!(
-            parse_goal_command("/goal cancel", surface),
-            Ok(GoalCommand::Cancel)
-        );
-        assert_eq!(
-            parse_goal_command("/goal help", surface),
-            Ok(GoalCommand::Help)
-        );
-        assert_eq!(
-            parse_goal_command("/goal objective revised target", surface),
-            Ok(GoalCommand::Objective {
-                objective: "revised target".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn parser_rejects_missing_or_unknown_objective_subcommands() {
-        let surface = CommandSurface::Channel;
-        assert_eq!(
-            parse_goal_command("/goal start", surface),
-            Err(GoalCommandParseError::MissingObjective("start"))
-        );
-        assert_eq!(
-            parse_goal_command("/goal objective", surface),
-            Err(GoalCommandParseError::MissingObjective("objective"))
-        );
-        assert_eq!(
-            parse_goal_command("/goal retry", surface),
-            Err(GoalCommandParseError::UnknownSubcommand(
-                "retry".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn pause_rejects_a_trailing_reason() {
-        assert_eq!(
-            parse_goal_command("/goal pause for maintenance", CommandSurface::Channel),
-            Err(GoalCommandParseError::UnexpectedArguments("pause"))
-        );
-    }
-
-    #[test]
-    fn argument_free_subcommands_reject_trailing_text() {
-        for command in ["status", "budget", "cancel", "help"] {
-            assert_eq!(
-                parse_goal_command(
-                    &format!("/goal {command} unexpected"),
-                    CommandSurface::Channel
-                ),
-                Err(GoalCommandParseError::UnexpectedArguments(command))
-            );
+        for command in [
+            "/goal start objective",
+            "/goal start --",
+            "/goal objective change",
+            "/goal resume note",
+            "/goal start --unlimited -- x",
+            "/goal start --tokens=1 -- x",
+            "/goal start --tokens 1 --tokens 2 -- x",
+            "/goal budget set",
+            "/goal budget set --cost-usd -1",
+        ] {
+            assert!(parse_goal_command(command, surface).is_err(), "{command}");
         }
-    }
-
-    #[test]
-    fn objective_length_bound_counts_characters_not_bytes() {
-        let accepted = "界".repeat(MAX_GOAL_TEXT_CHARS);
-        let rejected = "界".repeat(MAX_GOAL_TEXT_CHARS + 1);
-
-        assert_eq!(
-            parse_goal_command(&format!("/goal start {accepted}"), CommandSurface::Channel),
-            Ok(GoalCommand::Start {
-                objective: accepted
-            })
-        );
-        assert_eq!(
-            parse_goal_command(&format!("/goal start {rejected}"), CommandSurface::Channel),
-            Err(GoalCommandParseError::TextTooLong {
-                max: MAX_GOAL_TEXT_CHARS,
-            })
-        );
-    }
-
-    #[test]
-    fn multiline_objective_preserves_interior_newlines_verbatim() {
-        assert_eq!(
-            parse_goal_command(
-                "/goal start first line\nsecond line",
-                CommandSurface::Channel
-            ),
-            Ok(GoalCommand::Start {
-                objective: "first line\nsecond line".to_string(),
-            })
-        );
     }
 }

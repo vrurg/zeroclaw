@@ -22434,6 +22434,9 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
+        self.goal
+            .validate()
+            .map_err(|error| anyhow::anyhow!("invalid goal configuration: {error:?}"))?;
 
         // Skills — extra registries
         {

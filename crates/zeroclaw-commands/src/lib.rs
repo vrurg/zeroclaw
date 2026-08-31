@@ -38,8 +38,6 @@ pub enum BuiltinCommandId {
     Config,
     /// Show or change model thinking/reasoning effort.
     Thinking,
-    /// Manage durable goal-mode work.
-    Goal,
 }
 
 impl BuiltinCommandId {
@@ -53,7 +51,6 @@ impl BuiltinCommandId {
             Self::Models => "models",
             Self::Config => "config",
             Self::Thinking => "thinking",
-            Self::Goal => "goal",
         }
     }
 }
@@ -66,8 +63,6 @@ pub enum CommandExecution {
     ClientLocal,
     /// The channel/runtime command handler owns the command.
     RuntimeCommand,
-    /// The durable goal controller/admission path owns the command.
-    GoalAdmission,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -191,15 +186,6 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         description_key: "command-thinking-description",
         surfaces: CHANNEL_ONLY,
         execution: CommandExecution::RuntimeCommand,
-    },
-    CommandSpec {
-        id: BuiltinCommandId::Goal,
-        name: "goal",
-        aliases: &[],
-        usage: "/goal <start <objective>|objective <objective>|status|budget|pause|resume [reason]|cancel|help> ...",
-        description_key: "command-goal-description",
-        surfaces: CHANNEL_ONLY,
-        execution: CommandExecution::GoalAdmission,
     },
 ];
 
@@ -332,21 +318,5 @@ mod tests {
         assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
-    }
-
-    #[test]
-    fn goal_is_advertised_only_where_admission_is_implemented() {
-        assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
-        assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
-        let goal = command_by_name("/goal").expect("goal command should be registered");
-        assert!(
-            goal.usage.contains("start <objective>"),
-            "goal command usage must advertise the required start objective"
-        );
-        assert!(
-            goal.usage.contains("objective <objective>"),
-            "goal command usage must advertise objective amendment syntax"
-        );
     }
 }
