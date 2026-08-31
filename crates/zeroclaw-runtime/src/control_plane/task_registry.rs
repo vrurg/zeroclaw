@@ -104,6 +104,12 @@ pub struct TaskRecord {
     /// `originator_route` and `originator_chain`, never this field.
     #[serde(default)]
     pub principal_id: Option<String>,
+    /// Canonical session binding for Goal tasks. Legacy and unrelated tasks may omit it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Durable executor fence for session-bound Goal tasks.
+    #[serde(default)]
+    pub execution_epoch: i64,
     /// Task registration/start timestamp in RFC3339 form.
     pub started_at: String,
     /// Terminal transition timestamp in RFC3339 form.
@@ -142,7 +148,8 @@ pub struct TerminalSettlementIntent {
 /// delegate/subagent/peer producers all converge here (CROSS-CUTTING epic-A D1).
 #[async_trait::async_trait]
 pub trait TaskRegistry: Send + Sync {
-    /// Register a new unit of work. Idempotent on `rec.id`.
+    /// Register a new non-Goal unit of work. Idempotent on `rec.id`; Goal
+    /// admission must use the session-bound [`super::GoalTaskRegistry`] API.
     async fn create(&self, rec: TaskRecord) -> anyhow::Result<()>;
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;

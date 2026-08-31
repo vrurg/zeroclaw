@@ -2772,8 +2772,10 @@ impl DelegateTool {
                 delivered: false,
                 idem_key: None,
                 // Forensic record of the launching tool-loop session; the
-                // owner check above consults aliases only, never this.
+                // owner check above consults the trusted caller chain, never this.
                 principal_id: current_tool_loop_session_key(),
+                session_id: None,
+                execution_epoch: 0,
                 started_at: started_at.clone(),
                 finished_at: None,
             })
