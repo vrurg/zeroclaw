@@ -194,10 +194,6 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
     if version < 8 {
         for (column, sql) in [
             (
-                "success_criteria",
-                "ALTER TABLE goal_tasks ADD COLUMN success_criteria TEXT NOT NULL DEFAULT ''",
-            ),
-            (
                 "pending_call_id",
                 "ALTER TABLE goal_tasks ADD COLUMN pending_call_id TEXT",
             ),
@@ -228,18 +224,18 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
             "UPDATE tasks SET status = 'failed',
                     error = COALESCE(error, CASE
                         WHEN session_id IS NULL THEN 'legacy_goal_missing_session'
-                        ELSE 'legacy_goal_missing_success_criteria'
+                        ELSE 'legacy_goal_missing_objective'
                     END),
                     finished_at = COALESCE(finished_at, ?1)
              WHERE kind = 'goal' AND status IN ('running', 'paused')
                AND (session_id IS NULL OR NOT EXISTS (
                    SELECT 1 FROM goal_tasks
                     WHERE goal_tasks.task_id = tasks.id
-                      AND length(trim(goal_tasks.success_criteria)) > 0
+                      AND length(trim(goal_tasks.objective)) > 0
                ))",
             params![chrono::Utc::now().to_rfc3339()],
         )
-        .context("reconcile legacy goals without V1 identity or criteria")?;
+        .context("reconcile legacy goals without V1 identity or objective")?;
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_tasks_active_goal_context;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_current_session
@@ -294,6 +290,16 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         )
         .context("apply control-plane schema v8")?;
     }
+    // New and provisional v8 databases both need the immutable-objective
+    // guard. Existing provisional `success_criteria` columns remain ignored.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_objective_immutable
+             BEFORE UPDATE OF objective ON goal_tasks
+             FOR EACH ROW
+             WHEN NEW.objective IS NOT OLD.objective
+             BEGIN SELECT RAISE(ABORT, 'goal objective is immutable'); END;",
+    )
+    .context("apply immutable goal objective guard")?;
     Ok(())
 }
 
@@ -566,7 +572,6 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
         pause_reason,
         pause_description: row.get("pause_description")?,
         blockers: blockers_from_db(row.get("blockers_json")?)?,
-        success_criteria: row.get("success_criteria")?,
         pending_call_id: row.get("pending_call_id")?,
         pending_call_epoch: row.get("pending_call_epoch")?,
         accounting_state: match row.get::<_, String>("accounting_state")?.as_str() {
@@ -620,9 +625,9 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
     conn.execute(
         "INSERT INTO goal_tasks
             (task_id, objective, effective_token_limit, effective_cost_limit_usd,
-             pause_reason, pause_description, blockers_json, success_criteria,
+             pause_reason, pause_description, blockers_json,
              pending_call_id, pending_call_epoch, accounting_state, tool_phase)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(task_id) DO NOTHING",
         params![
             rec.task_id,
@@ -632,7 +637,6 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
             pause_reason,
             rec.pause_description,
             blockers_json,
-            rec.success_criteria,
             rec.pending_call_id,
             rec.pending_call_epoch,
             accounting_state_to_db(rec.accounting_state),
@@ -794,7 +798,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
-                    pause_reason, pause_description, blockers_json, success_criteria,
+                    pause_reason, pause_description, blockers_json,
                     pending_call_id, pending_call_epoch, accounting_state, tool_phase
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
@@ -802,23 +806,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
         )
         .optional()
         .context("get goal task")
-    }
-
-    async fn update_goal_objective(&self, task_id: &str, objective: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        reject_session_goal_legacy_mutation(&conn, task_id)?;
-        let updated = conn
-            .execute(
-                "UPDATE goal_tasks
-                    SET objective = ?1
-                  WHERE task_id = ?2",
-                params![objective, task_id],
-            )
-            .context("update goal objective")?;
-        if updated == 0 {
-            anyhow::bail!("goal task {task_id} has no goal extension row");
-        }
-        Ok(())
     }
 
     async fn update_goal_limits(
@@ -942,8 +929,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if task.status != TaskStatus::Running || task.finished_at.is_some() {
             anyhow::bail!("new session goals must start running without terminal metadata");
         }
-        if goal.objective.trim().is_empty() || goal.success_criteria.trim().is_empty() {
-            anyhow::bail!("new session goals require objective and success criteria");
+        if goal.objective.trim().is_empty() {
+            anyhow::bail!("new session goals require an objective");
         }
         if goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
@@ -1592,12 +1579,6 @@ mod tests {
             limited.objective, "ship goal mode",
             "budget updates must not duplicate or rewrite objective state"
         );
-
-        s.update_goal_objective("goal-1", "ship amended goal mode")
-            .await
-            .unwrap();
-        let amended = s.get_goal_task("goal-1").await.unwrap().unwrap();
-        assert_eq!(amended.objective, "ship amended goal mode");
 
         s.update_goal_pause("goal-1", None).await.unwrap();
         let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();

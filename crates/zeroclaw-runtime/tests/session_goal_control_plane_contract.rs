@@ -49,7 +49,6 @@ fn session_goal_extension(task_id: &str) -> GoalTaskRecord {
     GoalTaskRecord {
         task_id: task_id.into(),
         objective: "produce a verified result".into(),
-        success_criteria: "the verifier accepts the exact candidate".into(),
         ..GoalTaskRecord::default()
     }
 }
@@ -108,6 +107,94 @@ fn independent_connections_admit_exactly_one_current_goal_for_a_session() {
     assert_eq!(
         duplicate_error.sqlite_error_code(),
         Some(ErrorCode::ConstraintViolation)
+    );
+}
+
+#[test]
+fn objective_is_immutable_even_to_raw_sql() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+
+    let connection = Connection::open(directory.path().join("control_plane.db"))
+        .expect("open verification connection");
+    let success_criteria_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('goal_tasks') WHERE name = 'success_criteria'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect fresh Goal schema");
+    assert_eq!(
+        success_criteria_columns, 0,
+        "fresh schemas retain only the canonical objective"
+    );
+    insert_current_goal(&connection, "goal-one", "session-one")
+        .expect("insert session-bound Goal task");
+    connection
+        .execute(
+            "INSERT INTO goal_tasks (task_id, objective) VALUES (?1, ?2)",
+            params!["goal-one", "finish the existing task"],
+        )
+        .expect("insert Goal control state");
+
+    let error = connection
+        .execute(
+            "UPDATE goal_tasks SET objective = ?1 WHERE task_id = ?2",
+            params!["a different stopping criterion", "goal-one"],
+        )
+        .expect_err("direct SQLite cannot rewrite an admitted Goal objective");
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
+
+    let objective: String = connection
+        .query_row(
+            "SELECT objective FROM goal_tasks WHERE task_id = ?1",
+            params!["goal-one"],
+            |row| row.get(0),
+        )
+        .expect("read persisted objective");
+    assert_eq!(objective, "finish the existing task");
+}
+
+#[tokio::test]
+async fn provisional_v8_success_criteria_is_ignored() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let database = directory.path().join("control_plane.db");
+    let connection = Connection::open(&database).expect("open provisional v8 database");
+    connection
+        .execute_batch(
+            "ALTER TABLE goal_tasks
+                 ADD COLUMN success_criteria TEXT NOT NULL DEFAULT '';
+             UPDATE goal_tasks
+                SET success_criteria = 'ignored legacy criterion';",
+        )
+        .expect("add provisional local v8 column");
+    drop(connection);
+
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("provisional", "provisional-session"),
+                session_goal_extension("provisional"),
+            )
+            .await
+            .expect("create Goal through corrected storage model"),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let reopened = SqliteTaskStore::new(directory.path()).expect("reopen provisional v8 database");
+    let goal = reopened
+        .get_goal_task("provisional")
+        .await
+        .expect("read provisional v8 Goal");
+    assert_eq!(
+        goal.expect("Goal control state remains readable").objective,
+        "produce a verified result",
+        "the old column is ignored rather than becoming a second model field"
     );
 }
 
@@ -626,13 +713,17 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
             "DROP TRIGGER trg_goal_tasks_require_session_insert;
              DROP TRIGGER trg_goal_tasks_require_session_update;
              INSERT INTO tasks (
-                 id, kind, agent, status, owner_pid, owner_boot_id, execution_epoch, started_at
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
              ) VALUES
-                 ('legacy-running', 'goal', 'main', 'running', 1, 'boot-old', 0, 'now'),
-                 ('legacy-completed', 'goal', 'main', 'completed', 1, 'boot-old', 0, 'now');
+                 ('legacy-running', 'goal', 'main', 'running', 1, 'boot-old', NULL, 0, 'now'),
+                 ('legacy-completed', 'goal', 'main', 'completed', 1, 'boot-old', NULL, 0, 'now'),
+                 ('legacy-blank-objective', 'goal', 'main', 'running', 1, 'boot-old',
+                  'legacy-blank-session', 0, 'now');
              INSERT INTO goal_tasks (task_id, objective) VALUES
                  ('legacy-running', 'old goal'),
-                 ('legacy-completed', 'old terminal goal');
+                 ('legacy-completed', 'old terminal goal'),
+                 ('legacy-blank-objective', '');
              PRAGMA user_version = 7;",
         )
         .expect("write pre-v8 Goal fixtures");
@@ -657,6 +748,18 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
     assert_eq!(running.0, "failed");
     assert_eq!(running.1.as_deref(), Some("legacy_goal_missing_session"));
     assert!(running.2.is_none());
+    let blank_objective: (String, Option<String>) = verify
+        .query_row(
+            "SELECT status, error FROM tasks WHERE id = 'legacy-blank-objective'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read migrated blank-objective Goal");
+    assert_eq!(blank_objective.0, "failed");
+    assert_eq!(
+        blank_objective.1.as_deref(),
+        Some("legacy_goal_missing_objective")
+    );
     let terminal_status: String = verify
         .query_row(
             "SELECT status FROM tasks WHERE id = 'legacy-completed'",

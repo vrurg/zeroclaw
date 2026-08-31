@@ -30,9 +30,6 @@ pub struct GoalTaskRecord {
     /// goal-specific pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<GoalBlocker>,
-    /// Immutable verifier-facing success criteria declared at creation.
-    #[serde(default)]
-    pub success_criteria: String,
     /// Durable fence for one admitted logical provider operation.
     #[serde(default)]
     pub pending_call_id: Option<String>,
@@ -57,7 +54,6 @@ impl Default for GoalTaskRecord {
             pause_reason: None,
             pause_description: None,
             blockers: Vec::new(),
-            success_criteria: String::new(),
             pending_call_id: None,
             pending_call_epoch: None,
             accounting_state: GoalAccountingState::Complete,
@@ -313,8 +309,6 @@ pub trait GoalTaskRegistry: Send + Sync {
     ) -> anyhow::Result<Option<String>>;
 
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>>;
-
-    async fn update_goal_objective(&self, task_id: &str, objective: &str) -> anyhow::Result<()>;
 
     /// Replace the persisted effective budget limits for a goal.
     /// These are creation/update-time policy limits only. Consumed and
