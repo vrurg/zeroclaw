@@ -1,6 +1,6 @@
 //! SQLite-backed [`GoalTaskRegistry`] implementation.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
@@ -993,24 +993,57 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let blockers = blockers_to_db(&pause.blockers)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal pause")?;
+        let tool_phase = tx
+            .query_row(
+                "SELECT tool_phase FROM goal_tasks WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(tool_phase) = tool_phase else {
+            return transition_failure(&tx, task_id, session_id);
+        };
+        let tool_phase_in_flight = match tool_phase.as_str() {
+            "clean" => false,
+            "in_flight" => true,
+            _ => bail!("invalid persisted Goal tool phase for task {task_id}"),
+        };
+        let (status, error, finished_at) = if tool_phase_in_flight {
+            (
+                "failed",
+                Some("tool_phase_incomplete"),
+                Some(chrono::Utc::now().to_rfc3339()),
+            )
+        } else {
+            ("paused", None, None)
+        };
         let updated = tx.execute(
             "UPDATE tasks
-                SET status = 'paused', execution_epoch = execution_epoch + 1
+                SET status = ?4, error = ?5, finished_at = ?6,
+                    execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                 AND status = 'running' AND execution_epoch = ?3
                 AND execution_epoch < 9223372036854775807",
-            params![task_id, session_id, expected_epoch],
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                status,
+                error,
+                finished_at
+            ],
         )?;
         if updated == 0 {
             return transition_failure(&tx, task_id, session_id);
         }
-        tx.execute(
-            "UPDATE goal_tasks
-                SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3,
-                    tool_phase = 'clean'
-              WHERE task_id = ?4",
-            params![reason, pause.description, blockers, task_id],
-        )?;
+        if !tool_phase_in_flight {
+            tx.execute(
+                "UPDATE goal_tasks
+                    SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
+                  WHERE task_id = ?4",
+                params![reason, pause.description, blockers, task_id],
+            )?;
+        }
         tx.commit().context("commit guarded goal pause")?;
         Ok(GoalTransitionResult::Applied)
     }
