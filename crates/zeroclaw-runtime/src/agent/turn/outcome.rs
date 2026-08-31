@@ -179,11 +179,17 @@ impl std::error::Error for StreamTerminalCompletion {
 #[derive(Debug)]
 pub(crate) struct StreamPreExecutedToolsWithoutFinalResponse {
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
-    /// A generic provider stream failure can carry a typed Reliable cause. Keep
-    /// it through the no-replay boundary so delivery retains the established
-    /// provider-specific error category instead of degrading to a generic
-    /// provider-tools message.
-    pub(crate) cause: Option<zeroclaw_providers::ReliableProviderTerminalFailure>,
+    /// Preserve a classified terminal cause through the no-replay boundary.
+    /// Provider-executed work still owns the recovery decision, but delivery
+    /// must not collapse an output limit or invalid terminal state into a
+    /// generic provider-tools message.
+    pub(crate) cause: Option<StreamPreExecutedToolsCause>,
+}
+
+#[derive(Debug)]
+pub(crate) enum StreamPreExecutedToolsCause {
+    Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
+    Reliable(zeroclaw_providers::ReliableProviderTerminalFailure),
 }
 
 impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
@@ -194,9 +200,10 @@ impl std::fmt::Display for StreamPreExecutedToolsWithoutFinalResponse {
 
 impl std::error::Error for StreamPreExecutedToolsWithoutFinalResponse {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cause
-            .as_ref()
-            .map(|cause| cause as &(dyn std::error::Error + 'static))
+        match self.cause.as_ref()? {
+            StreamPreExecutedToolsCause::Terminal(cause) => Some(cause),
+            StreamPreExecutedToolsCause::Reliable(cause) => Some(cause),
+        }
     }
 }
 
@@ -850,6 +857,31 @@ mod tests {
                 }),
             ),
         ));
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The provider reached its output token limit before completing the response."
+                    .to_string()
+            )
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<TerminalCompletionFailure>()
+                .is_some_and(|failure| failure.reason == TerminalCompletionError::OutputTokenLimit)
+        }));
+    }
+
+    #[test]
+    fn provider_tool_no_replay_outcome_keeps_typed_terminal_delivery_cause() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let error = anyhow::Error::new(StreamPreExecutedToolsWithoutFinalResponse {
+            usage: None,
+            cause: Some(StreamPreExecutedToolsCause::Terminal(
+                TerminalCompletionFailure::from(TerminalCompletionError::OutputTokenLimit),
+            )),
+        });
 
         assert_eq!(
             terminal_completion_error_message(&error, None),

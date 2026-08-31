@@ -2572,6 +2572,15 @@ impl AnthropicModelProvider {
                             .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                         continue;
                     }
+                    if is_open_provider_tool && delta_type != Some("input_json_delta") {
+                        // Provider-owned tool input is not client-executable,
+                        // but every open block still has a protocol-defined
+                        // delta envelope. Do not let malformed provider work
+                        // reach a clean Final response.
+                        terminal_completion_error
+                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                        continue;
+                    }
 
                     if let (Some(delta), Some(delta_type)) = (delta, delta_type) {
                         match delta_type {
@@ -2681,14 +2690,27 @@ impl AnthropicModelProvider {
                         && !content_block_index
                             .is_some_and(|index| invalid_tool_block_indices.remove(&index))
                     {
-                        let _ = tx
-                            .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
-                                id: state.id,
-                                name: state.name,
-                                arguments: state.input_json,
-                                extra_content: None,
-                            })))
-                            .await;
+                        // Incremental wire JSON becomes executable only after
+                        // it is complete and object-shaped. The runtime's
+                        // legacy `{}` fallback is not a valid recovery for a
+                        // malformed native tool request.
+                        if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                            &state.input_json,
+                        )
+                        .is_ok()
+                        {
+                            let _ = tx
+                                .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                    id: state.id,
+                                    name: state.name,
+                                    arguments: state.input_json,
+                                    extra_content: None,
+                                })))
+                                .await;
+                        } else {
+                            terminal_completion_error
+                                .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                        }
                     }
                 }
                 "message_delta" => {
@@ -2729,6 +2751,15 @@ impl AnthropicModelProvider {
                             })),
                             "stream: malformed message_delta envelope; stream remains non-final"
                         );
+                    } else if stop_reason_value.is_none() {
+                        // Anthropic uses an explicit null when no terminal
+                        // reason is observed. A missing key is malformed and
+                        // must not reuse an earlier clean reason at stop.
+                        terminal_completion_error
+                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                        if last_stop_reason.is_none() {
+                            last_stop_reason = Some("missing_stop_reason".to_string());
+                        }
                     } else if let Some(stop_reason) = stop_reason {
                         if let Some(first_stop_reason) = last_stop_reason.as_deref() {
                             if first_stop_reason != stop_reason {
@@ -4507,6 +4538,9 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
 event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"search"}}
 
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}
+
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
 
@@ -5287,11 +5321,11 @@ data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"1\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"value\\\":1\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: content_block_delta\n\
-data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"2\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"2}\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: message_delta\n\
@@ -5318,7 +5352,141 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(calls.len(), 1, "only the matching tool stop emits a call");
         assert_eq!(calls[0].id, "tool-0");
         assert_eq!(calls[0].name, "lookup");
-        assert_eq!(calls[0].arguments, "12");
+        assert_eq!(calls[0].arguments, r#"{"value":12}"#);
+    }
+
+    #[tokio::test]
+    async fn incomplete_accumulated_tool_json_is_not_executable_or_final() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-0\",\"name\":\"lookup\",\"input\":{}}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut tool_calls = 0;
+        let mut final_count = 0;
+        let mut failures = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::ToolCall(_)) => tool_calls += 1,
+                Ok(StreamEvent::Final) => final_count += 1,
+                Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(tool_calls, 0, "incomplete JSON must not become a tool call");
+        assert_eq!(final_count, 0, "incomplete JSON must not emit Final");
+        assert_eq!(failures.len(), 1, "one typed failure must be emitted");
+        assert_eq!(
+            failures[0].reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_message_delta_stop_reason_is_not_a_usage_only_observation() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut final_count = 0;
+        let mut failures = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => final_count += 1,
+                Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(final_count, 0, "missing stop_reason must not emit Final");
+        assert_eq!(failures.len(), 1, "one typed failure must be emitted");
+        assert_eq!(
+            failures[0].reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            failures[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(5),
+            "latest cumulative usage must survive malformed terminal framing"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_provider_tool_delta_never_emits_final() {
+        use std::io::Cursor;
+
+        for provider_tool in ["server_tool_use", "mcp_tool_use"] {
+            let bytes = format!(
+                "event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{provider_tool}\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+            let mut final_count = 0;
+            let mut failures = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_count += 1,
+                    Err(StreamError::TerminalCompletion(failure)) => failures.push(failure),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+
+            assert_eq!(
+                final_count, 0,
+                "{provider_tool} malformed delta must not emit Final"
+            );
+            assert_eq!(
+                failures.len(),
+                1,
+                "{provider_tool} must emit one typed failure"
+            );
+            assert_eq!(
+                failures[0].reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+        }
     }
 
     #[tokio::test]

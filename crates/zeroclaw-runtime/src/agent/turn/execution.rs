@@ -72,6 +72,7 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         } = request;
+        let text_only = tools.is_none();
         let sanitized = multimodal::sanitize_audio_markers(messages);
         let request = ChatRequest {
             messages: &sanitized,
@@ -87,7 +88,12 @@ impl ResolvedModelAccess<'_> {
                 dispatcher.chat(request, self.model, self.temperature),
             ))
             .await;
-        if result.is_ok() {
+        if matches!(
+            result.as_ref(),
+            Ok(response)
+                if !response.is_semantically_empty_terminal()
+                    && (!text_only || response.tool_calls.is_empty())
+        ) {
             scope.mark_logical_success();
         }
         let accounting = scope.take();
@@ -108,6 +114,10 @@ impl ResolvedModelAccess<'_> {
                 if response.is_semantically_empty_terminal() {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+                }
+                if text_only && !response.tool_calls.is_empty() {
+                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    anyhow::bail!("text-only model query returned unexpected tool calls");
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 crate::agent::cost::settle_provider_attempts(
@@ -602,7 +612,7 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
-    async fn run_model_query_keeps_direct_tool_only_response_valid() {
+    async fn run_model_query_rejects_unexpected_tool_calls_before_accepted_accounting() {
         let provider = DirectResponseProvider {
             response: ChatResponse {
                 text: None,
@@ -624,7 +634,7 @@ mod run_model_query_tests {
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
 
-        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 direct_access(&provider)
                     .run_model_query(ChatRequest {
@@ -635,12 +645,12 @@ mod run_model_query_tests {
                     .await
             })
             .await
-            .expect("a direct tool-only response remains valid");
+            .expect_err("a text-only query must reject unexpected tool calls");
 
-        assert!(response.has_tool_calls());
+        assert!(error.to_string().contains("unexpected tool calls"));
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
-        assert_eq!(recorded.last_input_tokens, 80);
+        assert_eq!(recorded.last_input_tokens, 0);
     }
 }
