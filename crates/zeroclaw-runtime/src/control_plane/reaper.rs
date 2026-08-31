@@ -211,7 +211,6 @@ mod tests {
         let goal = GoalTaskRecord {
             task_id: "goal".into(),
             objective: "objective".into(),
-            success_criteria: "criteria".into(),
             ..GoalTaskRecord::default()
         };
         store
