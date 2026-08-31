@@ -9,6 +9,7 @@ pub mod cli_input;
 /// Locale table rendered from repo-root `locales.toml` by
 /// `cargo generate installers runtime-locales`. Generated, not hand-edited.
 mod generated_locales;
+pub mod goal_mode;
 pub mod identity;
 pub mod migration;
 pub mod util;
