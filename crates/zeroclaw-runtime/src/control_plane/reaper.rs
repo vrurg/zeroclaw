@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::task_registry::{TaskRegistry, TaskStatus};
+use super::task_registry::{TaskKind, TaskRegistry, TaskStatus};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -81,6 +81,14 @@ pub async fn sweep(
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     for rec in store.list_running().await? {
+        // Goal execution has no GM-01 in-process supervisor yet. Its guarded
+        // controller owns restart, deadline, and cancellation in later stages;
+        // generic TaskRegistry mutations are intentionally fenced meanwhile.
+        // Do not let a Goal abort this shared sweep before unrelated tasks are
+        // reclaimed.
+        if rec.kind == TaskKind::Goal {
+            continue;
+        }
         if rec.owner_boot_id != boot_id {
             // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
             let _ = store.reconcile_lost(&rec.id, boot_id).await?;
@@ -105,8 +113,12 @@ pub async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::task_registry::{TaskKind, TaskRecord};
-    use crate::control_plane::task_store_sqlite::SqliteTaskStore;
+    use crate::control_plane::{
+        GoalTaskRecord, GoalTaskRegistry,
+        task_registry::{TaskKind, TaskRecord},
+        task_store_sqlite::SqliteTaskStore,
+    };
+    use rusqlite::Connection;
 
     fn rec(id: &str, boot: &str, pid: u32, beat_secs_ago: Option<i64>) -> TaskRecord {
         let beat = beat_secs_ago.map(|s| (Utc::now() - chrono::Duration::seconds(s)).to_rfc3339());
@@ -124,6 +136,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         }
@@ -167,6 +181,56 @@ mod tests {
         );
         assert_eq!(
             s.get("fresh").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_session_bound_goals_to_the_goal_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let task = TaskRecord {
+            id: "goal".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Running,
+            owner_pid: std::process::id(),
+            owner_boot_id: "boot-NEW".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("session".into()),
+            execution_epoch: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: "goal".into(),
+            objective: "objective".into(),
+            success_criteria: "criteria".into(),
+            ..GoalTaskRecord::default()
+        };
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+
+        let db = dir.path().join("control_plane.db");
+        Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET heartbeat_at = ?1 WHERE id = 'goal'",
+                [(Utc::now() - chrono::Duration::seconds(99_999)).to_rfc3339()],
+            )
+            .unwrap();
+
+        sweep(&store, "boot-NEW", 600).await.unwrap();
+        assert_eq!(
+            store.get("goal").await.unwrap().unwrap().status,
             TaskStatus::Running
         );
     }
