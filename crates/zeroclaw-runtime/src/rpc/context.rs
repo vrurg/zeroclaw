@@ -264,6 +264,7 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions,
             session_backend: None,
             memory: None,
