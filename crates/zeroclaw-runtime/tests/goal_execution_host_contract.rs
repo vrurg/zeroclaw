@@ -10,15 +10,101 @@ use zeroclaw_runtime::control_plane::{
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalResponse, GoalSessionBinding, GoalSessionDriver, GoalSessionKey, GoalSessionLease,
-    GoalSurface,
+    GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
     binding: GoalSessionBinding,
     binds: AtomicUsize,
     execution_acquires: AtomicUsize,
+}
+
+struct RecordingExecutionLease {
+    delivered: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for RecordingExecutionLease {
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(&mut self, turn: GoalParentTurn) -> anyhow::Result<String> {
+        Ok(format!("parent:{}", turn.objective))
+    }
+
+    async fn run_verifier(&mut self, turn: GoalVerifierTurn) -> anyhow::Result<String> {
+        Ok(format!("verifier:{}", turn.candidate))
+    }
+
+    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ExecutionDriver {
+    binding: GoalSessionBinding,
+    execution_acquires: AtomicUsize,
+    delivered: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl GoalSessionDriver for ExecutionDriver {
+    fn surface(&self) -> GoalSurface {
+        self.binding.surface()
+    }
+
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        self.execution_acquires.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(RecordingExecutionLease {
+            delivered: self.delivered.clone(),
+        }))
+    }
+}
+
+struct WrongBindingDriver {
+    advertised: GoalSessionKey,
+    returned_binding: GoalSessionBinding,
+    binds: AtomicUsize,
+}
+
+#[async_trait]
+impl GoalSessionDriver for WrongBindingDriver {
+    fn surface(&self) -> GoalSurface {
+        self.advertised.surface()
+    }
+
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.advertised
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        self.binds.fetch_add(1, Ordering::SeqCst);
+        Ok(GoalSessionLease::new(self.returned_binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        anyhow::bail!("wrong binding driver has no execution lease")
+    }
 }
 
 #[async_trait]
@@ -356,7 +442,7 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
 
 fn matrix_ingress() -> GoalIngressContext {
     GoalIngressContext::trusted(
-        GoalSessionKey::matrix("matrix_room:!room:example.org:@alice:example.org").unwrap(),
+        GoalSessionKey::matrix("matrix_room__room_example_org__alice_example_org").unwrap(),
         "main",
         "matrix:primary",
         GoalIngressPrincipal::Matrix {
@@ -374,6 +460,19 @@ fn zerocode_ingress(agent: &str) -> GoalIngressContext {
         GoalIngressPrincipal::ZeroCode {
             tui_id: "current-tui-connection".into(),
         },
+    )
+    .unwrap()
+}
+
+fn host_settings(enabled: bool) -> GoalHostSettings {
+    GoalHostSettings::new(
+        enabled,
+        zeroclaw_commands::goal::GoalBudgetLimits {
+            token_limit: None,
+            cost_limit_usd: None,
+        },
+        42,
+        "test-boot",
     )
     .unwrap()
 }
@@ -418,14 +517,13 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
-    let scope = zeroclaw_runtime::goal_mode::GoalExecutionScope {
-        task_id: "goal-1".into(),
-        session_id: "rpc_wrong-session".into(),
-        execution_epoch: 1,
-    };
+    let scope =
+        zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
+            .unwrap();
+    let settings = host_settings(true);
 
     let error = match GoalExecutionHost::new()
-        .acquire_execution(&ingress, driver.clone(), &scope)
+        .acquire_execution(&settings, &ingress, driver.clone(), &scope)
         .await
     {
         Ok(_) => panic!("mismatched scope must not acquire an execution lease"),
@@ -433,6 +531,116 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     };
 
     assert!(error.to_string().contains("does not match"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn execution_driver_key_mismatch_is_rejected_before_driver_acquisition() {
+    let ingress = matrix_ingress();
+    let other_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
+    let driver = Arc::new(RecordingDriver {
+        binding: GoalSessionBinding::new(other_key, "fresh-connection").unwrap(),
+        binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
+    });
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let settings = host_settings(true);
+
+    let error = match GoalExecutionHost::new()
+        .acquire_execution(&settings, &ingress, driver.clone(), &scope)
+        .await
+    {
+        Ok(_) => panic!("mismatched driver key must not acquire an execution lease"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("session key"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn driver_returning_a_different_binding_is_rejected_after_binding() {
+    let ingress = matrix_ingress();
+    let returned_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
+    let driver = Arc::new(WrongBindingDriver {
+        advertised: ingress.session_key().clone(),
+        returned_binding: GoalSessionBinding::new(returned_key, "fresh-connection").unwrap(),
+        binds: AtomicUsize::new(0),
+    });
+
+    let error = GoalExecutionHost::new()
+        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("binding does not match"));
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn matching_execution_scope_returns_a_serializing_session_lease() {
+    let ingress = matrix_ingress();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: delivered.clone(),
+    });
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let settings = host_settings(true);
+
+    let mut lease = GoalExecutionHost::new()
+        .acquire_execution(&settings, &ingress, driver.clone(), &scope)
+        .await
+        .unwrap();
+
+    assert!(lease.canonical_history().unwrap().is_empty());
+    assert_eq!(
+        lease
+            .run_parent_turn(GoalParentTurn {
+                objective: "finish the task".into(),
+                working_history: Vec::new(),
+            })
+            .await
+            .unwrap(),
+        "parent:finish the task"
+    );
+    assert_eq!(
+        lease
+            .run_verifier(GoalVerifierTurn {
+                objective: "finish the task".into(),
+                candidate: "candidate".into(),
+            })
+            .await
+            .unwrap(),
+        "verifier:candidate"
+    );
+    lease
+        .append_verified_candidate("candidate".into())
+        .await
+        .unwrap();
+
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let settings = host_settings(false);
+
+    let error = match GoalExecutionHost::new()
+        .acquire_execution(&settings, &ingress, driver.clone(), &scope)
+        .await
+    {
+        Ok(_) => panic!("disabled Goal Mode must not acquire an execution lease"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("disabled"));
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
 }
 
@@ -460,11 +668,25 @@ async fn exact_driver_binding_and_typed_command_are_preserved() {
 
 #[test]
 fn identical_raw_ids_from_matrix_and_zerocode_are_not_the_same_session() {
-    let matrix = GoalSessionKey::matrix("matrix:shared-id").unwrap();
+    let matrix = GoalSessionKey::matrix("matrix_shared-id").unwrap();
     let zerocode = GoalSessionKey::zero_code("shared-id").unwrap();
 
     assert_ne!(matrix, zerocode);
     assert_ne!(matrix.durable_id(), zerocode.durable_id());
+}
+
+#[test]
+fn matrix_history_key_must_already_use_the_canonical_session_form() {
+    let raw = "matrix_room:!room:example.org:@alice:example.org";
+
+    assert!(GoalSessionKey::matrix(raw).is_err());
+}
+
+#[test]
+fn execution_scope_rejects_blank_ids_and_nonpositive_epochs() {
+    assert!(GoalExecutionScope::new("", "matrix_session", 1).is_err());
+    assert!(GoalExecutionScope::new("goal-1", "", 1).is_err());
+    assert!(GoalExecutionScope::new("goal-1", "matrix_session", 0).is_err());
 }
 
 #[tokio::test]
