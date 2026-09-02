@@ -383,11 +383,27 @@ impl GoalSessionLease {
 ///
 /// This is intentionally non-cloneable: duplicating it could allow a stale
 /// authority proof to outlive the session transition it protects.
-#[derive(Debug)]
 pub struct GoalSubmission {
     ingress: GoalIngressContext,
     command: GoalCommand,
+    /// The exact driver validated alongside `ingress`. Future execution must
+    /// retain this object rather than resolving a new driver from route or
+    /// session text after the durable lifecycle transition.
+    driver: Arc<dyn GoalSessionDriver>,
     lease: GoalSessionLease,
+}
+
+impl std::fmt::Debug for GoalSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalSubmission")
+            .field("ingress", &self.ingress)
+            .field("command", &self.command)
+            .field("driver_surface", &self.driver.surface())
+            .field("driver_session_key", self.driver.session_key())
+            .field("lease", &self.lease)
+            .finish()
+    }
 }
 
 impl GoalSubmission {
@@ -401,6 +417,15 @@ impl GoalSubmission {
 
     pub fn binding(&self) -> &GoalSessionBinding {
         self.lease.binding()
+    }
+
+    /// Borrow the exact surface driver validated during admission.
+    ///
+    /// The caller must use this object for later foreground acquisition;
+    /// resolving another driver from route or session text would discard the
+    /// authority proof established by [`GoalExecutionHost::submit`].
+    pub fn driver(&self) -> &Arc<dyn GoalSessionDriver> {
+        &self.driver
     }
 }
 
@@ -437,6 +462,7 @@ impl GoalExecutionHost {
         Ok(GoalSubmission {
             ingress,
             command,
+            driver,
             lease,
         })
     }
@@ -609,6 +635,7 @@ impl GoalController {
         let GoalSubmission {
             ingress,
             command,
+            driver: _driver,
             lease,
         } = submission;
         // Keep the surface-owned lease through every guarded transition below.
