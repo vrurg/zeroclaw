@@ -41,6 +41,16 @@ pub enum GoalSessionKey {
 }
 
 impl GoalSessionKey {
+    /// Build a Matrix key from the adapter's existing canonical history key.
+    ///
+    /// Callers must pass the already-canonical Matrix key and must not
+    /// pre-sanitize it. This preserves a one-to-one binding to the session
+    /// identity produced by the Matrix history owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a blank or padded key, a key whose existing shared
+    /// sanitizer would change it, or a key outside the `matrix_` namespace.
     pub fn matrix(history_key: impl Into<String>) -> Result<Self> {
         let history_key = canonical_session_key("Matrix history key", history_key.into())?;
         if sanitize_session_key(&history_key) != history_key {
@@ -52,6 +62,16 @@ impl GoalSessionKey {
         Ok(Self::Matrix { history_key })
     }
 
+    /// Build a ZeroCode key from the adapter's canonical raw session ID.
+    ///
+    /// Callers must pass the already-canonical ID and must not pre-sanitize
+    /// it. The durable `rpc_` namespace is applied only by [`Self::durable_id`]
+    /// so this raw identifier cannot be confused with a Matrix history key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a blank or padded ID, or an ID whose existing
+    /// shared sanitizer would change it.
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
         let raw_session_id = canonical_session_key("ZeroCode session id", raw_session_id.into())?;
         if sanitize_session_key(&raw_session_id) != raw_session_id {
@@ -112,6 +132,15 @@ pub struct GoalIngressContext {
 }
 
 impl GoalIngressContext {
+    /// Build trusted ingress facts after an adapter has parsed a Goal command.
+    ///
+    /// The adapter, rather than user command text or a mutable hook, supplies
+    /// every authority-bearing value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the principal surface differs from the session key,
+    /// or if the agent, route, or principal is blank.
     pub fn trusted(
         session_key: GoalSessionKey,
         agent: impl Into<String>,
@@ -170,6 +199,11 @@ pub struct GoalSessionBinding {
 }
 
 impl GoalSessionBinding {
+    /// Build the live-session binding returned by a selected surface driver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver's diagnostic freshness token is blank.
     pub fn new(session_key: GoalSessionKey, freshness_token: impl Into<String>) -> Result<Self> {
         Ok(Self {
             session_key,
@@ -241,6 +275,11 @@ pub struct GoalExecutionScope {
 }
 
 impl GoalExecutionScope {
+    /// Build controller-owned facts for one fenced Goal execution epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for blank task/session IDs or a non-positive epoch.
     pub fn new(
         task_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -455,6 +494,15 @@ pub struct GoalHostSettings {
 }
 
 impl GoalHostSettings {
+    /// Build settings resolved from the active Goal configuration for one
+    /// controller admission.
+    ///
+    /// Callers must resolve these from the current runtime configuration; this
+    /// value is not a long-lived policy snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the owner boot ID is blank.
     pub fn new(
         enabled: bool,
         default_limits: GoalBudgetLimits,
@@ -548,6 +596,11 @@ impl GoalController {
         Self { registry }
     }
 
+    /// Apply a previously host-validated Goal submission through guarded
+    /// durable transitions.
+    ///
+    /// The caller must keep `settings` current for this admission; a disabled
+    /// setting returns [`GoalResponse::Disabled`] without a lifecycle change.
     pub async fn submit(
         &self,
         settings: &GoalHostSettings,
