@@ -677,28 +677,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("get goal task")
     }
 
-    async fn update_goal_objective(&self, task_id: &str, objective: &str) -> Result<()> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .context("start guarded legacy goal objective update")?;
-        reject_session_goal_legacy_mutation(&tx, task_id)?;
-        let updated = tx
-            .execute(
-                "UPDATE goal_tasks
-                    SET objective = ?1
-                  WHERE task_id = ?2",
-                params![objective, task_id],
-            )
-            .context("update goal objective")?;
-        if updated == 0 {
-            anyhow::bail!("goal task {task_id} has no goal extension row");
-        }
-        tx.commit()
-            .context("commit guarded legacy goal objective update")?;
-        Ok(())
-    }
-
     async fn update_goal_limits(
         &self,
         task_id: &str,
@@ -1652,10 +1630,6 @@ mod tests {
             limited.objective, "ship goal mode",
             "budget updates must not duplicate or rewrite objective state"
         );
-
-        s.update_goal_objective("goal-1", "ship amended goal mode")
-            .await
-            .expect_err("the declared session Goal objective is immutable");
 
         assert_eq!(
             s.pause_session_goal(
