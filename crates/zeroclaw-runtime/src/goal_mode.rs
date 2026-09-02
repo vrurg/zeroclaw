@@ -42,7 +42,7 @@ pub enum GoalSessionKey {
 
 impl GoalSessionKey {
     pub fn matrix(history_key: impl Into<String>) -> Result<Self> {
-        let history_key = required("Matrix history key", history_key.into())?;
+        let history_key = canonical_session_key("Matrix history key", history_key.into())?;
         if sanitize_session_key(&history_key) != history_key {
             bail!("Matrix Goal history key is not canonical");
         }
@@ -53,7 +53,7 @@ impl GoalSessionKey {
     }
 
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
-        let raw_session_id = required("ZeroCode session id", raw_session_id.into())?;
+        let raw_session_id = canonical_session_key("ZeroCode session id", raw_session_id.into())?;
         if sanitize_session_key(&raw_session_id) != raw_session_id {
             bail!("ZeroCode Goal session id is not canonical");
         }
@@ -435,8 +435,18 @@ fn required(name: &str, value: String) -> Result<String> {
     Ok(value.trim().to_owned())
 }
 
+fn canonical_session_key(name: &str, value: String) -> Result<String> {
+    if value.trim().is_empty() {
+        bail!("{name} is blank");
+    }
+    if value.trim() != value {
+        bail!("{name} is not canonical");
+    }
+    Ok(value)
+}
+
 /// Process-local settings already validated from the active Goal configuration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct GoalHostSettings {
     enabled: bool,
     default_limits: GoalBudgetLimits,
