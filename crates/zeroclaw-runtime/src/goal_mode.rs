@@ -46,13 +46,18 @@ impl GoalSessionKey {
         if sanitize_session_key(&history_key) != history_key {
             bail!("Matrix Goal history key is not canonical");
         }
+        if !history_key.starts_with("matrix_") {
+            bail!("Matrix Goal history key is outside the Matrix namespace");
+        }
         Ok(Self::Matrix { history_key })
     }
 
     pub fn zero_code(raw_session_id: impl Into<String>) -> Result<Self> {
-        Ok(Self::ZeroCode {
-            raw_session_id: required("ZeroCode session id", raw_session_id.into())?,
-        })
+        let raw_session_id = required("ZeroCode session id", raw_session_id.into())?;
+        if sanitize_session_key(&raw_session_id) != raw_session_id {
+            bail!("ZeroCode Goal session id is not canonical");
+        }
+        Ok(Self::ZeroCode { raw_session_id })
     }
 
     pub const fn surface(&self) -> GoalSurface {
@@ -433,10 +438,10 @@ fn required(name: &str, value: String) -> Result<String> {
 /// Process-local settings already validated from the active Goal configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalHostSettings {
-    pub enabled: bool,
-    pub default_limits: GoalBudgetLimits,
-    pub owner_pid: u32,
-    pub owner_boot_id: String,
+    enabled: bool,
+    default_limits: GoalBudgetLimits,
+    owner_pid: u32,
+    owner_boot_id: String,
 }
 
 impl GoalHostSettings {
@@ -452,6 +457,22 @@ impl GoalHostSettings {
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn default_limits(&self) -> &GoalBudgetLimits {
+        &self.default_limits
+    }
+
+    pub const fn owner_pid(&self) -> u32 {
+        self.owner_pid
+    }
+
+    pub fn owner_boot_id(&self) -> &str {
+        &self.owner_boot_id
     }
 }
 
@@ -830,5 +851,11 @@ mod tests {
     fn matrix_key_must_keep_the_existing_matrix_history_namespace() {
         assert!(GoalSessionKey::matrix("rpc_shared").is_err());
         assert!(GoalSessionKey::matrix("matrix_primary_room").is_ok());
+    }
+
+    #[test]
+    fn zerocode_key_must_keep_the_existing_canonical_session_form() {
+        assert!(GoalSessionKey::zero_code("same session").is_err());
+        assert!(GoalSessionKey::zero_code("same-session").is_ok());
     }
 }
