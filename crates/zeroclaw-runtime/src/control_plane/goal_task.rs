@@ -203,6 +203,10 @@ pub enum GoalPauseReason {
     BudgetExhausted,
     /// An effective limit exists but canonical usage records are unavailable.
     BudgetUnavailable,
+    /// A provider operation may have consumed usage that could not be
+    /// attributed exactly. Resuming this pause acknowledges that any remaining
+    /// finite limit is best-effort.
+    AccountingUncertain,
     /// The daemon stopped before the goal could finish and restart recovery
     /// chose not to auto-continue it.
     #[serde(rename = "daemon_restarted", alias = "daemon_restart")]
@@ -429,6 +433,15 @@ pub trait GoalTaskRegistry: Send + Sync {
         reserved_cost_usd: Option<f64>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Settle one exact pending logical operation after its accounting result
+    /// is durable. When `uncertain_pause` is present and the settled result is
+    /// `OutcomeUnknown` for a finite-limited Goal, the store atomically clears
+    /// the pending slot, fences the epoch, and pauses the Goal. If an exact
+    /// `OperatorPaused` race already fenced that operation, the same
+    /// acknowledgement-required pause is normalized onto that row instead.
+    /// Callers must pass `None` for an abandoned/unsettled operation, which is
+    /// classified terminally by its owning lifecycle path rather than treated
+    /// as an acknowledged lower-bound accounting result.
     async fn settle_pending_call(
         &self,
         task_id: &str,
@@ -436,6 +449,7 @@ pub trait GoalTaskRegistry: Send + Sync {
         admitted_epoch: i64,
         pending_call_id: &str,
         accounting_state: GoalAccountingState,
+        uncertain_pause: Option<GoalPauseState>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Enter the durable in-flight phase before a prepared Goal tool batch is

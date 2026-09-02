@@ -4,8 +4,9 @@ use std::sync::{Arc, Barrier};
 
 use rusqlite::Connection;
 use zeroclaw_runtime::control_plane::{
-    GoalAccountingState, GoalTaskRecord, GoalTaskRegistry, GoalToolPhase, GoalTransitionResult,
-    SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
+    GoalToolPhase, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry,
+    TaskStatus,
 };
 
 fn session_goal(id: &str, session_id: &str) -> (TaskRecord, GoalTaskRecord) {
@@ -336,6 +337,167 @@ async fn boot_classifies_pending_operations_after_pause_or_terminal_fencing() {
             .unwrap(),
         GoalTransitionResult::Applied
     );
+}
+
+#[tokio::test]
+async fn reboot_preserves_an_acknowledgeable_accounting_uncertainty_pause() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+    let (task, goal) = session_goal("acknowledgeable", "acknowledgeable-session");
+    store
+        .create_or_replace_session_goal(task, goal)
+        .await
+        .unwrap();
+    store
+        .pause_session_goal(
+            "acknowledgeable",
+            "acknowledgeable-session",
+            1,
+            GoalPauseState {
+                reason: GoalPauseReason::AccountingUncertain,
+                description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    {
+        let conn = Connection::open(directory.path().join("control_plane.db")).unwrap();
+        conn.execute(
+            "UPDATE goal_tasks SET accounting_state = 'outcome_unknown' WHERE task_id = ?1",
+            ["acknowledgeable"],
+        )
+        .unwrap();
+    }
+    drop(store);
+
+    let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(reopened.reconcile_goal_boot_state("boot-b").unwrap(), 0);
+    let task = reopened.get("acknowledgeable").await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Paused);
+    assert_eq!(task.execution_epoch, 2);
+    let goal = reopened
+        .get_goal_task("acknowledgeable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+    assert_eq!(
+        goal.pause_reason,
+        Some(GoalPauseReason::AccountingUncertain)
+    );
+    assert_eq!(
+        reopened
+            .resume_session_goal("acknowledgeable", "acknowledgeable-session", 2, 2, "boot-b",)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+}
+
+#[tokio::test]
+async fn reboot_preserves_prior_accounting_acknowledgement_for_running_goals() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteTaskStore::new(directory.path()).unwrap();
+
+    let (acknowledged, acknowledged_goal) = session_goal("acknowledged", "acknowledged-session");
+    store
+        .create_or_replace_session_goal(acknowledged, acknowledged_goal)
+        .await
+        .unwrap();
+    store
+        .pause_session_goal(
+            "acknowledged",
+            "acknowledged-session",
+            1,
+            GoalPauseState {
+                reason: GoalPauseReason::AccountingUncertain,
+                description: None,
+                blockers: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    {
+        let conn = Connection::open(directory.path().join("control_plane.db")).unwrap();
+        conn.execute(
+            "UPDATE goal_tasks SET accounting_state = 'outcome_unknown' WHERE task_id = ?1",
+            ["acknowledged"],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        store
+            .resume_session_goal("acknowledged", "acknowledged-session", 2, 2, "boot-a")
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    let (unlimited, unlimited_goal) = session_goal("unlimited", "unlimited-session");
+    store
+        .create_or_replace_session_goal(unlimited, unlimited_goal)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_session_goal_limits("unlimited", "unlimited-session", 1, None, None)
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_call_with_reservation(
+                "unlimited",
+                "unlimited-session",
+                1,
+                None,
+                None,
+                "unlimited-operation",
+                None,
+                None,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_call(
+                "unlimited",
+                "unlimited-session",
+                1,
+                "unlimited-operation",
+                GoalAccountingState::OutcomeUnknown,
+                None,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let reopened = SqliteTaskStore::new(directory.path()).unwrap();
+    assert_eq!(reopened.reconcile_goal_boot_state("boot-b").unwrap(), 2);
+    for (task_id, session_id, expected_epoch) in [
+        ("acknowledged", "acknowledged-session", 4),
+        ("unlimited", "unlimited-session", 2),
+    ] {
+        let task = reopened.get(task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.execution_epoch, expected_epoch);
+        let goal = reopened.get_goal_task(task_id).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+        assert_eq!(
+            reopened
+                .resume_session_goal(task_id, session_id, expected_epoch, 2, "boot-b")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
 }
 
 #[tokio::test]

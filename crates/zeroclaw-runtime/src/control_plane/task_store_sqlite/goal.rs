@@ -383,9 +383,9 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
 
 impl SqliteTaskStore {
     /// Fence Goal rows interrupted by a prior daemon. A durable pending
-    /// operation has an unknown outcome and is never replayed; a settled
-    /// operation pauses for an explicit resume. `InFlight` is preserved, so a
-    /// later executor cannot pretend it has the missing tool-result pairing.
+    /// operation has an unknown outcome and is never replayed; a cleanly
+    /// settled operation pauses for an explicit resume. An interrupted tool
+    /// phase fails rather than being presented as resumable work.
     pub fn reconcile_goal_boot_state(&self, boot_id: &str) -> Result<u64> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -423,7 +423,32 @@ impl SqliteTaskStore {
                      WHERE task_id = tasks.id
                        AND ((pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
                             OR (tasks.status IN ('running', 'paused')
-                                AND accounting_state != 'complete'))
+                                AND (
+                                    accounting_state != 'complete'
+                                    OR tool_phase != 'clean'
+                                )
+                                AND NOT (
+                                    tasks.status = 'paused'
+                                    AND pending_call_id IS NULL
+                                    AND pending_call_epoch IS NULL
+                                    AND accounting_state = 'outcome_unknown'
+                                    AND tool_phase = 'clean'
+                                    AND (
+                                        pause_reason IN ('accounting_uncertain', 'daemon_restarted')
+                                        OR (
+                                            pause_reason = 'operator_paused'
+                                            AND effective_token_limit IS NULL
+                                            AND effective_cost_limit_usd IS NULL
+                                        )
+                                    )
+                                )
+                                AND NOT (
+                                    tasks.status = 'running'
+                                    AND pending_call_id IS NULL
+                                    AND pending_call_epoch IS NULL
+                                    AND accounting_state = 'outcome_unknown'
+                                    AND tool_phase = 'clean'
+                                )))
                 )",
                 params![boot_id, &now],
             )
@@ -450,7 +475,8 @@ impl SqliteTaskStore {
                      WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                        AND owner_boot_id != ?1 AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                    AND accounting_state = 'complete'",
+                    AND tool_phase = 'clean'
+                    AND accounting_state IN ('complete', 'outcome_unknown')",
             params![boot_id],
         )
         .context("mark interrupted goal pause")?;
@@ -465,7 +491,8 @@ impl SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                       AND accounting_state = 'complete'
+                       AND tool_phase = 'clean'
+                       AND accounting_state IN ('complete', 'outcome_unknown')
                 )",
                 params![boot_id],
             )
@@ -481,7 +508,8 @@ impl SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                       AND accounting_state = 'complete'
+                       AND tool_phase = 'clean'
+                       AND accounting_state IN ('complete', 'outcome_unknown')
                 )",
                 params![boot_id, &now],
             )
@@ -1155,9 +1183,23 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 AND execution_epoch < 9223372036854775807
                 AND EXISTS (
                     SELECT 1 FROM goal_tasks
-                     WHERE task_id = tasks.id AND accounting_state = 'complete'
+                     WHERE task_id = tasks.id
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                        AND tool_phase = 'clean'
+                       AND (
+                            accounting_state = 'complete'
+                            OR (
+                                accounting_state = 'outcome_unknown'
+                                AND (
+                                    pause_reason IN ('accounting_uncertain', 'daemon_restarted')
+                                    OR (
+                                        pause_reason = 'operator_paused'
+                                        AND effective_token_limit IS NULL
+                                        AND effective_cost_limit_usd IS NULL
+                                    )
+                                )
+                            )
+                       )
                 )",
             params![
                 task_id,
@@ -1240,7 +1282,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 SET pending_call_id = ?4, pending_call_epoch = ?3,
                     pending_reserved_tokens = ?5, pending_reserved_cost_usd = ?6
               WHERE task_id = ?1 AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                AND accounting_state = 'complete'
+                AND accounting_state IN ('complete', 'outcome_unknown')
                 AND effective_token_limit IS ?7 AND effective_cost_limit_usd IS ?8
                 AND EXISTS (
                     SELECT 1 FROM tasks
@@ -1271,13 +1313,31 @@ impl GoalTaskRegistry for SqliteTaskStore {
         admitted_epoch: i64,
         pending_call_id: &str,
         accounting_state: GoalAccountingState,
+        uncertain_pause: Option<GoalPauseState>,
     ) -> Result<GoalTransitionResult> {
-        let conn = self.conn.lock();
-        let updated = conn.execute(
+        let uncertain_pause = uncertain_pause
+            .map(|pause| {
+                Ok::<_, anyhow::Error>((
+                    pause_reason_to_db(pause.reason)?,
+                    pause.description,
+                    blockers_to_db(&pause.blockers)?,
+                ))
+            })
+            .transpose()?;
+        let accounting_state = accounting_state_to_db(accounting_state);
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("start guarded Goal pending-call settlement")?;
+        let updated = tx.execute(
             "UPDATE goal_tasks
                 SET pending_call_id = NULL, pending_call_epoch = NULL,
                     pending_reserved_tokens = NULL, pending_reserved_cost_usd = NULL,
-                    accounting_state = ?5
+                    accounting_state = CASE
+                        WHEN accounting_state = 'outcome_unknown' AND ?5 = 'complete'
+                            THEN 'outcome_unknown'
+                        ELSE ?5
+                    END
               WHERE task_id = ?1 AND pending_call_id = ?4 AND pending_call_epoch = ?3
                 AND EXISTS (
                     SELECT 1 FROM tasks
@@ -1288,12 +1348,62 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 session_id,
                 admitted_epoch,
                 pending_call_id,
-                accounting_state_to_db(accounting_state),
+                accounting_state,
             ],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&tx, task_id, session_id);
         }
+        if let Some((reason, description, blockers)) = uncertain_pause
+            && accounting_state == "outcome_unknown"
+        {
+            let paused = tx.execute(
+                "UPDATE tasks
+                    SET status = 'paused', execution_epoch = execution_epoch + 1
+                  WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                    AND status = 'running' AND execution_epoch = ?3
+                    AND execution_epoch < 9223372036854775807
+                    AND EXISTS (
+                        SELECT 1 FROM goal_tasks
+                         WHERE task_id = tasks.id
+                           AND (effective_token_limit IS NOT NULL
+                             OR effective_cost_limit_usd IS NOT NULL)
+                    )",
+                params![task_id, session_id, admitted_epoch],
+            )?;
+            if paused == 1 {
+                tx.execute(
+                    "UPDATE goal_tasks
+                        SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
+                      WHERE task_id = ?4",
+                    params![&reason, &description, &blockers, task_id],
+                )?;
+            } else {
+                // An operator may have fenced the worker after admission but
+                // before its normal settlement. The operation is settled, so
+                // make that already-paused bounded Goal explicitly
+                // acknowledgeable instead of leaving an unknown-accounting
+                // dead end under the old pause reason.
+                tx.execute(
+                    "UPDATE goal_tasks
+                        SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
+                      WHERE task_id = ?4
+                        AND EXISTS (
+                            SELECT 1 FROM tasks
+                             WHERE id = goal_tasks.task_id AND kind = 'goal'
+                               AND session_id = ?5 AND status = 'paused'
+                        )
+                        AND accounting_state = 'outcome_unknown'
+                        AND pause_reason = 'operator_paused'
+                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                        AND (effective_token_limit IS NOT NULL
+                          OR effective_cost_limit_usd IS NOT NULL)",
+                    params![&reason, &description, &blockers, task_id, session_id],
+                )?;
+            }
+        }
+        tx.commit()
+            .context("commit guarded Goal pending-call settlement")?;
         Ok(GoalTransitionResult::Applied)
     }
 
@@ -1541,6 +1651,284 @@ mod tests {
                 .unwrap(),
             GoalTransitionResult::Stale,
             "the fenced executor cannot clear a phase after pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_acknowledges_uncertain_bounded_usage() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = session_goal_task("uncertain-resume", "session-1");
+        let mut goal = goal_record("uncertain-resume", "ship it");
+        goal.effective_token_limit = Some(100);
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    "uncertain-resume",
+                    "session-1",
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::AccountingUncertain,
+                        description: Some("usage may be higher".into()),
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE goal_tasks SET accounting_state = 'outcome_unknown' WHERE task_id = ?1",
+                params!["uncertain-resume"],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .resume_session_goal("uncertain-resume", "session-1", 2, 2, "boot-2")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied,
+            "explicit resume acknowledges that bounded usage is now best-effort"
+        );
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    "uncertain-resume",
+                    "session-1",
+                    3,
+                    Some(100),
+                    None,
+                    "call-complete",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_call(
+                    "uncertain-resume",
+                    "session-1",
+                    3,
+                    "call-complete",
+                    GoalAccountingState::Complete,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .get_goal_task("uncertain-resume")
+                .await
+                .unwrap()
+                .unwrap()
+                .accounting_state,
+            GoalAccountingState::OutcomeUnknown,
+            "a later complete operation cannot restore exact accounting"
+        );
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    "uncertain-resume",
+                    "session-1",
+                    3,
+                    Some(100),
+                    None,
+                    "call-unknown",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_call(
+                    "uncertain-resume",
+                    "session-1",
+                    3,
+                    "call-unknown",
+                    GoalAccountingState::OutcomeUnknown,
+                    Some(GoalPauseState {
+                        reason: GoalPauseReason::AccountingUncertain,
+                        description: None,
+                        blockers: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let task = store
+            .current_goal_for_session("session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.execution_epoch, 4);
+        assert_eq!(
+            store
+                .get_goal_task("uncertain-resume")
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(GoalPauseReason::AccountingUncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_settlement_atomically_pauses_a_bounded_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = session_goal_task("uncertain-settlement", "session-1");
+        let mut goal = goal_record("uncertain-settlement", "ship it");
+        goal.effective_token_limit = Some(100);
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    "uncertain-settlement",
+                    "session-1",
+                    1,
+                    Some(100),
+                    None,
+                    "call-a",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(
+            store
+                .settle_pending_call(
+                    "uncertain-settlement",
+                    "session-1",
+                    1,
+                    "call-a",
+                    GoalAccountingState::OutcomeUnknown,
+                    Some(GoalPauseState {
+                        reason: GoalPauseReason::AccountingUncertain,
+                        description: Some("usage may be higher".into()),
+                        blockers: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let task = store
+            .current_goal_for_session("session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store
+            .get_goal_task("uncertain-settlement")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.execution_epoch, 2);
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(
+            goal.pause_reason,
+            Some(GoalPauseReason::AccountingUncertain)
+        );
+        assert!(goal.pending_call_id.is_none());
+        assert!(goal.pending_call_epoch.is_none());
+    }
+
+    #[tokio::test]
+    async fn uncertain_settlement_after_operator_pause_becomes_acknowledgeable() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = session_goal_task("racing-settlement", "session-1");
+        let mut goal = goal_record("racing-settlement", "ship it");
+        goal.effective_token_limit = Some(100);
+        store
+            .create_or_replace_session_goal(task, goal)
+            .await
+            .unwrap();
+        store
+            .admit_pending_call_with_reservation(
+                "racing-settlement",
+                "session-1",
+                1,
+                Some(100),
+                None,
+                "call-a",
+                Some(1),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .pause_session_goal(
+                "racing-settlement",
+                "session-1",
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .settle_pending_call(
+                "racing-settlement",
+                "session-1",
+                1,
+                "call-a",
+                GoalAccountingState::OutcomeUnknown,
+                Some(GoalPauseState {
+                    reason: GoalPauseReason::AccountingUncertain,
+                    description: None,
+                    blockers: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        let goal = store
+            .get_goal_task("racing-settlement")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert_eq!(
+            goal.pause_reason,
+            Some(GoalPauseReason::AccountingUncertain)
+        );
+        assert_eq!(
+            store
+                .resume_session_goal("racing-settlement", "session-1", 2, 2, "boot-2")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
         );
     }
 
@@ -1828,14 +2216,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(tool.status, TaskStatus::Paused);
+        assert_eq!(tool.status, TaskStatus::Failed);
         assert_eq!(
             reopened
                 .resume_session_goal("tool", "tool-session", 2, 2, "boot-2")
                 .await
                 .unwrap(),
             GoalTransitionResult::Stale,
-            "the in-flight phase survives restart and blocks resume"
+            "an in-flight phase is not safely resumable after restart"
         );
         let pending = reopened
             .current_goal_for_session("pending-session")

@@ -359,6 +359,7 @@ pub enum GoalMessageKey {
     Budget,
     Paused,
     AlreadyPaused,
+    PauseDraining,
     Resumed,
     Cancelled,
     AlreadyCancelled,
@@ -397,6 +398,16 @@ impl GoalResponse {
     }
 }
 
+/// Typed accounting caveat for transport adapters to render through their
+/// own Fluent catalogues. Durable accounting state remains the source of
+/// truth; this value avoids parsing explanatory pause text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalUsageNotice {
+    /// Known ledger totals are only a lower bound because provider usage could
+    /// not be fully accounted.
+    UnaccountedUsageMayBeHigher,
+}
+
 /// Current Goal status derived from canonical task rows and the usage ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GoalStatusProjection {
@@ -411,6 +422,7 @@ pub struct GoalStatusProjection {
     pub cost_accounting_complete: bool,
     pub remaining_tokens: Option<u64>,
     pub remaining_cost_usd: Option<f64>,
+    pub usage_notice: Option<GoalUsageNotice>,
     pub accounting_state: GoalAccountingState,
     pub tool_phase: GoalToolPhase,
     pub pause_reason: Option<GoalPauseReason>,
@@ -523,6 +535,14 @@ pub enum GoalExecutionReadiness {
 pub trait GoalExecutor: Send + Sync {
     async fn preflight(&self, request: &GoalExecutionPreflight) -> GoalExecutionReadiness;
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()>;
+
+    /// Wait for exactly the executor fenced by an operator pause to finish
+    /// its already-admitted operation without signalling cancellation. Once
+    /// the durable pause has advanced the epoch, that worker cannot admit a
+    /// subsequent operation and exits after settling the current one.
+    async fn join(&self, _task_id: &str, _session_id: &str, _epoch: i64) -> Result<(), ()> {
+        Ok(())
+    }
 
     /// Quiesce exactly the executor that was fenced by a durable lifecycle
     /// transition. A dormant executor may have no process-local work to stop.
@@ -895,7 +915,7 @@ impl GoalRuntime {
             .map_err(GoalRuntimeError::control_plane)?;
         if result == GoalTransitionResult::Applied {
             let Some((reloaded, unsettled)) = self
-                .quiesce_fenced_goal(&ingress, &current.task.id, current.task.execution_epoch)
+                .drain_fenced_pause(&ingress, &current.task.id, current.task.execution_epoch)
                 .await?
             else {
                 return Ok(GoalResponse::message(GoalMessageKey::Stale));
@@ -917,6 +937,26 @@ impl GoalRuntime {
                     GoalMessageKey::AccountingIncomplete,
                 )));
             }
+            if matches!(
+                reloaded.goal.accounting_state,
+                GoalAccountingState::Missing | GoalAccountingState::Invalid
+            ) {
+                let failed = self
+                    .goals
+                    .finish_session_goal(
+                        &reloaded.task.id,
+                        ingress.session_id(),
+                        reloaded.task.execution_epoch,
+                        TaskStatus::Failed,
+                        Some("accounting_missing_or_invalid".to_owned()),
+                    )
+                    .await
+                    .map_err(GoalRuntimeError::control_plane)?;
+                return Ok(GoalResponse::message(transition_message(
+                    failed,
+                    GoalMessageKey::AccountingIncomplete,
+                )));
+            }
         }
         Ok(GoalResponse::message(transition_message(
             result,
@@ -924,11 +964,172 @@ impl GoalRuntime {
         )))
     }
 
+    /// Drain an operator-paused epoch. The durable pause is committed before
+    /// this method runs, so it immediately prevents another admission. When
+    /// an operation is already pending, waiting for the exact worker lets the
+    /// ordinary provider path settle and persist every surfaced usage event.
+    /// A missing settlement remains fail-closed rather than being replayed.
+    async fn drain_fenced_pause(
+        &self,
+        ingress: &GoalIngressContext,
+        task_id: &str,
+        fenced_epoch: i64,
+    ) -> Result<Option<(CurrentGoal, bool)>, GoalRuntimeError> {
+        let Some(current) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if current.task.id != task_id {
+            return Ok(None);
+        }
+        let pending =
+            current.goal.pending_call_id.is_some() || current.goal.pending_call_epoch.is_some();
+        if pending {
+            if self
+                .executor
+                .join(task_id, ingress.session_id(), fenced_epoch)
+                .await
+                .is_err()
+            {
+                return self.classify_failed_pause_drain(ingress, task_id).await;
+            }
+        } else {
+            self.executor
+                .cancel(task_id, ingress.session_id(), fenced_epoch)
+                .await
+                .map_err(|_| {
+                    GoalRuntimeError::control_plane(anyhow::Error::msg(
+                        "Goal executor did not quiesce after lifecycle fence",
+                    ))
+                })?;
+        }
+
+        let Some(mut current) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if current.task.id != task_id {
+            return Ok(None);
+        }
+        let pending = current
+            .goal
+            .pending_call_id
+            .clone()
+            .zip(current.goal.pending_call_epoch);
+        let Some((call_id, admitted_epoch)) = pending else {
+            return Ok(Some((current, false)));
+        };
+        match self
+            .goals
+            .settle_pending_call(
+                &current.task.id,
+                ingress.session_id(),
+                admitted_epoch,
+                &call_id,
+                GoalAccountingState::OutcomeUnknown,
+                None,
+            )
+            .await
+            .map_err(GoalRuntimeError::control_plane)?
+        {
+            GoalTransitionResult::Applied => {}
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+        }
+        let Some(reloaded) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if reloaded.task.id != task_id {
+            return Ok(None);
+        }
+        current = reloaded;
+        Ok(Some((current, true)))
+    }
+
+    async fn classify_failed_pause_drain(
+        &self,
+        ingress: &GoalIngressContext,
+        task_id: &str,
+    ) -> Result<Option<(CurrentGoal, bool)>, GoalRuntimeError> {
+        let Some(current) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if current.task.id != task_id {
+            return Ok(None);
+        }
+        if let Some((call_id, admitted_epoch)) = current
+            .goal
+            .pending_call_id
+            .clone()
+            .zip(current.goal.pending_call_epoch)
+        {
+            match self
+                .goals
+                .settle_pending_call(
+                    &current.task.id,
+                    ingress.session_id(),
+                    admitted_epoch,
+                    &call_id,
+                    GoalAccountingState::OutcomeUnknown,
+                    None,
+                )
+                .await
+                .map_err(GoalRuntimeError::control_plane)?
+            {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(reloaded) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if reloaded.task.id != task_id {
+            return Ok(None);
+        }
+        Ok(Some((reloaded, true)))
+    }
+
     async fn resume(&self, ingress: GoalIngressContext) -> Result<GoalResponse, GoalRuntimeError> {
         let Some(current) = self.current_goal(&ingress).await? else {
             return Ok(GoalResponse::message(GoalMessageKey::NoCurrentGoal));
         };
         if current.task.status != TaskStatus::Paused {
+            return Ok(GoalResponse::message(
+                if current.task.status.is_terminal() {
+                    GoalMessageKey::Terminal
+                } else {
+                    GoalMessageKey::Stale
+                },
+            ));
+        }
+        // A durable pause fences its executor by advancing the epoch. Ensure
+        // that old handle is gone before evaluating or launching the new
+        // epoch; otherwise an acknowledgement can race the old worker's
+        // cleanup and turn an otherwise resumable Goal into a launch failure.
+        let task_id = current.task.id.clone();
+        let paused_epoch = current.task.execution_epoch;
+        // `pause` publishes its fence before it drains an operation that was
+        // already admitted by the prior epoch.  That operation must finish
+        // through its normal accounting path; in particular, `resume` must
+        // not turn the acknowledgement into a cancellation request.
+        if current.goal.pending_call_id.is_some() || current.goal.pending_call_epoch.is_some() {
+            return Ok(GoalResponse::message(GoalMessageKey::PauseDraining));
+        }
+        let Some(fenced_epoch) = paused_epoch.checked_sub(1) else {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
+        };
+        self.executor
+            .cancel(&task_id, ingress.session_id(), fenced_epoch)
+            .await
+            .map_err(|_| {
+                GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "Goal executor did not quiesce before resume",
+                ))
+            })?;
+        let Some(current) = self.current_goal(&ingress).await? else {
+            return Ok(GoalResponse::message(GoalMessageKey::Stale));
+        };
+        if current.task.id != task_id
+            || current.task.execution_epoch != paused_epoch
+            || current.task.status != TaskStatus::Paused
+        {
             return Ok(GoalResponse::message(
                 if current.task.status.is_terminal() {
                     GoalMessageKey::Terminal
@@ -1045,27 +1246,42 @@ impl GoalRuntime {
         task_id: &str,
         fenced_epoch: i64,
     ) -> Result<Option<(CurrentGoal, bool)>, GoalRuntimeError> {
-        self.executor
-            .cancel(task_id, ingress.session_id(), fenced_epoch)
-            .await
-            .map_err(|_| {
-                GoalRuntimeError::control_plane(anyhow::Error::msg(
-                    "Goal executor did not quiesce after lifecycle fence",
-                ))
-            })?;
-
         let Some(mut current) = self.current_goal(ingress).await? else {
             return Ok(None);
         };
         if current.task.id != task_id {
             return Ok(None);
         }
+        let worker_epoch = current.goal.pending_call_epoch.unwrap_or(fenced_epoch);
+        // The production forced-abort path reports successful quiescence. An
+        // executor error leaves quiescence unproven, but the durable terminal
+        // fence is already committed. Keep going first so an admitted
+        // operation is classified instead of leaving a falsely-complete
+        // pending slot; return that uncertainty after the classification.
+        let executor_failed = self
+            .executor
+            .cancel(task_id, ingress.session_id(), worker_epoch)
+            .await
+            .is_err();
+
+        let Some(reloaded) = self.current_goal(ingress).await? else {
+            return Ok(None);
+        };
+        if reloaded.task.id != task_id {
+            return Ok(None);
+        }
+        current = reloaded;
         let pending = current
             .goal
             .pending_call_id
             .clone()
             .zip(current.goal.pending_call_epoch);
         let Some((call_id, admitted_epoch)) = pending else {
+            if executor_failed {
+                return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                    "Goal executor did not quiesce after lifecycle fence",
+                )));
+            }
             return Ok(Some((current, false)));
         };
 
@@ -1077,6 +1293,7 @@ impl GoalRuntime {
                 admitted_epoch,
                 &call_id,
                 GoalAccountingState::OutcomeUnknown,
+                None,
             )
             .await
             .map_err(GoalRuntimeError::control_plane)?
@@ -1091,6 +1308,11 @@ impl GoalRuntime {
             return Ok(None);
         }
         current = reloaded;
+        if executor_failed {
+            return Err(GoalRuntimeError::control_plane(anyhow::Error::msg(
+                "Goal executor did not quiesce after lifecycle fence",
+            )));
+        }
         Ok(Some((current, true)))
     }
 
@@ -1211,7 +1433,16 @@ impl GoalRuntime {
         if current.task.status != TaskStatus::Paused || current.task.execution_epoch == i64::MAX {
             return GoalResumeReadiness::NotPaused;
         }
-        let settled = current.goal.accounting_state == GoalAccountingState::Complete
+        let settled = (current.goal.accounting_state == GoalAccountingState::Complete
+            || (current.goal.accounting_state == GoalAccountingState::OutcomeUnknown
+                && matches!(
+                    current.goal.pause_reason,
+                    Some(GoalPauseReason::AccountingUncertain | GoalPauseReason::DaemonRestart)
+                )
+                || (current.goal.accounting_state == GoalAccountingState::OutcomeUnknown
+                    && current.goal.pause_reason == Some(GoalPauseReason::OperatorPaused)
+                    && current.goal.effective_token_limit.is_none()
+                    && current.goal.effective_cost_limit_usd.is_none())))
             && current.goal.pending_call_id.is_none()
             && current.goal.pending_call_epoch.is_none();
         if !settled {
@@ -1462,6 +1693,8 @@ fn status_projection(
             .then_some(current.goal.effective_cost_limit_usd)
             .flatten()
             .map(|limit| (limit - totals.1).max(0.0)),
+        usage_notice: (current.goal.accounting_state == GoalAccountingState::OutcomeUnknown)
+            .then_some(GoalUsageNotice::UnaccountedUsageMayBeHigher),
         accounting_state: current.goal.accounting_state,
         tool_phase: current.goal.tool_phase,
         pause_reason: current.goal.pause_reason,
@@ -1488,6 +1721,7 @@ fn sanitize_terminal_reason(reason: &str) -> String {
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use zeroclaw_config::{cost::TokenUsage, schema::CostConfig};
 
     use crate::control_plane::SqliteTaskStore;
@@ -1497,7 +1731,15 @@ mod tests {
         preflights: Mutex<Vec<GoalExecutionPreflight>>,
         launches: Mutex<Vec<GoalExecutionScope>>,
         cancellations: Mutex<Vec<(String, String, i64)>>,
+        joins: Mutex<Vec<(String, String, i64)>>,
+        join_gate: Mutex<Option<Arc<JoinGate>>>,
+        fail_cancel: AtomicBool,
         fail_launch: bool,
+    }
+
+    struct JoinGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1519,6 +1761,22 @@ mod tests {
             self.cancellations
                 .lock()
                 .push((task_id.to_owned(), session_id.to_owned(), epoch));
+            if self.fail_cancel.load(Ordering::SeqCst) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn join(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+            self.joins
+                .lock()
+                .push((task_id.to_owned(), session_id.to_owned(), epoch));
+            let gate = { self.join_gate.lock().clone() };
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
             Ok(())
         }
     }
@@ -1549,6 +1807,9 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancellations: Mutex::new(Vec::new()),
+            joins: Mutex::new(Vec::new()),
+            join_gate: Mutex::new(None),
+            fail_cancel: AtomicBool::new(false),
             fail_launch,
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -1833,6 +2094,7 @@ mod tests {
     #[tokio::test]
     async fn start_persists_immutable_criteria_and_launches_only_exact_epoch() {
         let (runtime, store, executor, _directory) = controller(ready(), false);
+        let runtime = Arc::new(runtime);
 
         assert_eq!(
             runtime
@@ -1913,7 +2175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_with_an_unsettled_operation_fails_closed_after_quiescence() {
+    async fn pause_drains_an_unsettled_operation_before_failing_closed() {
         let (runtime, store, executor, _directory) = controller(ready(), false);
 
         runtime.submit(ingress(), start_command()).await.unwrap();
@@ -1958,8 +2220,66 @@ mod tests {
         assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
         assert!(goal.pending_call_id.is_none());
         assert_eq!(
-            executor.cancellations.lock().as_slice(),
+            executor.joins.lock().as_slice(),
             &[(task.id, "session".to_owned(), task.execution_epoch)]
+        );
+        assert!(executor.cancellations.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_cancel_an_operation_while_pause_is_draining_it() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        let runtime = Arc::new(runtime);
+        let gate = Arc::new(JoinGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *executor.join_gate.lock() = Some(Arc::clone(&gate));
+
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    goal.effective_token_limit,
+                    goal.effective_cost_limit_usd,
+                    "pause-drain-operation",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let pause_runtime = runtime.clone();
+        let pause = zeroclaw_spawn::spawn!(async move {
+            pause_runtime.submit(ingress(), GoalCommand::Pause).await
+        });
+        gate.entered.notified().await;
+
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::PauseDraining
+        );
+        assert!(executor.cancellations.lock().is_empty());
+
+        gate.release.notify_one();
+        assert_eq!(
+            pause.await.unwrap().unwrap().key,
+            GoalMessageKey::AccountingIncomplete
         );
     }
 
@@ -2012,6 +2332,52 @@ mod tests {
             executor.cancellations.lock().as_slice(),
             &[(task.id, "session".to_owned(), task.execution_epoch)]
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_classifies_pending_usage_even_when_executor_reports_failure() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    goal.effective_token_limit,
+                    goal.effective_cost_limit_usd,
+                    "failed-cancel-operation",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        executor.fail_cancel.store(true, Ordering::SeqCst);
+
+        assert!(
+            runtime
+                .submit(ingress(), GoalCommand::Cancel)
+                .await
+                .is_err()
+        );
+        let current = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(current.status, TaskStatus::Cancelled);
+        assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+        assert!(goal.pending_call_id.is_none());
     }
 
     #[tokio::test]
@@ -2324,6 +2690,151 @@ mod tests {
             GoalMessageKey::Resumed
         );
         assert_eq!(executor.launches.lock().len(), 2);
+        assert_eq!(
+            executor.cancellations.lock().as_slice(),
+            &[(task.id.clone(), "session".into(), 1)],
+            "resume must quiesce the prior fenced executor before launching a new epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_an_accounting_acknowledgement_across_daemon_restart() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        runtime.submit(ingress(), start_command()).await.unwrap();
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    Some(8),
+                    None,
+                    "unknown-operation",
+                    Some(1),
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_call(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    "unknown-operation",
+                    GoalAccountingState::OutcomeUnknown,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(store.reconcile_goal_boot_state("new-boot").unwrap(), 1);
+
+        let status = runtime
+            .submit(ingress(), GoalCommand::Status)
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert!(status.resumable);
+        assert_eq!(
+            status.usage_notice,
+            Some(GoalUsageNotice::UnaccountedUsageMayBeHigher)
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Resumed
+        );
+        assert_eq!(executor.launches.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unlimited_operator_pause_can_resume_after_a_settled_unknown_operation() {
+        let (runtime, store, executor, _directory) = controller(ready(), false);
+        let response = runtime
+            .submit(
+                ingress(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Unlimited,
+                    success_criteria: "done".into(),
+                    objective: "objective".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.key, GoalMessageKey::Started);
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .admit_pending_call_with_reservation(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    None,
+                    None,
+                    "unknown-operation",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .settle_pending_call(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    "unknown-operation",
+                    GoalAccountingState::OutcomeUnknown,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    "session",
+                    task.execution_epoch,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            runtime
+                .submit(ingress(), GoalCommand::Resume)
+                .await
+                .unwrap()
+                .key,
+            GoalMessageKey::Resumed
+        );
+        assert_eq!(executor.launches.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -2389,6 +2900,9 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancellations: Mutex::new(Vec::new()),
+            joins: Mutex::new(Vec::new()),
+            join_gate: Mutex::new(None),
+            fail_cancel: AtomicBool::new(false),
             fail_launch: false,
         });
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
@@ -2691,6 +3205,9 @@ mod tests {
             preflights: Mutex::new(Vec::new()),
             launches: Mutex::new(Vec::new()),
             cancellations: Mutex::new(Vec::new()),
+            joins: Mutex::new(Vec::new()),
+            join_gate: Mutex::new(None),
+            fail_cancel: AtomicBool::new(false),
             fail_launch: false,
         });
         let mut config = Config::default();

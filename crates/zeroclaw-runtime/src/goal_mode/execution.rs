@@ -10,8 +10,8 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit},
-    task::JoinHandle,
+    sync::{Mutex, Notify, OwnedSemaphorePermit},
+    task::AbortHandle,
 };
 use uuid::Uuid;
 use zeroclaw_config::{
@@ -302,6 +302,7 @@ impl GoalOperationAccountant {
                     self.scope.execution_epoch,
                     &call_id,
                     GoalAccountingState::OutcomeUnknown,
+                    None,
                 )
                 .await
             {
@@ -363,8 +364,10 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             .await
             .context("goal logical-operation permit is closed")?;
         let (task, goal) = self.current_goal().await?;
-        if goal.accounting_state != GoalAccountingState::Complete
-            || goal.pending_call_id.is_some()
+        if !matches!(
+            goal.accounting_state,
+            GoalAccountingState::Complete | GoalAccountingState::OutcomeUnknown
+        ) || goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
         {
             anyhow::bail!("goal accounting is not settled");
@@ -448,6 +451,8 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                 self.scope.execution_epoch,
                 &call_id,
                 state,
+                (state == GoalAccountingState::OutcomeUnknown)
+                    .then_some(accounting_uncertainty_pause()),
             )
             .await?
         {
@@ -463,8 +468,16 @@ impl GoalOperationAccounting for GoalOperationAccountant {
         {
             anyhow::bail!("goal logical operation changed during settlement");
         }
-        if recorded.is_err() || state == GoalAccountingState::OutcomeUnknown {
+        if recorded.is_err() {
             return Err(GoalAccountingFailure::OutcomeUnknown.into());
+        }
+        // A completed high-level operation may have recovered from one
+        // uncertain physical provider attempt. The durable settlement has
+        // already paused bounded Goals or retained the lower-bound state for
+        // unlimited Goals; the worker decides whether its epoch remains
+        // eligible before it processes the normal response.
+        if state == GoalAccountingState::OutcomeUnknown {
+            return Ok(());
         }
         if state != GoalAccountingState::Complete {
             return Err(GoalAccountingFailure::MissingOrInvalid.into());
@@ -473,6 +486,16 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             return Err(GoalAccountingFailure::PricingUnavailable.into());
         }
         Ok(())
+    }
+}
+
+fn accounting_uncertainty_pause() -> GoalPauseState {
+    GoalPauseState {
+        reason: GoalPauseReason::AccountingUncertain,
+        // The reason plus GoalUsageNotice is the durable, transport-neutral
+        // contract. Channel adapters render localized resume/cancel guidance.
+        description: None,
+        blockers: Vec::new(),
     }
 }
 
@@ -494,7 +517,37 @@ struct ActiveGoalWorker {
     session_id: String,
     execution_epoch: i64,
     cancellation: tokio_util::sync::CancellationToken,
-    handle: JoinHandle<()>,
+    completion: Arc<GoalWorkerCompletion>,
+    abort: AbortHandle,
+}
+
+struct GoalWorkerCompletion {
+    result: Mutex<Option<Result<(), ()>>>,
+    ready: Notify,
+}
+
+impl GoalWorkerCompletion {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Notify::new(),
+        }
+    }
+
+    async fn finish(&self, result: Result<(), ()>) {
+        *self.result.lock().await = Some(result);
+        self.ready.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), ()> {
+        loop {
+            let notified = self.ready.notified();
+            if let Some(result) = *self.result.lock().await {
+                return result;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl GoalExecutionDriver {
@@ -522,6 +575,23 @@ impl GoalExecutionDriver {
             Some(GoalAccountingFailure::OutcomeUnknown) => "accounting_outcome_unknown",
             Some(GoalAccountingFailure::PricingUnavailable) => "pricing_unavailable",
             None => fallback,
+        }
+    }
+
+    async fn remove_completed_worker(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        epoch: i64,
+        completion: &Arc<GoalWorkerCompletion>,
+    ) {
+        let mut workers = self.workers.lock().await;
+        if workers.get(task_id).is_some_and(|worker| {
+            worker.session_id == session_id
+                && worker.execution_epoch == epoch
+                && Arc::ptr_eq(&worker.completion, completion)
+        }) {
+            workers.remove(task_id);
         }
     }
 
@@ -729,6 +799,9 @@ impl GoalExecutionDriver {
                     return;
                 }
                 Err(error) => {
+                    if !self.scope_still_running(&scope).await {
+                        return;
+                    }
                     let outcome_unknown = accountant.classify_unsettled_operation().await;
                     if scope.cancellation.is_cancelled() && !outcome_unknown {
                         self.pause_exact(
@@ -754,6 +827,13 @@ impl GoalExecutionDriver {
                     return;
                 }
             };
+            // An uncertain settlement atomically fences a bounded Goal. Do
+            // not let the old worker verify, append, or deliver its candidate
+            // after that transition. Unlimited Goals remain Running and carry
+            // on with their lower-bound accounting notice.
+            if !self.scope_still_running(&scope).await {
+                return;
+            }
             if candidate.trim().is_empty() {
                 self.finish_failed(&scope, "candidate_empty").await;
                 return;
@@ -774,6 +854,9 @@ impl GoalExecutionDriver {
             )
             .await
             .and_then(|response| parse_verifier_response(&response));
+            if !self.scope_still_running(&scope).await {
+                return;
+            }
             match verifier {
                 Ok(VerifierOutcome::Complete) => {
                     if self
@@ -831,6 +914,9 @@ impl GoalExecutionDriver {
                     return;
                 }
                 Err(error) => {
+                    if !self.scope_still_running(&scope).await {
+                        return;
+                    }
                     let outcome_unknown = accountant.classify_unsettled_operation().await;
                     if scope.cancellation.is_cancelled() && !outcome_unknown {
                         self.pause_exact(
@@ -879,7 +965,6 @@ impl GoalExecutor for GoalExecutionDriver {
 
     async fn launch(&self, scope: GoalExecutionScope) -> Result<(), ()> {
         let mut workers = self.workers.lock().await;
-        workers.retain(|_, worker| !worker.handle.is_finished());
         if workers.contains_key(&scope.task_id) {
             return Err(());
         }
@@ -895,13 +980,33 @@ impl GoalExecutor for GoalExecutionDriver {
         let execution_epoch = scope.execution_epoch;
         let cancellation = scope.cancellation.clone();
         let handle = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        let abort = handle.abort_handle();
+        let completion = Arc::new(GoalWorkerCompletion::new());
+        let completion_watcher = Arc::clone(&completion);
+        let workers_watcher = Arc::clone(&self.workers);
+        let watcher_key = key.clone();
+        let watcher_session_id = session_id.clone();
+        zeroclaw_spawn::spawn!(async move {
+            completion_watcher
+                .finish(handle.await.map(|_| ()).map_err(|_| ()))
+                .await;
+            let mut workers = workers_watcher.lock().await;
+            if workers.get(&watcher_key).is_some_and(|worker| {
+                worker.session_id == watcher_session_id
+                    && worker.execution_epoch == execution_epoch
+                    && Arc::ptr_eq(&worker.completion, &completion_watcher)
+            }) {
+                workers.remove(&watcher_key);
+            }
+        });
         workers.insert(
             key,
             ActiveGoalWorker {
                 session_id,
                 execution_epoch,
                 cancellation,
-                handle,
+                completion,
+                abort,
             },
         );
         Ok(())
@@ -909,34 +1014,59 @@ impl GoalExecutor for GoalExecutionDriver {
 
     async fn cancel(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
         let worker = {
-            let mut workers = self.workers.lock().await;
-            workers.retain(|_, worker| !worker.handle.is_finished());
+            let workers = self.workers.lock().await;
             let Some(worker) = workers.get(task_id) else {
                 return Ok(());
             };
             if worker.session_id != session_id || worker.execution_epoch != epoch {
                 return Ok(());
             }
-            workers.remove(task_id)
+            (
+                worker.cancellation.clone(),
+                Arc::clone(&worker.completion),
+                worker.abort.clone(),
+            )
         };
-        let Some(mut worker) = worker else {
-            return Ok(());
-        };
-        worker.cancellation.cancel();
-        let completed = tokio::time::timeout(EXECUTOR_QUIESCE_GRACE, &mut worker.handle).await;
-        match completed {
+        let (cancellation, completion, abort) = worker;
+        cancellation.cancel();
+        let completed = tokio::time::timeout(EXECUTOR_QUIESCE_GRACE, completion.wait()).await;
+        let result = match completed {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.is_cancelled() => Ok(()),
             Ok(Err(_)) => Err(()),
             Err(_) => {
-                worker.handle.abort();
-                match worker.handle.await {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.is_cancelled() => Ok(()),
-                    Err(_) => Err(()),
-                }
+                abort.abort();
+                // This JoinError is expected: we just aborted the sole
+                // worker after the bounded graceful-drain period elapsed.
+                // It is still quiescent, so the lifecycle controller can
+                // classify any durable pending operation as outcome-unknown.
+                // A panic before the timeout remains an executor failure.
+                let _ = completion.wait().await;
+                Ok(())
             }
-        }
+        };
+        self.remove_completed_worker(task_id, session_id, epoch, &completion)
+            .await;
+        result
+    }
+
+    async fn join(&self, task_id: &str, session_id: &str, epoch: i64) -> Result<(), ()> {
+        let completion = {
+            let workers = self.workers.lock().await;
+            let Some(worker) = workers.get(task_id) else {
+                return Ok(());
+            };
+            if worker.session_id != session_id || worker.execution_epoch != epoch {
+                return Ok(());
+            }
+            Arc::clone(&worker.completion)
+        };
+        // The watcher is the sole JoinHandle consumer. Other lifecycle paths
+        // retain registry ownership, can signal cancellation, and await this
+        // shared completion without polling the task twice.
+        let result = completion.wait().await;
+        self.remove_completed_worker(task_id, session_id, epoch, &completion)
+            .await;
+        result
     }
 }
 
@@ -988,9 +1118,12 @@ fn combine_accounting_state(
 ) -> GoalAccountingState {
     use GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
     match (current, next) {
-        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Invalid, _) | (_, Invalid) => Invalid,
         (Missing, _) | (_, Missing) => Missing,
+        // Unknown usage from a recovered attempt is continuable only when
+        // every surfaced event is otherwise usable. Malformed or missing
+        // usage is never made acknowledgeable by an additional unknown event.
+        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Complete, Complete) => Complete,
     }
 }
@@ -1049,7 +1182,7 @@ fn conservative_cost_reservation(
 mod tests {
     use std::sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use super::{
@@ -1104,11 +1237,21 @@ mod tests {
 
     struct AdmittingDeadlineAdapter;
 
-    struct AdmittingDeadlineLease;
+    struct AdmittingPendingLease;
+
+    struct AdmittingNonCooperativeAdapter;
 
     struct AdmittingCancellationAdapter;
 
     struct AdmittingCancellationLease;
+
+    struct UncertainUsageAdapter {
+        verifier_calls: Arc<AtomicUsize>,
+    }
+
+    struct UncertainUsageLease {
+        verifier_calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl GoalSessionAdapter for Adapter {
@@ -1243,7 +1386,47 @@ mod tests {
             _scope: &GoalExecutionScope,
             _binding: &GoalSessionBinding,
         ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
-            Ok(Box::new(AdmittingDeadlineLease))
+            Ok(Box::new(AdmittingPendingLease))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for AdmittingNonCooperativeAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "admitting-noncooperative-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation::default())
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(AdmittingPendingLease))
         }
     }
 
@@ -1284,6 +1467,51 @@ mod tests {
             _binding: &GoalSessionBinding,
         ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
             Ok(Box::new(AdmittingCancellationLease))
+        }
+    }
+
+    #[async_trait]
+    impl GoalSessionAdapter for UncertainUsageAdapter {
+        fn owns(&self, binding: &GoalSessionBinding) -> bool {
+            binding.route() == "uncertain-usage-route"
+        }
+
+        async fn preflight(
+            &self,
+            _binding: &GoalSessionBinding,
+            _request: &GoalExecutionPreflight,
+        ) -> std::result::Result<GoalOperationReservation, GoalHostPreflightError> {
+            Ok(GoalOperationReservation {
+                token_count: Some(1),
+                cost_usd: None,
+            })
+        }
+
+        async fn model_binding(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<GoalHostModelBinding> {
+            Ok(GoalHostModelBinding {
+                provider_ref: "test".into(),
+                model: "model".into(),
+            })
+        }
+
+        async fn deadline(
+            &self,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Option<tokio::time::Instant>> {
+            Ok(None)
+        }
+
+        async fn acquire(
+            &self,
+            _scope: &GoalExecutionScope,
+            _binding: &GoalSessionBinding,
+        ) -> anyhow::Result<Box<dyn GoalSessionLease>> {
+            Ok(Box::new(UncertainUsageLease {
+                verifier_calls: Arc::clone(&self.verifier_calls),
+            }))
         }
     }
 
@@ -1378,7 +1606,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl GoalSessionLease for AdmittingDeadlineLease {
+    impl GoalSessionLease for AdmittingPendingLease {
         fn working_history(
             &self,
         ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
@@ -1465,6 +1693,63 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl GoalSessionLease for UncertainUsageLease {
+        fn working_history(
+            &self,
+        ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+            Ok(Vec::new())
+        }
+
+        async fn run_parent_turn(
+            &mut self,
+            _turn: GoalParentTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<(String, Vec<zeroclaw_api::model_provider::ChatMessage>)> {
+            let Some(accounting) = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+            else {
+                anyhow::bail!("uncertain-usage test requires Goal accounting");
+            };
+            accounting
+                .admit(crate::agent::cost::GoalOperationRequest {
+                    model_provider: "test.provider".into(),
+                    model: "test-model".into(),
+                    temperature: None,
+                    thinking: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                })
+                .await?;
+            accounting
+                .settle(crate::agent::cost::GoalOperationSettlement {
+                    accounting_state: crate::control_plane::GoalAccountingState::OutcomeUnknown,
+                    pricing_complete: false,
+                    usage_events: Vec::new(),
+                })
+                .await?;
+            Ok(("verified candidate".into(), Vec::new()))
+        }
+
+        async fn run_verifier(
+            &mut self,
+            _turn: GoalVerifierTurn,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<String> {
+            self.verifier_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(r#"{"decision":"complete","reason":"meets criteria"}"#.into())
+        }
+
+        async fn append_verified_candidate(
+            &mut self,
+            _candidate: super::super::host::GoalVerifiedCandidate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn verifier_protocol_accepts_only_complete_without_blockers() {
         assert!(matches!(
@@ -1476,6 +1761,28 @@ mod tests {
                 r#"{"decision":"complete","reason":"meets criteria","blockers":[]}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_usage_dominates_an_unknown_attempt_for_goal_policy() {
+        use crate::control_plane::GoalAccountingState::{Invalid, Missing, OutcomeUnknown};
+
+        assert_eq!(
+            super::combine_accounting_state(OutcomeUnknown, Missing),
+            Missing
+        );
+        assert_eq!(
+            super::combine_accounting_state(Missing, OutcomeUnknown),
+            Missing
+        );
+        assert_eq!(
+            super::combine_accounting_state(OutcomeUnknown, Invalid),
+            Invalid
+        );
+        assert_eq!(
+            super::combine_accounting_state(Invalid, OutcomeUnknown),
+            Invalid
         );
     }
 
@@ -1495,6 +1802,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervisory_deadline_stops_a_goal_operation_before_completion() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
         let scope = GoalExecutionScope {
             task_id: "goal-task".into(),
             session_id: "session".into(),
@@ -1502,7 +1810,7 @@ mod tests {
                 .unwrap(),
             execution_epoch: 1,
             turn_kind: crate::goal_mode::GoalTurnKind::Start,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation: cancellation.clone(),
             deadline: Some(tokio::time::Instant::now()),
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -1581,6 +1889,171 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("generic Goal driver did not complete the exact session task");
+    }
+
+    #[tokio::test]
+    async fn unlimited_goal_completes_after_recovered_unaccounted_usage_and_reports_lower_bound() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                UncertainUsageAdapter {
+                    verifier_calls: Arc::clone(&verifier_calls),
+                },
+            )])),
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        let ingress = crate::goal_mode::GoalIngressContext::trusted(
+            "session",
+            "main",
+            "uncertain-usage-route",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress.clone(),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .key,
+            crate::goal_mode::GoalMessageKey::Started
+        );
+
+        for _ in 0..100 {
+            if store
+                .current_goal_for_session("session")
+                .await
+                .unwrap()
+                .is_some_and(|task| task.status == TaskStatus::Completed)
+            {
+                let task = store
+                    .current_goal_for_session("session")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+                assert_eq!(
+                    goal.accounting_state,
+                    crate::control_plane::GoalAccountingState::OutcomeUnknown
+                );
+                let status = runtime
+                    .submit(ingress, GoalCommand::Status)
+                    .await
+                    .unwrap()
+                    .status
+                    .unwrap();
+                assert!(!status.token_accounting_complete);
+                assert!(!status.cost_accounting_complete);
+                assert_eq!(status.remaining_tokens, None);
+                assert_eq!(status.remaining_cost_usd, None);
+                assert_eq!(
+                    status.usage_notice,
+                    Some(crate::goal_mode::GoalUsageNotice::UnaccountedUsageMayBeHigher)
+                );
+                assert_eq!(verifier_calls.load(Ordering::Acquire), 1);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("unlimited Goal did not complete after recovered unaccounted usage");
+    }
+
+    #[tokio::test]
+    async fn bounded_goal_pauses_before_verification_after_unaccounted_usage() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                UncertainUsageAdapter {
+                    verifier_calls: Arc::clone(&verifier_calls),
+                },
+            )])),
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        let ingress = crate::goal_mode::GoalIngressContext::trusted(
+            "session",
+            "main",
+            "uncertain-usage-route",
+            None,
+        )
+        .unwrap();
+
+        runtime
+            .submit(
+                ingress.clone(),
+                GoalCommand::Start {
+                    budget: GoalBudgetRequest::Limits {
+                        token_limit: Some(1_000_000),
+                        cost_limit_usd: None,
+                    },
+                    objective: "objective".into(),
+                    success_criteria: "criteria".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..100 {
+            let Some(task) = store.current_goal_for_session("session").await.unwrap() else {
+                panic!("bounded Goal disappeared");
+            };
+            if task.status == TaskStatus::Paused {
+                let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+                assert_eq!(
+                    goal.accounting_state,
+                    crate::control_plane::GoalAccountingState::OutcomeUnknown
+                );
+                assert_eq!(
+                    goal.pause_reason,
+                    Some(crate::control_plane::GoalPauseReason::AccountingUncertain)
+                );
+                assert_eq!(verifier_calls.load(Ordering::Acquire), 0);
+                let status = runtime
+                    .submit(ingress, GoalCommand::Status)
+                    .await
+                    .unwrap()
+                    .status
+                    .unwrap();
+                assert_eq!(status.pause_description, None);
+                assert_eq!(
+                    status.usage_notice,
+                    Some(crate::goal_mode::GoalUsageNotice::UnaccountedUsageMayBeHigher)
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("bounded Goal did not pause after unaccounted usage");
     }
 
     #[tokio::test]
@@ -1751,6 +2224,7 @@ mod tests {
                 .unwrap(),
             crate::control_plane::GoalTransitionResult::Applied
         );
+        let cancellation = tokio_util::sync::CancellationToken::new();
         let scope = GoalExecutionScope {
             task_id: "goal-task".into(),
             session_id: "session".into(),
@@ -1758,7 +2232,7 @@ mod tests {
                 .unwrap(),
             execution_epoch: 1,
             turn_kind: crate::goal_mode::GoalTurnKind::Start,
-            cancellation: tokio_util::sync::CancellationToken::new(),
+            cancellation: cancellation.clone(),
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
@@ -2067,14 +2541,14 @@ mod tests {
         let goals: Arc<dyn GoalTaskRegistry> = store.clone();
         let directory = tempfile::tempdir().unwrap();
         let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
-        let driver = GoalExecutionDriver::new(
+        let driver = Arc::new(GoalExecutionDriver::new(
             Arc::new(GoalExecutionHost::new(vec![Arc::new(
                 AdmittingCancellationAdapter,
             )])),
             goals.clone(),
             Arc::new(Config::default()),
             tracker,
-        );
+        ));
         let task = crate::control_plane::TaskRecord {
             id: "goal-task".into(),
             kind: crate::control_plane::TaskKind::Goal,
@@ -2124,10 +2598,30 @@ mod tests {
             deadline: None,
             operation_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         };
-        let task = zeroclaw_spawn::spawn!(async move { driver.run_scope(scope).await });
+        driver.launch(scope).await.unwrap();
+        for _ in 0..100 {
+            if store
+                .get_goal_task("goal-task")
+                .await
+                .unwrap()
+                .is_some_and(|goal| goal.pending_call_id.is_some())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let waiting_driver = Arc::clone(&driver);
+        let joined =
+            zeroclaw_spawn::spawn!(
+                async move { waiting_driver.join("goal-task", "session", 1).await }
+            );
         tokio::task::yield_now().await;
-        cancellation.cancel();
-        task.await.unwrap();
+        assert!(
+            !joined.is_finished(),
+            "joining a paused worker must not signal cancellation to its admitted operation"
+        );
+        driver.cancel("goal-task", "session", 1).await.unwrap();
+        assert!(joined.await.unwrap().is_ok());
         let current = store
             .current_goal_for_session("session")
             .await
@@ -2135,6 +2629,90 @@ mod tests {
             .unwrap();
         assert_eq!(current.status, TaskStatus::Failed);
         let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+        assert_eq!(
+            goal.accounting_state,
+            crate::control_plane::GoalAccountingState::OutcomeUnknown
+        );
+        assert!(goal.pending_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_cancel_after_forced_abort_classifies_the_pending_operation() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.provider = "openai.verifier".into();
+        let _ = config.providers.models.ensure("openai", "verifier");
+        let config = Arc::new(config);
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let goals: Arc<dyn GoalTaskRegistry> = store.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let tracker = Arc::new(CostTracker::new(CostConfig::default(), directory.path()).unwrap());
+        let driver = Arc::new(GoalExecutionDriver::new(
+            Arc::new(GoalExecutionHost::new(vec![Arc::new(
+                AdmittingNonCooperativeAdapter,
+            )])),
+            goals.clone(),
+            Arc::clone(&config),
+            Arc::clone(&tracker),
+        ));
+        let runtime = GoalRuntime::new(config, goals, tracker, driver, "boot").unwrap();
+        let ingress = crate::goal_mode::GoalIngressContext::trusted(
+            "session",
+            "main",
+            "admitting-noncooperative-route",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit(
+                    ingress.clone(),
+                    GoalCommand::Start {
+                        budget: GoalBudgetRequest::Unlimited,
+                        objective: "objective".into(),
+                        success_criteria: "criteria".into(),
+                    },
+                )
+                .await
+                .unwrap()
+                .key,
+            crate::goal_mode::GoalMessageKey::Started
+        );
+        let mut admitted = false;
+        for _ in 0..100 {
+            if let Some(task) = store.current_goal_for_session("session").await.unwrap()
+                && store
+                    .get_goal_task(&task.id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|goal| goal.pending_call_id.is_some())
+            {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            admitted,
+            "worker did not durably admit its parent operation"
+        );
+
+        assert_eq!(
+            runtime
+                .submit(ingress, GoalCommand::Cancel)
+                .await
+                .unwrap()
+                .key,
+            crate::goal_mode::GoalMessageKey::Cancelled
+        );
+        let task = store
+            .current_goal_for_session("session")
+            .await
+            .unwrap()
+            .expect("cancelled Goal remains auditable");
+        let goal = store.get_goal_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
         assert_eq!(
             goal.accounting_state,
             crate::control_plane::GoalAccountingState::OutcomeUnknown

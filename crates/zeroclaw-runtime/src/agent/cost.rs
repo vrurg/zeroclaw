@@ -428,9 +428,12 @@ fn combine_goal_accounting_state(
 ) -> crate::control_plane::GoalAccountingState {
     use crate::control_plane::GoalAccountingState::{Complete, Invalid, Missing, OutcomeUnknown};
     match (current, next) {
-        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Invalid, _) | (_, Invalid) => Invalid,
         (Missing, _) | (_, Missing) => Missing,
+        // Goal policy permits an acknowledged unknown outcome only when all
+        // surfaced usage is valid and complete. Generic dispatch accounting
+        // retains its own conservative ordering for non-Goal consumers.
+        (OutcomeUnknown, _) | (_, OutcomeUnknown) => OutcomeUnknown,
         (Complete, Complete) => Complete,
     }
 }
@@ -791,6 +794,28 @@ mod tests {
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[test]
+    fn goal_accounting_keeps_missing_and_invalid_fail_closed_with_unknown_attempts() {
+        use crate::control_plane::GoalAccountingState::{Invalid, Missing, OutcomeUnknown};
+
+        assert_eq!(
+            combine_goal_accounting_state(OutcomeUnknown, Missing),
+            Missing
+        );
+        assert_eq!(
+            combine_goal_accounting_state(Missing, OutcomeUnknown),
+            Missing
+        );
+        assert_eq!(
+            combine_goal_accounting_state(OutcomeUnknown, Invalid),
+            Invalid
+        );
+        assert_eq!(
+            combine_goal_accounting_state(Invalid, OutcomeUnknown),
+            Invalid
+        );
     }
 
     #[tokio::test]
