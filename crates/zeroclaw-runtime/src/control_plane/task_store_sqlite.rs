@@ -1,6 +1,7 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -11,7 +12,7 @@ use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -35,10 +36,14 @@ impl SqliteTaskStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // A file-backed first open races with other processes doing the same
+        // initialization. Install the busy handler before `journal_mode`,
+        // because switching to WAL can itself take a database lock.
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("set control-plane busy timeout")?;
+        set_wal_mode_with_retry(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
+            "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
              PRAGMA foreign_keys = ON;",
         )
@@ -58,6 +63,8 @@ impl SqliteTaskStore {
                  delivered       INTEGER NOT NULL DEFAULT 0,
                  idem_key        TEXT,
                  principal_id    TEXT,
+                 session_id      TEXT,
+                 execution_epoch INTEGER NOT NULL DEFAULT 0,
                  started_at      TEXT NOT NULL,
                  finished_at     TEXT,
                  output          TEXT,
@@ -91,31 +98,224 @@ impl SqliteTaskStore {
 
     /// Admin enumeration — delete this agent's records (alias-delete cascade).
     pub fn delete_by_agent(&self, agent: &str) -> Result<u64> {
-        let conn = self.conn.lock();
-        let n = conn
+        let mut conn = self.conn.lock();
+        // The classification and mutation must share one writer transaction:
+        // another connection may otherwise admit a Goal after the check and
+        // before the generic delete.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded generic agent deletion")?;
+        let has_session_goal = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tasks
+                     WHERE agent = ?1 AND kind = 'goal'
+                       AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+                 )",
+                params![agent],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("classify session-bound Goal agent deletion")?;
+        if has_session_goal {
+            anyhow::bail!(
+                "session-bound Goal tasks require guarded GoalTaskRegistry disposal; generic agent deletion is unavailable"
+            );
+        }
+        let n = tx
             .execute("DELETE FROM tasks WHERE agent = ?1", params![agent])
             .context("delete tasks by agent")?;
+        tx.commit()
+            .context("commit guarded generic agent deletion")?;
         Ok(n as u64)
+    }
+
+    /// Reconcile Goal work for a newly opened control plane.
+    ///
+    /// A pending provider operation or tool phase cannot be replayed safely,
+    /// so it fails closed as `outcome_unknown`. Its executor fences are then
+    /// retired: the interrupted executor is gone, the terminal Goal is not
+    /// resumable, and session disposal or replacement must remain possible.
+    /// A clean operation is paused for explicit resume.
+    pub(crate) fn reconcile_goal_boot_state(&self) -> Result<u64> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start Goal boot reconciliation")?;
+        let goals = {
+            let mut stmt = tx
+                .prepare("SELECT * FROM tasks WHERE kind = 'goal'")
+                .context("prepare Goal boot-reconciliation query")?;
+            let rows = stmt
+                .query_map([], row_to_record)
+                .context("query interrupted Goals")?;
+            collect_skipping_bad_rows(rows)
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut reconciled = 0;
+        // A control-plane database has one active Goal runtime. Opening it
+        // fences every persisted Goal, including a record stamped by the same
+        // boot ID: a reload must not leave a Running Goal whose executor was
+        // discarded. The generic task reaper retains its narrower authority
+        // policy for non-Goal task kinds.
+        for task in goals {
+            let unsettled = tx
+                .query_row(
+                    "SELECT pending_operation_id IS NOT NULL
+                          OR pending_operation_epoch IS NOT NULL
+                          OR tool_phase != 'clean'
+                          OR tool_phase_epoch IS NOT NULL
+                       FROM goal_tasks WHERE task_id = ?1",
+                    params![task.id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .context("classify interrupted Goal settlement")?
+                // A Goal without its extension is corrupt control state. Do
+                // not allow it to resume or block future session cleanup.
+                .unwrap_or(true);
+
+            if unsettled {
+                // The owner died before it could settle these fences. The
+                // accounting failure is durable, but retaining a fence no
+                // living executor can settle would permanently wedge session
+                // replacement and disposal.
+                tx.execute(
+                    "UPDATE goal_tasks
+                        SET accounting_state = 'outcome_unknown',
+                            pending_operation_id = NULL,
+                            pending_operation_epoch = NULL,
+                            tool_phase = 'clean',
+                            tool_phase_epoch = NULL
+                      WHERE task_id = ?1",
+                    params![task.id],
+                )?;
+                let changed = tx.execute(
+                    "UPDATE tasks
+                        SET status = 'failed',
+                            error = COALESCE(error, 'accounting_outcome_unknown'),
+                            finished_at = COALESCE(finished_at, ?2),
+                            execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                                THEN execution_epoch + 1 ELSE execution_epoch END
+                      WHERE id = ?1 AND kind = 'goal'
+                        AND status IN ('running', 'paused')",
+                    params![task.id, now],
+                )?;
+                // Terminal lifecycle decisions remain terminal, but their
+                // dead executor fence is still retired above.
+                let _ = changed;
+            } else {
+                if task.status != TaskStatus::Running {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE goal_tasks
+                        SET pause_reason = 'daemon_restarted',
+                            pause_description = NULL,
+                            blockers_json = '[]'
+                      WHERE task_id = ?1",
+                    params![task.id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks
+                        SET status = 'paused', execution_epoch = CASE
+                            WHEN execution_epoch < 9223372036854775807
+                            THEN execution_epoch + 1 ELSE execution_epoch END
+                      WHERE id = ?1 AND kind = 'goal' AND status = 'running'",
+                    params![task.id],
+                )?;
+            }
+            reconciled += 1;
+        }
+        tx.commit().context("commit Goal boot reconciliation")?;
+        Ok(reconciled)
     }
 }
 
+/// SQLite can return `SQLITE_BUSY` immediately when two first-openers both
+/// attempt the journal-mode transition. The connection-level busy handler is
+/// installed first, and this narrowly retries only that bootstrap operation.
+fn set_wal_mode_with_retry(conn: &Connection) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 100;
+    const RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match conn.execute_batch("PRAGMA journal_mode = WAL;") {
+            Ok(()) => return Ok(()),
+            Err(error) if is_sqlite_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(error) => return Err(error).context("set control-plane journal mode to WAL"),
+        }
+    }
+
+    unreachable!("the final journal-mode attempt returns above")
+}
+
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite_error, _)
+            if matches!(
+                sqlite_error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn migrate_schema(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
+    // Avoid taking a writer lock for the normal already-current case. A
+    // migration-needed opener re-reads this version after acquiring the writer
+    // lock below, so a concurrent migrator cannot leave this observation stale.
+    let observed_version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    goal::migrate_schema(conn, version)?;
-    if version > CONTROL_PLANE_SCHEMA_VERSION {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "db_version": version,
-                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
-                })
-            ),
-            "control-plane DB was created by a newer schema version"
-        );
+    if observed_version >= CONTROL_PLANE_SCHEMA_VERSION {
+        if observed_version > CONTROL_PLANE_SCHEMA_VERSION {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "db_version": observed_version,
+                        "known_version": CONTROL_PLANE_SCHEMA_VERSION,
+                    })),
+                "control-plane DB was created by a newer schema version"
+            );
+        }
+        return Ok(());
     }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("begin control-plane schema migration")?;
+    // Read the version only after taking the writer lock. Two first-openers
+    // must not both apply an additive migration based on a stale observation.
+    let version: i64 = tx
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read control-plane schema version")?;
+    if version >= CONTROL_PLANE_SCHEMA_VERSION {
+        tx.commit()
+            .context("commit current control-plane schema transaction")?;
+        return Ok(());
+    }
+    if version < 8 {
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "session_id",
+            "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "execution_epoch",
+            "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    goal::migrate_schema(&tx, version)?;
+    tx.execute_batch(&format!(
+        "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
+    ))
+    .context("mark control-plane schema version")?;
+    tx.commit()
+        .context("commit control-plane schema migration")?;
     Ok(())
 }
 
@@ -192,6 +392,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         delivered: row.get::<_, i64>("delivered")? != 0,
         idem_key: row.get("idem_key")?,
         principal_id: row.get("principal_id")?,
+        session_id: row.get("session_id")?,
+        execution_epoch: row.get("execution_epoch")?,
         started_at: row.get("started_at")?,
         finished_at: row.get("finished_at")?,
     })
@@ -224,16 +426,16 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
-fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
+fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<usize> {
     // ON CONFLICT DO NOTHING, NOT INSERT OR REPLACE: re-registering an existing id
     // must be a true no-op, never clobber an already-recorded output/error/terminal
     // status back to NULL/running (review finding— the documented idempotency).
     conn.execute(
         "INSERT INTO tasks
             (id, kind, agent, status, owner_pid, owner_boot_id, heartbeat_at, depth,
-             parent_id, originator_route, delivered, idem_key, principal_id,
-             started_at, finished_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+             parent_id, originator_route, delivered, idem_key, principal_id, session_id,
+             execution_epoch, started_at, finished_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
          ON CONFLICT(id) DO NOTHING",
         params![
             rec.id,
@@ -249,12 +451,13 @@ fn insert_task_record(conn: &Connection, rec: TaskRecord) -> Result<()> {
             rec.delivered as i64,
             rec.idem_key,
             rec.principal_id,
+            rec.session_id,
+            rec.execution_epoch,
             rec.started_at,
             rec.finished_at,
         ],
     )
-    .context("insert task record")?;
-    Ok(())
+    .context("insert task record")
 }
 
 fn update_task_status_record(
@@ -298,9 +501,35 @@ fn claim_task_owner_record(
     .context("claim task owner")
 }
 
+fn reject_session_bound_goal_mutation(
+    conn: &Connection,
+    task_id: &str,
+    operation: &str,
+) -> Result<()> {
+    let session_bound = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+               FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("classify generic task lifecycle mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!(
+            "session-bound Goal tasks require guarded GoalTaskRegistry APIs; {operation} is unavailable"
+        );
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
+        if rec.kind == TaskKind::Goal {
+            anyhow::bail!("Goal tasks require the session-bound GoalTaskRegistry admission API");
+        }
         let conn = self.conn.lock();
         insert_task_record(&conn, rec)?;
         Ok(())
@@ -308,15 +537,21 @@ impl TaskRegistry for SqliteTaskStore {
 
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded generic task heartbeat")?;
+        reject_session_bound_goal_mutation(&tx, id, "heartbeat")?;
         // Only the heart-beating owner refreshes; prevents a stale boot from
         // resurrecting liveness it does not own.
-        conn.execute(
+        tx.execute(
             "UPDATE tasks SET heartbeat_at = ?1
              WHERE id = ?2 AND owner_boot_id = ?3",
             params![now, id, owner_boot_id],
         )
         .context("heartbeat task")?;
+        tx.commit()
+            .context("commit guarded generic task heartbeat")?;
         Ok(())
     }
 
@@ -327,14 +562,26 @@ impl TaskRegistry for SqliteTaskStore {
         output: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        let conn = self.conn.lock();
-        update_task_status_record(&conn, id, status, output, error)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded generic task status update")?;
+        reject_session_bound_goal_mutation(&tx, id, "status update")?;
+        update_task_status_record(&tx, id, status, output, error)?;
+        tx.commit()
+            .context("commit guarded generic task status update")?;
         Ok(())
     }
 
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded generic task owner claim")?;
+        reject_session_bound_goal_mutation(&tx, id, "owner claim")?;
+        claim_task_owner_record(&tx, id, owner_pid, owner_boot_id)?;
+        tx.commit()
+            .context("commit guarded generic task owner claim")?;
         Ok(())
     }
 
@@ -374,8 +621,12 @@ impl TaskRegistry for SqliteTaskStore {
     }
 
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
-        let conn = self.conn.lock();
-        let rec = conn
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded generic task loss reconciliation")?;
+        reject_session_bound_goal_mutation(&tx, id, "loss reconciliation")?;
+        let rec = tx
             .query_row(
                 "SELECT * FROM tasks WHERE id = ?1",
                 params![id],
@@ -383,25 +634,54 @@ impl TaskRegistry for SqliteTaskStore {
             )
             .optional()
             .context("reconcile: load task")?;
-        let Some(rec) = rec else { return Ok(false) };
+        let Some(rec) = rec else {
+            tx.commit()
+                .context("commit missing generic task loss reconciliation")?;
+            return Ok(false);
+        };
+        // Goal restart policy is explicit: clean work pauses and unsettled
+        // work fails closed. The generic reaper must not overwrite either.
+        if rec.kind == TaskKind::Goal {
+            tx.commit()
+                .context("commit rejected Goal loss reconciliation")?;
+            return Ok(false);
+        }
         // Never reclaim a terminal record, and never one a live owner still holds.
         if rec.status.is_terminal() || !is_authoritative(&rec, now_boot_id) {
+            tx.commit()
+                .context("commit skipped generic task loss reconciliation")?;
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE tasks SET status = 'lost', finished_at = ?1
+        let changed = tx
+            .execute(
+                "UPDATE tasks SET status = 'lost', finished_at = ?1
               WHERE id = ?2 AND status = 'running'",
-            params![now, id],
-        )
-        .context("reconcile: mark lost")?;
-        Ok(true)
+                params![now, id],
+            )
+            .context("reconcile: mark lost")?;
+        tx.commit()
+            .context("commit guarded generic task loss reconciliation")?;
+        Ok(changed == 1)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_schema_migration_uses_a_read_only_fast_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION}; PRAGMA query_only = ON;"
+        ))
+        .unwrap();
+
+        // An already-current database must not acquire a write transaction or
+        // rewrite `user_version` merely because another daemon opens it.
+        migrate_schema(&conn).unwrap();
+    }
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
         TaskRecord {
@@ -418,6 +698,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }

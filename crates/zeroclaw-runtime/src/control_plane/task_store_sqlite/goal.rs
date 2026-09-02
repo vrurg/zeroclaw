@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::control_plane::goal_task::{
-    GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    TaskContinuationContext,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
+    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -154,7 +154,158 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         )
         .context("apply control-plane schema v7")?;
     }
+    if version < 8 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pending_operation_id",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_operation_id TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "pending_operation_epoch",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_operation_epoch INTEGER",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "accounting_state",
+            "ALTER TABLE goal_tasks ADD COLUMN accounting_state TEXT NOT NULL DEFAULT 'complete'",
+        )?;
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "tool_phase",
+            "ALTER TABLE goal_tasks ADD COLUMN tool_phase TEXT NOT NULL DEFAULT 'clean'",
+        )?;
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_tasks_active_goal_context;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_current_goal_session
+                 ON tasks(session_id)
+                 WHERE kind = 'goal' AND session_id IS NOT NULL
+                   AND length(trim(session_id)) > 0;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_pending_operation
+                 ON goal_tasks(pending_operation_id)
+                 WHERE pending_operation_id IS NOT NULL;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_pending_operation_pair_insert
+                 BEFORE INSERT ON goal_tasks
+                 FOR EACH ROW
+                 WHEN (NEW.pending_operation_id IS NULL) != (NEW.pending_operation_epoch IS NULL)
+                 BEGIN SELECT RAISE(ABORT, 'goal pending operation id and epoch must be paired'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_pending_operation_pair_update
+                 BEFORE UPDATE OF pending_operation_id, pending_operation_epoch ON goal_tasks
+                 FOR EACH ROW
+                 WHEN (NEW.pending_operation_id IS NULL) != (NEW.pending_operation_epoch IS NULL)
+                 BEGIN SELECT RAISE(ABORT, 'goal pending operation id and epoch must be paired'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_state_domains_insert
+                 BEFORE INSERT ON goal_tasks
+                 FOR EACH ROW
+                 WHEN NEW.accounting_state NOT IN ('complete', 'missing', 'invalid', 'outcome_unknown')
+                   OR NEW.tool_phase NOT IN ('clean', 'in_flight')
+                 BEGIN SELECT RAISE(ABORT, 'invalid goal accounting or tool phase'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_state_domains_update
+                 BEFORE UPDATE OF accounting_state, tool_phase ON goal_tasks
+                 FOR EACH ROW
+                 WHEN NEW.accounting_state NOT IN ('complete', 'missing', 'invalid', 'outcome_unknown')
+                   OR NEW.tool_phase NOT IN ('clean', 'in_flight')
+                 BEGIN SELECT RAISE(ABORT, 'invalid goal accounting or tool phase'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_tasks_goal_session_insert
+                 BEFORE INSERT ON tasks
+                 FOR EACH ROW WHEN NEW.kind = 'goal'
+                   AND (NEW.session_id IS NULL OR length(trim(NEW.session_id)) = 0)
+                 BEGIN SELECT RAISE(ABORT, 'new goal tasks require a nonblank session id'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_tasks_goal_session_rebind
+                 BEFORE UPDATE OF kind, session_id ON tasks
+                 FOR EACH ROW WHEN NEW.kind = 'goal'
+                   AND (NEW.session_id IS NULL OR length(trim(NEW.session_id)) = 0)
+                 BEGIN SELECT RAISE(ABORT, 'goal tasks require a nonblank session id'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_tasks_goal_session_immutable
+                 BEFORE UPDATE OF session_id ON tasks
+                 FOR EACH ROW WHEN OLD.kind = 'goal'
+                   AND OLD.session_id IS NOT NULL AND length(trim(OLD.session_id)) > 0
+                   AND NEW.session_id IS NOT OLD.session_id
+                 BEGIN SELECT RAISE(ABORT, 'goal session binding is immutable'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_objective_immutable
+                 BEFORE UPDATE OF objective ON goal_tasks
+                 FOR EACH ROW WHEN NEW.objective IS NOT OLD.objective
+                   AND EXISTS (
+                       SELECT 1 FROM tasks
+                        WHERE id = OLD.task_id AND kind = 'goal'
+                          AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+                   )
+                 BEGIN SELECT RAISE(ABORT, 'session Goal objective is immutable'); END;
+             UPDATE tasks
+                SET status = 'failed',
+                    error = COALESCE(error, 'legacy_goal_missing_session'),
+                    finished_at = COALESCE(
+                        finished_at,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    )
+              WHERE kind = 'goal'
+                AND (session_id IS NULL OR length(trim(session_id)) = 0)
+                AND status IN ('running', 'paused');",
+        )
+        .context("apply control-plane schema v8")?;
+    }
+    if version < 9 {
+        add_column_if_missing(
+            conn,
+            "goal_tasks",
+            "tool_phase_epoch",
+            "ALTER TABLE goal_tasks ADD COLUMN tool_phase_epoch INTEGER",
+        )?;
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_tool_phase_epoch_insert
+                BEFORE INSERT ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.tool_phase = 'clean' AND NEW.tool_phase_epoch IS NOT NULL)
+                  OR (NEW.tool_phase = 'in_flight' AND NEW.tool_phase_epoch IS NULL)
+                BEGIN SELECT RAISE(ABORT, 'goal tool phase and epoch must be paired'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_tool_phase_epoch_update
+                BEFORE UPDATE OF tool_phase, tool_phase_epoch ON goal_tasks
+                FOR EACH ROW
+                WHEN (NEW.tool_phase = 'clean' AND NEW.tool_phase_epoch IS NOT NULL)
+                  OR (NEW.tool_phase = 'in_flight' AND NEW.tool_phase_epoch IS NULL)
+                BEGIN SELECT RAISE(ABORT, 'goal tool phase and epoch must be paired'); END;
+             UPDATE goal_tasks
+                SET tool_phase_epoch = (
+                    SELECT execution_epoch FROM tasks WHERE tasks.id = goal_tasks.task_id
+                )
+              WHERE tool_phase = 'in_flight' AND tool_phase_epoch IS NULL;
+             PRAGMA user_version = 9;",
+        )
+        .context("apply control-plane schema v9")?;
+    }
     Ok(())
+}
+
+fn accounting_state_to_db(state: GoalAccountingState) -> Result<String> {
+    serde_json::to_value(state)
+        .context("serialize goal accounting state")?
+        .as_str()
+        .map(str::to_owned)
+        .context("serialized goal accounting state is not a string")
+}
+
+fn accounting_state_from_db(value: String) -> rusqlite::Result<GoalAccountingState> {
+    serde_json::from_value(serde_json::Value::String(value.clone())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+    })
+}
+
+fn tool_phase_to_db(phase: GoalToolPhase) -> Result<String> {
+    serde_json::to_value(phase)
+        .context("serialize goal tool phase")?
+        .as_str()
+        .map(str::to_owned)
+        .context("serialized goal tool phase is not a string")
+}
+
+fn tool_phase_from_db(value: String) -> rusqlite::Result<GoalToolPhase> {
+    serde_json::from_value(serde_json::Value::String(value.clone())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+    })
 }
 
 fn ensure_goal_task_identity(task: &TaskRecord, goal: &GoalTaskRecord) -> Result<()> {
@@ -269,19 +420,27 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
         pause_reason,
         pause_description: row.get("pause_description")?,
         blockers: blockers_from_db(row.get("blockers_json")?)?,
+        pending_operation_id: row.get("pending_operation_id")?,
+        pending_operation_epoch: row.get("pending_operation_epoch")?,
+        accounting_state: accounting_state_from_db(row.get("accounting_state")?)?,
+        tool_phase: tool_phase_from_db(row.get("tool_phase")?)?,
+        tool_phase_epoch: row.get("tool_phase_epoch")?,
     })
 }
 
-fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
+fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<usize> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
     let (effective_token_limit, effective_cost_limit_usd) =
         goal_limits_to_db(rec.effective_token_limit, rec.effective_cost_limit_usd)?;
+    let accounting_state = accounting_state_to_db(rec.accounting_state)?;
+    let tool_phase = tool_phase_to_db(rec.tool_phase)?;
     conn.execute(
         "INSERT INTO goal_tasks
             (task_id, objective, effective_token_limit, effective_cost_limit_usd,
-             pause_reason, pause_description, blockers_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             pause_reason, pause_description, blockers_json, pending_operation_id,
+             pending_operation_epoch, accounting_state, tool_phase, tool_phase_epoch)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(task_id) DO NOTHING",
         params![
             rec.task_id,
@@ -291,10 +450,14 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
             pause_reason,
             rec.pause_description,
             blockers_json,
+            rec.pending_operation_id,
+            rec.pending_operation_epoch,
+            accounting_state,
+            tool_phase,
+            rec.tool_phase_epoch,
         ],
     )
-    .context("insert goal task record")?;
-    Ok(())
+    .context("insert goal task record")
 }
 
 fn update_goal_pause_record(
@@ -342,6 +505,42 @@ fn ensure_goal_task_row(conn: &Connection, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn transition_failure(
+    conn: &Connection,
+    task_id: &str,
+    session_id: &str,
+) -> Result<GoalTransitionResult> {
+    let exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND kind = 'goal' AND session_id = ?2)",
+            params![task_id, session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("classify guarded Goal transition")?;
+    Ok(if exists {
+        GoalTransitionResult::Stale
+    } else {
+        GoalTransitionResult::Missing
+    })
+}
+
+fn reject_session_goal_legacy_mutation(conn: &Connection, task_id: &str) -> Result<()> {
+    let session_bound = conn
+        .query_row(
+            "SELECT kind = 'goal' AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+               FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("classify legacy Goal mutation")?
+        .unwrap_or(false);
+    if session_bound {
+        anyhow::bail!("session-bound Goals require guarded GoalTaskRegistry APIs");
+    }
+    Ok(())
+}
+
 fn upsert_continuation_context(
     conn: &Connection,
     task_id: &str,
@@ -366,19 +565,18 @@ impl GoalTaskRegistry for SqliteTaskStore {
         goal: GoalTaskRecord,
         continuation_context: Option<TaskContinuationContext>,
     ) -> Result<()> {
-        ensure_goal_task_identity(&task, &goal)?;
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .context("start create goal transaction")?;
-        let task_id = goal.task_id.clone();
-        insert_task_record(&tx, task)?;
-        insert_goal_task_record(&tx, goal)?;
-        if let Some(context) = continuation_context {
-            upsert_continuation_context(&tx, &task_id, &context)?;
+        if continuation_context.is_some() {
+            anyhow::bail!(
+                "session-bound Goals do not persist TaskContinuationContext; use a Goal execution host"
+            );
         }
-        tx.commit().context("commit create goal transaction")?;
-        Ok(())
+        match self.create_or_replace_session_goal(task, goal).await? {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale => anyhow::bail!("session already has a current Goal"),
+            GoalTransitionResult::Missing => {
+                anyhow::bail!("Goal creation lost its canonical task row")
+            }
+        }
     }
 
     async fn latest_active_goal_for_agent(&self, agent: &str) -> Result<Option<TaskRecord>> {
@@ -469,7 +667,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
-                    pause_reason, pause_description, blockers_json
+                    pause_reason, pause_description, blockers_json, pending_operation_id,
+                    pending_operation_epoch, accounting_state, tool_phase, tool_phase_epoch
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
@@ -479,8 +678,12 @@ impl GoalTaskRegistry for SqliteTaskStore {
     }
 
     async fn update_goal_objective(&self, task_id: &str, objective: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        let updated = conn
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded legacy goal objective update")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
+        let updated = tx
             .execute(
                 "UPDATE goal_tasks
                     SET objective = ?1
@@ -491,6 +694,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
         }
+        tx.commit()
+            .context("commit guarded legacy goal objective update")?;
         Ok(())
     }
 
@@ -502,8 +707,12 @@ impl GoalTaskRegistry for SqliteTaskStore {
     ) -> Result<()> {
         let (effective_token_limit, effective_cost_limit_usd) =
             goal_limits_to_db(token_limit, cost_limit_usd)?;
-        let conn = self.conn.lock();
-        let updated = conn
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded legacy goal limits update")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
+        let updated = tx
             .execute(
                 "UPDATE goal_tasks
                 SET effective_token_limit = ?1,
@@ -515,23 +724,32 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
         }
+        tx.commit()
+            .context("commit guarded legacy goal limits update")?;
         Ok(())
     }
 
     async fn update_goal_pause(&self, task_id: &str, pause: Option<GoalPauseState>) -> Result<()> {
-        let conn = self.conn.lock();
-        let updated = update_goal_pause_record(&conn, task_id, pause)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded legacy goal pause update")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
+        let updated = update_goal_pause_record(&tx, task_id, pause)?;
         if updated == 0 {
             anyhow::bail!("goal task {task_id} has no goal extension row");
         }
+        tx.commit()
+            .context("commit guarded legacy goal pause update")?;
         Ok(())
     }
 
     async fn pause_goal_task(&self, task_id: &str, pause: GoalPauseState) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("start pause goal task transaction")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
         ensure_goal_task_row(&tx, task_id)?;
         let updated = update_task_status_record(&tx, task_id, TaskStatus::Paused, None, None)?;
         if updated == 0 {
@@ -554,8 +772,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
     ) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("start resume goal task transaction")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
         ensure_goal_task_row(&tx, task_id)?;
         if let Some(context) = continuation_context {
             upsert_continuation_context(&tx, task_id, &context)?;
@@ -581,18 +800,24 @@ impl GoalTaskRegistry for SqliteTaskStore {
         task_id: &str,
         context: Option<TaskContinuationContext>,
     ) -> Result<()> {
-        let conn = self.conn.lock();
-        ensure_goal_task_row(&conn, task_id)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded legacy continuation-context update")?;
+        reject_session_goal_legacy_mutation(&tx, task_id)?;
+        ensure_goal_task_row(&tx, task_id)?;
         match context {
-            Some(context) => upsert_continuation_context(&conn, task_id, &context)?,
+            Some(context) => upsert_continuation_context(&tx, task_id, &context)?,
             None => {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM task_continuation_contexts WHERE task_id = ?1",
                     params![task_id],
                 )
                 .context("delete task continuation context")?;
             }
         }
+        tx.commit()
+            .context("commit guarded legacy continuation-context update")?;
         Ok(())
     }
 
@@ -610,6 +835,422 @@ impl GoalTaskRegistry for SqliteTaskStore {
         )
         .optional()
         .context("get task continuation context")
+    }
+
+    async fn current_goal_for_session(&self, session_id: &str) -> Result<Option<TaskRecord>> {
+        if session_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT * FROM tasks WHERE kind = 'goal' AND session_id = ?1",
+            params![session_id],
+            row_to_record,
+        )
+        .optional()
+        .context("get current Goal for session")
+    }
+
+    async fn create_or_replace_session_goal(
+        &self,
+        mut task: TaskRecord,
+        goal: GoalTaskRecord,
+    ) -> Result<GoalTransitionResult> {
+        ensure_goal_task_identity(&task, &goal)?;
+        let session_id = task
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("new Goal requires a nonblank session id")?;
+        if task.status != TaskStatus::Running || task.finished_at.is_some() {
+            anyhow::bail!("new session Goals must start running without terminal metadata");
+        }
+        if goal.objective.trim().is_empty() {
+            anyhow::bail!("new session Goals require a nonblank objective");
+        }
+        if goal.pending_operation_id.is_some()
+            || goal.pending_operation_epoch.is_some()
+            || goal.accounting_state != GoalAccountingState::Complete
+            || goal.tool_phase != GoalToolPhase::Clean
+            || goal.tool_phase_epoch.is_some()
+        {
+            anyhow::bail!("new session Goals must not carry in-flight or incomplete state");
+        }
+        task.execution_epoch = 1;
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start create or replace session Goal transaction")?;
+        let predecessor = tx
+            .query_row(
+                "SELECT * FROM tasks WHERE kind = 'goal' AND session_id = ?1",
+                params![session_id],
+                row_to_record,
+            )
+            .optional()
+            .context("read current session Goal")?;
+        if let Some(predecessor) = predecessor {
+            if !predecessor.status.is_terminal() {
+                return Ok(GoalTransitionResult::Stale);
+            }
+            // Task ID and epoch fence a live executor together. Reusing the
+            // predecessor ID would reset its epoch to one and let stale work
+            // alias the replacement Goal.
+            if predecessor.id == task.id {
+                return Ok(GoalTransitionResult::Stale);
+            }
+            let settled = tx
+                .query_row(
+                    "SELECT pending_operation_id IS NULL
+                           AND pending_operation_epoch IS NULL
+                           AND tool_phase = 'clean' AND tool_phase_epoch IS NULL
+                      FROM goal_tasks WHERE task_id = ?1",
+                    params![&predecessor.id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()
+                .context("check terminal Goal settlement")?
+                .unwrap_or(false);
+            if !settled {
+                return Ok(GoalTransitionResult::Stale);
+            }
+            tx.execute("DELETE FROM tasks WHERE id = ?1", params![&predecessor.id])
+                .context("delete terminal Goal control state")?;
+        }
+        if insert_task_record(&tx, task)? != 1 {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        if insert_goal_task_record(&tx, goal)? != 1 {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        tx.commit()
+            .context("commit create or replace session Goal transaction")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn pause_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        pause: GoalPauseState,
+    ) -> Result<GoalTransitionResult> {
+        let reason = pause_reason_to_db(pause.reason)?;
+        let blockers = blockers_to_db(&pause.blockers)?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("start guarded Goal pause")?;
+        let updated = tx.execute(
+            "UPDATE tasks
+                SET status = 'paused', execution_epoch = execution_epoch + 1
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'running' AND execution_epoch = ?3
+                AND execution_epoch < 9223372036854775807",
+            params![task_id, session_id, expected_epoch],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
+              WHERE task_id = ?4",
+            params![reason, pause.description, blockers, task_id],
+        )?;
+        tx.commit().context("commit guarded Goal pause")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn resume_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("start guarded Goal resume")?;
+        let updated = tx.execute(
+            "UPDATE tasks
+                SET status = 'running', execution_epoch = execution_epoch + 1,
+                    owner_pid = ?4, owner_boot_id = ?5, heartbeat_at = NULL
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'paused' AND execution_epoch = ?3
+                AND execution_epoch < 9223372036854775807
+                AND EXISTS (
+                    SELECT 1 FROM goal_tasks
+                     WHERE task_id = tasks.id AND accounting_state = 'complete'
+                       AND pending_operation_id IS NULL AND pending_operation_epoch IS NULL
+                       AND tool_phase = 'clean' AND tool_phase_epoch IS NULL
+                )",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                owner_pid as i64,
+                owner_boot_id
+            ],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = NULL, pause_description = NULL, blockers_json = '[]'
+              WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        tx.commit().context("commit guarded Goal resume")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn finish_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        status: TaskStatus,
+        error: Option<String>,
+    ) -> Result<GoalTransitionResult> {
+        if !status.is_terminal() {
+            anyhow::bail!("guarded Goal finish requires a terminal task status");
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("start guarded Goal finish")?;
+        let updated = tx.execute(
+            "UPDATE tasks
+                SET status = ?4, error = ?5, finished_at = COALESCE(finished_at, ?6),
+                    execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                        THEN execution_epoch + 1 ELSE execution_epoch END
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status IN ('running', 'paused') AND execution_epoch = ?3",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                super::status_to_db(status),
+                error,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit().context("commit guarded Goal finish")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn admit_pending_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        operation_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        if operation_id.trim().is_empty() {
+            anyhow::bail!("Goal pending operation id must be nonblank");
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal pending-operation admission")?;
+        let updated = tx.execute(
+            "UPDATE goal_tasks
+                SET pending_operation_id = ?4, pending_operation_epoch = ?3
+              WHERE task_id = ?1 AND pending_operation_id IS NULL AND pending_operation_epoch IS NULL
+                AND accounting_state = 'complete'
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status = 'running' AND execution_epoch = ?3
+                )",
+            params![task_id, session_id, expected_epoch, operation_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit()
+            .context("commit guarded Goal pending-operation admission")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn settle_pending_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        operation_id: &str,
+        accounting_state: GoalAccountingState,
+    ) -> Result<GoalTransitionResult> {
+        let accounting_state = accounting_state_to_db(accounting_state)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal pending-operation settlement")?;
+        let updated = tx.execute(
+            "UPDATE goal_tasks
+                SET pending_operation_id = NULL, pending_operation_epoch = NULL,
+                    accounting_state = ?5
+              WHERE task_id = ?1 AND pending_operation_id = ?4 AND pending_operation_epoch = ?3
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                )",
+            params![
+                task_id,
+                session_id,
+                admitted_epoch,
+                operation_id,
+                accounting_state,
+            ],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit()
+            .context("commit guarded Goal pending-operation settlement")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn begin_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal tool-phase admission")?;
+        let updated = tx.execute(
+            "UPDATE goal_tasks SET tool_phase = 'in_flight', tool_phase_epoch = ?3
+              WHERE task_id = ?1 AND tool_phase = 'clean' AND tool_phase_epoch IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status = 'running' AND execution_epoch = ?3
+                )",
+            params![task_id, session_id, expected_epoch],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit()
+            .context("commit guarded Goal tool-phase admission")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn complete_goal_tool_phase(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal tool-phase settlement")?;
+        // A tool phase can outlive the running epoch while an operator pauses
+        // the Goal to drain it. Its admitted epoch distinguishes that drain
+        // from a later phase on the same task.
+        let updated = tx.execute(
+            "UPDATE goal_tasks SET tool_phase = 'clean', tool_phase_epoch = NULL
+              WHERE task_id = ?1 AND tool_phase = 'in_flight' AND tool_phase_epoch = ?3
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                )",
+            params![task_id, session_id, admitted_epoch],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit()
+            .context("commit guarded Goal tool-phase settlement")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn update_session_goal_limits(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) -> Result<GoalTransitionResult> {
+        let (token_limit, cost_limit_usd) = goal_limits_to_db(token_limit, cost_limit_usd)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal limit update")?;
+        let updated = tx.execute(
+            "UPDATE goal_tasks
+                SET effective_token_limit = ?4, effective_cost_limit_usd = ?5
+              WHERE task_id = ?1
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status IN ('running', 'paused') AND execution_epoch = ?3
+                )",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                token_limit,
+                cost_limit_usd
+            ],
+        )?;
+        if updated == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit().context("commit guarded Goal limit update")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn delete_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("start guarded Goal deletion")?;
+        let task = tx
+            .query_row(
+                "SELECT * FROM tasks WHERE id = ?1 AND kind = 'goal' AND session_id = ?2",
+                params![task_id, session_id],
+                row_to_record,
+            )
+            .optional()
+            .context("load guarded Goal deletion target")?;
+        let Some(task) = task else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if task.execution_epoch != expected_epoch || !task.status.is_terminal() {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let deleted = tx.execute(
+            "DELETE FROM tasks
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND execution_epoch = ?3
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_tasks
+                     WHERE task_id = tasks.id
+                       AND (pending_operation_id IS NOT NULL
+                            OR pending_operation_epoch IS NOT NULL
+                            OR tool_phase != 'clean'
+                            OR tool_phase_epoch IS NOT NULL)
+                )",
+            params![task_id, session_id, expected_epoch],
+        )?;
+        if deleted == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit().context("commit guarded Goal deletion")?;
+        Ok(GoalTransitionResult::Applied)
     }
 }
 
@@ -635,6 +1276,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: Some(format!("test-session-{id}")),
+            execution_epoch: 0,
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
@@ -649,7 +1292,32 @@ mod tests {
             pause_reason: None,
             pause_description: None,
             blockers: Vec::new(),
+            ..GoalTaskRecord::default()
         }
+    }
+
+    async fn create_session_goal(store: &SqliteTaskStore, task_id: &str) -> TaskRecord {
+        create_session_goal_owned(store, task_id, 1, "boot-1").await
+    }
+
+    async fn create_session_goal_owned(
+        store: &SqliteTaskStore,
+        task_id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+    ) -> TaskRecord {
+        let mut task = rec(task_id, "main", owner_pid, owner_boot_id);
+        task.kind = TaskKind::Goal;
+        task.session_id = Some(format!("matrix:test:{task_id}"));
+        let goal = goal_record(task_id, "finish the requested work");
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        store.get(task_id).await.unwrap().unwrap()
     }
 
     fn continuation_context() -> TaskContinuationContext {
@@ -673,15 +1341,33 @@ mod tests {
         old_goal.kind = TaskKind::Goal;
         old_goal.originator_route = Some("route-old".into());
         old_goal.started_at = "2026-06-18T00:00:00Z".into();
-        s.create(old_goal).await.unwrap();
+        s.create_goal(old_goal, goal_record("old-goal", "legacy projection"), None)
+            .await
+            .unwrap();
 
         let mut newer_terminal_goal = rec("done-goal", "main", 1, "boot-1");
         newer_terminal_goal.kind = TaskKind::Goal;
         newer_terminal_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(newer_terminal_goal).await.unwrap();
-        s.update_status("done-goal", TaskStatus::Completed, None, None)
+        let terminal_session = newer_terminal_goal.session_id.clone().unwrap();
+        s.create_goal(
+            newer_terminal_goal,
+            goal_record("done-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.finish_session_goal(
+                "done-goal",
+                &terminal_session,
+                1,
+                TaskStatus::Completed,
+                None
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
 
         let mut newest_delegate = rec("newest-delegate", "main", 1, "boot-1");
         newest_delegate.started_at = "2026-06-21T00:00:00Z".into();
@@ -690,7 +1376,13 @@ mod tests {
         let mut latest_active_goal = rec("latest-goal", "main", 1, "boot-1");
         latest_active_goal.kind = TaskKind::Goal;
         latest_active_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(latest_active_goal).await.unwrap();
+        s.create_goal(
+            latest_active_goal,
+            goal_record("latest-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let got = s
             .latest_active_goal_for_agent("main")
@@ -715,21 +1407,39 @@ mod tests {
         other_route_goal.originator_route = Some("route-b".into());
         other_route_goal.principal_id = Some("principal-a".into());
         other_route_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(other_route_goal).await.unwrap();
+        s.create_goal(
+            other_route_goal,
+            goal_record("other-route", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut other_principal_goal = rec("other-principal", "main", 1, "boot-1");
         other_principal_goal.kind = TaskKind::Goal;
         other_principal_goal.originator_route = Some("route-a".into());
         other_principal_goal.principal_id = Some("principal-b".into());
         other_principal_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(other_principal_goal).await.unwrap();
+        s.create_goal(
+            other_principal_goal,
+            goal_record("other-principal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut wanted_goal = rec("wanted", "main", 1, "boot-1");
         wanted_goal.kind = TaskKind::Goal;
         wanted_goal.originator_route = Some("route-a".into());
         wanted_goal.principal_id = Some("principal-a".into());
         wanted_goal.started_at = "2026-06-18T00:00:00Z".into();
-        s.create(wanted_goal).await.unwrap();
+        s.create_goal(
+            wanted_goal,
+            goal_record("wanted", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let got = s
             .latest_active_goal_for_context("main", Some("route-a"), Some("principal-a"))
@@ -753,14 +1463,26 @@ mod tests {
         first_goal.originator_route = Some("route-a".into());
         first_goal.principal_id = Some("principal-a".into());
         first_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(first_goal).await.unwrap();
+        s.create_goal(
+            first_goal,
+            goal_record("first-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut second_goal = rec("second-goal", "main", 1, "boot-1");
         second_goal.kind = TaskKind::Goal;
         second_goal.originator_route = Some("route-b".into());
         second_goal.principal_id = Some("principal-b".into());
         second_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(second_goal).await.unwrap();
+        s.create_goal(
+            second_goal,
+            goal_record("second-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let got = s
             .latest_active_goal_for_agent("main")
@@ -792,20 +1514,26 @@ mod tests {
         older_valid_goal.originator_route = Some("route-a".into());
         older_valid_goal.principal_id = Some("principal-a".into());
         older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(older_valid_goal).await.unwrap();
-
-        {
-            let conn = s.conn.lock();
-            conn.execute("DROP INDEX idx_tasks_active_goal_context", [])
-                .unwrap();
-        }
+        s.create_goal(
+            older_valid_goal,
+            goal_record("older-valid-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
         unreadable_newer_goal.kind = TaskKind::Goal;
         unreadable_newer_goal.originator_route = Some("route-a".into());
         unreadable_newer_goal.principal_id = Some("principal-a".into());
         unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(unreadable_newer_goal).await.unwrap();
+        s.create_goal(
+            unreadable_newer_goal,
+            goal_record("unreadable-newer-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
         {
             let conn = s.conn.lock();
             conn.execute(
@@ -836,12 +1564,24 @@ mod tests {
         older_valid_goal.kind = TaskKind::Goal;
         older_valid_goal.originator_route = Some("route-valid".into());
         older_valid_goal.started_at = "2026-06-19T00:00:00Z".into();
-        s.create(older_valid_goal).await.unwrap();
+        s.create_goal(
+            older_valid_goal,
+            goal_record("older-valid-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut unreadable_newer_goal = rec("unreadable-newer-goal", "main", 1, "boot-1");
         unreadable_newer_goal.kind = TaskKind::Goal;
         unreadable_newer_goal.started_at = "2026-06-20T00:00:00Z".into();
-        s.create(unreadable_newer_goal).await.unwrap();
+        s.create_goal(
+            unreadable_newer_goal,
+            goal_record("unreadable-newer-goal", "legacy projection"),
+            None,
+        )
+        .await
+        .unwrap();
         {
             let conn = s.conn.lock();
             conn.execute(
@@ -864,7 +1604,6 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-1", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        task.status = TaskStatus::Paused;
         s.create_goal(
             task,
             GoalTaskRecord {
@@ -872,13 +1611,10 @@ mod tests {
                 objective: "ship goal mode".into(),
                 effective_token_limit: Some(10_000),
                 effective_cost_limit_usd: Some(1.25),
-                pause_reason: Some(GoalPauseReason::NeedsUserInput),
-                pause_description: Some("waiting for operator".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::NeedsUserInput,
-                    message: "Need operator answer".into(),
-                    payload: Some(serde_json::json!({"question": "continue?"})),
-                }],
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+                ..GoalTaskRecord::default()
             },
             None,
         )
@@ -889,21 +1625,26 @@ mod tests {
         let goal = s.get_goal_task("goal-1").await.unwrap().unwrap();
 
         assert_eq!(task.kind, TaskKind::Goal);
-        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.status, TaskStatus::Running);
         assert_eq!(goal.task_id, task.id);
         assert_eq!(goal.objective, "ship goal mode");
         assert_eq!(goal.effective_token_limit, Some(10_000));
         assert_eq!(goal.effective_cost_limit_usd, Some(1.25));
-        assert_eq!(goal.pause_reason, Some(GoalPauseReason::NeedsUserInput));
-        assert_eq!(
-            goal.pause_description.as_deref(),
-            Some("waiting for operator")
-        );
-        assert_eq!(goal.blockers.len(), 1);
+        assert!(goal.pause_reason.is_none());
+        assert!(goal.blockers.is_empty());
 
-        s.update_goal_limits("goal-1", Some(20_000), None)
+        assert_eq!(
+            s.update_session_goal_limits(
+                "goal-1",
+                task.session_id.as_deref().unwrap(),
+                task.execution_epoch,
+                Some(20_000),
+                None,
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
         let limited = s.get_goal_task("goal-1").await.unwrap().unwrap();
         assert_eq!(limited.effective_token_limit, Some(20_000));
         assert_eq!(limited.effective_cost_limit_usd, None);
@@ -914,15 +1655,240 @@ mod tests {
 
         s.update_goal_objective("goal-1", "ship amended goal mode")
             .await
-            .unwrap();
-        let amended = s.get_goal_task("goal-1").await.unwrap().unwrap();
-        assert_eq!(amended.objective, "ship amended goal mode");
+            .expect_err("the declared session Goal objective is immutable");
 
-        s.update_goal_pause("goal-1", None).await.unwrap();
+        assert_eq!(
+            s.pause_session_goal(
+                "goal-1",
+                task.session_id.as_deref().unwrap(),
+                task.execution_epoch,
+                GoalPauseState {
+                    reason: GoalPauseReason::NeedsUserInput,
+                    description: Some("waiting for operator".into()),
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
         let resumed = s.get_goal_task("goal-1").await.unwrap().unwrap();
-        assert!(resumed.pause_reason.is_none());
-        assert!(resumed.pause_description.is_none());
+        assert_eq!(resumed.pause_reason, Some(GoalPauseReason::NeedsUserInput));
+        assert_eq!(
+            resumed.pause_description.as_deref(),
+            Some("waiting for operator")
+        );
         assert!(resumed.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_goal_is_bound_to_exact_session_not_route_or_principal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut first = rec("goal-session-a", "main", 1, "boot-1");
+        first.kind = TaskKind::Goal;
+        first.session_id = Some("matrix:room-a:thread-a".into());
+        first.execution_epoch = 0;
+
+        let mut second = rec("goal-session-b", "main", 1, "boot-1");
+        second.kind = TaskKind::Goal;
+        second.session_id = Some("matrix:room-b:thread-b".into());
+        second.execution_epoch = 0;
+
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(first, goal_record("goal-session-a", "done"))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(second, goal_record("goal-session-b", "done"))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let first = store
+            .current_goal_for_session("matrix:room-a:thread-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, "goal-session-a");
+        assert_eq!(first.execution_epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_session_transitions_fence_stale_executors_and_replace_terminals() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = create_session_goal(&store, "goal-guarded").await;
+        let session_id = task.session_id.as_deref().unwrap();
+
+        assert_eq!(
+            store
+                .admit_pending_operation(&task.id, session_id, 1, "operation-1")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    session_id,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_operation(&task.id, session_id, 1, "operation-stale")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert_eq!(
+            store
+                .settle_pending_operation(
+                    &task.id,
+                    session_id,
+                    1,
+                    "operation-1",
+                    GoalAccountingState::Complete,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .resume_session_goal(&task.id, session_id, 2, 2, "boot-2")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let resumed = store.get(&task.id).await.unwrap().unwrap();
+        assert_eq!(resumed.execution_epoch, 3);
+
+        assert_eq!(
+            store
+                .finish_session_goal(&task.id, session_id, 3, TaskStatus::Completed, None,)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            task.id,
+            "terminal current Goals remain visible until explicit replacement or disposal"
+        );
+        let mut reused_id = task.clone();
+        reused_id.owner_pid = 3;
+        reused_id.owner_boot_id = "boot-3".into();
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    reused_id,
+                    goal_record(&task.id, "must not reuse a fenced task id"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale,
+            "a successor must receive a distinct task id so a stale executor cannot alias it"
+        );
+        assert_eq!(
+            store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            task.id
+        );
+
+        let mut successor = rec("goal-successor", "main", 3, "boot-3");
+        successor.kind = TaskKind::Goal;
+        successor.session_id = Some(session_id.to_owned());
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    successor,
+                    goal_record("goal-successor", "finish successor work"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(store.get(&task.id).await.unwrap().is_none());
+        assert_eq!(
+            store
+                .current_goal_for_session(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "goal-successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_rejects_unbound_goals_and_unpaired_pending_operations() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        {
+            let conn = store.conn.lock();
+            let error = conn
+                .execute(
+                    "INSERT INTO tasks (id, kind, agent, status, started_at)
+                     VALUES ('raw-unbound-goal', 'goal', 'main', 'running', '2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .expect_err("new Goal rows require a canonical session binding");
+            assert!(format!("{error:#}").contains("nonblank session id"));
+        }
+
+        let task = create_session_goal(&store, "paired-pending").await;
+        let conn = store.conn.lock();
+        let error = conn
+            .execute(
+                "UPDATE goal_tasks SET pending_operation_id = 'operation-only'
+                  WHERE task_id = ?1",
+                params![task.id],
+            )
+            .expect_err("pending operation id and epoch must change as one pair");
+        assert!(format!("{error:#}").contains("must be paired"));
+        let error = conn
+            .execute(
+                "UPDATE goal_tasks SET tool_phase = 'in_flight' WHERE task_id = ?1",
+                params![task.id],
+            )
+            .expect_err("an in-flight tool phase requires its admitted epoch");
+        assert!(format!("{error:#}").contains("must be paired"));
+        let error = conn
+            .execute(
+                "UPDATE tasks SET session_id = 'matrix:other' WHERE id = ?1",
+                params![task.id],
+            )
+            .expect_err("the canonical Goal session binding is immutable");
+        assert!(format!("{error:#}").contains("binding is immutable"));
+        let error = conn
+            .execute(
+                "UPDATE goal_tasks SET objective = 'mutated' WHERE task_id = ?1",
+                params![task.id],
+            )
+            .expect_err("the declared Goal objective is immutable");
+        assert!(format!("{error:#}").contains("objective is immutable"));
     }
 
     #[tokio::test]
@@ -940,6 +1906,7 @@ mod tests {
                     pause_reason: None,
                     pause_description: None,
                     blockers: Vec::new(),
+                    ..GoalTaskRecord::default()
                 },
             )
         }
@@ -967,6 +1934,7 @@ mod tests {
                     pause_reason: None,
                     pause_description: None,
                     blockers: Vec::new(),
+                    ..GoalTaskRecord::default()
                 },
             )
         }
@@ -991,6 +1959,7 @@ mod tests {
                     pause_reason: None,
                     pause_description: None,
                     blockers: Vec::new(),
+                    ..GoalTaskRecord::default()
                 },
                 None,
             )
@@ -1021,6 +1990,7 @@ mod tests {
                     pause_reason: None,
                     pause_description: None,
                     blockers: Vec::new(),
+                    ..GoalTaskRecord::default()
                 },
                 None,
             )
@@ -1145,26 +2115,11 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-without-extension", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create(task).await.unwrap();
-
         let err = s
-            .update_goal_limits("goal-without-extension", Some(100), None)
+            .create(task)
             .await
-            .expect_err("limit updates must reject missing goal extension rows");
-        assert!(format!("{err:#}").contains("goal extension"));
-
-        let err = s
-            .update_goal_pause(
-                "goal-without-extension",
-                Some(GoalPauseState {
-                    reason: GoalPauseReason::NeedsUserInput,
-                    description: None,
-                    blockers: Vec::new(),
-                }),
-            )
-            .await
-            .expect_err("pause updates must reject missing goal extension rows");
-        assert!(format!("{err:#}").contains("goal extension"));
+            .expect_err("generic task registration cannot create an extension-less Goal");
+        assert!(format!("{err:#}").contains("session-bound GoalTaskRegistry"));
     }
 
     #[tokio::test]
@@ -1205,6 +2160,7 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-paused", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
+        let session_id = task.session_id.clone().unwrap();
         s.create_goal(
             task,
             GoalTaskRecord {
@@ -1215,26 +2171,32 @@ mod tests {
                 pause_reason: None,
                 pause_description: None,
                 blockers: Vec::new(),
+                ..GoalTaskRecord::default()
             },
             None,
         )
         .await
         .unwrap();
 
-        s.pause_goal_task(
-            "goal-paused",
-            GoalPauseState {
-                reason: GoalPauseReason::NeedsUserInput,
-                description: Some("waiting".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::NeedsUserInput,
-                    message: "Need operator answer".into(),
-                    payload: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            s.pause_session_goal(
+                "goal-paused",
+                &session_id,
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::NeedsUserInput,
+                    description: Some("waiting".into()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::NeedsUserInput,
+                        message: "Need operator answer".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
 
         let task = s.get("goal-paused").await.unwrap().unwrap();
         let goal = s.get_goal_task("goal-paused").await.unwrap().unwrap();
@@ -1249,6 +2211,7 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-operator-paused", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
+        let session_id = task.session_id.clone().unwrap();
         s.create_goal(
             task,
             GoalTaskRecord {
@@ -1259,26 +2222,32 @@ mod tests {
                 pause_reason: None,
                 pause_description: None,
                 blockers: Vec::new(),
+                ..GoalTaskRecord::default()
             },
             None,
         )
         .await
         .unwrap();
 
-        s.pause_goal_task(
-            "goal-operator-paused",
-            GoalPauseState {
-                reason: GoalPauseReason::OperatorPaused,
-                description: Some("maintenance window".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::OperatorPause,
-                    message: "maintenance window".into(),
-                    payload: None,
-                }],
-            },
-        )
-        .await
-        .unwrap();
+        assert_eq!(
+            s.pause_session_goal(
+                "goal-operator-paused",
+                &session_id,
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: Some("maintenance window".into()),
+                    blockers: vec![GoalBlocker {
+                        kind: GoalBlockerKind::OperatorPause,
+                        message: "maintenance window".into(),
+                        payload: None,
+                    }],
+                },
+            )
+            .await
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
 
         let task = s.get("goal-operator-paused").await.unwrap().unwrap();
         let goal = s
@@ -1301,23 +2270,12 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-missing-extension", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        s.create(task).await.unwrap();
-
         let err = s
-            .pause_goal_task(
-                "goal-missing-extension",
-                GoalPauseState {
-                    reason: GoalPauseReason::NeedsUserInput,
-                    description: None,
-                    blockers: Vec::new(),
-                },
-            )
+            .create(task)
             .await
-            .expect_err("goal pause must require the goal extension row");
-
-        assert!(format!("{err:#}").contains("goal extension"));
-        let task = s.get("goal-missing-extension").await.unwrap().unwrap();
-        assert_eq!(task.status, TaskStatus::Running);
+            .expect_err("generic task registration cannot create a pausable Goal shell");
+        assert!(format!("{err:#}").contains("session-bound GoalTaskRegistry"));
+        assert!(s.get("goal-missing-extension").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1325,7 +2283,7 @@ mod tests {
         let s = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-resume", "main", 1, "boot-1");
         task.kind = TaskKind::Goal;
-        task.status = TaskStatus::Paused;
+        let session_id = task.session_id.clone().unwrap();
         s.create_goal(
             task,
             GoalTaskRecord {
@@ -1333,22 +2291,37 @@ mod tests {
                 objective: "resume me".into(),
                 effective_token_limit: None,
                 effective_cost_limit_usd: None,
-                pause_reason: Some(GoalPauseReason::NeedsUserInput),
-                pause_description: Some("waiting".into()),
-                blockers: vec![GoalBlocker {
-                    kind: GoalBlockerKind::NeedsUserInput,
-                    message: "Need operator answer".into(),
-                    payload: None,
-                }],
+                pause_reason: None,
+                pause_description: None,
+                blockers: Vec::new(),
+                ..GoalTaskRecord::default()
             },
             None,
         )
         .await
         .unwrap();
 
-        s.resume_goal_task("goal-resume", 42, "boot-2", None)
+        assert_eq!(
+            s.pause_session_goal(
+                "goal-resume",
+                &session_id,
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::NeedsUserInput,
+                    description: Some("waiting".into()),
+                    blockers: Vec::new(),
+                },
+            )
             .await
-            .unwrap();
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            s.resume_session_goal("goal-resume", &session_id, 2, 42, "boot-2")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
 
         let task = s.get("goal-resume").await.unwrap().unwrap();
         let goal = s.get_goal_task("goal-resume").await.unwrap().unwrap();
@@ -1358,5 +2331,362 @@ mod tests {
         assert!(goal.pause_reason.is_none());
         assert!(goal.pause_description.is_none());
         assert!(goal.blockers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_pauses_clean_work_and_fails_only_unsettled_work() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let clean = create_session_goal(&store, "goal-clean-restart").await;
+        let unsettled = create_session_goal(&store, "goal-unsettled-restart").await;
+        let paused_tool = create_session_goal(&store, "goal-paused-tool-restart").await;
+        let terminal_pending = create_session_goal(&store, "goal-terminal-pending-restart").await;
+        let historical = create_session_goal(&store, "goal-historical-failure").await;
+        let live_same_boot =
+            create_session_goal_owned(&store, "goal-live-same-boot", std::process::id(), "boot-2")
+                .await;
+
+        let unsettled_session = unsettled.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .admit_pending_operation(&unsettled.id, unsettled_session, 1, "pending-restart")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let paused_tool_session = paused_tool.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&paused_tool.id, paused_tool_session, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &paused_tool.id,
+                    paused_tool_session,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let terminal_pending_session = terminal_pending.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .admit_pending_operation(
+                    &terminal_pending.id,
+                    terminal_pending_session,
+                    1,
+                    "terminal-pending-restart",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &terminal_pending.id,
+                    terminal_pending_session,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &terminal_pending.id,
+                    terminal_pending_session,
+                    2,
+                    TaskStatus::Cancelled,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let historical_session = historical.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    &historical.id,
+                    historical_session,
+                    1,
+                    TaskStatus::Failed,
+                    Some("accounting_outcome_unknown".into()),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(store.reconcile_goal_boot_state().unwrap(), 5);
+
+        let clean_task = store.get(&clean.id).await.unwrap().unwrap();
+        let clean_goal = store.get_goal_task(&clean.id).await.unwrap().unwrap();
+        assert_eq!(clean_task.status, TaskStatus::Paused);
+        assert_eq!(clean_task.execution_epoch, 2);
+        assert_eq!(
+            clean_goal.pause_reason,
+            Some(GoalPauseReason::DaemonRestart)
+        );
+        assert_eq!(clean_goal.accounting_state, GoalAccountingState::Complete);
+
+        let unsettled_task = store.get(&unsettled.id).await.unwrap().unwrap();
+        let unsettled_goal = store.get_goal_task(&unsettled.id).await.unwrap().unwrap();
+        assert_eq!(unsettled_task.status, TaskStatus::Failed);
+        assert_eq!(
+            unsettled_goal.accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        assert!(unsettled_goal.pending_operation_id.is_none());
+        assert!(unsettled_goal.pending_operation_epoch.is_none());
+        assert_eq!(unsettled_goal.tool_phase, GoalToolPhase::Clean);
+
+        // The failure remains non-resumable, but its dead executor fences no
+        // longer prevent the session from disposing its control state.
+        assert_eq!(
+            store
+                .delete_session_goal(&unsettled.id, unsettled_session, 2)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(store.get(&unsettled.id).await.unwrap().is_none());
+
+        let paused_tool_after = store.get_goal_task(&paused_tool.id).await.unwrap().unwrap();
+        assert_eq!(
+            store.get(&paused_tool.id).await.unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            paused_tool_after.accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        assert_eq!(paused_tool_after.tool_phase, GoalToolPhase::Clean);
+        assert!(paused_tool_after.tool_phase_epoch.is_none());
+        assert_eq!(
+            store
+                .delete_session_goal(&paused_tool.id, paused_tool_session, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let terminal_pending_after = store
+            .get_goal_task(&terminal_pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&terminal_pending.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            terminal_pending_after.accounting_state,
+            GoalAccountingState::OutcomeUnknown
+        );
+        assert!(terminal_pending_after.pending_operation_id.is_none());
+        assert!(terminal_pending_after.pending_operation_epoch.is_none());
+        assert_eq!(
+            store
+                .delete_session_goal(&terminal_pending.id, terminal_pending_session, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        // Goal boot reconciliation is single-owner: a new runtime fences even
+        // same-boot work rather than leaving a Goal Running without an executor.
+        assert_eq!(
+            store.get(&live_same_boot.id).await.unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+
+        let historical_goal = store.get_goal_task(&historical.id).await.unwrap().unwrap();
+        assert_eq!(
+            historical_goal.accounting_state,
+            GoalAccountingState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn disposal_requires_a_settled_terminal_goal() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = create_session_goal(&store, "goal-disposal").await;
+        let session_id = task.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, session_id, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    session_id,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: Some("drain in-flight tool work".into()),
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(&task.id, session_id, 2, TaskStatus::Cancelled, None)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .delete_session_goal(&task.id, session_id, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        let mut successor = rec("goal-disposal-successor", "main", 1, "boot-1");
+        successor.kind = TaskKind::Goal;
+        successor.session_id = Some(session_id.to_owned());
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    successor,
+                    goal_record("goal-disposal-successor", "finish the requested work"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert_eq!(
+            store
+                .complete_goal_tool_phase(&task.id, session_id, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .delete_session_goal(&task.id, session_id, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(store.get(&task.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_session_transitions_report_missing_for_another_session() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = create_session_goal(&store, "goal-session-fence").await;
+
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, "matrix:other-session", 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Missing
+        );
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, task.session_id.as_deref().unwrap(), 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_tool_phase_settlement_cannot_clear_a_later_epoch() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task = create_session_goal(&store, "goal-tool-phase-epoch").await;
+        let session_id = task.session_id.as_deref().unwrap();
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, session_id, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    &task.id,
+                    session_id,
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .complete_goal_tool_phase(&task.id, session_id, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .resume_session_goal(&task.id, session_id, 2, 7, "boot-2")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .begin_goal_tool_phase(&task.id, session_id, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .complete_goal_tool_phase(&task.id, session_id, 1)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale
+        );
+        assert_eq!(
+            store
+                .complete_goal_tool_phase(&task.id, session_id, 3)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
     }
 }

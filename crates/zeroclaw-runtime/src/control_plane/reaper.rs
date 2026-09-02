@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::task_registry::{TaskRegistry, TaskStatus};
+use super::task_registry::{TaskKind, TaskRegistry, TaskStatus};
 
 /// How often the periodic sweep runs.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -40,6 +40,17 @@ fn age_secs(ts: &str, now: DateTime<Utc>) -> Option<i64> {
 pub async fn recovery_pass(store: &dyn TaskRegistry, boot_id: &str) -> anyhow::Result<usize> {
     let mut reclaimed = 0usize;
     for rec in store.list_running().await? {
+        // Goal boot reconciliation owns Goal recovery before this generic
+        // pass. Never let the generic guard turn an already reconciled (or
+        // corrupt legacy) Goal into a daemon-startup failure.
+        if rec.kind == TaskKind::Goal
+            && rec
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+        {
+            continue;
+        }
         if rec.owner_boot_id != boot_id && store.reconcile_lost(&rec.id, boot_id).await? {
             reclaimed += 1;
         }
@@ -81,6 +92,17 @@ pub async fn sweep(
 ) -> anyhow::Result<()> {
     let now = Utc::now();
     for rec in store.list_running().await? {
+        // Session-bound Goals have their own guarded boot and lifecycle path.
+        // Generic status updates reject them, so they must not abort a sweep
+        // for unrelated tasks while a future executor drains current work.
+        if rec.kind == TaskKind::Goal
+            && rec
+                .session_id
+                .as_deref()
+                .is_some_and(|session_id| !session_id.trim().is_empty())
+        {
+            continue;
+        }
         if rec.owner_boot_id != boot_id {
             // Prior-boot orphan — reclaim (authority-guarded inside reconcile_lost).
             let _ = store.reconcile_lost(&rec.id, boot_id).await?;
@@ -105,6 +127,7 @@ pub async fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::goal_task::{GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult};
     use crate::control_plane::task_registry::{TaskKind, TaskRecord};
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
 
@@ -124,6 +147,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         }
@@ -147,6 +172,34 @@ mod tests {
         assert_eq!(
             s.get("mine").await.unwrap().unwrap().status,
             TaskStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_pass_leaves_session_goals_to_goal_boot_reconciliation() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut goal_task = rec("goal", "boot-OLD", 999_999, None);
+        goal_task.kind = TaskKind::Goal;
+        goal_task.session_id = Some("matrix:room:thread".into());
+        assert_eq!(
+            s.create_or_replace_session_goal(
+                goal_task,
+                GoalTaskRecord {
+                    task_id: "goal".into(),
+                    objective: "finish the requested work".into(),
+                    ..GoalTaskRecord::default()
+                },
+            )
+            .await
+            .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(recovery_pass(&s, "boot-NEW").await.unwrap(), 0);
+        assert_eq!(
+            s.get("goal").await.unwrap().unwrap().status,
+            TaskStatus::Running,
+            "the dedicated Goal boot path owns the lifecycle transition"
         );
     }
 
