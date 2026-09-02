@@ -18,6 +18,7 @@ use zeroclaw_runtime::goal_mode::{
 struct RecordingDriver {
     binding: GoalSessionBinding,
     binds: AtomicUsize,
+    execution_acquires: AtomicUsize,
 }
 
 #[async_trait]
@@ -33,6 +34,15 @@ impl GoalSessionDriver for RecordingDriver {
     async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
         self.binds.fetch_add(1, Ordering::SeqCst);
         Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionExecutionLease>> {
+        self.execution_acquires.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("recording driver has no execution lease")
     }
 }
 
@@ -81,6 +91,14 @@ impl GoalSessionDriver for LeaseDriver {
                 available_for_reconnect: self.available_for_reconnect.clone(),
             },
         ))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &zeroclaw_runtime::goal_mode::GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn zeroclaw_runtime::goal_mode::GoalSessionExecutionLease>> {
+        anyhow::bail!("lease driver has no execution lease")
     }
 }
 
@@ -365,6 +383,7 @@ fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
         binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
             .unwrap(),
         binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
     })
 }
 
@@ -378,6 +397,7 @@ async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
         )
         .unwrap(),
         binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
     });
 
     let error = GoalExecutionHost::new()
@@ -390,12 +410,40 @@ async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
 }
 
 #[tokio::test]
+async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
+    let ingress = matrix_ingress();
+    let driver = Arc::new(RecordingDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
+    });
+    let scope = zeroclaw_runtime::goal_mode::GoalExecutionScope {
+        task_id: "goal-1".into(),
+        session_id: "rpc_wrong-session".into(),
+        execution_epoch: 1,
+    };
+
+    let error = match GoalExecutionHost::new()
+        .acquire_execution(&ingress, driver.clone(), &scope)
+        .await
+    {
+        Ok(_) => panic!("mismatched scope must not acquire an execution lease"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("does not match"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn exact_driver_binding_and_typed_command_are_preserved() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
             .unwrap(),
         binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
     });
     let command = GoalCommand::Pause;
 
@@ -438,6 +486,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
             .unwrap(),
         binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
     });
     let host = GoalExecutionHost::new();
 
