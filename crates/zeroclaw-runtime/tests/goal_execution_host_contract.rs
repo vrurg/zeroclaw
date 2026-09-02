@@ -732,6 +732,11 @@ async fn exact_driver_binding_and_typed_command_are_preserved() {
     assert_eq!(submission.ingress(), &ingress);
     assert_eq!(submission.command(), &command);
     assert_eq!(submission.binding(), &driver.binding);
+    let retained: Arc<dyn GoalSessionDriver> = driver.clone();
+    assert!(
+        Arc::ptr_eq(submission.driver(), &retained),
+        "the executor must receive the exact driver validated at admission"
+    );
     assert_eq!(driver.binds.load(Ordering::SeqCst), 1);
 }
 
