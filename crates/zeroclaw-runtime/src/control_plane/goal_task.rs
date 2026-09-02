@@ -9,8 +9,9 @@ use super::task_registry::{TaskRecord, TaskStatus};
 pub struct GoalTaskRecord {
     /// Foreign key to the canonical [`TaskRecord`].
     pub task_id: String,
-    /// Operator/model-supplied objective text. Treated as prompt input, not as
-    /// trusted policy data.
+    /// Immutable, user-declared success criterion. It is supplied as
+    /// untrusted prompt data to the parent and verifier, never as policy or
+    /// authority data.
     pub objective: String,
     #[serde(default)]
     pub effective_token_limit: Option<u64>,
@@ -130,7 +131,8 @@ impl TaskGoal {
         self.status().is_terminal()
     }
 
-    /// Untrusted objective text from the goal extension.
+    /// Immutable, user-declared success criterion from the goal extension.
+    /// It remains untrusted prompt data, not policy or authority data.
     pub fn objective(&self) -> &str {
         &self.goal.objective
     }
