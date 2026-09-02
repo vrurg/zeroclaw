@@ -274,6 +274,35 @@ pub struct GoalExecutionScope {
     execution_epoch: i64,
 }
 
+/// Controller-owned identity for one admitted logical provider operation.
+///
+/// The executor creates this only after durable pending-operation admission.
+/// Drivers use it to scope their normal turn-engine invocation; they must not
+/// derive a replacement task, session, epoch, or operation identity from
+/// mutable transport state.
+#[derive(Debug, Clone)]
+pub struct GoalOperationScope {
+    execution: GoalExecutionScope,
+    operation_id: String,
+}
+
+impl GoalOperationScope {
+    pub fn new(execution: GoalExecutionScope, operation_id: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            execution,
+            operation_id: required("Goal operation id", operation_id.into())?,
+        })
+    }
+
+    pub fn execution(&self) -> &GoalExecutionScope {
+        &self.execution
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
 impl GoalExecutionScope {
     /// Build controller-owned facts for one fenced Goal execution epoch.
     ///
@@ -328,8 +357,16 @@ pub struct GoalVerifierTurn {
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
-    async fn run_parent_turn(&mut self, turn: GoalParentTurn) -> Result<String>;
-    async fn run_verifier(&mut self, turn: GoalVerifierTurn) -> Result<String>;
+    async fn run_parent_turn(
+        &mut self,
+        operation: &GoalOperationScope,
+        turn: GoalParentTurn,
+    ) -> Result<String>;
+    async fn run_verifier(
+        &mut self,
+        operation: &GoalOperationScope,
+        turn: GoalVerifierTurn,
+    ) -> Result<String>;
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
 }
 
