@@ -308,10 +308,6 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         Ok(Some(self.goal.clone()))
     }
 
-    async fn update_goal_objective(&self, _task_id: &str, _objective: &str) -> anyhow::Result<()> {
-        panic!("unexpected legacy objective update")
-    }
-
     async fn update_goal_limits(
         &self,
         _task_id: &str,
