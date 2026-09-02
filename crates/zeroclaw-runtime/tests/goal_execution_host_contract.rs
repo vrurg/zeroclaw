@@ -83,6 +83,35 @@ struct WrongBindingDriver {
     binds: AtomicUsize,
 }
 
+struct SurfaceMismatchedDriver {
+    session_key: GoalSessionKey,
+    execution_acquires: AtomicUsize,
+}
+
+#[async_trait]
+impl GoalSessionDriver for SurfaceMismatchedDriver {
+    fn surface(&self) -> GoalSurface {
+        GoalSurface::ZeroCode
+    }
+
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        anyhow::bail!("surface mismatched driver must never bind")
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        self.execution_acquires.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("surface mismatched driver must never acquire")
+    }
+}
+
 #[async_trait]
 impl GoalSessionDriver for WrongBindingDriver {
     fn surface(&self) -> GoalSurface {
@@ -491,7 +520,7 @@ async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
         binding: GoalSessionBinding::new(
-            GoalSessionKey::zero_code("room:!room:example.org:@alice:example.org").unwrap(),
+            GoalSessionKey::zero_code("wrong-session").unwrap(),
             "fresh-connection",
         )
         .unwrap(),
@@ -559,6 +588,28 @@ async fn execution_driver_key_mismatch_is_rejected_before_driver_acquisition() {
 }
 
 #[tokio::test]
+async fn execution_driver_surface_mismatch_is_rejected_before_driver_acquisition() {
+    let ingress = matrix_ingress();
+    let driver = Arc::new(SurfaceMismatchedDriver {
+        session_key: ingress.session_key().clone(),
+        execution_acquires: AtomicUsize::new(0),
+    });
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let settings = host_settings(true);
+
+    let error = match GoalExecutionHost::new()
+        .acquire_execution(&settings, &ingress, driver.clone(), &scope)
+        .await
+    {
+        Ok(_) => panic!("mismatched driver surface must not acquire an execution lease"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("surface"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn driver_returning_a_different_binding_is_rejected_after_binding() {
     let ingress = matrix_ingress();
     let returned_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
@@ -578,7 +629,7 @@ async fn driver_returning_a_different_binding_is_rejected_after_binding() {
 }
 
 #[tokio::test]
-async fn matching_execution_scope_returns_a_serializing_session_lease() {
+async fn matching_execution_scope_returns_a_working_session_lease() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
