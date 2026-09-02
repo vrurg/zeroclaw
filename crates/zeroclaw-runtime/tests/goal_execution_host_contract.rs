@@ -11,8 +11,9 @@ use zeroclaw_runtime::control_plane::{
 };
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
+    GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -31,11 +32,19 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         Ok(Vec::new())
     }
 
-    async fn run_parent_turn(&mut self, turn: GoalParentTurn) -> anyhow::Result<String> {
+    async fn run_parent_turn(
+        &mut self,
+        _operation: &GoalOperationScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
         Ok(format!("parent:{}", turn.objective))
     }
 
-    async fn run_verifier(&mut self, turn: GoalVerifierTurn) -> anyhow::Result<String> {
+    async fn run_verifier(
+        &mut self,
+        _operation: &GoalOperationScope,
+        turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
         Ok(format!("verifier:{}", turn.candidate))
     }
 
@@ -657,6 +666,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         delivered: delivered.clone(),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let operation = GoalOperationScope::new(scope.clone(), "operation-1").unwrap();
     let settings = host_settings(true);
 
     let mut lease = GoalExecutionHost::new()
@@ -667,20 +677,26 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     assert!(lease.canonical_history().unwrap().is_empty());
     assert_eq!(
         lease
-            .run_parent_turn(GoalParentTurn {
-                objective: "finish the task".into(),
-                working_history: Vec::new(),
-            })
+            .run_parent_turn(
+                &operation,
+                GoalParentTurn {
+                    objective: "finish the task".into(),
+                    working_history: Vec::new(),
+                }
+            )
             .await
             .unwrap(),
         "parent:finish the task"
     );
     assert_eq!(
         lease
-            .run_verifier(GoalVerifierTurn {
-                objective: "finish the task".into(),
-                candidate: "candidate".into(),
-            })
+            .run_verifier(
+                &operation,
+                GoalVerifierTurn {
+                    objective: "finish the task".into(),
+                    candidate: "candidate".into(),
+                }
+            )
             .await
             .unwrap(),
         "verifier:candidate"
