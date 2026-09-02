@@ -488,6 +488,13 @@ pub struct Config {
     #[group = "Operations"]
     pub cost: CostConfig,
 
+    /// Experimental Goal Mode admission inputs (`[goal]`). This stage only
+    /// stores and validates the configuration; runtime admission is deferred.
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: crate::goal::GoalConfig,
+
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
     #[nested]
@@ -21077,6 +21084,7 @@ impl Default for Config {
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
@@ -24933,6 +24941,7 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
+        self.validate_goal_config()?;
 
         // Skills — extra registries
         {
@@ -25736,6 +25745,39 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_goal_config(&self) -> Result<()> {
+        if let Err(error) = self.goal.validate() {
+            validation_bail!(
+                InvalidFormat,
+                "goal",
+                "goal configuration is invalid: {error:?}"
+            );
+        }
+        if !self.goal.enabled {
+            return Ok(());
+        }
+
+        let verifier = self.goal.verifier.model_provider.as_str().trim();
+        let Some((provider_type, provider_alias)) = verifier.split_once('.') else {
+            anyhow::bail!(
+                "goal.verifier.model_provider must be a configured <type>.<alias> reference"
+            );
+        };
+        if provider_type.is_empty()
+            || provider_alias.is_empty()
+            || self
+                .providers
+                .models
+                .find(provider_type, provider_alias)
+                .is_none()
+        {
+            anyhow::bail!(
+                "goal.verifier.model_provider '{verifier}' does not resolve in providers.models"
+            );
+        }
         Ok(())
     }
 
@@ -32848,6 +32890,7 @@ auto_save = true
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
@@ -34041,6 +34084,7 @@ default_temperature = 0.7
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
