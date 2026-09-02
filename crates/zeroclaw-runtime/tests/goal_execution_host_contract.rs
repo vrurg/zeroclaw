@@ -85,6 +85,7 @@ struct WrongBindingDriver {
 
 struct SurfaceMismatchedDriver {
     session_key: GoalSessionKey,
+    binds: AtomicUsize,
     execution_acquires: AtomicUsize,
 }
 
@@ -99,6 +100,7 @@ impl GoalSessionDriver for SurfaceMismatchedDriver {
     }
 
     async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        self.binds.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("surface mismatched driver must never bind")
     }
 
@@ -538,6 +540,25 @@ async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
 }
 
 #[tokio::test]
+async fn supplied_driver_surface_mismatch_is_rejected_before_binding() {
+    let ingress = matrix_ingress();
+    let driver = Arc::new(SurfaceMismatchedDriver {
+        session_key: ingress.session_key().clone(),
+        binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
+    });
+
+    let error = GoalExecutionHost::new()
+        .submit(ingress, driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("trusted ingress"));
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
@@ -592,6 +613,7 @@ async fn execution_driver_surface_mismatch_is_rejected_before_driver_acquisition
     let ingress = matrix_ingress();
     let driver = Arc::new(SurfaceMismatchedDriver {
         session_key: ingress.session_key().clone(),
+        binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
@@ -731,6 +753,8 @@ fn matrix_history_key_must_already_use_the_canonical_session_form() {
     let raw = "matrix_room:!room:example.org:@alice:example.org";
 
     assert!(GoalSessionKey::matrix(raw).is_err());
+    assert!(GoalSessionKey::matrix(" matrix_room").is_err());
+    assert!(GoalSessionKey::zero_code(" same-session").is_err());
 }
 
 #[test]
