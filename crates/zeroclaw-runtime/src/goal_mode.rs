@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
+use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
 
 use crate::control_plane::{
@@ -203,6 +204,46 @@ pub trait GoalSessionDriver: Send + Sync {
     /// I/O, so it must be async-safe and must not be a lock that a Goal
     /// lifecycle path needs to acquire again.
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease>;
+
+    /// Acquire the exact session's foreground execution lease. The returned
+    /// object is the sole transport bridge used by the later Goal executor.
+    async fn acquire_execution(
+        &self,
+        ingress: &GoalIngressContext,
+        scope: &GoalExecutionScope,
+    ) -> Result<Box<dyn GoalSessionExecutionLease>>;
+}
+
+/// Controller-owned facts for one fenced Goal execution epoch.
+#[derive(Debug, Clone)]
+pub struct GoalExecutionScope {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+}
+
+/// Trusted input for a parent Goal turn.
+#[derive(Debug, Clone)]
+pub struct GoalParentTurn {
+    pub objective: String,
+    pub working_history: Vec<ChatMessage>,
+}
+
+/// Trusted, isolated input for the mandatory Goal verifier.
+#[derive(Debug, Clone)]
+pub struct GoalVerifierTurn {
+    pub objective: String,
+    pub candidate: String,
+}
+
+/// Surface-owned foreground execution bridge. It has no lifecycle or ledger
+/// authority; the later executor owns both around these calls.
+#[async_trait]
+pub trait GoalSessionExecutionLease: Send {
+    fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
+    async fn run_parent_turn(&mut self, turn: GoalParentTurn) -> Result<String>;
+    async fn run_verifier(&mut self, turn: GoalVerifierTurn) -> Result<String>;
+    async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
 }
 
 /// A driver's owned proof that a live session remains authoritative.
@@ -311,6 +352,23 @@ impl GoalExecutionHost {
             command,
             lease,
         })
+    }
+
+    /// Acquire execution only through the same exact trusted driver boundary
+    /// used for command admission. This never selects a driver from route text.
+    pub async fn acquire_execution(
+        &self,
+        ingress: &GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        scope: &GoalExecutionScope,
+    ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+        if driver.surface() != ingress.surface()
+            || driver.session_key() != ingress.session_key()
+            || scope.session_id != ingress.session_key().durable_id()
+        {
+            bail!("Goal session driver does not match trusted execution scope");
+        }
+        driver.acquire_execution(ingress, scope).await
     }
 }
 
