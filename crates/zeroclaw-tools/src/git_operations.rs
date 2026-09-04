@@ -406,13 +406,15 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
         let repository_root = self.validated_repository_root(working_dir, false)?;
+        let filter_drivers = self.configured_filter_drivers(working_dir).await?;
         let mut command = tokio::process::Command::new("git");
         Self::bind_git_worktree(command.as_std_mut(), &repository_root);
         command
             .args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat"])
-            .args(args)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
+        Self::disable_filter_drivers(command.as_std_mut(), &filter_drivers);
+        command.args(args);
         self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
         let output = command.output().await?;
 
@@ -422,6 +424,80 @@ impl GitOperationsTool {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Return all Git filter drivers defined by the effective configuration.
+    ///
+    /// Attribute lookup alone is insufficient because Git may need to inspect
+    /// content before it knows which configured driver applies. Reading config
+    /// key names does not run a driver, so this preflight lets the real read
+    /// command disable every configured clean, smudge, and process filter.
+    async fn configured_filter_drivers(&self, working_dir: &Path) -> anyhow::Result<Vec<String>> {
+        let repository_root = self.validated_repository_root(working_dir, false)?;
+        let mut command = tokio::process::Command::new("git");
+        Self::bind_git_worktree(command.as_std_mut(), &repository_root);
+        command
+            .args([
+                "config",
+                "--null",
+                "--name-only",
+                "--includes",
+                "--get-regexp",
+                r"^filter\..*\.(clean|smudge|process|required)$",
+            ])
+            .current_dir(working_dir)
+            .stdin(std::process::Stdio::null());
+        self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
+        let output = command.output().await?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) {
+                return Ok(Vec::new());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Git filter configuration query failed: {stderr}");
+        }
+
+        let mut drivers = Vec::new();
+        for key in output.stdout.split(|byte| *byte == b'\0') {
+            if key.is_empty() {
+                continue;
+            }
+            let key = std::str::from_utf8(key)?;
+            let Some(driver) = Self::filter_driver_from_config_key(key) else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "git_operations: Git filter configuration cannot be disabled safely"
+                );
+                anyhow::bail!("Git filter configuration cannot be disabled safely: {key}");
+            };
+            drivers.push(driver);
+        }
+        drivers.sort_unstable();
+        drivers.dedup();
+        Ok(drivers)
+    }
+
+    fn filter_driver_from_config_key(key: &str) -> Option<String> {
+        let driver = key
+            .strip_prefix("filter.")?
+            .strip_suffix(".clean")
+            .or_else(|| key.strip_prefix("filter.")?.strip_suffix(".smudge"))
+            .or_else(|| key.strip_prefix("filter.")?.strip_suffix(".process"))
+            .or_else(|| key.strip_prefix("filter.")?.strip_suffix(".required"))?;
+        if driver.is_empty() || driver.contains('=') {
+            return None;
+        }
+        Some(driver.to_owned())
+    }
+
+    fn disable_filter_drivers(command: &mut std::process::Command, filter_drivers: &[String]) {
+        for driver in filter_drivers {
+            for setting in ["clean=", "smudge=", "process=", "required=false"] {
+                command.arg("-c").arg(format!("filter.{driver}.{setting}"));
+            }
+        }
     }
 
     fn configure_git_environment(
@@ -568,7 +644,13 @@ impl GitOperationsTool {
     ) -> anyhow::Result<ToolResult> {
         let output = self
             .run_git_read_command(
-                &["--no-optional-locks", "status", "--porcelain=2", "--branch"],
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--ignore-submodules=dirty",
+                    "--porcelain=2",
+                    "--branch",
+                ],
                 working_dir,
             )
             .await?;
@@ -638,6 +720,7 @@ impl GitOperationsTool {
         let mut git_args = vec![
             "--no-optional-locks",
             "diff",
+            "--ignore-submodules=dirty",
             "--no-ext-diff",
             "--no-textconv",
             "--unified=3",
@@ -2786,6 +2869,273 @@ mod tests {
         assert!(
             !marker.exists(),
             "read-only status must not execute repository core.fsmonitor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_read_only_commands_do_not_run_repository_clean_filters() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &["tracked.txt"]).await;
+        std::fs::write(
+            read_only_root.path().join(".gitattributes"),
+            "tracked.txt filter=marker\n",
+        )
+        .unwrap();
+        for args in [
+            ["add", ".gitattributes"].as_slice(),
+            ["commit", "-m", "attributes"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "test repository setup must succeed");
+        }
+
+        let marker = workspace.path().join("clean-filter-ran");
+        let clean_filter = format!("sh -c 'touch {}; cat'", marker.display());
+        let status = std::process::Command::new("git")
+            .args(["config", "filter.marker.clean", &clean_filter])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test filter configuration must succeed");
+        let required = std::process::Command::new("git")
+            .args(["config", "filter.marker.required", "true"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(required.success(), "test filter must be required");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(read_only_root.path().join("tracked.txt"), "changed").unwrap();
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        for args in [
+            json!({"operation": "status", "path": read_only_root.path()}),
+            json!({"operation": "diff", "path": read_only_root.path()}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "read command failed: {:?}", result.error);
+            assert!(
+                !marker.exists(),
+                "read-only Git commands must not execute repository clean filters"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_read_only_commands_do_not_run_submodule_clean_filters() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        let source_submodule = workspace.path().join("source-submodule");
+        std::fs::create_dir(&source_submodule).unwrap();
+        bootstrap_repo(&source_submodule, &["tracked.txt"]).await;
+        std::fs::write(
+            source_submodule.join(".gitattributes"),
+            "tracked.txt filter=marker\n",
+        )
+        .unwrap();
+        let attributes_commit = std::process::Command::new("git")
+            .args(["add", ".gitattributes"])
+            .current_dir(&source_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            attributes_commit.success(),
+            "test setup must stage attributes"
+        );
+        let attributes_commit = std::process::Command::new("git")
+            .args(["commit", "-m", "attributes"])
+            .current_dir(&source_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            attributes_commit.success(),
+            "test setup must commit attributes"
+        );
+
+        bootstrap_repo(read_only_root.path(), &[]).await;
+        let submodule_add = std::process::Command::new("git")
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(&source_submodule)
+            .arg("submodule")
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(submodule_add.success(), "test setup must add submodule");
+        let submodule_commit = std::process::Command::new("git")
+            .args(["commit", "-am", "submodule"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(
+            submodule_commit.success(),
+            "test setup must commit submodule"
+        );
+
+        let marker = workspace.path().join("submodule-clean-filter-ran");
+        let cloned_submodule = read_only_root.path().join("submodule");
+        for args in [
+            ["config", "user.email", "test@test.com"].as_slice(),
+            ["config", "user.name", "Test"].as_slice(),
+            ["config", "commit.gpgsign", "false"].as_slice(),
+        ] {
+            let identity = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cloned_submodule)
+                .status()
+                .unwrap();
+            assert!(
+                identity.success(),
+                "test setup must configure clone identity"
+            );
+        }
+        let clean_filter = format!("sh -c 'touch {}; cat'", marker.display());
+        let filter_config = std::process::Command::new("git")
+            .args(["config", "filter.marker.clean", &clean_filter])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(filter_config.success(), "test setup must configure filter");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(cloned_submodule.join("tracked.txt"), "changed").unwrap();
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        let resolved_root = read_only_root.path().canonicalize().unwrap();
+        for path in [read_only_root.path(), cloned_submodule.as_path()] {
+            for args in [
+                json!({"operation": "status", "path": path}),
+                json!({"operation": "diff", "path": path}),
+            ] {
+                let result = tool.execute(args).await.unwrap();
+                assert!(result.success, "read command failed: {:?}", result.error);
+                assert!(
+                    !marker.exists(),
+                    "read-only Git commands must not execute submodule clean filters"
+                );
+            }
+        }
+
+        std::fs::write(cloned_submodule.join("other.txt"), "next").unwrap();
+        let submodule_update = std::process::Command::new("git")
+            .args(["add", "other.txt"])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            submodule_update.success(),
+            "test setup must stage submodule update"
+        );
+        let submodule_update = std::process::Command::new("git")
+            .args(["commit", "-m", "next"])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            submodule_update.success(),
+            "test setup must commit submodule update"
+        );
+        let stage_gitlink = std::process::Command::new("git")
+            .args(["add", "submodule"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(
+            stage_gitlink.success(),
+            "test setup must stage gitlink update"
+        );
+
+        let status = tool
+            .run_git_read_command(
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--ignore-submodules=dirty",
+                    "--porcelain=2",
+                    "--branch",
+                ],
+                &resolved_root,
+            )
+            .await
+            .unwrap();
+        assert!(
+            status.contains("submodule"),
+            "read status must retain staged superproject gitlink changes: {status:?}"
+        );
+        let diff = tool
+            .run_git_read_command(
+                &[
+                    "--no-optional-locks",
+                    "diff",
+                    "--ignore-submodules=dirty",
+                    "--cached",
+                ],
+                &resolved_root,
+            )
+            .await
+            .unwrap();
+        assert!(
+            diff.contains("Subproject commit"),
+            "read diff must retain staged superproject gitlink changes: {diff:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_write_commands_retain_repository_clean_filters() {
+        let workspace = TempDir::new().unwrap();
+        bootstrap_repo(workspace.path(), &["tracked.txt"]).await;
+        std::fs::write(
+            workspace.path().join(".gitattributes"),
+            "tracked.txt filter=marker\n",
+        )
+        .unwrap();
+        let attributes = std::process::Command::new("git")
+            .args(["add", ".gitattributes"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(attributes.success(), "test setup must stage attributes");
+        let attributes = std::process::Command::new("git")
+            .args(["commit", "-m", "attributes"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(attributes.success(), "test setup must commit attributes");
+
+        let marker = workspace.path().join("write-clean-filter-ran");
+        let clean_filter = format!("sh -c 'touch {}; cat'", marker.display());
+        let filter = std::process::Command::new("git")
+            .args(["config", "filter.marker.clean", &clean_filter])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(filter.success(), "test setup must configure filter");
+        std::fs::write(workspace.path().join("tracked.txt"), "changed").unwrap();
+
+        let result = test_tool(workspace.path())
+            .execute(json!({"operation": "add", "paths": "tracked.txt"}))
+            .await
+            .unwrap();
+        assert!(result.success, "write command failed: {:?}", result.error);
+        assert!(marker.exists(), "write command must retain clean filters");
+    }
+
+    #[test]
+    fn filter_driver_names_allow_legal_config_subsections() {
+        assert_eq!(
+            GitOperationsTool::filter_driver_from_config_key("filter.my_filter.clean"),
+            Some("my_filter".to_owned())
+        );
+        assert_eq!(
+            GitOperationsTool::filter_driver_from_config_key("filter.a=b.clean"),
+            None
         );
     }
 
