@@ -964,14 +964,20 @@ fn persist_conversation_messages(
     if !backend.session_exists(session_key) {
         return;
     }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
+    let chat_messages: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            zeroclaw_providers::ConversationMessage::Chat(message) => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    for message in zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(
+        &chat_messages,
+    ) {
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        let _ = backend.append(session_key, &message);
     }
 }
 
@@ -2819,6 +2825,72 @@ data: {\"type\":\"message_stop\"}\n\n",
             backend.append_calls.lock().unwrap().is_empty(),
             "persist_conversation_messages must not resurrect a session whose \
              session_exists() returned false (see #7126)"
+        );
+    }
+
+    struct RecordingSessionBackend {
+        appended: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for RecordingSessionBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.appended.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn persist_conversation_messages_redacts_session_prompt_tool_exchange() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let marker = "session-prompt-private-marker";
+        let backend = RecordingSessionBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+        };
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::assistant(format!(
+                "<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{marker}\"}}}}</tool_call>"
+            ))),
+            ConversationMessage::Chat(ChatMessage::user(format!(
+                "[Tool results]\\n<tool_result name=\"session_prompt_set\">stored {marker}</tool_result>"
+            ))),
+            ConversationMessage::Chat(ChatMessage::assistant("done")),
+        ];
+
+        persist_conversation_messages(&backend, "gw_prompt", &messages);
+
+        let appended = backend.appended.lock().unwrap();
+        assert_eq!(appended.len(), 3);
+        assert_eq!(
+            appended[0].content,
+            "[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(
+            appended[1].content,
+            "[Session-prompt tool exchange omitted from export]"
+        );
+        assert_eq!(appended[2].content, "done");
+        assert!(
+            appended
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "retained transcripts must not include opaque session-prompt bodies"
         );
     }
 

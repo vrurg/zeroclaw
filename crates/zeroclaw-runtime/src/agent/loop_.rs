@@ -552,6 +552,9 @@ fn elide_image_data(content: &str) -> String {
 }
 
 pub(crate) fn scrub_for_export(content: &str) -> String {
+    if crate::agent::prompt::session_prompt_tool_name_mentioned(content) {
+        return "[Session-prompt tool exchange omitted from export]".to_string();
+    }
     let without_attachments =
         crate::agent::prompt::redact_session_prompt_attachments_for_export(content);
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
@@ -572,12 +575,15 @@ pub(crate) fn capture_llm_messages(
         LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot,
     };
 
-    let system_instructions = messages
+    let export_messages =
+        crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(messages);
+
+    let system_instructions = export_messages
         .iter()
         .find(|m| m.role == "system")
         .map(|m| scrub_for_export(&m.content));
 
-    let input = messages
+    let input = export_messages
         .iter()
         .filter(|m| m.role != "system")
         .map(|m| MessageSnapshot {
@@ -593,7 +599,13 @@ pub(crate) fn capture_llm_messages(
         .map(|tc| ToolCallSnapshot {
             id: tc.id.clone(),
             name: tc.name.clone(),
-            arguments_json: scrub_for_export(&tc.arguments),
+            arguments_json: if crate::agent::tool_execution::is_sensitive_session_prompt_tool(
+                &tc.name,
+            ) {
+                "[Session-prompt tool arguments omitted from export]".to_string()
+            } else {
+                scrub_for_export(&tc.arguments)
+            },
         })
         .collect();
 

@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
+use zeroclaw_providers::ChatMessage;
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
 /// selects host-owned descriptive semantics; it never carries prompt prose or
@@ -98,6 +99,8 @@ pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversat
 pub(crate) const SYSTEM_PROMPT_TRUNCATION_MARKER: &str =
     "\n\n[System prompt truncated to fit context budget]\n";
 const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omitted from export]";
+const SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER: &str =
+    "[Session-prompt tool exchange omitted from export]";
 
 /// Return an observability-safe view of a host system prompt.
 ///
@@ -115,6 +118,66 @@ pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<
         "{}{SESSION_PROMPTS_EXPORT_MARKER}",
         &prompt[..start]
     ))
+}
+
+/// Replace sensitive session-prompt tool exchanges at non-provider export
+/// boundaries. The provider keeps the raw history; observers, hooks, logs, and
+/// retained transcripts do not receive opaque attachment bodies.
+pub fn redact_session_prompt_tool_exchanges_for_export(
+    messages: &[ChatMessage],
+) -> Vec<ChatMessage> {
+    let mut redact_next_result = false;
+
+    messages
+        .iter()
+        .map(|message| {
+            let is_sensitive_call = session_prompt_tool_name_mentioned(&message.content);
+            let is_result = matches!(message.role.as_str(), "tool" | "user");
+            let redact = is_sensitive_call || (redact_next_result && is_result);
+
+            if message.role == "assistant" {
+                redact_next_result = is_sensitive_call;
+            } else if is_result {
+                redact_next_result = false;
+            }
+
+            if redact {
+                ChatMessage {
+                    role: message.role.clone(),
+                    content: SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER.to_string(),
+                }
+            } else if message.role == "system" {
+                ChatMessage {
+                    role: message.role.clone(),
+                    content: redact_session_prompt_attachments_for_export(&message.content)
+                        .into_owned(),
+                }
+            } else {
+                message.clone()
+            }
+        })
+        .collect()
+}
+
+/// Native tool-call snapshots retain the tool name separately, but text
+/// protocol exchanges carry the name in their message content.
+pub(crate) fn session_prompt_tool_name_mentioned(content: &str) -> bool {
+    zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+        .iter()
+        .any(|name| content.contains(name))
+}
+
+/// Whether a tool belongs in the model-visible catalog for this turn.
+///
+/// Session-prompt tools are registered in the sealed agent registry so their
+/// execution path can be enabled for durable primary chat turns. Their
+/// availability is nevertheless per-turn: advertising them outside that
+/// capability scope would invite a call the runtime must reject.
+pub(crate) fn tool_is_advertised_for_current_turn(name: &str) -> bool {
+    zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        .try_with(|allowed| *allowed)
+        .unwrap_or(false)
+        || !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&name)
 }
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
@@ -360,7 +423,11 @@ impl PromptSection for ToolHonestySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.tools.is_empty() {
+        if !ctx
+            .tools
+            .iter()
+            .any(|tool| tool_is_advertised_for_current_turn(tool.name()))
+        {
             return Ok(String::new());
         }
 
@@ -380,7 +447,11 @@ impl PromptSection for ToolsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.tools.is_empty() {
+        if !ctx
+            .tools
+            .iter()
+            .any(|tool| tool_is_advertised_for_current_turn(tool.name()))
+        {
             return Ok(String::new());
         }
         if ctx.sends_native_tool_specs {
@@ -388,7 +459,11 @@ impl PromptSection for ToolsSection {
         }
 
         let mut out = String::from("## Tools\n\n");
-        for tool in ctx.tools {
+        for tool in ctx
+            .tools
+            .iter()
+            .filter(|tool| tool_is_advertised_for_current_turn(tool.name()))
+        {
             let i18n_description = crate::i18n::get_tool_description(tool.name());
             let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(
@@ -468,13 +543,19 @@ impl PromptSection for SkillsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mode = crate::skills::skills_prompt_mode_with_loader_fallback(
             ctx.skills_prompt_mode,
-            ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
+            ctx.tools.iter().any(|tool| {
+                tool_is_advertised_for_current_turn(tool.name()) && tool.name() == "read_skill"
+            }),
         );
         Ok(crate::skills::skills_to_prompt_with_mode_and_availability(
             ctx.skills,
             ctx.workspace_dir,
             mode,
-            |name| ctx.tools.iter().any(|tool| tool.name() == name),
+            |name| {
+                ctx.tools.iter().any(|tool| {
+                    tool_is_advertised_for_current_turn(tool.name()) && tool.name() == name
+                })
+            },
         ))
     }
 }
@@ -529,7 +610,10 @@ impl PromptSection for ShellSection {
         // syntax list is dead weight otherwise. An empty string is dropped by
         // the builder, so this section costs nothing when skipped.
         if !zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
-            ctx.tools.iter().map(|tool| tool.name()),
+            ctx.tools
+                .iter()
+                .filter(|tool| tool_is_advertised_for_current_turn(tool.name()))
+                .map(|tool| tool.name()),
         ) {
             return Ok(String::new());
         }
@@ -579,6 +663,8 @@ impl PromptSection for ChannelMediaSection {
 
 #[cfg(test)]
 mod tests {
+    use zeroclaw_providers::ChatMessage;
+
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
@@ -632,6 +718,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(ShellTestTool);
     zeroclaw_api::mock_tool_attribution!(CronAddTestTool);
     zeroclaw_api::mock_tool_attribution!(SkillToolTestTool);
+    zeroclaw_api::mock_tool_attribution!(SessionPromptTestTool);
 
     struct TestTool;
     struct ReadSkillTestTool;
@@ -727,6 +814,34 @@ mod tests {
 
         fn description(&self) -> &str {
             "tool desc"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct SessionPromptTestTool;
+
+    #[async_trait]
+    impl Tool for SessionPromptTestTool {
+        fn name(&self) -> &str {
+            "session_prompt_set"
+        }
+
+        fn description(&self) -> &str {
+            "Attach durable session context"
         }
 
         fn parameters_schema(&self) -> serde_json::Value {
@@ -844,6 +959,38 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn tool_catalog_omits_session_prompt_tools_without_durable_turn_capability() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SessionPromptTestTool)];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "XML tool protocol",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
+        };
+
+        let hidden = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .sync_scope(false, || ToolsSection.build(&ctx).unwrap());
+        assert!(
+            hidden.is_empty(),
+            "an unsupported text-protocol turn must not advertise session-prompt tools"
+        );
+
+        let visible = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .sync_scope(true, || ToolsSection.build(&ctx).unwrap());
+        assert!(visible.contains("session_prompt_set"));
+        assert!(visible.contains("XML tool protocol"));
     }
 
     #[test]
@@ -1546,5 +1693,51 @@ mod tests {
         // A shell-less runtime keeps the POSIX wording it rendered before.
         let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
         assert!(none.contains("trash"), "{none}");
+    }
+
+    #[test]
+    fn export_copy_redacts_native_prompt_tool_call_and_its_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}]}}"#
+            )),
+            ChatMessage::tool(format!(r#"{{\"content\":\"{marker}\"}}"#)),
+            ChatMessage::user("ordinary follow-up"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert!(
+            export
+                .iter()
+                .all(|message| !message.content.contains(marker))
+        );
+        assert_eq!(
+            messages[0].content,
+            format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}]}}"#
+            )
+        );
+        assert_eq!(export[2].content, "ordinary follow-up");
+    }
+
+    #[test]
+    fn export_copy_redacts_text_protocol_prompt_call_and_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"#
+            )),
+            ChatMessage::user(format!(
+                r#"[Tool results]\n<tool_result name=\"session_prompt_set\">{marker}</tool_result>"#
+            )),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert!(
+            export
+                .iter()
+                .all(|message| !message.content.contains(marker))
+        );
     }
 }

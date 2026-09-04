@@ -37,9 +37,13 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
+        // The relaxed session-prompt policy skips only the dedicated exact
+        // confirmation. Ordinary approval and audit surfaces remain exports,
+        // so they receive stable metadata rather than attachment content.
+        let approval_args = generic_approval_arguments(tool_name, tool_args);
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
-            arguments: tool_args.clone(),
+            arguments: approval_args.clone(),
         };
 
         // Interactive CLI: prompt the operator.
@@ -112,7 +116,7 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        mgr.record_decision(tool_name, &approval_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -158,7 +162,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": scrub_credentials(&approval_args.to_string()),
                         "result": denied,
                         "trace_id": ctx.turn_id,
                         // Operator-facing only. The remedy lives here rather than
@@ -214,7 +218,7 @@ pub(crate) async fn gate_tool_approval(
                         "model": ctx.model,
                         "iteration": iteration + 1,
                         "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "arguments": scrub_credentials(&approval_args.to_string()),
                         "replaced": true,
                         "output": scrub_credentials(replacement),
                         "trace_id": ctx.turn_id,
@@ -243,6 +247,48 @@ pub(crate) async fn gate_tool_approval(
 
 fn is_session_prompt_mutation(tool_name: &str) -> bool {
     matches!(tool_name, "session_prompt_set" | "session_prompt_delete")
+}
+
+/// Render arguments for ordinary approval and audit exports. The set tool's
+/// body is model-visible only through the provider context, explicit list
+/// result, and exact one-time confirmation; a relaxed confirmation policy does
+/// not make the body safe for generic approval sinks.
+fn generic_approval_arguments(tool_name: &str, tool_args: &serde_json::Value) -> serde_json::Value {
+    if !is_session_prompt_mutation(tool_name) {
+        return tool_args.clone();
+    }
+
+    let raw_id = tool_args
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let attachment_id = zeroclaw_infra::session_prompts::validate_prompt_id(raw_id).ok();
+    let action = if tool_name == "session_prompt_set" {
+        "set"
+    } else {
+        "delete"
+    };
+    let content_sha256 = if action == "set" {
+        tool_args
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            // Validate before hashing so an impossible mutation is never
+            // rendered or digested for an approval request.
+            .and_then(|content| {
+                zeroclaw_infra::session_prompts::validate_prompt(raw_id, content)
+                    .ok()
+                    .map(|_| format!("{:x}", Sha256::digest(content.as_bytes())))
+            })
+    } else {
+        None
+    };
+
+    serde_json::json!({
+        "storage_domain": "sqlite chat session prompts",
+        "action": action,
+        "attachment_id": attachment_id,
+        "content_sha256": content_sha256,
+    })
 }
 
 fn session_prompt_approval_summary(
@@ -283,6 +329,10 @@ fn session_prompt_approval_summary(
             .get("content")
             .and_then(serde_json::Value::as_str)
             .ok_or("the prompt content is missing")?;
+        // Keep approval work below the same content bound as persistence. This
+        // avoids hashing or rendering an oversized request that cannot run.
+        zeroclaw_infra::session_prompts::validate_prompt(&id, content)
+            .map_err(|_| "the prompt content is invalid")?;
         let digest = Sha256::digest(content.as_bytes());
         let _ = writeln!(summary, "content_sha256: {digest:x}");
         let _ = writeln!(
@@ -377,13 +427,7 @@ async fn gate_session_prompt_approval(
         )
     };
 
-    let audit_args = serde_json::json!({
-        "storage_domain": "sqlite chat session prompts",
-        "session_id": zeroclaw_api::TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten(),
-        "attachment_id": tool_args.get("id").and_then(serde_json::Value::as_str).map(str::trim),
-        "action": if tool_name == "session_prompt_set" { "set" } else { "delete" },
-        "content_sha256": tool_args.get("content").and_then(serde_json::Value::as_str).map(|content| format!("{:x}", Sha256::digest(content.as_bytes()))),
-    });
+    let audit_args = generic_approval_arguments(tool_name, tool_args);
     mgr.record_decision(
         tool_name,
         &audit_args,
@@ -415,11 +459,137 @@ fn is_one_time_session_prompt_approval(
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_prompt_preview, is_one_time_session_prompt_approval, session_prompt_approval_summary,
+        escape_prompt_preview, gate_tool_approval, generic_approval_arguments,
+        is_one_time_session_prompt_approval, session_prompt_approval_summary,
     };
+    use crate::agent::turn::context::TurnCtx;
+    use crate::approval::ApprovalManager;
+    use crate::observability::NoopObserver;
+    use parking_lot::Mutex;
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
     use zeroclaw_api::channel::{
-        ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
+        ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
+        ChannelApprovalResponse, ChannelMessage, SendMessage,
     };
+    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+
+    struct CapturingApprovalChannel {
+        response: Option<ChannelApprovalResponse>,
+        requests: Mutex<Vec<ChannelApprovalRequest>>,
+    }
+
+    impl Attributable for CapturingApprovalChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Webhook)
+        }
+
+        fn alias(&self) -> &str {
+            "capturing-approval"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for CapturingApprovalChannel {
+        fn name(&self) -> &str {
+            "capturing-approval"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.requests.lock().push(request.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_approval_exports_metadata_not_prompt_body_for_every_decision() {
+        let marker = "session-prompt-private-marker";
+        for response in [
+            Some(ChannelApprovalResponse::Approve),
+            Some(ChannelApprovalResponse::Deny),
+            None,
+        ] {
+            let channel = CapturingApprovalChannel {
+                response,
+                requests: Mutex::new(Vec::new()),
+            };
+            let approval = ApprovalManager::for_non_interactive_backchannel(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            );
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let ctx = TurnCtx {
+                observer: &observer,
+                provider_name: "test-provider",
+                model: "test-model",
+                temperature: None,
+                approval: Some(&approval),
+                // Exercise the relaxed dedicated-confirmation policy. Ordinary
+                // supervised approval must still redact its generic exports.
+                session_prompt_approval_required: false,
+                channel_name: "test-channel",
+                channel_reply_target: Some("operator"),
+                cancellation_token: None,
+                on_delta: None,
+                event_tx: None,
+                hooks: None,
+                dedup_exempt_tools: &[],
+                pacing: &pacing,
+                strict_tool_parsing: false,
+                channel: Some(&channel),
+                draft_reasoning: StreamReasoningMode::Off,
+                turn_id: "test-turn",
+                agent_alias: None,
+                parent_agent_alias: None,
+            };
+
+            let _ = gate_tool_approval(
+                &ctx,
+                "session_prompt_set",
+                &serde_json::json!({"id": "task", "content": marker}),
+                0,
+            )
+            .await;
+
+            let requests = channel.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(
+                !request.arguments_summary.contains(marker)
+                    && !request
+                        .raw_arguments
+                        .as_ref()
+                        .is_some_and(|arguments| arguments.to_string().contains(marker)),
+                "generic channel approval must not receive the opaque body"
+            );
+            assert_eq!(
+                request.raw_arguments.as_ref().unwrap()["attachment_id"],
+                "task"
+            );
+            assert!(request.raw_arguments.as_ref().unwrap()["content_sha256"].is_string());
+            assert!(
+                approval
+                    .audit_log()
+                    .iter()
+                    .all(|entry| !entry.arguments_summary.contains(marker)),
+                "approval audit must not receive the opaque body"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn session_prompt_confirmation_binds_session_id_content_and_digest() {
@@ -502,6 +672,32 @@ mod tests {
                 ApprovalSource::TimedOut,
             )
         ));
+    }
+
+    #[test]
+    fn generic_session_prompt_approval_arguments_keep_identity_without_content() {
+        let marker = "session-prompt-private-marker";
+        let args = generic_approval_arguments(
+            "session_prompt_set",
+            &serde_json::json!({"id": "current-task", "content": marker}),
+        );
+
+        assert_eq!(args["action"], "set");
+        assert_eq!(args["attachment_id"], "current-task");
+        assert!(args["content_sha256"].as_str().is_some());
+        assert!(!args.to_string().contains(marker));
+    }
+
+    #[test]
+    fn generic_session_prompt_approval_arguments_do_not_hash_invalid_content() {
+        let marker = "x".repeat(zeroclaw_infra::session_prompts::MAX_SESSION_PROMPT_BYTES + 1);
+        let args = generic_approval_arguments(
+            "session_prompt_set",
+            &serde_json::json!({"id": "current-task", "content": marker}),
+        );
+
+        assert!(args["content_sha256"].is_null());
+        assert!(!args.to_string().contains(&marker));
     }
 
     #[tokio::test]

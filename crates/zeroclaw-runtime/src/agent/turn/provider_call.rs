@@ -11,7 +11,7 @@ use super::outcome::{
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
 use crate::agent::cost::check_tool_loop_budget;
-use crate::agent::prompt::redact_session_prompt_attachments_for_export;
+use crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export;
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -73,17 +73,11 @@ pub(crate) async fn announce_llm_request(
             && policy.captures_payload()
             && let ::serde_json::Value::Object(map) = &mut attrs
         {
-            let rendered: Vec<::serde_json::Value> = request_messages
-                .iter()
-                .map(|m| {
-                    let content = if m.role == "system" {
-                        redact_session_prompt_attachments_for_export(&m.content)
-                    } else {
-                        std::borrow::Cow::Borrowed(m.content.as_str())
-                    };
-                    ::serde_json::json!({"role": m.role.as_str(), "content": content})
-                })
-                .collect();
+            let rendered: Vec<::serde_json::Value> =
+                redact_session_prompt_tool_exchanges_for_export(request_messages)
+                    .iter()
+                    .map(|m| ::serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+                    .collect();
             let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
             let scrubbed = scrub_credentials(&serialized);
             if let Some(capture) =
@@ -115,17 +109,7 @@ pub(crate) async fn announce_llm_request(
 
     // Fire void hook before LLM call
     if let Some(hooks) = ctx.hooks {
-        let export_messages: Vec<ChatMessage> = request_messages
-            .iter()
-            .map(|message| ChatMessage {
-                role: message.role.clone(),
-                content: if message.role == "system" {
-                    redact_session_prompt_attachments_for_export(&message.content).into_owned()
-                } else {
-                    message.content.clone()
-                },
-            })
-            .collect();
+        let export_messages = redact_session_prompt_tool_exchanges_for_export(request_messages);
         hooks.fire_llm_input(&export_messages, active_model).await;
     }
 

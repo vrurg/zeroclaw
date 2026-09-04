@@ -2128,7 +2128,14 @@ impl Agent {
         } else {
             &no_tools
         };
-        let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let has_advertised_tools = prompt_tools
+            .iter()
+            .any(|tool| crate::agent::prompt::tool_is_advertised_for_current_turn(tool.name()));
+        let instructions = if has_advertised_tools {
+            dispatcher.prompt_instructions(prompt_tools)
+        } else {
+            String::new()
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -2139,8 +2146,7 @@ impl Agent {
             identity_config: Some(&self.identity_config),
             interaction: self.interaction_context.as_ref(),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: dispatcher.should_send_tool_specs()
-                && !prompt_tools.is_empty(),
+            sends_native_tool_specs: dispatcher.should_send_tool_specs() && has_advertised_tools,
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
             shell_profile: self.shell_profile.clone(),

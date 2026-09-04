@@ -92,8 +92,8 @@ where
         let session_prompt_tools_allowed = session_prompt_backend.is_some();
         let session_prompt_budget = if session_prompt_tools_allowed {
             Some(
-                guard
-                    .session_prompt_budget()
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .sync_scope(true, || guard.session_prompt_budget())
                     .map_err(|error| StreamedTurnError {
                         error,
                         committed_response: String::new(),
