@@ -60,10 +60,13 @@ returned.
 `PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported
 config operations are `add`, `replace`, `remove`, and `test`. ZeroClaw also
 accepts a `comment` extension for config annotations. Config operations run
-against an in-memory copy; once every operation has applied,
-`Config::validate()` runs once on the result. If validation passes, the new
-state is persisted and swapped in. If any operation or final validation fails,
-on-disk and in-memory state are unchanged. Comment annotations are applied
+against an in-memory copy; once every operation has applied, the final
+validation checks the changed (dirty) paths. An error affecting a changed path
+rejects the request, leaving on-disk and in-memory state unchanged. An existing
+error at an unrelated path does not block repair: the valid change is persisted
+and the response carries a structured `pre_existing_validation_error` warning
+with that path. Clients must surface that warning; it means the saved whole
+configuration still needs a separate repair. Comment annotations are applied
 after the save on a non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
@@ -77,7 +80,7 @@ server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
-response shape (`--json` for scripts).
+response shape (`--json` for scripts), including repair warnings.
 
 ## Secrets: write-only over HTTP
 

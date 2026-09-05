@@ -4,6 +4,7 @@
 pub mod v1;
 pub mod v2;
 
+use crate::api_error::ConfigApiError;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
@@ -23264,11 +23265,11 @@ impl Config {
     /// Validate a configuration mutation while allowing an unrelated legacy
     /// provider alias that the current mutation grammar deliberately rejects.
     ///
-    /// This is intentionally narrow: only the colon-name check is waived for
-    /// untouched aliases. The provider entries stay in the validation graph,
-    /// so agents and routes that already reference them continue to resolve.
-    /// All dirty paths and every other configuration invariant remain subject
-    /// to [`Self::validate`].
+    /// An error affecting a dirty path remains fatal. An unrelated retained
+    /// error is returned as a structured warning so an operator can repair a
+    /// valid field without being locked out by a separate pre-existing defect.
+    /// The provider entries stay in the validation graph, so agents and routes
+    /// that already reference them continue to resolve.
     /// Replace this compatibility bridge when configuration validation and
     /// warning transport are centralized.
     pub fn validate_for_config_repair(
@@ -23316,20 +23317,54 @@ impl Config {
                     .then_some(path)
             })
             .collect();
-        self.validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)?;
+        let mut warnings = Vec::new();
+        if let Err(error) =
+            self.validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)
+        {
+            let api_error = ConfigApiError::from_validation(error);
+            let error_path = api_error.path.as_deref().unwrap_or("");
+            let touches_dirty = !error_path.is_empty()
+                && self.dirty_paths.iter().any(|dirty| {
+                    error_path == dirty
+                        || error_path.starts_with(&format!("{dirty}."))
+                        || dirty.starts_with(&format!("{error_path}."))
+                });
+            // Alias-name validation reports the alias path rather than a
+            // distinct dirty reference that introduced it. Any remaining
+            // colon alias here was deliberately not grandfathered above:
+            // it is OAuth, non-Anthropic, touched, or newly referenced. Keep
+            // that ownership-sensitive rejection fatal instead of hiding it
+            // behind an unrelated-path warning.
+            let rejected_colon_alias =
+                self.providers
+                    .models
+                    .iter_entries()
+                    .any(|(family, alias, _)| {
+                        alias.contains(':')
+                            && error_path == format!("providers.models.{family}.{alias}")
+                            && !excluded_legacy_alias_paths
+                                .contains(&format!("providers.models.{family}.{alias}"))
+                    });
+            if touches_dirty || rejected_colon_alias || error_path.is_empty() {
+                return Err(anyhow::Error::from(api_error));
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "pre_existing_validation_error",
+                api_error.message,
+                error_path,
+            ));
+        }
         let mut excluded_legacy_alias_paths: Vec<_> =
             excluded_legacy_alias_paths.into_iter().collect();
         excluded_legacy_alias_paths.sort();
-        Ok(excluded_legacy_alias_paths
-            .into_iter()
-            .map(|path| {
-                crate::validation_warnings::ValidationWarning::new(
-                    "pre_existing_validation_error",
-                    "unrelated legacy provider alias contains `:` and must be repaired separately",
-                    path,
-                )
-            })
-            .collect())
+        warnings.extend(excluded_legacy_alias_paths.into_iter().map(|path| {
+            crate::validation_warnings::ValidationWarning::new(
+                "pre_existing_validation_error",
+                "unrelated legacy provider alias contains `:` and must be repaired separately",
+                path,
+            )
+        }));
+        Ok(warnings)
     }
 
     pub fn mark_dirty(&mut self, path: &str) {
@@ -43984,6 +44019,30 @@ model_provider = \"ollama.default\"
             .validate_for_config_repair()
             .expect_err("only Anthropic static aliases may use the repair bridge");
         assert!(error.to_string().contains("legacy:custom"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_warns_for_an_unrelated_existing_validation_error() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated repair should retain the existing invalid value as a warning");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "pre_existing_validation_error");
+        assert_eq!(warnings[0].path, "gateway.websocket_ping_interval_secs");
+
+        config.mark_dirty("gateway.websocket_ping_interval_secs");
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty invalid value must still be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("gateway.websocket_ping_interval_secs")
+        );
     }
 
     #[::core::prelude::v1::test]
