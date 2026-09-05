@@ -660,18 +660,14 @@ impl GoalController {
     pub async fn submit(
         &self,
         settings: &GoalHostSettings,
-        submission: GoalSubmission,
+        submission: &GoalSubmission,
     ) -> Result<GoalResponse> {
-        let GoalSubmission {
-            ingress,
-            command,
-            driver: _driver,
-            lease,
-        } = submission;
         // Keep the surface-owned lease through every guarded transition below.
         // Dropping it any earlier would permit a reconnect to invalidate the
         // binding between host admission and durable mutation.
-        let _lease = lease;
+        let _lease = submission.binding();
+        let ingress = submission.ingress();
+        let command = submission.command();
 
         if matches!(command, GoalCommand::Help) {
             return Ok(GoalResponse::Help);
@@ -682,14 +678,15 @@ impl GoalController {
 
         match command {
             GoalCommand::Start { budget, objective } => {
-                self.start(settings, &ingress, budget, objective).await
+                self.start(settings, ingress, *budget, objective.clone())
+                    .await
             }
-            GoalCommand::Status => self.status(&ingress, false).await,
-            GoalCommand::Budget => self.status(&ingress, true).await,
-            GoalCommand::SetBudget(selection) => self.set_budget(&ingress, selection).await,
-            GoalCommand::Pause => self.pause(&ingress).await,
-            GoalCommand::Resume => self.resume(settings, &ingress).await,
-            GoalCommand::Cancel => self.cancel(&ingress).await,
+            GoalCommand::Status => self.status(ingress, false).await,
+            GoalCommand::Budget => self.status(ingress, true).await,
+            GoalCommand::SetBudget(selection) => self.set_budget(ingress, *selection).await,
+            GoalCommand::Pause => self.pause(ingress).await,
+            GoalCommand::Resume => self.resume(settings, ingress).await,
+            GoalCommand::Cancel => self.cancel(ingress).await,
             GoalCommand::Help => unreachable!("handled before controller dispatch"),
         }
     }
