@@ -11,9 +11,9 @@ use zeroclaw_runtime::control_plane::{
 };
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalSessionBinding,
-    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
-    GoalVerifierTurn,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -844,6 +844,48 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     assert!(matches!(
         controller.submit(&settings, &cancel).await.unwrap(),
         GoalResponse::Cancelled(_)
+    ));
+}
+
+#[tokio::test]
+async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let driver = Arc::new(RecordingDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        binds: AtomicUsize::new(0),
+        execution_acquires: AtomicUsize::new(0),
+    });
+
+    let submission = runtime
+        .submit(
+            &settings,
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let (response, execution) = submission.into_parts();
+    let GoalResponse::Started(started) = response else {
+        panic!("expected a started Goal");
+    };
+    let execution = execution.expect("a started Goal must launch exactly one execution request");
+    assert_eq!(execution.scope().task_id(), started.task_id);
+    assert_eq!(
+        execution.scope().session_id(),
+        ingress.session_key().durable_id()
+    );
+    assert_eq!(execution.scope().execution_epoch(), started.execution_epoch);
+    assert!(Arc::ptr_eq(
+        execution.submission().driver(),
+        &(driver as Arc<dyn GoalSessionDriver>)
     ));
 }
 
