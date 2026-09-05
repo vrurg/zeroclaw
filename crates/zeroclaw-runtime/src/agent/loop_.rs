@@ -552,7 +552,7 @@ fn elide_image_data(content: &str) -> String {
 }
 
 pub(crate) fn scrub_for_export(content: &str) -> String {
-    if crate::agent::prompt::session_prompt_tool_name_mentioned(content) {
+    if crate::agent::prompt::session_prompt_tool_call_envelope_mentioned(content) {
         return "[Session-prompt tool exchange omitted from export]".to_string();
     }
     let without_attachments =

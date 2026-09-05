@@ -136,7 +136,8 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     messages
         .iter()
         .map(|message| {
-            let is_sensitive_call = session_prompt_tool_name_mentioned(&message.content);
+            let is_sensitive_call = message.role == "assistant"
+                && session_prompt_tool_call_envelope_mentioned(&message.content);
             let is_native_result = message.role == "tool";
             let is_text_protocol_result = message.role == "user";
             let redact = is_sensitive_call
@@ -176,19 +177,26 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
 /// boundary. Native tool calls are represented separately, but this response
 /// string may contain a complete XML tool call including an attachment body.
 pub(crate) fn redact_session_prompt_text_protocol_for_export(content: &str) -> Cow<'_, str> {
-    if session_prompt_tool_name_mentioned(content) {
+    if session_prompt_tool_call_envelope_mentioned(content) {
         Cow::Borrowed(SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER)
     } else {
         Cow::Borrowed(content)
     }
 }
 
-/// Native tool-call snapshots retain the tool name separately, but text
-/// protocol exchanges carry the name in their message content.
-pub(crate) fn session_prompt_tool_name_mentioned(content: &str) -> bool {
-    zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
-        .iter()
-        .any(|name| content.contains(name))
+/// Identify a session-prompt invocation embedded in a provider tool envelope.
+///
+/// Mentioning a tool name in normal user, assistant, or system prose is not a
+/// sensitive exchange. Provider adapters may retain native JSON as literal or
+/// escaped text, while malformed XML is still a log-sensitive tool envelope.
+pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool {
+    let has_tool_envelope = content.contains("<tool_call")
+        || content.contains("\"tool_calls\"")
+        || content.contains("\\\"tool_calls\\\"");
+    has_tool_envelope
+        && zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+            .iter()
+            .any(|name| content.contains(name))
 }
 
 /// Whether a tool belongs in the model-visible catalog for this turn.
@@ -1795,6 +1803,32 @@ mod tests {
             r#"<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"#
         );
         let export = redact_session_prompt_text_protocol_for_export(&response);
+        assert!(!export.contains(marker));
+        assert!(export.contains("omitted from export"));
+    }
+
+    #[test]
+    fn export_copy_preserves_ordinary_mentions_of_prompt_tools() {
+        let messages = vec![
+            ChatMessage::user("How do I use session_prompt_set?"),
+            ChatMessage::assistant("Use session_prompt_set to attach context."),
+            ChatMessage::system("The host documents session_prompt_set here."),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert_eq!(export.len(), messages.len());
+        for (actual, expected) in export.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
+    }
+
+    #[test]
+    fn text_protocol_export_redactor_covers_malformed_prompt_envelopes() {
+        let marker = "session-prompt-private-marker";
+        let malformed =
+            format!(r#"<tool_call {{\"name\":\"session_prompt_set\",\"content\":\"{marker}\""#);
+        let export = redact_session_prompt_text_protocol_for_export(&malformed);
         assert!(!export.contains(marker));
         assert!(export.contains("omitted from export"));
     }

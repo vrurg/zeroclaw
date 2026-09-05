@@ -221,7 +221,9 @@ pub(crate) async fn interpret_chat_response(
                     "model": model,
                     "iteration": iteration + 1,
                     "issue": issue.as_str(),
-                    "response": scrub_credentials(&response_text),
+                    "response": scrub_credentials(
+                        &redact_session_prompt_text_protocol_for_export(&response_text),
+                    ),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_parse_issue"
