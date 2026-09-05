@@ -666,7 +666,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         delivered: delivered.clone(),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
-    let operation = GoalOperationScope::new(scope.clone(), "operation-1").unwrap();
+    let operation = GoalOperationScope::new(scope.clone());
     let settings = host_settings(true);
 
     let mut lease = GoalExecutionHost::new()
