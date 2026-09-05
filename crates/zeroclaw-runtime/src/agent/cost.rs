@@ -354,7 +354,11 @@ fn goal_operation_settlement(
     settlement
 }
 
-fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
+/// Resolve the configured rate map for an immutable actual provider/model
+/// attribution. Goal execution consumes this same resolver when it persists
+/// #10144 attempt reports, so configured model aliases cannot drift between
+/// ordinary and Goal-scoped accounting.
+pub(crate) fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> Option<ModelRates> {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
