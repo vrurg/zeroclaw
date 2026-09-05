@@ -1503,6 +1503,29 @@ async fn local_help_does_not_bind_a_live_session_when_goal_mode_is_enabled() {
 }
 
 #[tokio::test]
+async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
+    });
+
+    let (response, execution) = runtime
+        .submit(&settings, ingress, driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap()
+        .into_parts();
+    assert!(matches!(response, GoalResponse::NoCurrentGoal));
+    assert!(execution.is_none());
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
