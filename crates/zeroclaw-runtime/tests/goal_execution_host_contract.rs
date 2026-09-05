@@ -4,15 +4,17 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use tempfile::TempDir;
 use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_config::cost::CostTracker;
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionScope, GoalHostSettings,
+    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse,
+    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
@@ -24,6 +26,7 @@ struct RecordingDriver {
 
 struct RecordingExecutionLease {
     delivered: Arc<AtomicUsize>,
+    complete_verifier: bool,
 }
 
 #[async_trait]
@@ -45,7 +48,14 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
-        Ok(format!("verifier:{}", turn.candidate))
+        if self.complete_verifier {
+            Ok(
+                r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
+                    .to_owned(),
+            )
+        } else {
+            Ok(format!("verifier:{}", turn.candidate))
+        }
     }
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
@@ -58,6 +68,7 @@ struct ExecutionDriver {
     binding: GoalSessionBinding,
     execution_acquires: AtomicUsize,
     delivered: Arc<AtomicUsize>,
+    complete_verifier: bool,
 }
 
 #[async_trait]
@@ -82,6 +93,7 @@ impl GoalSessionDriver for ExecutionDriver {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(RecordingExecutionLease {
             delivered: self.delivered.clone(),
+            complete_verifier: self.complete_verifier,
         }))
     }
 }
@@ -540,6 +552,7 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
             .unwrap(),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
+        complete_verifier: false,
     });
     let scope =
         zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
@@ -633,6 +646,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
             .unwrap(),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
+        complete_verifier: false,
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
     let operation = GoalOperationScope::new(scope.clone());
@@ -840,6 +854,7 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
             .unwrap(),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
+        complete_verifier: false,
     });
 
     let submission = runtime
@@ -878,6 +893,70 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
 }
 
 #[tokio::test]
+async fn execution_engine_completes_through_the_exact_runtime_handoff() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: delivered.clone(),
+        complete_verifier: true,
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = GoalExecutionEngine::new(
+        store.clone() as Arc<dyn GoalTaskRegistry>,
+        tracker,
+        "main",
+        Arc::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.run(&runtime, &settings, &request).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .current_goal_for_session(request.scope().session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
 async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
@@ -888,6 +967,7 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
             .unwrap(),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
+        complete_verifier: false,
     });
 
     let (response, execution) = runtime
@@ -1017,6 +1097,25 @@ async fn session_lease_blocks_reconnect_until_controller_returns() {
         driver.reconnect_is_allowed(),
         "the lease may release only after the controller has finished"
     );
+}
+
+#[tokio::test]
+async fn host_submission_cannot_apply_a_second_lifecycle_transition() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(false);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let submission = GoalExecutionHost::new()
+        .submit(ingress, driver, GoalCommand::Status)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        controller.submit(&settings, &submission).await.unwrap(),
+        GoalResponse::Disabled
+    ));
+    assert!(controller.submit(&settings, &submission).await.is_err());
 }
 
 #[tokio::test]
