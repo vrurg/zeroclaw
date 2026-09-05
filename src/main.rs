@@ -288,15 +288,22 @@ fn config_patch_scoped_validate(
         .validate_for_config_repair()
         .map_err(ConfigApiError::from_validation)?;
     for warning in &warnings {
+        let message = match warning.code.as_str() {
+            "legacy_colon_alias_retained" => format!(
+                "saving a config repair while retaining an unrelated legacy provider alias with `:`: {}",
+                warning.path
+            ),
+            _ => format!(
+                "saving a config repair while retaining a pre-existing validation error at {}: {}",
+                warning.path, warning.message
+            ),
+        };
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"path": warning.path})),
-            &format!(
-                "saving a config repair while retaining an unrelated legacy provider alias with `:`: {}",
-                warning.path
-            )
+            &message
         );
     }
     Ok(warnings)
@@ -306,7 +313,7 @@ fn config_patch_human_warning(
     warning: &zeroclaw_config::validation_warnings::ValidationWarning,
 ) -> String {
     match warning.code.as_str() {
-        "pre_existing_validation_error" => ta(
+        "legacy_colon_alias_retained" => ta(
             "cli-config-patch-warning-pre-existing-validation",
             &[("path", &warning.path)],
             &format!(

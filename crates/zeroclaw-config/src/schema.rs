@@ -23275,60 +23275,78 @@ impl Config {
     pub fn validate_for_config_repair(
         &self,
     ) -> Result<Vec<crate::validation_warnings::ValidationWarning>> {
+        fn paths_overlap(left: &str, right: &str) -> bool {
+            left == right
+                || left
+                    .strip_prefix(right)
+                    .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
+                || right
+                    .strip_prefix(left)
+                    .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
+        }
+
         let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
             .providers
             .models
             .iter_entries()
             .filter_map(|(family, alias, _)| {
-                let path = format!("providers.models.{family}.{alias}");
-                let touches_dirty = self.dirty_paths.iter().any(|dirty| {
-                    dirty == &path
-                        || dirty.starts_with(&format!("{path}."))
-                        || path.starts_with(&format!("{dirty}."))
-                });
+                if family != "anthropic" || !alias.contains(':') {
+                    return None;
+                }
                 // OAuth aliases participate in profile ownership, so they are
                 // never grandfathered by this static-credential bridge.
-                let is_legacy_static_alias = family == "anthropic"
-                    && self
-                        .providers
-                        .models
-                        .anthropic
-                        .get(alias)
-                        .is_some_and(|provider| provider.auth_mode.is_none());
+                if !self
+                    .providers
+                    .models
+                    .anthropic
+                    .get(alias)
+                    .is_some_and(|provider| provider.auth_mode.is_none())
+                {
+                    return None;
+                }
+                let path = format!("providers.models.{family}.{alias}");
+                let touches_dirty = self
+                    .dirty_paths
+                    .iter()
+                    .any(|dirty| paths_overlap(dirty, &path));
+                if touches_dirty {
+                    return None;
+                }
                 // Do not allow a config-patch request to create a new direct
                 // reference to a colon alias. Existing references are safe to
                 // retain while another field is repaired because their paths
                 // are not dirty.
-                let alias_reference = format!("{family}.{alias}");
-                let dirty_path_references_alias = self.dirty_paths.iter().any(|dirty| {
-                    self.get_prop(dirty).is_ok_and(|value| {
-                        value == alias_reference
-                            || serde_json::from_str::<Vec<String>>(&value).is_ok_and(|references| {
-                                references
-                                    .iter()
-                                    .any(|reference| reference == &alias_reference)
-                            })
-                    })
-                });
-                (alias.contains(':')
-                    && is_legacy_static_alias
-                    && !touches_dirty
-                    && !dirty_path_references_alias)
-                    .then_some(path)
+                let alias_kind = crate::alias_refs::AliasKind::Provider {
+                    category: crate::alias_refs::ProviderCategory::Models,
+                    family: family.to_string(),
+                };
+                let dirty_path_references_alias =
+                    crate::alias_refs::find_all_references(self, &alias_kind, alias)
+                        .iter()
+                        .any(|reference| {
+                            self.dirty_paths
+                                .iter()
+                                .any(|dirty| paths_overlap(dirty, &reference.path))
+                        });
+                (!dirty_path_references_alias).then_some(path)
             })
             .collect();
         let mut warnings = Vec::new();
-        if let Err(error) =
-            self.validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)
-        {
+        let mut validation_probe = self.clone();
+        let mut isolated_error_paths = std::collections::HashSet::new();
+        loop {
+            let Err(error) = validation_probe
+                .validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)
+            else {
+                break;
+            };
             let api_error = ConfigApiError::from_validation(error);
             let error_path = api_error.path.as_deref().unwrap_or("");
             let touches_dirty = !error_path.is_empty()
-                && self.dirty_paths.iter().any(|dirty| {
-                    error_path == dirty
-                        || error_path.starts_with(&format!("{dirty}."))
-                        || dirty.starts_with(&format!("{error_path}."))
-                });
+                && self
+                    .dirty_paths
+                    .iter()
+                    .any(|dirty| paths_overlap(error_path, dirty));
             // Alias-name validation reports the alias path rather than a
             // distinct dirty reference that introduced it. Any remaining
             // colon alias here was deliberately not grandfathered above:
@@ -23348,6 +23366,30 @@ impl Config {
             if touches_dirty || rejected_colon_alias || error_path.is_empty() {
                 return Err(anyhow::Error::from(api_error));
             }
+
+            // `validate_allowing_legacy_colon_aliases` reports one error at a
+            // time. Isolate each demonstrably unrelated error in a disposable
+            // probe before accepting the repair, so an earlier existing error
+            // cannot mask a later error caused by a dirty field. This bounded
+            // bridge must be replaced by centralized multi-error validation.
+            if !isolated_error_paths.insert(error_path.to_string()) {
+                return Err(anyhow::Error::from(api_error));
+            }
+            let Ok(default_value) = Config::default().get_prop(error_path) else {
+                return Err(anyhow::Error::from(api_error));
+            };
+            if validation_probe
+                .get_prop(error_path)
+                .is_ok_and(|current| current == default_value)
+            {
+                return Err(anyhow::Error::from(api_error));
+            }
+            if validation_probe
+                .set_prop(error_path, &default_value)
+                .is_err()
+            {
+                return Err(anyhow::Error::from(api_error));
+            }
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 "pre_existing_validation_error",
                 api_error.message,
@@ -23359,7 +23401,7 @@ impl Config {
         excluded_legacy_alias_paths.sort();
         warnings.extend(excluded_legacy_alias_paths.into_iter().map(|path| {
             crate::validation_warnings::ValidationWarning::new(
-                "pre_existing_validation_error",
+                "legacy_colon_alias_retained",
                 "unrelated legacy provider alias contains `:` and must be repaired separately",
                 path,
             )
@@ -43988,7 +44030,7 @@ model_provider = \"ollama.default\"
             .validate_for_config_repair()
             .expect("an unrelated repair may retain a static legacy alias");
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "pre_existing_validation_error");
+        assert_eq!(warnings[0].code, "legacy_colon_alias_retained");
         assert_eq!(
             warnings[0].path,
             "providers.models.anthropic.legacy:subscription"
@@ -44064,6 +44106,25 @@ model_provider = \"ollama.default\"
         let error = config
             .validate_for_config_repair()
             .expect_err("a patch may not create a colon-alias reference");
+        assert!(error.to_string().contains("legacy:subscription"));
+
+        let mut padded_reference_config = Config::default();
+        padded_reference_config.providers.models.anthropic.insert(
+            "legacy:subscription".into(),
+            AnthropicModelProviderConfig::default(),
+        );
+        padded_reference_config.agents.insert(
+            "researcher".into(),
+            AliasedAgentConfig {
+                model_provider: "  anthropic.legacy:subscription  ".into(),
+                ..Default::default()
+            },
+        );
+        padded_reference_config.mark_dirty("agents.researcher.model_provider");
+
+        let error = padded_reference_config
+            .validate_for_config_repair()
+            .expect_err("trimmed model-provider resolution must not bypass colon-alias ownership");
         assert!(error.to_string().contains("legacy:subscription"));
 
         let mut fallback_config = Config::default();

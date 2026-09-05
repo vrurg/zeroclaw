@@ -639,9 +639,9 @@ impl AnthropicModelProvider {
         if Self::is_setup_token(token) {
             AnthropicAuthKind::Authorization
         } else {
-            // Static credentials preserve the legacy API-key wire contract.
-            // Token-shape inference is reserved for stored OAuth profiles,
-            // whose metadata can explicitly select Authorization.
+            // Static ordinary API keys retain the x-api-key wire contract.
+            // Legacy inline setup tokens are handled by the branch above;
+            // stored OAuth profiles use their explicit auth-kind metadata.
             AnthropicAuthKind::ApiKey
         }
     }

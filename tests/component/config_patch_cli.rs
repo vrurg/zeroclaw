@@ -368,7 +368,7 @@ fn config_patch_repairs_another_path_when_a_legacy_colon_alias_is_invalid() {
         .as_array()
         .expect("repair warning array");
     assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0]["code"], "pre_existing_validation_error");
+    assert_eq!(warnings[0]["code"], "legacy_colon_alias_retained");
     assert_eq!(
         warnings[0]["path"],
         "providers.models.anthropic.legacy:subscription"
@@ -419,6 +419,30 @@ fn config_patch_human_success_reports_retained_legacy_alias_warning() {
             .contains("providers.models.anthropic.legacy:subscription"),
         "human success must retain the repair warning: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_patch_human_warning_describes_an_unrelated_validation_error() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_unrelated_invalid_ping_interval(config_dir.path());
+
+    let output = run_cli_patch_output_human(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert!(
+        output.status.success(),
+        "human patch should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("gateway.websocket_ping_interval_secs"));
+    assert!(stderr.contains("out of range"));
+    assert!(
+        !stderr.contains("legacy provider alias"),
+        "a generic validation warning must not claim the path is an alias: {stderr}"
     );
 }
 
@@ -509,6 +533,43 @@ async fn config_patch_rejects_dirty_validation_hidden_by_legacy_colon_alias() {
             !parsed.gateway.host.is_empty(),
             "a rejected dirty validation must not persist an empty gateway host: {saved}"
         );
+    }
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_rejects_dirty_validation_hidden_by_an_unrelated_error() {
+    let patch_doc = br#"[{"op":"replace","path":"/gateway/host","value":""}]"#;
+    let cli_config_dir = tempfile::tempdir().expect("temp CLI config dir");
+    let http_config_dir = tempfile::tempdir().expect("temp HTTP config dir");
+
+    let _ = config_with_unrelated_invalid_ping_interval(cli_config_dir.path());
+    let cli_envelope = run_cli_patch(cli_config_dir.path(), patch_doc);
+    let (status, http_envelope) = run_http_patch_with_config(
+        config_with_unrelated_invalid_ping_interval(http_config_dir.path()),
+        patch_doc,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    for field in ["code", "path"] {
+        assert_eq!(
+            cli_envelope[field], http_envelope[field],
+            "CLI and HTTP mismatch on `{field}`:\nCLI:  {cli_envelope}\nHTTP: {http_envelope}",
+        );
+    }
+    assert_eq!(cli_envelope["code"], "required_field_empty");
+    assert_eq!(cli_envelope["path"], "gateway.host");
+
+    for config_dir in [&cli_config_dir, &http_config_dir] {
+        let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+            .expect("read rejected-patch config");
+        let parsed: Config = toml::from_str(&saved).expect("rejected-patch config parses");
+        assert!(
+            !parsed.gateway.host.is_empty(),
+            "a dirty validation error must not be masked by the pre-existing ping error: {saved}"
+        );
+        assert_eq!(parsed.gateway.websocket_ping_interval_secs, 86_401);
     }
 }
 
