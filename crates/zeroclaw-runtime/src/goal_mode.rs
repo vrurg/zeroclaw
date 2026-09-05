@@ -674,6 +674,25 @@ impl GoalRuntime {
             execution,
         })
     }
+
+    /// Acquire the foreground lease for an exact running Goal handoff.
+    ///
+    /// The caller supplies the request returned by [`Self::submit`]; this
+    /// method deliberately has no route- or session-key lookup path.
+    pub async fn acquire_execution(
+        &self,
+        settings: &GoalHostSettings,
+        request: &GoalExecutionRequest,
+    ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+        self.host
+            .acquire_execution(
+                settings,
+                request.submission().ingress(),
+                Arc::clone(request.submission().driver()),
+                request.scope(),
+            )
+            .await
+    }
 }
 
 fn required(name: &str, value: String) -> Result<String> {
