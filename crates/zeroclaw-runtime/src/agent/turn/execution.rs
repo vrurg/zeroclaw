@@ -51,9 +51,14 @@ impl ResolvedModelAccess<'_> {
         if !response.tool_calls.is_empty() {
             anyhow::bail!("text-only model query returned unexpected tool calls");
         }
-        response
+        let text = response
             .text
-            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))?;
+        let text = zeroclaw_api::model_provider::normalize_terminal_display_text(&text);
+        if text.is_empty() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(text)
     }
 
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
@@ -609,6 +614,25 @@ mod run_model_query_tests {
             assert_eq!(recorded.output_tokens, 5, "case {text:?}");
             assert_eq!(recorded.last_input_tokens, 0, "case {text:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn run_text_query_returns_normalized_terminal_text() {
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: Some("answer<eom>".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            },
+        };
+
+        let response = direct_access(&provider)
+            .run_text_query(None, "hi")
+            .await
+            .expect("nonempty terminal text must succeed");
+
+        assert_eq!(response, "answer");
     }
 
     #[tokio::test]

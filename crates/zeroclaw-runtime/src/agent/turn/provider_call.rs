@@ -661,7 +661,6 @@ mod streaming_fallback_tests {
     };
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
-    use axum::{Router, http::StatusCode, routing::post};
     use futures_util::StreamExt;
     use futures_util::stream::BoxStream;
     use std::sync::{

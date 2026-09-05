@@ -1977,8 +1977,10 @@ impl AnthropicModelProvider {
             let kind = block.kind;
             match kind.as_str() {
                 "text" => {
-                    if let Some(text) = block.text.map(|t| t.trim().to_string())
-                        && !text.is_empty()
+                    if let Some(text) = block
+                        .text
+                        .map(|text| text.trim().to_string())
+                        .filter(|text| !text.is_empty())
                     {
                         text_parts.push(text);
                     }
@@ -2569,6 +2571,11 @@ impl AnthropicModelProvider {
                                     | "web_search_tool_result"
                                     | "mcp_tool_use"
                                     | "mcp_tool_result"
+                                    // Server-side fallback marks a model
+                                    // boundary with a start/stop pair and no
+                                    // delta. It is protocol state, not a
+                                    // client-executable tool or display text.
+                                    | "fallback"
                             )
                         });
                     let started = match (content_block_index, block_type) {
@@ -2774,10 +2781,10 @@ impl AnthropicModelProvider {
                         // Known terminal blocks without defined deltas must not
                         // silently turn malformed framing into a clean Final.
                         _ => {
-                            if kind.is_some_and(|kind| kind == "tool_use") {
-                                if let Some(index) = index {
-                                    invalid_tool_block_indices.insert(index);
-                                }
+                            if kind.is_some_and(|kind| kind == "tool_use")
+                                && let Some(index) = index
+                            {
+                                invalid_tool_block_indices.insert(index);
                             }
                             invalid();
                         }
@@ -4514,16 +4521,35 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     #[tokio::test]
     async fn streaming_rejects_malformed_content_block_start_envelopes() {
-        for content_block in [
-            "null",
-            "[]",
-            "{}",
-            "{\"type\":7}",
-            "{\"type\":\"future\"}",
-            "{\"type\":\"fallback\"}",
-        ] {
+        for content_block in ["null", "[]", "{}", "{\"type\":7}", "{\"type\":\"future\"}"] {
             assert_malformed_content_block_start_is_rejected(content_block).await;
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_server_fallback_block_without_delta_completes_cleanly() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        assert!(
+            matches!(rx.recv().await, Some(Ok(StreamEvent::Usage(usage))) if usage.output_tokens == Some(5))
+        );
+        assert!(matches!(rx.recv().await, Some(Ok(StreamEvent::Final))));
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]
@@ -4918,6 +4944,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "redacted_thinking",
             "web_search_tool_result",
             "mcp_tool_result",
+            "fallback",
         ] {
             let bytes = format!(
                 "event: content_block_start\n\
