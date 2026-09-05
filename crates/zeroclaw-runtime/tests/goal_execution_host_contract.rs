@@ -779,6 +779,13 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         panic!("expected a started Goal");
     };
     assert_eq!(started.execution_epoch, 1);
+    assert!(
+        Arc::ptr_eq(
+            start.driver(),
+            &(driver.clone() as Arc<dyn GoalSessionDriver>)
+        ),
+        "the controller must not consume or replace the validated execution driver"
+    );
 
     let pause = host
         .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
