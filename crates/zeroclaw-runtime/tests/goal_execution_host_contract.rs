@@ -12,9 +12,9 @@ use zeroclaw_runtime::control_plane::{
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionScope, GoalHostSettings,
-    GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse,
-    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
+    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
@@ -923,16 +923,12 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
         )
         .unwrap(),
     );
-    let engine = GoalExecutionEngine::new(
-        store.clone() as Arc<dyn GoalTaskRegistry>,
-        tracker,
-        "main",
-        Arc::default(),
-    )
-    .unwrap();
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
 
     assert_eq!(
-        engine.run(&runtime, &settings, &request).await.unwrap(),
+        engine.run(&settings, &request).await.unwrap(),
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
     );
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
