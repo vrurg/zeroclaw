@@ -13,7 +13,9 @@ use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+use zeroclaw_api::model_provider::{
+    TerminalCompletionError, TerminalCompletionFailure, ThinkingDisplay,
+};
 use zeroclaw_api::tool::ToolSpec;
 
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
@@ -106,7 +108,11 @@ pub struct AnthropicModelProvider {
 struct StreamingToolState {
     id: String,
     name: String,
+    // Anthropic starts native tools with an object placeholder. A zero-argument
+    // tool may legitimately have no later JSON deltas, so retain that object
+    // until an input_json_delta makes the accumulated wire JSON authoritative.
     input_json: String,
+    saw_input_json_delta: bool,
 }
 
 #[cfg(test)]
@@ -166,11 +172,92 @@ struct NativeChatRequest {
 struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
-    budget_tokens: u32,
+    /// Fixed token budget for `enabled` thinking. Absent for `adaptive`
+    /// thinking, which lets the model pace itself — adaptive-only models
+    /// (Opus 4.7, Fable 5.1) reject `enabled` with HTTP 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+    /// Anthropic's `thinking.display` beta field. `None` leaves the key out
+    /// of the request body entirely, matching pre-beta requests byte-for-byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<ThinkingDisplay>,
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
+/// Beta features carried by OAuth (Claude Code setup) tokens.
+const ANTHROPIC_OAUTH_BETA_FEATURES: &str =
+    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
+
+/// Beta feature enabling the `thinking.display` request field
+/// (`thinking.display` controls omitted/updates/summarized thinking blocks).
+const ANTHROPIC_THINKING_DISPLAY_BETA: &str = "thinking-display-updates-2026-08-18";
+
+/// Flush an in-flight streaming thinking block as a durable reasoning chunk.
+///
+/// Emits the accumulated `{"thinking":..,"signature":..}` JSON object in the
+/// exact newline-joined representation the non-streaming `reasoning_content`
+/// contract uses (subsequent blocks are '\n'-prefixed so the consumer's raw
+/// concatenation round-trips). Returns `false` when the receiver is gone and
+/// the caller should stop pumping the stream.
+async fn flush_streaming_thinking_block(
+    thinking_text: &mut String,
+    thinking_signature: &mut String,
+    thinking_block_active: &mut bool,
+    reasoning_block_emitted: &mut bool,
+    tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+) -> bool {
+    if !*thinking_block_active {
+        return true;
+    }
+    let thinking = std::mem::take(thinking_text);
+    let signature = std::mem::take(thinking_signature);
+    *thinking_block_active = false;
+    // `omitted` display and some `updates` blocks legitimately carry an
+    // empty `thinking` field with a required signature; the signature alone
+    // must reach replay or tool-use continuation breaks.
+    if thinking.is_empty() && signature.is_empty() {
+        return true;
+    }
+    let mut payload = String::new();
+    if *reasoning_block_emitted {
+        payload.push('\n');
+    }
+    payload
+        .push_str(&serde_json::json!({ "thinking": thinking, "signature": signature }).to_string());
+    *reasoning_block_emitted = true;
+    tx.send(Ok(StreamEvent::ReasoningFinalized(payload)))
+        .await
+        .is_ok()
+}
+
+/// Value for the `anthropic-beta` header, if one should be sent. OAuth tokens
+/// always carry the Claude Code beta set; the thinking-display beta is appended
+/// whenever the request body carries `thinking.display`.
+fn anthropic_beta_features(is_oauth: bool, thinking_display_beta: bool) -> Option<String> {
+    match (is_oauth, thinking_display_beta) {
+        (false, false) => None,
+        (false, true) => Some(ANTHROPIC_THINKING_DISPLAY_BETA.to_string()),
+        (true, false) => Some(ANTHROPIC_OAUTH_BETA_FEATURES.to_string()),
+        (true, true) => Some(format!(
+            "{ANTHROPIC_OAUTH_BETA_FEATURES},{ANTHROPIC_THINKING_DISPLAY_BETA}"
+        )),
+    }
+}
+
+/// Anthropic thinking request styles. Adaptive-only models (Opus 4.7,
+/// Fable 5.1) reject the fixed-budget `enabled` shape with HTTP 400 and
+/// require `adaptive`; budget-based models require `enabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicThinkingStyle {
+    Budget,
+    Adaptive,
+}
+
+fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
+    if model.contains("claude-opus-4-7") || model.contains("claude-fable-5-1") {
+        AnthropicThinkingStyle::Adaptive
+    } else {
+        AnthropicThinkingStyle::Budget
+    }
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -532,20 +619,21 @@ impl AnthropicModelProvider {
         &self,
         request: reqwest::RequestBuilder,
         credential: &str,
+        thinking_display_beta: bool,
     ) -> reqwest::RequestBuilder {
         let is_setup = Self::is_setup_token(credential);
         let len = credential.len();
         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len})), "Anthropic auth header applied");
-        if is_setup {
+        let request = if is_setup {
             request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header(
-                    "anthropic-beta",
-                    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
             request.header("x-api-key", credential)
+        };
+        match anthropic_beta_features(is_setup, thinking_display_beta) {
+            Some(beta_features) => request.header("anthropic-beta", beta_features),
+            None => request,
         }
     }
 
@@ -1866,6 +1954,7 @@ impl AnthropicModelProvider {
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut has_unsupported_content_block = false;
+        let mut has_malformed_client_tool = false;
 
         let usage = response.usage.map(|u| {
             let uncached = u.input_tokens.unwrap_or(0);
@@ -1895,10 +1984,18 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref()) {
+                    // Signature-only blocks (empty `thinking`, e.g. under
+                    // the `omitted` display) must reach replay too.
+                    let thinking = block
+                        .thinking
+                        .as_deref()
+                        .or(block.text.as_deref())
+                        .unwrap_or("");
+                    let signature = block.signature.as_deref().unwrap_or("");
+                    if !thinking.is_empty() || !signature.is_empty() {
                         let json_block = serde_json::json!({
                             "thinking": thinking,
-                            "signature": block.signature.as_deref().unwrap_or(""),
+                            "signature": signature,
                         });
                         thinking_parts.push(json_block.to_string());
                     }
@@ -1910,17 +2007,18 @@ impl AnthropicModelProvider {
                     }
                 }
                 "tool_use" => {
-                    let name = block.name.unwrap_or_default();
-                    if !name.is_empty() {
-                        let arguments = block
-                            .input
-                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                    let id = block.id.filter(|id| !id.is_empty());
+                    let name = block.name.filter(|name| !name.is_empty());
+                    let arguments = block.input.filter(serde_json::Value::is_object);
+                    if let (Some(id), Some(name), Some(arguments)) = (id, name, arguments) {
                         tool_calls.push(ProviderToolCall {
-                            id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            id,
                             name,
                             arguments: arguments.to_string(),
                             extra_content: None,
                         });
+                    } else {
+                        has_malformed_client_tool = true;
                     }
                 }
                 // These are valid Anthropic provider-executed blocks. Their
@@ -1959,7 +2057,7 @@ impl AnthropicModelProvider {
             reasoning_content,
         };
 
-        if has_unsupported_content_block {
+        if has_unsupported_content_block || has_malformed_client_tool {
             let error = TerminalCompletionError::InvalidTerminalReason;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1972,7 +2070,7 @@ impl AnthropicModelProvider {
                         "content_block_count": content_block_count,
                         "content_block_types": content_block_types,
                     })),
-                "Anthropic response contained an unsupported content block"
+                "Anthropic response contained malformed or unsupported terminal content"
             );
             return Err(terminal_completion_context_error(
                 TerminalCompletionFailure::new(error, parsed.usage.clone()),
@@ -2099,37 +2197,44 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(params) if anthropic_model_supports_native_thinking(model) => {
+            Some(params) => {
+                let style = anthropic_thinking_style(model);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                        .with_attrs(::serde_json::json!({
+                            "model": model,
+                            "style": match style {
+                                AnthropicThinkingStyle::Budget => "enabled",
+                                AnthropicThinkingStyle::Adaptive => "adaptive",
+                            },
+                        })),
                     "Native extended thinking enabled; forcing temperature=1.0"
                 );
-                // API requires max_tokens > budget_tokens (strictly greater).
-                let min_required = params.budget_tokens + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (
-                    Some(1.0),
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: params.budget_tokens,
-                    }),
-                    max_tokens,
-                )
-            }
-            Some(_) => {
-                // Caller asked for native thinking but the model rejects the
-                // fixed-budget request shape. Drop to prompt-based reasoning
-                // (the agent loop's prefix already injected) and keep the
-                // caller-supplied temperature so per-model guards still apply.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
+                // Thinking mode requires temperature 1.0 regardless of style.
+                let (config, max_tokens) = match style {
+                    AnthropicThinkingStyle::Budget => {
+                        // API requires max_tokens > budget_tokens (strictly greater).
+                        let min_required = params.budget_tokens + 1;
+                        (
+                            NativeThinkingConfig {
+                                kind: "enabled",
+                                budget_tokens: Some(params.budget_tokens),
+                                display: params.display,
+                            },
+                            self.max_tokens.max(min_required),
+                        )
+                    }
+                    AnthropicThinkingStyle::Adaptive => (
+                        NativeThinkingConfig {
+                            kind: "adaptive",
+                            budget_tokens: None,
+                            display: params.display,
+                        },
+                        self.max_tokens,
+                    ),
+                };
+                (Some(1.0), Some(config), max_tokens)
             }
             None => (temperature, None, self.max_tokens),
         }
@@ -2256,6 +2361,16 @@ impl AnthropicModelProvider {
         // index so its later stop cannot turn incomplete arguments into an
         // executable tool call.
         let mut invalid_tool_block_indices = BTreeSet::new();
+
+        // Extended-thinking block accumulation. Thinking deltas and their
+        // signatures arrive separately (`thinking_delta` / `signature_delta`)
+        // and are assembled into one JSON object per block at
+        // `content_block_stop`, matching the non-streaming `reasoning_content`
+        // shape exactly (newline-joined `{"thinking":..,"signature":..}`).
+        let mut thinking_text = String::new();
+        let mut thinking_signature = String::new();
+        let mut thinking_block_active = false;
+        let mut reasoning_block_emitted = false;
 
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
@@ -2492,6 +2607,24 @@ impl AnthropicModelProvider {
                         ) {
                             saw_server_tool_activity = true;
                         }
+                        // Defensive flush: a block start without a prior stop
+                        // means the previous thinking block never closed.
+                        if !flush_streaming_thinking_block(
+                            &mut thinking_text,
+                            &mut thinking_signature,
+                            &mut thinking_block_active,
+                            &mut reasoning_block_emitted,
+                            tx,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        if block_type == "thinking" {
+                            thinking_block_active = true;
+                            thinking_text.clear();
+                            thinking_signature.clear();
+                        }
                         if block_type == "tool_use" {
                             // Starting a native tool block is already an
                             // externally meaningful action boundary. A later
@@ -2502,14 +2635,20 @@ impl AnthropicModelProvider {
                             if let Some(index) = content_block_index.filter(|_| started) {
                                 let id = block.get("id").and_then(|value| value.as_str());
                                 let name = block.get("name").and_then(|value| value.as_str());
-                                if let (Some(id), Some(name)) = (
+                                let input = block
+                                    .get("input")
+                                    .filter(|input| input.is_object())
+                                    .map(serde_json::Value::to_string);
+                                if let (Some(id), Some(name), Some(input_json)) = (
                                     id.filter(|id| !id.is_empty()),
                                     name.filter(|name| !name.is_empty()),
+                                    input,
                                 ) {
                                     let state = StreamingToolState {
                                         id: id.to_string(),
                                         name: name.to_string(),
-                                        input_json: String::new(),
+                                        input_json,
+                                        saw_input_json_delta: false,
                                     };
                                     if tool_blocks.insert(index, state).is_some() {
                                         terminal_completion_error.get_or_insert(
@@ -2533,137 +2672,114 @@ impl AnthropicModelProvider {
                         .get("index")
                         .and_then(serde_json::Value::as_u64)
                         .and_then(|index| usize::try_from(index).ok());
-                    let is_open_text = index.is_some_and(|index| {
-                        open_content_block_indices.contains(&index)
-                            && content_block_kinds
-                                .get(&index)
-                                .is_some_and(|kind| kind == "text")
-                    });
-                    let is_open_tool = index.is_some_and(|index| {
-                        open_content_block_indices.contains(&index)
-                            && content_block_kinds
-                                .get(&index)
-                                .is_some_and(|kind| kind == "tool_use")
-                    });
-                    let is_open_provider_tool = index.is_some_and(|index| {
-                        open_content_block_indices.contains(&index)
-                            && content_block_kinds.get(&index).is_some_and(|kind| {
-                                matches!(kind.as_str(), "server_tool_use" | "mcp_tool_use")
-                            })
-                    });
                     let delta = event.get("delta").filter(|delta| delta.is_object());
                     let delta_type = delta
                         .and_then(|delta| delta.get("type"))
                         .and_then(serde_json::Value::as_str);
-
-                    // Text and tool blocks have one legal delta type. A missing,
-                    // non-object, or mismatched envelope is malformed framing;
-                    // a tool block must also be made non-executable at stop.
-                    if is_open_text && delta_type != Some("text_delta") {
+                    let kind = index.and_then(|index| {
+                        open_content_block_indices
+                            .contains(&index)
+                            .then(|| content_block_kinds.get(&index))
+                            .flatten()
+                    });
+                    let mut invalid = || {
                         terminal_completion_error
                             .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
-                        continue;
-                    }
-                    if is_open_tool && delta_type != Some("input_json_delta") {
-                        if let Some(index) = index {
-                            invalid_tool_block_indices.insert(index);
+                    };
+                    match (kind.map(String::as_str), delta, delta_type) {
+                        (Some("text"), Some(delta), Some("text_delta")) => {
+                            if let Some(text) =
+                                delta.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                if !text.is_empty() {
+                                    streamed_text.push_str(text);
+                                    if tx
+                                        .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                            text.to_string(),
+                                        ))))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            } else {
+                                invalid();
+                            }
                         }
-                        terminal_completion_error
-                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
-                        continue;
-                    }
-                    if is_open_provider_tool && delta_type != Some("input_json_delta") {
-                        // Provider-owned tool input is not client-executable,
-                        // but every open block still has a protocol-defined
-                        // delta envelope. Do not let malformed provider work
-                        // reach a clean Final response.
-                        terminal_completion_error
-                            .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
-                        continue;
-                    }
-
-                    if let (Some(delta), Some(delta_type)) = (delta, delta_type) {
-                        match delta_type {
-                            "text_delta" => {
-                                if !is_open_text {
-                                    terminal_completion_error.get_or_insert(
-                                        TerminalCompletionError::InvalidTerminalReason,
-                                    );
-                                } else {
-                                    match delta.get("text").and_then(|text| text.as_str()) {
-                                        Some(text) if !text.is_empty() => {
-                                            streamed_text.push_str(text);
-                                            if tx
-                                                .send(Ok(StreamEvent::TextDelta(
-                                                    StreamChunk::delta(text.to_string()),
-                                                )))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
-                                            }
+                        (Some("tool_use"), Some(delta), Some("input_json_delta")) => {
+                            match (
+                                index,
+                                delta
+                                    .get("partial_json")
+                                    .and_then(serde_json::Value::as_str),
+                            ) {
+                                (Some(index), Some(json)) => {
+                                    if let Some(state) = tool_blocks.get_mut(&index) {
+                                        if !state.saw_input_json_delta {
+                                            state.input_json.clear();
+                                            state.saw_input_json_delta = true;
                                         }
-                                        Some(_) => {}
-                                        None => {
-                                            // A text block was validly opened, so a missing or
-                                            // non-string payload is malformed protocol data, not
-                                            // an empty delta. Keep the terminal failure latched.
-                                            terminal_completion_error.get_or_insert(
-                                                TerminalCompletionError::InvalidTerminalReason,
-                                            );
-                                        }
+                                        state.input_json.push_str(json);
+                                    } else {
+                                        invalid();
                                     }
                                 }
+                                (Some(index), None) => {
+                                    invalid_tool_block_indices.insert(index);
+                                    invalid();
+                                }
+                                _ => invalid(),
                             }
-                            "input_json_delta" => {
-                                match delta.get("partial_json").and_then(|json| json.as_str()) {
-                                    Some(json) if is_open_tool => {
-                                        if let Some(index) = index
-                                            && let Some(state) = tool_blocks.get_mut(&index)
-                                        {
-                                            state.input_json.push_str(json);
-                                        } else {
-                                            terminal_completion_error.get_or_insert(
-                                                TerminalCompletionError::InvalidTerminalReason,
-                                            );
-                                        }
-                                    }
-                                    None if is_open_tool => {
-                                        // A tool block was validly opened, so a missing or
-                                        // non-string partial JSON payload invalidates its
-                                        // arguments and must not become executable at stop.
-                                        if let Some(index) = index {
-                                            invalid_tool_block_indices.insert(index);
-                                        }
-                                        terminal_completion_error.get_or_insert(
-                                            TerminalCompletionError::InvalidTerminalReason,
-                                        );
-                                    }
-                                    Some(_) if is_open_provider_tool => {
-                                        // Provider-side tools own their input internally. Their
-                                        // JSON deltas are valid protocol traffic, but cannot be
-                                        // converted into client-executable ToolCall events.
-                                    }
-                                    None if is_open_provider_tool => {
-                                        // Provider-owned input is not executable by the client,
-                                        // but it is still protocol data and must be a string.
-                                        terminal_completion_error.get_or_insert(
-                                            TerminalCompletionError::InvalidTerminalReason,
-                                        );
-                                    }
-                                    Some(_) | None => {
-                                        // Input JSON has no valid owning tool block. Failing
-                                        // closed is safer than assigning it to a sibling call.
-                                        terminal_completion_error.get_or_insert(
-                                            TerminalCompletionError::InvalidTerminalReason,
-                                        );
-                                    }
+                        }
+                        (
+                            Some("server_tool_use" | "mcp_tool_use"),
+                            Some(delta),
+                            Some("input_json_delta"),
+                        ) => {
+                            if delta
+                                .get("partial_json")
+                                .and_then(serde_json::Value::as_str)
+                                .is_none()
+                            {
+                                invalid();
+                            }
+                        }
+                        (Some("thinking"), Some(delta), Some("thinking_delta")) => {
+                            if let Some(text) =
+                                delta.get("thinking").and_then(serde_json::Value::as_str)
+                            {
+                                if !text.is_empty()
+                                    && tx
+                                        .send(Ok(StreamEvent::ThinkingDelta(text.to_string())))
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                thinking_text.push_str(text);
+                            } else {
+                                invalid();
+                            }
+                        }
+                        (Some("thinking"), Some(delta), Some("signature_delta")) => {
+                            if let Some(signature) =
+                                delta.get("signature").and_then(serde_json::Value::as_str)
+                            {
+                                thinking_signature.push_str(signature);
+                            } else {
+                                invalid();
+                            }
+                        }
+                        // Known terminal blocks without defined deltas must not
+                        // silently turn malformed framing into a clean Final.
+                        _ => {
+                            if kind.is_some_and(|kind| kind == "tool_use") {
+                                if let Some(index) = index {
+                                    invalid_tool_block_indices.insert(index);
                                 }
                             }
-                            // TODO: handle "thinking_delta" events for streaming
-                            // extended thinking content. Currently thinking blocks
-                            // are only captured in non-streaming parse_native_response().
-                            _ => {}
+                            invalid();
                         }
                     }
                 }
@@ -2711,6 +2827,17 @@ impl AnthropicModelProvider {
                             terminal_completion_error
                                 .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                         }
+                    }
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
                     }
                 }
                 "message_delta" => {
@@ -2854,6 +2981,20 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
+                    // A thinking block still active at message_stop never got
+                    // its content_block_stop; flush it rather than silently
+                    // dropping the accumulated reasoning.
+                    if !flush_streaming_thinking_block(
+                        &mut thinking_text,
+                        &mut thinking_signature,
+                        &mut thinking_block_active,
+                        &mut reasoning_block_emitted,
+                        tx,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     if collect_debug_metadata {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -2881,11 +3022,13 @@ impl AnthropicModelProvider {
                             (!open_content_block_indices.is_empty())
                                 .then_some(TerminalCompletionError::InvalidTerminalReason)
                         })
-                        .or_else(|| {
-                            last_stop_reason
-                                .is_none()
-                                .then_some(TerminalCompletionError::InvalidTerminalReason)
-                        });
+                        // `message_stop` is the clean terminal marker. A
+                        // preceding `message_delta` supplies a reason when
+                        // Anthropic emits one, but its absence is not itself
+                        // malformed after every indexed block has closed.
+                        // A malformed *present* message_delta remains latched
+                        // above and can never become Final here.
+                        ;
                     if let Some(error) = error {
                         Self::emit_terminal_completion_failure(
                             tx,
@@ -3081,7 +3224,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&request);
 
-        request = self.apply_auth(request, credential);
+        request = self.apply_auth(request, credential, false);
 
         let response = request.send().await?;
 
@@ -3149,6 +3292,9 @@ impl ModelProvider for AnthropicModelProvider {
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
         let native_thinking = thinking_config.is_some();
+        let thinking_display_beta = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -3187,7 +3333,10 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self
+            .apply_auth(req, credential, thinking_display_beta)
+            .send()
+            .await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -3276,7 +3425,7 @@ impl ModelProvider for AnthropicModelProvider {
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
+            request = self.apply_auth(request, credential, false);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
@@ -3347,8 +3496,11 @@ impl ModelProvider for AnthropicModelProvider {
 
         let (effective_temperature, thinking_config, effective_max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        let thinking_display_beta = thinking_config
+            .as_ref()
+            .is_some_and(|config| config.display.is_some());
 
-        if thinking_config.is_some() {
+        if thinking_config.is_some() && !thinking_display_beta {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3361,7 +3513,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
-                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
+                "native thinking without display beta; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
                 model: model.to_string(),
@@ -3397,13 +3549,14 @@ impl ModelProvider for AnthropicModelProvider {
                 if is_oauth {
                     req = req
                         .header("Authorization", format!("Bearer {credential}"))
-                        .header(
-                            "anthropic-beta",
-                            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                        )
                         .header("anthropic-dangerous-direct-browser-access", "true");
                 } else {
                     req = req.header("x-api-key", &credential);
+                }
+                if let Some(beta_features) =
+                    anthropic_beta_features(is_oauth, thinking_display_beta)
+                {
+                    req = req.header("anthropic-beta", beta_features);
                 }
                 let response = req
                     .send()
@@ -3462,12 +3615,18 @@ impl ModelProvider for AnthropicModelProvider {
                 Ok(NativeThinkingStreamOutcome::Response(resp)) => {
                     let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
                     if let Some(rc) = resp.reasoning_content {
-                        events.push(Ok(StreamEvent::TextDelta(StreamChunk {
-                            delta: String::new(),
-                            reasoning: Some(rc),
-                            is_final: false,
-                            token_count: 0,
-                        })));
+                        // Readable thinking progress (transient): the raw
+                        // text without the signed JSON envelope. Visible
+                        // thinking must never carry the signature payload.
+                        for part in rc.split('\n') {
+                            if let Ok(block) = serde_json::from_str::<serde_json::Value>(part)
+                                && let Some(text) = block.get("thinking").and_then(|t| t.as_str())
+                                && !text.is_empty()
+                            {
+                                events.push(Ok(StreamEvent::ThinkingDelta(text.to_string())));
+                            }
+                        }
+                        events.push(Ok(StreamEvent::ReasoningFinalized(rc)));
                     }
                     if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
@@ -3507,7 +3666,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": false,
+                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
             );
@@ -3569,13 +3729,12 @@ impl ModelProvider for AnthropicModelProvider {
             if is_oauth {
                 req = req
                     .header("Authorization", format!("Bearer {credential}"))
-                    .header(
-                        "anthropic-beta",
-                        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
-                    )
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
                 req = req.header("x-api-key", &credential);
+            }
+            if let Some(beta_features) = anthropic_beta_features(is_oauth, thinking_display_beta) {
+                req = req.header("anthropic-beta", beta_features);
             }
 
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
@@ -4030,6 +4189,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"u
             .iter()
             .map(|e| match e.as_ref() {
                 Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ThinkingDelta(_)) => "thinking",
+                Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning_final",
                 Ok(StreamEvent::ToolCall(_)) => "tool_call",
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
@@ -4448,6 +4609,14 @@ event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
@@ -4536,7 +4705,7 @@ data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\"}}\n\n",
 data: {"type":"message_start","message":{"usage":{"input_tokens":10}}}
 
 event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"search"}}
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"search","input":{}}}
 
 event: content_block_delta
 data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}
@@ -4710,6 +4879,103 @@ data: {\"type\":\"message_stop\"}\n\n";
             terminal.map(|failure| failure.reason),
             Some(TerminalCompletionError::InvalidTerminalReason)
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_zero_argument_tool_uses_start_placeholder_without_delta() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"status\",\"input\":{}}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut calls = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::ToolCall(call)) = event {
+                calls.push(call);
+            }
+        }
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn streaming_recognized_blocks_reject_invalid_delta_envelopes() {
+        use std::io::Cursor;
+
+        for kind in [
+            "thinking",
+            "redacted_thinking",
+            "web_search_tool_result",
+            "mcp_tool_result",
+        ] {
+            let bytes = format!(
+                "event: content_block_start\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{kind}\"}}}}\n\n\
+event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"unexpected\"}}}}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+            );
+            let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+            AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+            let mut final_seen = false;
+            let mut failure = None;
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                match event {
+                    Ok(StreamEvent::Final) => final_seen = true,
+                    Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            assert!(!final_seen, "{kind} malformed delta must not finalize");
+            assert_eq!(
+                failure.map(|failure| failure.reason),
+                Some(TerminalCompletionError::InvalidTerminalReason),
+                "{kind} malformed delta must be typed"
+            );
+        }
+    }
+
+    #[test]
+    fn native_malformed_tool_blocks_are_not_synthesized_or_dropped() {
+        for block in [
+            serde_json::json!({"type":"tool_use","name":"search","input":{}}),
+            serde_json::json!({"type":"tool_use","id":"call_1","input":{}}),
+            serde_json::json!({"type":"tool_use","id":"call_1","name":"search","input":[]}),
+        ] {
+            let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+                "stop_reason": "tool_use",
+                "content": [block],
+            }))
+            .expect("fixture must deserialize");
+            let error = AnthropicModelProvider::parse_native_response(response)
+                .expect_err("malformed native tool must fail closed");
+            assert_eq!(
+                crate::terminal::terminal_completion_context(&error)
+                    .expect("typed terminal failure")
+                    .failure()
+                    .reason,
+                TerminalCompletionError::InvalidTerminalReason
+            );
+        }
     }
 
     #[tokio::test]
@@ -5835,13 +6101,13 @@ data: {\"type\":\"message_stop\"}\n\n";
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
         let mut saw_usage = false;
-        let mut terminal_failure = None;
+        let mut saw_final = false;
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match ev {
                 Ok(StreamEvent::Usage(_)) => saw_usage = true,
-                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
+                Ok(StreamEvent::Final) => saw_final = true,
                 Ok(_) | Err(_) => {}
             }
         }
@@ -5849,11 +6115,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             !saw_usage,
             "must not emit Usage when provider sent no usage frames"
         );
-        assert_eq!(
-            terminal_failure.map(|failure| failure.reason),
-            Some(TerminalCompletionError::InvalidTerminalReason),
-            "message_stop without a recognized reason must not become Final"
-        );
+        assert!(saw_final, "message_stop closes a well-formed stream");
     }
 
     #[test]
@@ -6018,6 +6280,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 tools: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1_024,
+                    display: None,
                 }),
             },
             "claude-sonnet-4-5",
@@ -6046,6 +6309,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     tools: None,
                     thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                         budget_tokens: 1_024,
+                        display: None,
                     }),
                 },
                 "claude-sonnet-4-5",
@@ -6114,6 +6378,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 tools: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1_024,
+                    display: None,
                 }),
             },
             "claude-sonnet-4-5",
@@ -6154,6 +6419,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-oat01-test-token",
+                false,
             )
             .build()
             .expect("request should build");
@@ -6191,6 +6457,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
                 "sk-ant-api-key",
+                false,
             )
             .build()
             .expect("request should build");
@@ -6225,6 +6492,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                         .http_client()
                         .get("https://api.anthropic.com/v1/models"),
                     credential,
+                    false,
                 )
                 .build()
                 .expect("request should build");
@@ -6450,40 +6718,77 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
+    fn anthropic_thinking_style_matrix() {
+        // Adaptive-only families: fixed-budget `enabled` returns 400.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-7-20260101"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-fable-5-1-20260815"),
+            AnthropicThinkingStyle::Adaptive
+        );
+        // Budget-based families keep the `enabled` shape.
+        assert_eq!(
+            anthropic_thinking_style("claude-opus-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-sonnet-4-6"),
+            AnthropicThinkingStyle::Budget
+        );
+        assert_eq!(
+            anthropic_thinking_style("claude-haiku-4-5"),
+            AnthropicThinkingStyle::Budget
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_opus_4_7() {
         // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
-        assert!(!anthropic_model_supports_native_thinking(
-            "claude-opus-4-7-20260101"
-        ));
-    }
-
-    #[test]
-    fn anthropic_model_supports_native_thinking_allows_other_models() {
-        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
-        assert!(anthropic_model_supports_native_thinking(
-            "claude-sonnet-4-6"
-        ));
-        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
-    }
-
-    #[test]
-    fn resolve_thinking_drops_native_for_opus_4_7() {
+        // Native thinking is now sent in adaptive form instead of being
+        // dropped to prompt-based reasoning.
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         };
         let (temp, config, max_tokens) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
-        assert!(
-            config.is_none(),
-            "native thinking should be gated off for opus-4-7"
-        );
-        // Caller-supplied temperature is preserved (so per-model omit guard
-        // can still take effect downstream).
-        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
+        let config = config.expect("adaptive thinking config for opus-4-7");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, None);
+        assert_eq!(temp, Some(1.0));
+        assert_eq!(max_tokens, provider.max_tokens);
+    }
+
+    #[test]
+    fn resolve_thinking_uses_adaptive_for_fable_5_1_and_propagates_display() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (temp, config, max_tokens) =
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
+        let config = config.expect("adaptive thinking config for fable-5-1");
+        assert_eq!(config.kind, "adaptive");
+        assert_eq!(config.budget_tokens, None);
+        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(temp, Some(1.0));
         assert_eq!(max_tokens, provider.max_tokens);
     }
 
@@ -6494,6 +6799,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: 10_000,
+            display: None,
         };
         let (temp, config, _) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
@@ -7556,7 +7862,9 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_preserves_empty_thinking_blocks() {
+    fn native_response_keeps_signature_only_blocks() {
+        // `omitted` display yields empty `thinking` with a required
+        // signature; dropping the block would break tool-use replay.
         let json = r#"{
             "stop_reason": "end_turn",
             "content": [
@@ -10313,5 +10621,588 @@ data: {\"type\":\"message_stop\"}\n\n";
             !tool_result.to_string().contains("image(s) omitted"),
             "a placeholder is prose and must not be counted: {tool_result}"
         );
+    }
+
+    #[test]
+    fn beta_features_matrix_matches_oauth_and_display_flags() {
+        assert_eq!(anthropic_beta_features(false, false), None);
+        assert_eq!(
+            anthropic_beta_features(true, false).as_deref(),
+            Some(ANTHROPIC_OAUTH_BETA_FEATURES)
+        );
+        assert_eq!(
+            anthropic_beta_features(false, true).as_deref(),
+            Some(ANTHROPIC_THINKING_DISPLAY_BETA)
+        );
+        assert_eq!(
+            anthropic_beta_features(true, true).as_deref(),
+            Some(concat!(
+                "claude-code-20250219,oauth-2025-04-20,",
+                "interleaved-thinking-2025-05-14,",
+                "thinking-display-updates-2026-08-18"
+            ))
+        );
+    }
+
+    #[test]
+    fn apply_auth_adds_display_beta_for_regular_tokens() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        let request = model_provider
+            .apply_auth(
+                model_provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                "sk-ant-api-key",
+                true,
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some(ANTHROPIC_THINKING_DISPLAY_BETA)
+        );
+        assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn apply_auth_appends_display_beta_for_setup_tokens() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        let request = model_provider
+            .apply_auth(
+                model_provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                "sk-ant-oat01-test-token",
+                true,
+            )
+            .build()
+            .expect("request should build");
+
+        let beta = request
+            .headers()
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .expect("setup-token requests must carry the Claude Code beta set");
+        assert!(beta.starts_with(ANTHROPIC_OAUTH_BETA_FEATURES));
+        assert!(beta.ends_with(ANTHROPIC_THINKING_DISPLAY_BETA));
+        // Exactly one header line: comma-joined, never duplicated.
+        assert_eq!(
+            request.headers().get_all("anthropic-beta").iter().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolve_thinking_propagates_display() {
+        let model_provider = AnthropicModelProvider::builder("test").build();
+
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (_, config, _) =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        let config = config.expect("thinking config for supported model");
+        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        };
+        let (_, config, _) =
+            model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+        let config = config.expect("thinking config for supported model");
+        assert_eq!(config.display, None);
+    }
+
+    #[test]
+    fn request_body_carries_display_only_when_set() {
+        let message = NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        };
+        let request = NativeChatRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1_024,
+            system: None,
+            messages: vec![message],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(1_024),
+                display: Some(ThinkingDisplay::Updates),
+            }),
+        };
+
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+
+        let request = NativeChatRequest {
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(1_024),
+                display: None,
+            }),
+            ..request
+        };
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "display must stay off the wire when unset: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_thinking_blocks_surface_as_reasoning_chunks() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"weigh the options\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigA\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text = String::new();
+        let mut saw_final = false;
+        let mut first_thinking_pos = None;
+        let mut finalized_pos = None;
+        let mut position = 0usize;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => {
+                    first_thinking_pos.get_or_insert(position);
+                    thinking_deltas.push(delta);
+                }
+                Ok(StreamEvent::ReasoningFinalized(payload)) => {
+                    finalized_pos.get_or_insert(position);
+                    reasoning_payloads.push(payload);
+                }
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+            position += 1;
+        }
+
+        // Property 1: readable thinking updates arrive BEFORE the finalized
+        // replay block and before completion.
+        let first_thinking = first_thinking_pos.expect("transient thinking deltas must fire");
+        let finalized = finalized_pos.expect("finalized reasoning payload must be emitted");
+        assert!(
+            first_thinking < finalized,
+            "readable progress must precede the finalized replay block"
+        );
+        assert_eq!(
+            thinking_deltas,
+            vec!["weigh the options"],
+            "one readable delta per thinking_delta frame"
+        );
+
+        // Property 2: the signature payload exists only in the durable
+        // replay channel, never in visible events.
+        let visible: String = thinking_deltas.concat();
+        assert!(
+            !visible.contains("sigA") && !visible.contains("signature"),
+            "visible thinking must not carry the signature: {visible:?}"
+        );
+        assert_eq!(reasoning_payloads.len(), 1, "one thinking block, one chunk");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
+            .expect("reasoning payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "weigh the options");
+        assert_eq!(parsed["signature"], "sigA");
+
+        assert_eq!(text, "answer");
+        assert!(saw_final);
+    }
+
+    #[tokio::test]
+    async fn streaming_multiple_thinking_blocks_join_with_newline() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig1\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"two\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig2\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut reasoning_payloads = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Ok(StreamEvent::ReasoningFinalized(payload)) = ev {
+                reasoning_payloads.push(payload);
+            }
+        }
+
+        assert_eq!(reasoning_payloads.len(), 2);
+        assert!(
+            !reasoning_payloads[0].starts_with('\n'),
+            "first block must not carry a separator"
+        );
+        assert!(
+            reasoning_payloads[1].starts_with('\n'),
+            "subsequent blocks must be newline-separated for the consumer's raw concatenation"
+        );
+
+        // Round-trip invariant: the concatenation must parse as one JSON
+        // object per line, exactly like non-streaming reasoning_content.
+        let joined: String = reasoning_payloads.concat();
+        for line in joined.split('\n') {
+            let parsed: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line must be a JSON object: {line:?} ({e})"));
+            assert!(parsed.get("thinking").is_some());
+            assert!(parsed.get("signature").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn message_stop_flushes_unclosed_thinking_block() {
+        use std::io::Cursor;
+
+        // No content_block_stop for the thinking block: the accumulated
+        // reasoning must still be flushed at message_stop, not dropped.
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"orphan\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigX\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut finalized = None;
+        let mut saw_final = false;
+        let mut terminal_failure = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ReasoningFinalized(payload)) => finalized = Some(payload),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(_) => {}
+                Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
+                Err(e) => panic!("unexpected stream error: {e:?}"),
+            }
+        }
+
+        let payload = finalized.expect("unclosed thinking block must be flushed");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("flushed payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "orphan");
+        assert_eq!(parsed["signature"], "sigX");
+        assert!(!saw_final, "an unclosed block cannot finalize the stream");
+        assert_eq!(
+            terminal_failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+    }
+
+    #[tokio::test]
+    async fn display_enabled_thinking_uses_streaming_production_path() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+
+        // The reviewer's core blocker: `display = "updates"` must construct a
+        // real streaming request, not detour through the non-streaming
+        // fallback. Capture the request body the provider actually sends.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let captured = captured_for_route.clone();
+                async move {
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        *captured.lock().unwrap() = Some(parsed);
+                    }
+                    let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"live\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+                    axum::body::Body::from_stream(futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse))
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: 2_048,
+                    display: Some(ThinkingDisplay::Updates),
+                }),
+            },
+            "claude-sonnet-4-6",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let mut saw_thinking_delta = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("display-enabled stream must not fail") {
+                StreamEvent::ThinkingDelta(delta) => {
+                    saw_thinking_delta = true;
+                    assert_eq!(delta, "live");
+                }
+                StreamEvent::Final => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert!(
+            saw_thinking_delta,
+            "display-enabled requests must produce live thinking deltas from the SSE path"
+        );
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("streaming request body must be captured");
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+        assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(2_048));
+    }
+
+    #[test]
+    fn request_body_omits_budget_tokens_for_adaptive_models() {
+        let message = NativeMessage {
+            role: "user".to_string(),
+            content: vec![NativeContentOut::Text {
+                text: "hi".to_string(),
+                cache_control: None,
+            }],
+        };
+        let request = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 1_024,
+            system: None,
+            messages: vec![message],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some(ThinkingDisplay::Updates),
+            }),
+        };
+
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "adaptive thinking must not carry a budget: {body}"
+        );
+        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+    }
+
+    #[tokio::test]
+    async fn streaming_signature_only_omitted_block_reaches_replay() {
+        // `omitted` display returns signature-only blocks: empty `thinking`
+        // plus a required signature. Dropping them breaks tool-use replay.
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigO\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        let mut text = String::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert!(
+            thinking_deltas.is_empty(),
+            "signature-only block must not produce visible deltas: {thinking_deltas:?}"
+        );
+        assert_eq!(reasoning_payloads.len(), 1, "block must reach replay");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning_payloads[0])
+            .expect("reasoning payload must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigO");
+        assert_eq!(text, "answer");
+    }
+
+    #[tokio::test]
+    async fn streaming_mixed_updates_blocks_emit_deltas_and_full_replay() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigA\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigB\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut reasoning_payloads = Vec::new();
+        let mut thinking_deltas = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match ev {
+                Ok(StreamEvent::ThinkingDelta(delta)) => thinking_deltas.push(delta),
+                Ok(StreamEvent::ReasoningFinalized(payload)) => reasoning_payloads.push(payload),
+                Ok(_) => {}
+                Err(e) => panic!("stream must not error: {e:?}"),
+            }
+        }
+
+        assert_eq!(
+            thinking_deltas,
+            vec!["step one".to_string()],
+            "only the text-bearing block produces visible deltas"
+        );
+        assert_eq!(reasoning_payloads.len(), 2, "both blocks reach replay");
+        let second: serde_json::Value =
+            serde_json::from_str(reasoning_payloads[1].trim_start_matches('\n'))
+                .expect("second payload must be a JSON object");
+        assert_eq!(second["thinking"], "");
+        assert_eq!(second["signature"], "sigB");
+    }
+
+    #[test]
+    fn non_streaming_signature_only_block_reaches_replay() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": "sigX"},
+                {"type": "text", "text": "done"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp).expect("valid response");
+        let reasoning = result
+            .reasoning_content
+            .expect("signature-only block must reach replay");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning).expect("reasoning_content line must be a JSON object");
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sigX");
     }
 }
