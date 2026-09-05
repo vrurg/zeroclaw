@@ -826,6 +826,21 @@ impl GoalController {
         }
     }
 
+    /// Apply a guarded transition while retaining the exact host-validated
+    /// submission for the executor that must immediately follow it.
+    ///
+    /// This is the only controller handoff that preserves the surface-owned
+    /// driver and lease; an executor must never re-resolve either from route
+    /// or session text after a durable lifecycle change.
+    pub async fn submit_for_execution(
+        &self,
+        settings: &GoalHostSettings,
+        submission: GoalSubmission,
+    ) -> Result<(GoalResponse, GoalSubmission)> {
+        let response = self.submit(settings, &submission).await?;
+        Ok((response, submission))
+    }
+
     async fn start(
         &self,
         settings: &GoalHostSettings,

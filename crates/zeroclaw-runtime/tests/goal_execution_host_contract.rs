@@ -1063,7 +1063,11 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         )
         .await
         .unwrap();
-    let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
+    let (response, start) = controller
+        .submit_for_execution(&settings, start)
+        .await
+        .unwrap();
+    let GoalResponse::Started(started) = response else {
         panic!("expected a started Goal");
     };
     assert_eq!(started.execution_epoch, 1);
