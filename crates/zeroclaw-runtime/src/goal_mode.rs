@@ -505,7 +505,7 @@ impl GoalSubmission {
 }
 
 /// The transport-neutral authority boundary for Goal admission.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct GoalExecutionHost;
 
 impl GoalExecutionHost {
@@ -631,6 +631,7 @@ impl GoalExecutionRequest {
 }
 
 /// Single runtime entry point for a typed Goal command.
+#[derive(Clone)]
 pub struct GoalRuntime {
     host: GoalExecutionHost,
     controller: GoalController,
@@ -642,6 +643,18 @@ impl GoalRuntime {
             host: GoalExecutionHost::new(),
             controller: GoalController::new(registry),
         }
+    }
+
+    /// Create an execution engine bound to this runtime's canonical task
+    /// registry. This prevents an adapter from admitting a Goal through one
+    /// control plane and running/accounting it through another.
+    pub fn execution_engine(
+        &self,
+        tracker: Arc<crate::cost::CostTracker>,
+        agent_alias: impl Into<String>,
+        pricing: Arc<crate::agent::cost::ModelProviderPricing>,
+    ) -> Result<GoalExecutionEngine> {
+        GoalExecutionEngine::new(self.clone(), tracker, agent_alias, pricing)
     }
 
     pub async fn submit(
@@ -884,6 +897,7 @@ fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
 
 /// Transport-neutral lifecycle controller. Its input is opaque outside this
 /// module, so callers must pass through [`GoalExecutionHost`] first.
+#[derive(Clone)]
 pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
 }
