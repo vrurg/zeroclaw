@@ -1171,6 +1171,13 @@ mod tests {
         assert_eq!(turn_usage.output_tokens, 0);
     }
 
+    #[tokio::test]
+    async fn unscoped_turns_do_not_run_goal_operation_validation() {
+        admit_goal_operation_if_scoped(GoalOperationRequest::new("", ""))
+            .await
+            .expect("ordinary turns must not acquire Goal-only validation");
+    }
+
     struct PricedLeaf {
         alias: &'static str,
         usage: zeroclaw_providers::traits::TokenUsage,
