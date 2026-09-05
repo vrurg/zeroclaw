@@ -530,10 +530,10 @@ async fn supplied_driver_surface_mismatch_is_rejected_before_binding() {
 #[tokio::test]
 async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
-    let driver = Arc::new(RecordingDriver {
+    let driver = Arc::new(ExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
-        binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
     });
     let scope =
         zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
@@ -826,11 +826,11 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
     let runtime = GoalRuntime::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
     let ingress = matrix_ingress();
-    let driver = Arc::new(RecordingDriver {
+    let driver = Arc::new(ExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
             .unwrap(),
-        binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
     });
 
     let submission = runtime
@@ -856,6 +856,12 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
         ingress.session_key().durable_id()
     );
     assert_eq!(execution.scope().execution_epoch(), started.execution_epoch);
+    let lease = runtime
+        .acquire_execution(&settings, &execution)
+        .await
+        .unwrap();
+    assert!(lease.canonical_history().unwrap().is_empty());
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
     assert!(Arc::ptr_eq(
         execution.submission().driver(),
         &(driver as Arc<dyn GoalSessionDriver>)
