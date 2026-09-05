@@ -314,7 +314,7 @@ fn config_patch_human_warning(
 ) -> String {
     match warning.code.as_str() {
         "legacy_colon_alias_retained" => ta(
-            "cli-config-patch-warning-pre-existing-validation",
+            "cli-config-patch-warning-legacy-colon-alias",
             &[("path", &warning.path)],
             &format!(
                 "Warning: {} is a legacy provider alias that remains invalid and must be repaired separately.",
@@ -322,8 +322,8 @@ fn config_patch_human_warning(
             ),
         ),
         _ => ta(
-            "cli-alias-warn",
-            &[("warning", &warning.message)],
+            "cli-config-patch-warning-pre-existing-validation",
+            &[("path", &warning.path), ("warning", &warning.message)],
             &warning.message,
         ),
     }

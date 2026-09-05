@@ -326,6 +326,24 @@ fn config_with_unrelated_invalid_ping_interval(config_dir: &std::path::Path) -> 
     config
 }
 
+fn config_with_unrelated_dangling_agent(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config.agents.insert(
+        "orphan".into(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: "anthropic.missing".into(),
+            ..Default::default()
+        },
+    );
+    let raw = toml::to_string(&config).expect("serialize dangling-agent fixture");
+    std::fs::write(config_dir.join("config.toml"), raw).expect("write dangling-agent fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
 #[test]
 fn config_patch_json_success_emits_envelope_and_persists_change() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -397,6 +415,30 @@ fn config_patch_repairs_another_path_when_an_unrelated_validation_error_exists()
     let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
     assert_eq!(parsed.gateway.host, "127.0.0.2");
     assert_eq!(parsed.gateway.websocket_ping_interval_secs, 86_401);
+}
+
+#[test]
+fn config_patch_repairs_another_path_when_an_unrelated_dynamic_alias_error_exists() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_unrelated_dangling_agent(config_dir.path());
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    assert!(envelope["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning["code"] == "pre_existing_validation_error"
+                && warning["path"] == "agents.orphan.model_provider"
+        })
+    }));
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    assert_eq!(parsed.agents["orphan"].model_provider, "anthropic.missing");
 }
 
 #[test]
@@ -500,6 +542,31 @@ async fn config_patch_http_repairs_another_path_with_an_unrelated_validation_war
     let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
     assert_eq!(parsed.gateway.host, "127.0.0.2");
     assert_eq!(parsed.gateway.websocket_ping_interval_secs, 86_401);
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_repairs_another_path_with_an_unrelated_dynamic_alias_warning() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        config_with_unrelated_dangling_agent(config_dir.path()),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["saved"], true);
+    assert!(envelope["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning["code"] == "pre_existing_validation_error"
+                && warning["path"] == "agents.orphan.model_provider"
+        })
+    }));
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read repaired config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
+    assert_eq!(parsed.agents["orphan"].model_provider, "anthropic.missing");
 }
 
 #[cfg(feature = "gateway")]

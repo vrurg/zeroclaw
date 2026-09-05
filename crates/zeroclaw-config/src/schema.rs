@@ -21472,13 +21472,40 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
-        self.validate_allowing_legacy_colon_aliases(&std::collections::HashSet::new())
+        self.validate_allowing_legacy_colon_aliases(
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
     }
 
     fn validate_allowing_legacy_colon_aliases(
         &self,
         allowed_legacy_colon_alias_paths: &std::collections::HashSet<String>,
+        ignored_error_paths: &std::collections::HashSet<String>,
     ) -> Result<()> {
+        // `validate_for_config_repair` supplies only paths it has already
+        // classified as unrelated to the pending mutation. Keep those values
+        // intact and continue checking subsequent invariants, including any
+        // dirty path. This is deliberately local to the repair bridge: a
+        // centralized multi-error validation API should replace it rather than
+        // widening normal configuration validation semantics.
+        macro_rules! validation_bail {
+            ($code:ident, $path:expr, $($msg:tt)*) => {{
+                let err = $crate::api_error::ConfigApiError::new(
+                    $crate::api_error::ConfigApiCode::$code,
+                    format!($($msg)*),
+                )
+                .with_path($path);
+                if !err
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| ignored_error_paths.contains(path))
+                {
+                    return Err(::anyhow::Error::from(err));
+                }
+            }};
+        }
+
         validate_memory_rerank_config(&self.memory)?;
 
         // TOML deserialization inserts provider aliases directly into their
@@ -23055,11 +23082,15 @@ impl Config {
                     );
                 }
                 let Some(target_agent) = self.agents.get(target_str) else {
+                    let path = format!("agents.{alias}.workspace.read_memory_from[{i}]");
                     validation_bail!(
                         DanglingReference,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        path,
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
+                    // An explicitly ignored missing target has no remaining
+                    // same-target invariant to inspect in this iteration.
+                    continue;
                 };
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
@@ -23137,11 +23168,15 @@ impl Config {
             for (i, member) in group.agents.iter().enumerate() {
                 let member_str = member.as_str();
                 let Some(member_agent) = self.agents.get(member_str) else {
+                    let path = format!("peer_groups.{group_name}.agents[{i}]");
                     validation_bail!(
                         DanglingReference,
-                        format!("peer_groups.{group_name}.agents[{i}]"),
+                        path,
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
                     );
+                    // An explicitly ignored missing member has no remaining
+                    // same-member invariant to inspect in this iteration.
+                    continue;
                 };
                 let has_channel_match = member_agent.channels.iter().any(|ch| {
                     let ch_str = ch.as_str();
@@ -23227,7 +23262,12 @@ impl Config {
                     &path,
                 ) {
                     Ok(patterns) => patterns,
-                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                    Err(e) => {
+                        validation_bail!(InvalidFormat, path, "{}", e);
+                        // The ignored malformed host list cannot safely feed
+                        // the dependent private-carveout validation below.
+                        continue;
+                    }
                 }
             };
             let private = {
@@ -23237,7 +23277,12 @@ impl Config {
                     &path,
                 ) {
                     Ok(patterns) => patterns,
-                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                    Err(e) => {
+                        validation_bail!(InvalidFormat, path, "{}", e);
+                        // The ignored malformed carveout list cannot safely
+                        // participate in containment validation below.
+                        continue;
+                    }
                 }
             };
 
@@ -23332,12 +23377,12 @@ impl Config {
             })
             .collect();
         let mut warnings = Vec::new();
-        let mut validation_probe = self.clone();
-        let mut isolated_error_paths = std::collections::HashSet::new();
+        let mut ignored_error_paths = std::collections::HashSet::new();
         loop {
-            let Err(error) = validation_probe
-                .validate_allowing_legacy_colon_aliases(&excluded_legacy_alias_paths)
-            else {
+            let Err(error) = self.validate_allowing_legacy_colon_aliases(
+                &excluded_legacy_alias_paths,
+                &ignored_error_paths,
+            ) else {
                 break;
             };
             let api_error = ConfigApiError::from_validation(error);
@@ -23368,26 +23413,12 @@ impl Config {
             }
 
             // `validate_allowing_legacy_colon_aliases` reports one error at a
-            // time. Isolate each demonstrably unrelated error in a disposable
-            // probe before accepting the repair, so an earlier existing error
-            // cannot mask a later error caused by a dirty field. This bounded
-            // bridge must be replaced by centralized multi-error validation.
-            if !isolated_error_paths.insert(error_path.to_string()) {
-                return Err(anyhow::Error::from(api_error));
-            }
-            let Ok(default_value) = Config::default().get_prop(error_path) else {
-                return Err(anyhow::Error::from(api_error));
-            };
-            if validation_probe
-                .get_prop(error_path)
-                .is_ok_and(|current| current == default_value)
-            {
-                return Err(anyhow::Error::from(api_error));
-            }
-            if validation_probe
-                .set_prop(error_path, &default_value)
-                .is_err()
-            {
+            // time. Record each demonstrably unrelated error path and rerun
+            // against the unchanged configuration, so an earlier existing
+            // error cannot mask a later error caused by a dirty field. This
+            // bounded bridge must be replaced by centralized multi-error
+            // validation.
+            if !ignored_error_paths.insert(error_path.to_string()) {
                 return Err(anyhow::Error::from(api_error));
             }
             warnings.push(crate::validation_warnings::ValidationWarning::new(
@@ -44085,6 +44116,38 @@ model_provider = \"ollama.default\"
                 .to_string()
                 .contains("gateway.websocket_ping_interval_secs")
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_an_unrelated_dynamic_alias_error_without_mutating_it() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "orphan".into(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.missing".into(),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated dynamic alias error must not block a repair");
+        assert!(warnings.iter().any(|warning| {
+            warning.code == "pre_existing_validation_error"
+                && warning.path == "agents.orphan.model_provider"
+        }));
+        assert_eq!(
+            config.agents["orphan"].model_provider, "anthropic.missing",
+            "repair admission must not rewrite an unrelated dynamic alias"
+        );
+
+        config.gateway.host.clear();
+        config.mark_dirty("gateway.host");
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a later dirty error must still be reached");
+        assert!(error.to_string().contains("gateway.host"));
     }
 
     #[::core::prelude::v1::test]
