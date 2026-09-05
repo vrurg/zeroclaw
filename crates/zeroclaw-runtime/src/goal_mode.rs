@@ -593,6 +593,89 @@ impl GoalExecutionHost {
     }
 }
 
+/// Runtime-owned result of a Goal command. Only a successful lifecycle
+/// transition into `Running` yields an execution request.
+pub struct GoalRuntimeSubmission {
+    response: GoalResponse,
+    execution: Option<GoalExecutionRequest>,
+}
+
+impl GoalRuntimeSubmission {
+    pub fn response(&self) -> &GoalResponse {
+        &self.response
+    }
+
+    pub fn into_parts(self) -> (GoalResponse, Option<GoalExecutionRequest>) {
+        (self.response, self.execution)
+    }
+}
+
+/// Exact controller-to-executor handoff for a newly running Goal epoch.
+pub struct GoalExecutionRequest {
+    submission: GoalSubmission,
+    scope: GoalExecutionScope,
+}
+
+impl GoalExecutionRequest {
+    pub fn submission(&self) -> &GoalSubmission {
+        &self.submission
+    }
+
+    pub fn scope(&self) -> &GoalExecutionScope {
+        &self.scope
+    }
+
+    pub fn into_parts(self) -> (GoalSubmission, GoalExecutionScope) {
+        (self.submission, self.scope)
+    }
+}
+
+/// Single runtime entry point for a typed Goal command.
+pub struct GoalRuntime {
+    host: GoalExecutionHost,
+    controller: GoalController,
+}
+
+impl GoalRuntime {
+    pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
+        Self {
+            host: GoalExecutionHost::new(),
+            controller: GoalController::new(registry),
+        }
+    }
+
+    pub async fn submit(
+        &self,
+        settings: &GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+    ) -> Result<GoalRuntimeSubmission> {
+        let submission = self.host.submit(ingress, driver, command).await?;
+        let (response, submission) = self
+            .controller
+            .submit_for_execution(settings, submission)
+            .await?;
+        let execution = match &response {
+            GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
+                Some(GoalExecutionRequest {
+                    scope: GoalExecutionScope::new(
+                        projection.task_id.clone(),
+                        submission.ingress().session_key().durable_id(),
+                        projection.execution_epoch,
+                    )?,
+                    submission,
+                })
+            }
+            _ => None,
+        };
+        Ok(GoalRuntimeSubmission {
+            response,
+            execution,
+        })
+    }
+}
+
 fn required(name: &str, value: String) -> Result<String> {
     require_nonblank(name, &value)?;
     Ok(value.trim().to_owned())
