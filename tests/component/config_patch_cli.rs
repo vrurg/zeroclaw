@@ -326,6 +326,45 @@ fn config_with_unrelated_invalid_ping_interval(config_dir: &std::path::Path) -> 
     config
 }
 
+fn config_with_mdns_intervals(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    let raw = toml::to_string(&config).expect("serialize mDNS fixture");
+    std::fs::write(config_dir.join("config.toml"), raw).expect("write mDNS fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
+fn config_with_zero_mdns_peer_ttl(config_dir: &std::path::Path) -> Config {
+    let mut config = config_with_mdns_intervals(config_dir);
+    config.nodes.mdns.peer_ttl_secs = 0;
+    let raw = toml::to_string(&config).expect("serialize zero mDNS TTL fixture");
+    std::fs::write(config_dir.join("config.toml"), raw).expect("write zero mDNS TTL fixture");
+    config
+}
+
+fn config_with_disabled_gitea_and_invalid_api_url(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config.channels.git.insert(
+        "gitea".into(),
+        zeroclaw_config::schema::GitConfig {
+            enabled: false,
+            provider: "gitea".into(),
+            api_base_url: Some("not a URL".into()),
+            ..Default::default()
+        },
+    );
+    let raw = toml::to_string(&config).expect("serialize disabled Gitea fixture");
+    std::fs::write(config_dir.join("config.toml"), raw).expect("write disabled Gitea fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
 fn config_with_unrelated_dangling_agent(config_dir: &std::path::Path) -> Config {
     let mut config = Config {
         locale: Some("en".into()),
@@ -480,6 +519,58 @@ fn config_patch_rejects_oauth_auth_mode_beside_existing_anthropic_api_key() {
 }
 
 #[test]
+fn config_patch_rejects_dirty_mdns_interval_that_breaks_peer_ttl() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_mdns_intervals(config_dir.path());
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/nodes/mdns/announce_interval_secs","value":999}]"#,
+    );
+    assert!(!output.status.success());
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(
+        !saved.contains("announce_interval_secs = 999"),
+        "a mutation-caused cross-field failure must not reach disk: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_rejects_dirty_mdns_interval_hidden_by_a_preexisting_peer_ttl_error() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_zero_mdns_peer_ttl(config_dir.path());
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/nodes/mdns/announce_interval_secs","value":999}]"#,
+    );
+    assert!(!output.status.success());
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(
+        !saved.contains("announce_interval_secs = 999"),
+        "a dirty causal path must not be hidden by a pre-existing same-path error: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_rejects_enabling_gitea_with_a_preexisting_invalid_api_url() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_disabled_gitea_and_invalid_api_url(config_dir.path());
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/channels/git/gitea/enabled","value":true}]"#,
+    );
+    assert!(!output.status.success());
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    let parsed: Config = toml::from_str(&saved).expect("unchanged config should parse");
+    assert!(
+        !parsed.channels.git["gitea"].enabled,
+        "a dirty enablement path must not be hidden by its dependent URL error: {saved}"
+    );
+}
+
+#[test]
 fn config_patch_human_success_reports_retained_legacy_alias_warning() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     let _ = legacy_colon_alias_config(config_dir.path());
@@ -619,6 +710,67 @@ async fn config_patch_http_rejects_oauth_auth_mode_beside_existing_anthropic_api
     let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
         .expect("read unchanged config");
     assert!(!saved.contains("auth_mode = \"oauth\""));
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_dirty_mdns_interval_that_breaks_peer_ttl() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        config_with_mdns_intervals(config_dir.path()),
+        br#"[{"op":"replace","path":"/nodes/mdns/announce_interval_secs","value":999}]"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["path"], "nodes.mdns.peer_ttl_secs");
+    assert_eq!(
+        envelope["related_paths"],
+        serde_json::json!(["nodes.mdns.announce_interval_secs"])
+    );
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(!saved.contains("announce_interval_secs = 999"));
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_dirty_mdns_interval_hidden_by_a_preexisting_peer_ttl_error() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        config_with_zero_mdns_peer_ttl(config_dir.path()),
+        br#"[{"op":"replace","path":"/nodes/mdns/announce_interval_secs","value":999}]"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["path"], "nodes.mdns.peer_ttl_secs");
+    assert_eq!(
+        envelope["related_paths"],
+        serde_json::json!(["nodes.mdns.announce_interval_secs"])
+    );
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(!saved.contains("announce_interval_secs = 999"));
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_enabling_gitea_with_a_preexisting_invalid_api_url() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, envelope) = run_http_patch_with_config(
+        config_with_disabled_gitea_and_invalid_api_url(config_dir.path()),
+        br#"[{"op":"replace","path":"/channels/git/gitea/enabled","value":true}]"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(envelope["path"], "channels.git.gitea.api_base_url");
+    assert_eq!(
+        envelope["related_paths"],
+        serde_json::json!(["channels.git.gitea.enabled", "channels.git.gitea.provider"])
+    );
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    let parsed: Config = toml::from_str(&saved).expect("unchanged config should parse");
+    assert!(!parsed.channels.git["gitea"].enabled);
 }
 
 #[cfg(feature = "gateway")]

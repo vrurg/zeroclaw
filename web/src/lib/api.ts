@@ -39,12 +39,7 @@ export class UnauthorizedError extends Error {
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    public readonly envelope: {
-      code: string;
-      message: string;
-      path?: string;
-      op_index?: number;
-    },
+    public readonly envelope: ConfigApiError,
   ) {
     super(`[${envelope.code}] ${envelope.message}`);
     this.name = "ApiError";
@@ -571,6 +566,8 @@ export interface ConfigApiError {
   code: string;
   message: string;
   path?: string;
+  /** Other fields that participate in a cross-field validation failure. */
+  related_paths?: string[];
   op_index?: number;
 }
 

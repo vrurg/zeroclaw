@@ -10585,6 +10585,19 @@ fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Preserve a structured validation error while declaring fields that caused
+/// its enclosing conditional validator to run. Unstructured errors remain
+/// unchanged and therefore fail closed in config repair.
+fn with_validation_related_paths(
+    error: anyhow::Error,
+    related_paths: impl IntoIterator<Item = impl Into<String>>,
+) -> anyhow::Error {
+    match error.downcast::<ConfigApiError>() {
+        Ok(structured) => anyhow::Error::from(structured.with_related_paths(related_paths)),
+        Err(error) => error,
+    }
+}
+
 /// Shared bot-token rule for channel structs whose `bot_token` is required
 /// once the alias is enabled (Telegram, Discord). `field_path` must be the
 /// `channels.<type>.<alias>.bot_token` leaf; the enabled-state message
@@ -10605,6 +10618,7 @@ fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> 
         validation_bail!(
             RequiredFieldEmpty,
             field_path.to_string(),
+            related[enabled_path],
             "{field_path} is required when {enabled_path} = true",
         );
     }
@@ -10636,6 +10650,7 @@ pub(crate) fn validate_required_field(
         validation_bail!(
             RequiredFieldEmpty,
             field_path.to_string(),
+            related[enabled_path],
             "{field_path} is required when {enabled_path} = true",
         );
     }
@@ -21481,7 +21496,7 @@ impl Config {
     fn validate_allowing_legacy_colon_aliases(
         &self,
         allowed_legacy_colon_alias_paths: &std::collections::HashSet<String>,
-        ignored_error_paths: &std::collections::HashSet<String>,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
     ) -> Result<()> {
         // `validate_for_config_repair` supplies only paths it has already
         // classified as unrelated to the pending mutation. Keep those values
@@ -21490,17 +21505,24 @@ impl Config {
         // centralized multi-error validation API should replace it rather than
         // widening normal configuration validation semantics.
         macro_rules! validation_bail {
+            ($code:ident, $path:expr, related [$($related:expr),* $(,)?], $($msg:tt)*) => {{
+                let err = $crate::api_error::ConfigApiError::new(
+                    $crate::api_error::ConfigApiCode::$code,
+                    format!($($msg)*),
+                )
+                .with_path($path)
+                .with_related_paths([$($related),*]);
+                if !ignored_errors.contains(&err) {
+                    return Err(::anyhow::Error::from(err));
+                }
+            }};
             ($code:ident, $path:expr, $($msg:tt)*) => {{
                 let err = $crate::api_error::ConfigApiError::new(
                     $crate::api_error::ConfigApiCode::$code,
                     format!($($msg)*),
                 )
                 .with_path($path);
-                if !err
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| ignored_error_paths.contains(path))
-                {
+                if !ignored_errors.contains(&err) {
                     return Err(::anyhow::Error::from(err));
                 }
             }};
@@ -21531,6 +21553,7 @@ impl Config {
                 validation_bail!(
                     InvalidFormat,
                     path,
+                    related[format!("providers.models.anthropic.{alias}.auth_mode")],
                     "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
                 );
             }
@@ -21562,6 +21585,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "tunnel.openvpn.config_file",
+                    related["tunnel.tunnel_provider"],
                     "tunnel.openvpn.config_file must not be empty"
                 );
             }
@@ -21569,6 +21593,7 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
+                    related["tunnel.tunnel_provider"],
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
                 );
             }
@@ -21704,12 +21729,21 @@ impl Config {
                     None => validation_bail!(
                         RequiredFieldEmpty,
                         path,
+                        related [format!("channels.git.{alias}.enabled"), format!("channels.git.{alias}.provider")],
                         "{path} is required when provider = \"{provider}\": set the \
                          instance's API base URL including /api/v1 (e.g. \
                          https://git.example.org/api/v1); no default host is assumed \
                          because API requests carry the access token"
                     ),
-                    Some(url) => validate_http_base_url(&path, url)?,
+                    Some(url) => validate_http_base_url(&path, url).map_err(|error| {
+                        with_validation_related_paths(
+                            error,
+                            [
+                                format!("channels.git.{alias}.enabled"),
+                                format!("channels.git.{alias}.provider"),
+                            ],
+                        )
+                    })?,
                 }
             }
         }
@@ -21762,6 +21796,7 @@ impl Config {
             validation_bail!(
                 InvalidNumericRange,
                 "nodes.mdns.peer_ttl_secs",
+                related["nodes.mdns.announce_interval_secs"],
                 "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
             );
         }
@@ -21806,6 +21841,7 @@ impl Config {
                 validation_bail!(
                     InvalidFormat,
                     flag_path,
+                    related["memory.backend"],
                     "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
@@ -21816,6 +21852,7 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
+                        related[flag_path],
                         "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
@@ -21838,6 +21875,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "heartbeat.agent",
+                    related["heartbeat.enabled"],
                     "heartbeat.agent must reference a configured agent when heartbeat.enabled = true"
                 );
             }
@@ -21845,6 +21883,7 @@ impl Config {
                 validation_bail!(
                     DanglingReference,
                     "heartbeat.agent",
+                    related[format!("heartbeat.enabled"), format!("agents.{hb_agent}")],
                     "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
                 );
             }
@@ -22140,6 +22179,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("model_routes[{i}].model_provider"),
+                            related[format!("providers.models.{ty}.{inner}")],
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -22184,6 +22224,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("embedding_routes[{i}].model_provider"),
+                            related[format!("providers.models.{ty}.{inner}")],
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -22424,7 +22465,8 @@ impl Config {
 
         // MCP
         if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)?;
+            validate_mcp_config(&self.mcp)
+                .map_err(|error| with_validation_related_paths(error, ["mcp.enabled"]))?;
         }
 
         // Knowledge graph
@@ -22433,6 +22475,7 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "knowledge.max_nodes",
+                    related["knowledge.enabled"],
                     "knowledge.max_nodes must be greater than 0"
                 );
             }
@@ -22440,6 +22483,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "knowledge.db_path",
+                    related["knowledge.enabled"],
                     "knowledge.db_path must not be empty"
                 );
             }
@@ -22663,12 +22707,18 @@ impl Config {
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
-                anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    "notion.database_id",
+                    related["notion.enabled"],
+                    "notion.database_id must not be empty when notion.enabled = true"
+                );
             }
             if self.notion.poll_interval_secs == 0 {
                 validation_bail!(
                     InvalidNumericRange,
                     "notion.poll_interval_secs",
+                    related["notion.enabled"],
                     "notion.poll_interval_secs must be greater than 0"
                 );
             }
@@ -22676,6 +22726,7 @@ impl Config {
                 validation_bail!(
                     InvalidNumericRange,
                     "notion.max_concurrent",
+                    related["notion.enabled"],
                     "notion.max_concurrent must be greater than 0"
                 );
             }
@@ -22683,6 +22734,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.status_property",
+                    related["notion.enabled"],
                     "notion.status_property must not be empty"
                 );
             }
@@ -22690,6 +22742,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.input_property",
+                    related["notion.enabled"],
                     "notion.input_property must not be empty"
                 );
             }
@@ -22697,6 +22750,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     "notion.result_property",
+                    related["notion.enabled"],
                     "notion.result_property must not be empty"
                 );
             }
@@ -22796,6 +22850,7 @@ impl Config {
                             format!(
                                 "runtime_profiles.{palias}.context_compression.summary_provider"
                             ),
+                            related[format!("providers.models.{ty}.{inner}")],
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
@@ -22833,6 +22888,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
+                            related[format!("providers.models.{ty}")],
                             "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
                         );
                     }
@@ -22843,6 +22899,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
+                            related[format!("providers.models.{ty}.{inner}")],
                             "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
@@ -22873,6 +22930,7 @@ impl Config {
                             validation_bail!(
                                 DanglingReference,
                                 format!("agents.{alias}.channels[{i}]"),
+                                related[format!("channels.{ty}.{inner}")],
                                 "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
                             );
                         }
@@ -22925,6 +22983,7 @@ impl Config {
                             validation_bail!(
                                 DanglingReference,
                                 format!("agents.{alias}.{field}"),
+                                related[format!("{section_prefix}.{ty}.{inner}")],
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
@@ -22966,6 +23025,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.{field}[{i}]"),
+                            related[format!("{section}.{trimmed}")],
                             "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
                         );
                     }
@@ -22991,6 +23051,7 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.{field}"),
+                        related[format!("{section}.{trimmed}")],
                         "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
                     );
                 }
@@ -23004,6 +23065,7 @@ impl Config {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("agents.{alias}.risk_profile"),
+                    related[format!("agents.{alias}.enabled")],
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
                 );
             }
@@ -23034,6 +23096,7 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.delegates[{i}].agent"),
+                        related[format!("agents.{target_str}")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -23061,6 +23124,7 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         format!("agents.{alias}.workspace.access.{target_str}"),
+                        related[format!("agents.{target_str}")],
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -23086,6 +23150,7 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         path,
+                        related[format!("agents.{target_str}")],
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                     // An explicitly ignored missing target has no remaining
@@ -23097,6 +23162,7 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        related [format!("agents.{alias}.memory.backend"), format!("agents.{target_str}.memory.backend")],
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
                     );
                 }
@@ -23138,6 +23204,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -23153,6 +23220,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -23160,6 +23228,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related[format!("channels.{channel_type}.{alias}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
                         );
                     }
@@ -23172,6 +23241,7 @@ impl Config {
                     validation_bail!(
                         DanglingReference,
                         path,
+                        related[format!("agents.{member_str}")],
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str} is not configured",
                     );
                     // An explicitly ignored missing member has no remaining
@@ -23193,6 +23263,7 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
+                        related [format!("agents.{member_str}.channels"), format!("peer_groups.{group_name}.channel")],
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
                     );
                 }
@@ -23297,6 +23368,7 @@ impl Config {
                     validation_bail!(
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
+                        related[format!("plugins.entries.{}.egress_hosts", entry.name)],
                         "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
@@ -23329,28 +23401,6 @@ impl Config {
                     .strip_prefix(left)
                     .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
         }
-
-        // The Anthropic OAuth/API-key invariant is reported at `api_key`,
-        // although a patch to sibling `auth_mode` can introduce it. Keep the
-        // pair mutation-related until a centralized validation-provenance API
-        // can model cross-field constraints generally.
-        let anthropic_oauth_credential_sibling_is_dirty = |error_path: &str| {
-            let sibling = error_path
-                .strip_suffix(".api_key")
-                .map(|prefix| format!("{prefix}.auth_mode"))
-                .or_else(|| {
-                    error_path
-                        .strip_suffix(".auth_mode")
-                        .map(|prefix| format!("{prefix}.api_key"))
-                });
-            sibling.is_some_and(|path| {
-                path.starts_with("providers.models.anthropic.")
-                    && self
-                        .dirty_paths
-                        .iter()
-                        .any(|dirty| paths_overlap(dirty, &path))
-            })
-        };
 
         let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
             .providers
@@ -23399,22 +23449,21 @@ impl Config {
             })
             .collect();
         let mut warnings = Vec::new();
-        let mut ignored_error_paths = std::collections::HashSet::new();
+        let mut ignored_errors = std::collections::HashSet::new();
         loop {
             let Err(error) = self.validate_allowing_legacy_colon_aliases(
                 &excluded_legacy_alias_paths,
-                &ignored_error_paths,
+                &ignored_errors,
             ) else {
                 break;
             };
             let api_error = ConfigApiError::from_validation(error);
             let error_path = api_error.path.as_deref().unwrap_or("");
-            let touches_dirty = !error_path.is_empty()
-                && self
-                    .dirty_paths
+            let touches_dirty = api_error.affected_paths().any(|affected_path| {
+                self.dirty_paths
                     .iter()
-                    .any(|dirty| paths_overlap(error_path, dirty));
-            let touches_cross_field_dirty = anthropic_oauth_credential_sibling_is_dirty(error_path);
+                    .any(|dirty| paths_overlap(affected_path, dirty))
+            });
             // Alias-name validation reports the alias path rather than a
             // distinct dirty reference that introduced it. Any remaining
             // colon alias here was deliberately not grandfathered above:
@@ -23431,21 +23480,17 @@ impl Config {
                             && !excluded_legacy_alias_paths
                                 .contains(&format!("providers.models.{family}.{alias}"))
                     });
-            if touches_dirty
-                || touches_cross_field_dirty
-                || rejected_colon_alias
-                || error_path.is_empty()
-            {
+            if touches_dirty || rejected_colon_alias || error_path.is_empty() {
                 return Err(anyhow::Error::from(api_error));
             }
 
             // `validate_allowing_legacy_colon_aliases` reports one error at a
-            // time. Record each demonstrably unrelated error path and rerun
-            // against the unchanged configuration, so an earlier existing
-            // error cannot mask a later error caused by a dirty field. This
-            // bounded bridge must be replaced by centralized multi-error
-            // validation.
-            if !ignored_error_paths.insert(error_path.to_string()) {
+            // time. Suppress only this full, already-classified diagnostic,
+            // rather than every error with its primary display path: a later
+            // cross-field error can legitimately share that path while adding
+            // a dirty causal sibling. A centralized multi-error validation API
+            // must eventually replace this bounded repair bridge.
+            if !ignored_errors.insert(api_error.clone()) {
                 return Err(anyhow::Error::from(api_error));
             }
             warnings.push(crate::validation_warnings::ValidationWarning::new(
@@ -44171,6 +44216,87 @@ model_provider = \"ollama.default\"
                 .dirty_paths
                 .contains("providers.models.anthropic.subscription.auth_mode")
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_a_dirty_mdns_interval_that_breaks_a_sibling_bound() {
+        let mut config = Config::default();
+        config
+            .set_prop_persistent("nodes.mdns.announce_interval_secs", "999")
+            .expect("interval patch applies before validation");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty sibling of a cross-field bound must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(error.path.as_deref(), Some("nodes.mdns.peer_ttl_secs"));
+        assert_eq!(
+            error.related_paths,
+            vec!["nodes.mdns.announce_interval_secs"]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_a_dirty_mdns_interval_when_an_earlier_ttl_error_shares_its_path() {
+        let mut config = Config::default();
+        config.nodes.mdns.peer_ttl_secs = 0;
+        config
+            .set_prop_persistent("nodes.mdns.announce_interval_secs", "999")
+            .expect("interval patch applies before validation");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a suppressed unrelated TTL error must not hide a dirty sibling bound");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(error.path.as_deref(), Some("nodes.mdns.peer_ttl_secs"));
+        assert_eq!(
+            error.related_paths,
+            vec!["nodes.mdns.announce_interval_secs"]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_enabling_gitea_with_an_invalid_staged_api_url() {
+        let mut config = Config::default();
+        config.channels.git.insert(
+            "gitea".into(),
+            GitConfig {
+                enabled: false,
+                provider: "gitea".into(),
+                api_base_url: Some("not a URL".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .set_prop_persistent("channels.git.gitea.enabled", "true")
+            .expect("enable patch applies before validation");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("enabling a staged invalid Gitea URL must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("channels.git.gitea.api_base_url")
+        );
+        assert_eq!(
+            error.related_paths,
+            vec!["channels.git.gitea.enabled", "channels.git.gitea.provider"]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_an_unrelated_mdns_cross_field_failure() {
+        let mut config = Config::default();
+        config.nodes.mdns.peer_ttl_secs = 10;
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unchanged cross-field failure remains repairable elsewhere");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "pre_existing_validation_error");
+        assert_eq!(warnings[0].path, "nodes.mdns.peer_ttl_secs");
     }
 
     #[::core::prelude::v1::test]

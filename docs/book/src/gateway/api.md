@@ -67,7 +67,11 @@ error at an unrelated path can be isolated by the repair validator: the valid
 change is persisted and the response carries a structured
 `pre_existing_validation_error` warning with that path. The validator continues
 checking after each isolated error, so an earlier unrelated error cannot mask a
-later error caused by the submitted change. Retained legacy static Anthropic
+later error caused by the submitted change. Validation errors retain `path` as
+their primary display target and may include additive `related_paths` for the
+other fields participating in a cross-field rule; a change to any of those
+paths is mutation-caused and is rejected rather than demoted to a warning.
+Retained legacy static Anthropic
 aliases containing `:` use the distinct `legacy_colon_alias_retained` warning.
 Clients must surface warnings; they mean the saved whole configuration still
 needs a separate repair. Comment annotations are applied after the save on a
