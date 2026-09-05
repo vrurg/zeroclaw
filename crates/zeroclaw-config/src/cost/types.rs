@@ -164,6 +164,11 @@ pub struct CostRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_id: Option<String>,
+    /// Exact configured provider reference which served this event, when the
+    /// caller has immutable actual-route attribution. Existing ledger rows
+    /// omit it for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<String>,
 }
 
 impl CostRecord {
@@ -176,6 +181,7 @@ impl CostRecord {
             conversation_id: None,
             agent_alias: None,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -192,6 +198,7 @@ impl CostRecord {
             conversation_id: None,
             agent_alias,
             task_id: None,
+            provider_ref: None,
         }
     }
 
@@ -209,6 +216,26 @@ impl CostRecord {
             conversation_id: None,
             agent_alias,
             task_id,
+            provider_ref: None,
+        }
+    }
+
+    /// Create a durable-task record with the actual served provider route.
+    pub fn with_attribution_and_provider(
+        session_id: impl Into<String>,
+        agent_alias: Option<String>,
+        task_id: Option<String>,
+        provider_ref: Option<String>,
+        usage: TokenUsage,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            usage,
+            session_id: session_id.into(),
+            conversation_id: None,
+            agent_alias,
+            task_id,
+            provider_ref,
         }
     }
 
