@@ -8,6 +8,7 @@ use zeroclaw_providers::dispatch::{AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
+use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -98,6 +99,8 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
+        admit_goal_operation_if_scoped(GoalOperationRequest::new(self.provider_name, self.model))
+            .await?;
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
@@ -117,6 +120,7 @@ impl ResolvedModelAccess<'_> {
         let accounting = scope.take();
 
         let attempts = accounting.attempts();
+        let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
 
         let accepted_route = accounting.accepted_route().cloned();
         let (served_provider, served_model) = accepted_route
@@ -130,29 +134,42 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                     extend_rejected_summaries(settled_out, attempts);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
-                crate::agent::cost::settle_provider_attempts(
-                    &attempts[..attempts.len().saturating_sub(1)],
-                    None,
-                );
-                extend_rejected_summaries(
-                    settled_out,
-                    &attempts[..attempts.len().saturating_sub(1)],
-                );
+                if goal_scoped {
+                    crate::agent::cost::settle_provider_attempts(
+                        attempts,
+                        Some(attempts.len().saturating_sub(1)),
+                    )
+                    .await?;
+                } else {
+                    crate::agent::cost::settle_provider_attempts(
+                        &attempts[..attempts.len().saturating_sub(1)],
+                        None,
+                    )
+                    .await?;
+                    extend_rejected_summaries(
+                        settled_out,
+                        &attempts[..attempts.len().saturating_sub(1)],
+                    );
+                }
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                let accepted_cost_usd = response.usage.as_ref().and_then(|usage| {
-                    crate::agent::cost::record_tool_loop_cost_usage(
-                        &served_provider,
-                        &served_model,
-                        usage,
-                    )
-                    .map(|(_, cost_usd)| cost_usd)
-                });
+                let accepted_cost_usd = (!goal_scoped)
+                    .then(|| {
+                        response.usage.as_ref().and_then(|usage| {
+                            crate::agent::cost::record_tool_loop_cost_usage(
+                                &served_provider,
+                                &served_model,
+                                usage,
+                            )
+                            .map(|(_, cost_usd)| cost_usd)
+                        })
+                    })
+                    .flatten();
                 // The accepted leaf is always projected (even usage-less, so
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.
@@ -174,7 +191,7 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None);
+                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
                 extend_rejected_summaries(settled_out, attempts);
                 Err(error)
             }
