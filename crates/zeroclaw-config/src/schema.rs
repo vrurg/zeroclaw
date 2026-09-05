@@ -21528,7 +21528,26 @@ impl Config {
             }};
         }
 
-        validate_memory_rerank_config(&self.memory)?;
+        // Helpers use the exported `validation_bail!` macro and therefore
+        // return a structured `ConfigApiError` before this local macro can
+        // observe it. During repair, let an *already classified* unrelated
+        // helper diagnostic take the same continue path as a local
+        // diagnostic. Errors without that exact structured identity remain
+        // fatal: they cannot be safely attributed to an unrelated field.
+        macro_rules! validation_try {
+            ($result:expr) => {
+                if let Err(error) = $result {
+                    if !error
+                        .downcast_ref::<ConfigApiError>()
+                        .is_some_and(|structured| ignored_errors.contains(structured))
+                    {
+                        return Err(error);
+                    }
+                }
+            };
+        }
+
+        validation_try!(validate_memory_rerank_config(&self.memory));
 
         // TOML deserialization inserts provider aliases directly into their
         // maps. Preserve legacy aliases that are broader than the mutation
@@ -21655,17 +21674,17 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
-            tg.validate_bot_token(alias)?;
-            validate_http_base_url(
+            validation_try!(tg.validate_bot_token(alias));
+            validation_try!(validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
-            )?;
+            ));
         }
 
         for (alias, matrix) in &self.channels.matrix {
-            matrix.validate_stream_tool_arguments().with_context(|| {
+            validation_try!(matrix.validate_stream_tool_arguments().with_context(|| {
                 format!("invalid channels.matrix.{alias}.stream_tool_arguments")
-            })?;
+            }));
         }
 
         for (alias, slack) in &self.channels.slack {
@@ -21681,7 +21700,7 @@ impl Config {
         }
 
         for (alias, dc) in &self.channels.discord {
-            dc.validate_bot_token(alias)?;
+            validation_try!(dc.validate_bot_token(alias));
         }
 
         // Signal and Voice Call: like Telegram/Discord's bot_token, these
@@ -21690,29 +21709,29 @@ impl Config {
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
         for (alias, sig) in &self.channels.signal {
-            sig.validate_required(alias)?;
+            validation_try!(sig.validate_required(alias));
         }
 
         for (alias, vc) in &self.channels.voice_call {
             let enabled_path = format!("channels.voice_call.{alias}.enabled");
-            validate_required_field(
+            validation_try!(validate_required_field(
                 &format!("channels.voice_call.{alias}.account_id"),
                 &enabled_path,
                 vc.enabled,
                 &vc.account_id,
-            )?;
-            validate_required_field(
+            ));
+            validation_try!(validate_required_field(
                 &format!("channels.voice_call.{alias}.auth_token"),
                 &enabled_path,
                 vc.enabled,
                 &vc.auth_token,
-            )?;
-            validate_required_field(
+            ));
+            validation_try!(validate_required_field(
                 &format!("channels.voice_call.{alias}.from_number"),
                 &enabled_path,
                 vc.enabled,
                 &vc.from_number,
-            )?;
+            ));
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -21735,15 +21754,17 @@ impl Config {
                          https://git.example.org/api/v1); no default host is assumed \
                          because API requests carry the access token"
                     ),
-                    Some(url) => validate_http_base_url(&path, url).map_err(|error| {
-                        with_validation_related_paths(
-                            error,
-                            [
-                                format!("channels.git.{alias}.enabled"),
-                                format!("channels.git.{alias}.provider"),
-                            ],
-                        )
-                    })?,
+                    Some(url) => {
+                        validation_try!(validate_http_base_url(&path, url).map_err(|error| {
+                            with_validation_related_paths(
+                                error,
+                                [
+                                    format!("channels.git.{alias}.enabled"),
+                                    format!("channels.git.{alias}.provider"),
+                                ],
+                            )
+                        }))
+                    }
                 }
             }
         }
@@ -22460,13 +22481,15 @@ impl Config {
             }
         }
 
-        validate_plugin_entries(&self.plugins)?;
-        validate_plugin_channel_instances(&self.channels)?;
+        validation_try!(validate_plugin_entries(&self.plugins));
+        validation_try!(validate_plugin_channel_instances(&self.channels));
 
         // MCP
         if self.mcp.enabled {
-            validate_mcp_config(&self.mcp)
-                .map_err(|error| with_validation_related_paths(error, ["mcp.enabled"]))?;
+            validation_try!(
+                validate_mcp_config(&self.mcp)
+                    .map_err(|error| with_validation_related_paths(error, ["mcp.enabled"]))
+            );
         }
 
         // Knowledge graph
@@ -22657,8 +22680,8 @@ impl Config {
         }
 
         // Proxy (delegate to existing validation)
-        self.proxy.validate()?;
-        self.cloud_ops.validate()?;
+        validation_try!(self.proxy.validate());
+        validation_try!(self.cloud_ops.validate());
 
         // Skills — extra registries
         {
@@ -44187,6 +44210,71 @@ model_provider = \"ollama.default\"
             error
                 .to_string()
                 .contains("gateway.websocket_ping_interval_secs")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_an_unrelated_helper_validation_error() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "bad".into(),
+            TelegramConfig {
+                enabled: false,
+                api_base_url: "not a URL".into(),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated helper validation error remains repairable elsewhere");
+        assert!(warnings.iter().any(|warning| {
+            warning.code == "pre_existing_validation_error"
+                && warning.path == "channels.telegram.bad.api_base_url"
+        }));
+
+        config.mark_dirty("channels.telegram.bad.api_base_url");
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty helper-validated field must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("channels.telegram.bad.api_base_url")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_retains_an_unrelated_gitea_wrapper_error() {
+        let mut config = Config::default();
+        config.channels.git.insert(
+            "gitea".into(),
+            GitConfig {
+                enabled: true,
+                provider: "gitea".into(),
+                api_base_url: Some("not a URL".into()),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("gateway.host");
+
+        let warnings = config
+            .validate_for_config_repair()
+            .expect("an unrelated Gitea wrapper error remains repairable elsewhere");
+        assert!(warnings.iter().any(|warning| {
+            warning.code == "pre_existing_validation_error"
+                && warning.path == "channels.git.gitea.api_base_url"
+        }));
+
+        config.mark_dirty("channels.git.gitea.api_base_url");
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty Gitea wrapper error must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("channels.git.gitea.api_base_url")
         );
     }
 
