@@ -344,6 +344,30 @@ fn config_with_unrelated_dangling_agent(config_dir: &std::path::Path) -> Config 
     config
 }
 
+fn config_with_anthropic_inline_key(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config.providers.models.anthropic.insert(
+        "subscription".into(),
+        zeroclaw_config::schema::AnthropicModelProviderConfig {
+            base: zeroclaw_config::schema::ModelProviderConfig {
+                api_key: Some("legacy-inline-key".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    std::fs::write(
+        config_dir.join("config.toml"),
+        toml::to_string(&config).expect("serialize inline-key fixture"),
+    )
+    .expect("write inline-key fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
 #[test]
 fn config_patch_json_success_emits_envelope_and_persists_change() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -439,6 +463,20 @@ fn config_patch_repairs_another_path_when_an_unrelated_dynamic_alias_error_exist
     let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
     assert_eq!(parsed.gateway.host, "127.0.0.2");
     assert_eq!(parsed.agents["orphan"].model_provider, "anthropic.missing");
+}
+
+#[test]
+fn config_patch_rejects_oauth_auth_mode_beside_existing_anthropic_api_key() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let _ = config_with_anthropic_inline_key(config_dir.path());
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/providers/models/anthropic/subscription/auth_mode","value":"oauth"}]"#,
+    );
+    assert!(!output.status.success());
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(!saved.contains("auth_mode = \"oauth\""));
 }
 
 #[test]
@@ -567,6 +605,20 @@ async fn config_patch_http_repairs_another_path_with_an_unrelated_dynamic_alias_
     let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
     assert_eq!(parsed.gateway.host, "127.0.0.2");
     assert_eq!(parsed.agents["orphan"].model_provider, "anthropic.missing");
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_oauth_auth_mode_beside_existing_anthropic_api_key() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, _) = run_http_patch_with_config(
+        config_with_anthropic_inline_key(config_dir.path()),
+        br#"[{"op":"replace","path":"/providers/models/anthropic/subscription/auth_mode","value":"oauth"}]"#,
+    ).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    assert!(!saved.contains("auth_mode = \"oauth\""));
 }
 
 #[cfg(feature = "gateway")]

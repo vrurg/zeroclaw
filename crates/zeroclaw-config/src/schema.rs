@@ -23330,6 +23330,28 @@ impl Config {
                     .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
         }
 
+        // The Anthropic OAuth/API-key invariant is reported at `api_key`,
+        // although a patch to sibling `auth_mode` can introduce it. Keep the
+        // pair mutation-related until a centralized validation-provenance API
+        // can model cross-field constraints generally.
+        let anthropic_oauth_credential_sibling_is_dirty = |error_path: &str| {
+            let sibling = error_path
+                .strip_suffix(".api_key")
+                .map(|prefix| format!("{prefix}.auth_mode"))
+                .or_else(|| {
+                    error_path
+                        .strip_suffix(".auth_mode")
+                        .map(|prefix| format!("{prefix}.api_key"))
+                });
+            sibling.is_some_and(|path| {
+                path.starts_with("providers.models.anthropic.")
+                    && self
+                        .dirty_paths
+                        .iter()
+                        .any(|dirty| paths_overlap(dirty, &path))
+            })
+        };
+
         let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
             .providers
             .models
@@ -23392,6 +23414,7 @@ impl Config {
                     .dirty_paths
                     .iter()
                     .any(|dirty| paths_overlap(error_path, dirty));
+            let touches_cross_field_dirty = anthropic_oauth_credential_sibling_is_dirty(error_path);
             // Alias-name validation reports the alias path rather than a
             // distinct dirty reference that introduced it. Any remaining
             // colon alias here was deliberately not grandfathered above:
@@ -23408,7 +23431,11 @@ impl Config {
                             && !excluded_legacy_alias_paths
                                 .contains(&format!("providers.models.{family}.{alias}"))
                     });
-            if touches_dirty || rejected_colon_alias || error_path.is_empty() {
+            if touches_dirty
+                || touches_cross_field_dirty
+                || rejected_colon_alias
+                || error_path.is_empty()
+            {
                 return Err(anyhow::Error::from(api_error));
             }
 
@@ -44115,6 +44142,34 @@ model_provider = \"ollama.default\"
             error
                 .to_string()
                 .contains("gateway.websocket_ping_interval_secs")
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_rejects_oauth_auth_mode_when_a_sibling_api_key_exists() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("legacy-inline-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .set_prop_persistent("providers.models.anthropic.subscription.auth_mode", "oauth")
+            .expect("auth_mode patch applies before validation");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("OAuth must not be saved beside an existing API key");
+        assert!(error.to_string().contains("auth_mode = \"oauth\""));
+        assert!(
+            config
+                .dirty_paths
+                .contains("providers.models.anthropic.subscription.auth_mode")
         );
     }
 
