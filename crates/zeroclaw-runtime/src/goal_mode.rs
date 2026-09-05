@@ -274,32 +274,26 @@ pub struct GoalExecutionScope {
     execution_epoch: i64,
 }
 
-/// Controller-owned identity for one admitted logical provider operation.
+/// Controller-owned accounting scope for one fenced Goal execution.
 ///
-/// The executor creates this only after durable pending-operation admission.
-/// Drivers use it to scope their normal turn-engine invocation; they must not
-/// derive a replacement task, session, epoch, or operation identity from
-/// mutable transport state.
+/// A normal parent tool loop may make more than one model call. The executor
+/// therefore allocates a fresh pending-operation ID at each provider-call
+/// boundary, after rechecking this execution identity. Drivers receive this
+/// scope only to keep their normal turn-engine invocation inside the exact
+/// task/session/epoch fence; they must not derive lifecycle or operation
+/// identities from mutable transport state.
 #[derive(Debug, Clone)]
 pub struct GoalOperationScope {
     execution: GoalExecutionScope,
-    operation_id: String,
 }
 
 impl GoalOperationScope {
-    pub fn new(execution: GoalExecutionScope, operation_id: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            execution,
-            operation_id: required("Goal operation id", operation_id.into())?,
-        })
+    pub const fn new(execution: GoalExecutionScope) -> Self {
+        Self { execution }
     }
 
     pub fn execution(&self) -> &GoalExecutionScope {
         &self.execution
-    }
-
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
     }
 }
 
