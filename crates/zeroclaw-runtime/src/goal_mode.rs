@@ -3,15 +3,17 @@
 //! This module deliberately does not select a transport driver from route
 //! text. A trusted Matrix or ZeroCode adapter must supply the exact live
 //! session driver with the typed ingress it derived before mutable hooks or
-//! prompt handling. The host owns typed admission and the controller owns
-//! guarded durable lifecycle transitions; later stages add execution,
-//! accounting, and transport adapters behind those boundaries.
+//! prompt handling. The host owns typed admission, the controller owns
+//! guarded durable lifecycle transitions, and the execution engine accounts
+//! through the ordinary provider path behind those boundaries. Transport
+//! adapters remain later-stage work.
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::Mutex;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
@@ -20,6 +22,10 @@ use crate::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
+
+mod goal_execution;
+
+pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome};
 
 /// The only V1 surfaces permitted to admit a Goal command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,7 +415,13 @@ pub struct GoalSubmission {
     /// retain this object rather than resolving a new driver from route or
     /// session text after the durable lifecycle transition.
     driver: Arc<dyn GoalSessionDriver>,
-    lease: GoalSessionLease,
+    /// Stable diagnostic binding retained after the one-shot lease is
+    /// consumed by the controller. It is not an authority proof by itself.
+    binding: GoalSessionBinding,
+    /// A host admission can drive exactly one controller transition. The
+    /// controller takes and holds this lease across durable I/O, then drops it
+    /// before returning so ordinary commands do not block session replacement.
+    lease: Mutex<Option<GoalSessionLease>>,
 }
 
 impl std::fmt::Debug for GoalSubmission {
@@ -420,7 +432,8 @@ impl std::fmt::Debug for GoalSubmission {
             .field("command", &self.command)
             .field("driver_surface", &self.driver.surface())
             .field("driver_session_key", self.driver.session_key())
-            .field("lease", &self.lease)
+            .field("binding", &self.binding)
+            .field("lease_present", &self.lease.lock().is_some())
             .finish()
     }
 }
@@ -435,7 +448,14 @@ impl GoalSubmission {
     }
 
     pub fn binding(&self) -> &GoalSessionBinding {
-        self.lease.binding()
+        &self.binding
+    }
+
+    fn take_lease(&self) -> Result<GoalSessionLease> {
+        self.lease
+            .lock()
+            .take()
+            .ok_or_else(|| anyhow::Error::msg("Goal submission has already been applied"))
     }
 
     /// Borrow the exact surface driver validated during admission.
@@ -482,7 +502,8 @@ impl GoalExecutionHost {
             ingress,
             command,
             driver,
-            lease,
+            binding: lease.binding().clone(),
+            lease: Mutex::new(Some(lease)),
         })
     }
 
@@ -760,7 +781,7 @@ impl GoalController {
         // Keep the surface-owned lease through every guarded transition below.
         // Dropping it any earlier would permit a reconnect to invalidate the
         // binding between host admission and durable mutation.
-        let _lease = submission.binding();
+        let _lease = submission.take_lease()?;
         let ingress = submission.ingress();
         let command = submission.command();
 
@@ -789,9 +810,10 @@ impl GoalController {
     /// Apply a guarded transition while retaining the exact host-validated
     /// submission for the executor that must immediately follow it.
     ///
-    /// This is the only controller handoff that preserves the surface-owned
-    /// driver and lease; an executor must never re-resolve either from route
-    /// or session text after a durable lifecycle change.
+    /// This is the only controller handoff that preserves the exact
+    /// surface-owned driver; an executor must never re-resolve it from route
+    /// or session text after a durable lifecycle change. The one-shot session
+    /// lease has already protected and completed the lifecycle transition.
     pub async fn submit_for_execution(
         &self,
         settings: &GoalHostSettings,
