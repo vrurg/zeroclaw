@@ -47,6 +47,7 @@ pub enum GoalExecutionOutcome {
 /// supplied request.  A later Matrix or ZeroCode adapter therefore cannot
 /// retarget an already admitted execution to a different session.
 pub struct GoalExecutionEngine {
+    runtime: GoalRuntime,
     registry: Arc<dyn GoalTaskRegistry>,
     tracker: Arc<CostTracker>,
     agent_alias: String,
@@ -59,7 +60,7 @@ impl GoalExecutionEngine {
     /// Callers must pass the normal runtime's tracker and pricing view.  The
     /// engine deliberately does not create a second tracker or pricing store.
     pub fn new(
-        registry: Arc<dyn GoalTaskRegistry>,
+        runtime: GoalRuntime,
         tracker: Arc<CostTracker>,
         agent_alias: impl Into<String>,
         pricing: Arc<ModelProviderPricing>,
@@ -70,7 +71,8 @@ impl GoalExecutionEngine {
             "Goal execution agent alias must be nonblank"
         );
         Ok(Self {
-            registry,
+            registry: Arc::clone(&runtime.controller.registry),
+            runtime,
             tracker,
             agent_alias,
             pricing,
@@ -87,7 +89,6 @@ impl GoalExecutionEngine {
     /// operation for that logical call.
     pub async fn run(
         &self,
-        runtime: &GoalRuntime,
         settings: &GoalHostSettings,
         request: &GoalExecutionRequest,
     ) -> Result<GoalExecutionOutcome> {
@@ -100,7 +101,7 @@ impl GoalExecutionEngine {
             Arc::clone(&self.pricing),
             scope.clone(),
         ));
-        let mut lease = runtime.acquire_execution(settings, request).await?;
+        let mut lease = self.runtime.acquire_execution(settings, request).await?;
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
