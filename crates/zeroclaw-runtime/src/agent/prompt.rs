@@ -126,19 +126,32 @@ pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<
 pub fn redact_session_prompt_tool_exchanges_for_export(
     messages: &[ChatMessage],
 ) -> Vec<ChatMessage> {
-    let mut redact_next_result = false;
+    // A native batch can produce several `tool` messages, while the XML text
+    // protocol uses one following `user` message for all results. Keep those
+    // states separate: a user message after native results is ordinary next-
+    // turn input and must not be swallowed by export redaction.
+    let mut redact_native_tool_results = false;
+    let mut redact_text_protocol_result = false;
 
     messages
         .iter()
         .map(|message| {
             let is_sensitive_call = session_prompt_tool_name_mentioned(&message.content);
-            let is_result = matches!(message.role.as_str(), "tool" | "user");
-            let redact = is_sensitive_call || (redact_next_result && is_result);
+            let is_native_result = message.role == "tool";
+            let is_text_protocol_result = message.role == "user";
+            let redact = is_sensitive_call
+                || (redact_native_tool_results && is_native_result)
+                || (redact_text_protocol_result && is_text_protocol_result);
 
             if message.role == "assistant" {
-                redact_next_result = is_sensitive_call;
-            } else if is_result {
-                redact_next_result = false;
+                // Provider adapters may retain JSON itself or its escaped text
+                // representation, so test the stable field name after the
+                // message is already known to name a sensitive tool.
+                let native_batch = message.content.contains("tool_calls");
+                redact_native_tool_results = is_sensitive_call && native_batch;
+                redact_text_protocol_result = is_sensitive_call && !native_batch;
+            } else if is_text_protocol_result {
+                redact_text_protocol_result = false;
             }
 
             if redact {
@@ -157,6 +170,17 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
             }
         })
         .collect()
+}
+
+/// Redact a text-protocol provider response before it crosses an export
+/// boundary. Native tool calls are represented separately, but this response
+/// string may contain a complete XML tool call including an attachment body.
+pub(crate) fn redact_session_prompt_text_protocol_for_export(content: &str) -> Cow<'_, str> {
+    if session_prompt_tool_name_mentioned(content) {
+        Cow::Borrowed(SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER)
+    } else {
+        Cow::Borrowed(content)
+    }
 }
 
 /// Native tool-call snapshots retain the tool name separately, but text
@@ -1739,5 +1763,39 @@ mod tests {
                 .iter()
                 .all(|message| !message.content.contains(marker))
         );
+    }
+
+    #[test]
+    fn export_copy_redacts_every_result_from_a_mixed_sensitive_batch() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{"tool_calls":[{{"name":"shell","arguments":{{}}}},{{"name":"session_prompt_list","arguments":{{}}}}]}}"#
+            )),
+            ChatMessage::tool("shell output"),
+            ChatMessage::tool(format!("prompt list: {marker}")),
+            ChatMessage::assistant("next model response"),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert!(
+            export
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "every result from a mixed sensitive batch is an export boundary"
+        );
+        assert_eq!(export[4].content, "ordinary next-turn input");
+    }
+
+    #[test]
+    fn text_protocol_export_redactor_omits_prompt_tool_bodies() {
+        let marker = "session-prompt-private-marker";
+        let response = format!(
+            r#"<tool_call>{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}</tool_call>"#
+        );
+        let export = redact_session_prompt_text_protocol_for_export(&response);
+        assert!(!export.contains(marker));
+        assert!(export.contains("omitted from export"));
     }
 }

@@ -26,7 +26,8 @@ pub(crate) async fn gate_tool_approval(
     tool_args: &serde_json::Value,
     iteration: usize,
 ) -> ApprovalGateOutcome {
-    if is_session_prompt_mutation(tool_name) && ctx.session_prompt_approval_required {
+    let session_prompt_mutation = is_session_prompt_mutation(tool_name);
+    if session_prompt_mutation && ctx.session_prompt_approval_required {
         return gate_session_prompt_approval(ctx, tool_name, tool_args).await;
     }
 
@@ -116,7 +117,25 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, &approval_args, &decision, &decision_channel);
+        // A replacement is provider-visible working context, but the approval
+        // audit is an export. Preserve the decision kind without retaining a
+        // replacement body for a session-prompt mutation.
+        let audit_decision = if session_prompt_mutation {
+            match decision {
+                ApprovalResponse::ReplaceWith(_) => ApprovalResponse::ReplaceWith(
+                    "[Session-prompt replacement omitted from export]".to_string(),
+                ),
+                _ => decision.clone(),
+            }
+        } else {
+            decision.clone()
+        };
+        mgr.record_decision(
+            tool_name,
+            &approval_args,
+            &audit_decision,
+            &decision_channel,
+        );
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -220,7 +239,11 @@ pub(crate) async fn gate_tool_approval(
                         "tool": tool_name,
                         "arguments": scrub_credentials(&approval_args.to_string()),
                         "replaced": true,
-                        "output": scrub_credentials(replacement),
+                        "output": if session_prompt_mutation {
+                            "[Session-prompt replacement omitted from export]".to_string()
+                        } else {
+                            scrub_credentials(replacement)
+                        },
                         "trace_id": ctx.turn_id,
                     })),
                 "tool_call_result"
@@ -521,6 +544,9 @@ mod tests {
         for response in [
             Some(ChannelApprovalResponse::Approve),
             Some(ChannelApprovalResponse::Deny),
+            Some(ChannelApprovalResponse::DenyWithEdit {
+                replacement: format!("replacement: {marker}"),
+            }),
             None,
         ] {
             let channel = CapturingApprovalChannel {
@@ -582,10 +608,10 @@ mod tests {
             );
             assert!(request.raw_arguments.as_ref().unwrap()["content_sha256"].is_string());
             assert!(
-                approval
-                    .audit_log()
-                    .iter()
-                    .all(|entry| !entry.arguments_summary.contains(marker)),
+                approval.audit_log().iter().all(|entry| {
+                    !entry.arguments_summary.contains(marker)
+                        && !format!("{:?}", entry.decision).contains(marker)
+                }),
                 "approval audit must not receive the opaque body"
             );
         }

@@ -10,7 +10,9 @@ use super::protocol_detect::{
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
 use crate::agent::cost::record_tool_loop_cost_usage;
-use crate::agent::loop_::capture_llm_messages;
+use crate::agent::{
+    loop_::capture_llm_messages, prompt::redact_session_prompt_text_protocol_for_export,
+};
 use crate::observability::ObserverEvent;
 use std::time::Instant;
 use zeroclaw_api::agent::TurnEvent;
@@ -319,7 +321,9 @@ pub(crate) async fn record_accepted_chat_response(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "cost_usd": cost_usd,
-                "raw_response": scrub_credentials(response_text),
+                "raw_response": scrub_credentials(
+                    &redact_session_prompt_text_protocol_for_export(response_text),
+                ),
                 "native_tool_calls": native_tool_calls.len(),
                 "parsed_tool_calls": parsed_tool_calls,
                 "trace_id": ctx.turn_id,
