@@ -14700,10 +14700,21 @@ mod tests {
             let (dispatcher, sessions, chat_backend, acp_store) =
                 make_persistence_test_dispatcher(config, &data_dir);
 
-            let sid = format!("acp-removal-{removal:?}").to_ascii_lowercase();
-            acp_store
-                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
-                .unwrap();
+            // Chat deletion owns the durable Chat backend, while close and
+            // kill also support ACP's separate lifecycle. Keep each path in
+            // its owned storage domain; forcing ACP through session/delete is
+            // deliberately rejected by the v1 Chat-only contract.
+            let chat_mode = if matches!(removal, Removal::Delete) {
+                crate::rpc::types::ChatMode::Chat
+            } else {
+                crate::rpc::types::ChatMode::Acp
+            };
+            let sid = format!("{chat_mode:?}-removal-{removal:?}").to_ascii_lowercase();
+            if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+                acp_store
+                    .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
+                    .unwrap();
+            }
             let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
             let agent = crate::agent::agent::Agent::builder()
@@ -14728,7 +14739,7 @@ mod tests {
                         agent,
                         "test-agent",
                         tmp.path().to_str().unwrap(),
-                        crate::rpc::types::ChatMode::Acp,
+                        chat_mode.clone(),
                     ),
                 )
                 .await
@@ -14736,7 +14747,7 @@ mod tests {
 
             // Hold admission so both operations queue deterministically. The
             // prompt registers first; the removal must remain behind it until
-            // that ACP incarnation has finalized all durable work.
+            // that session incarnation has finalized all durable work.
             let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
             let prompt_handle = dispatcher.spawn_handle();
             let sid_for_prompt = sid.clone();
@@ -14744,7 +14755,7 @@ mod tests {
                 prompt_handle
                     .handle_session_prompt(&json!({
                         "session_id": sid_for_prompt,
-                        "prompt": "blocked ACP turn",
+                        "prompt": "blocked session turn",
                     }))
                     .await
             });
@@ -14788,26 +14799,23 @@ mod tests {
                 !removal_task.is_finished(),
                 "{removal:?} must not remove an incarnation that still owns admission"
             );
-            assert_eq!(
-                sessions.chat_mode(&sid).await,
-                Some(crate::rpc::types::ChatMode::Acp)
-            );
+            assert_eq!(sessions.chat_mode(&sid).await, Some(chat_mode));
 
             drop(admission_guard);
             started_rx
                 .recv()
                 .await
-                .expect("the queued ACP prompt must run before removal");
+                .expect("the queued prompt must run before removal");
             assert!(
                 !removal_task.is_finished(),
-                "{removal:?} must wait while the ACP provider is blocked"
+                "{removal:?} must wait while the provider is blocked"
             );
             release_tx.send(()).unwrap();
 
             let prompt_result = prompt_task.await.expect("prompt task must not panic");
             assert!(
                 prompt_result.is_ok(),
-                "ACP prompt should finalize before {removal:?}: {prompt_result:?}"
+                "prompt should finalize before {removal:?}: {prompt_result:?}"
             );
             let removal_result = removal_task.await.expect("removal task must not panic");
             assert!(
@@ -14836,7 +14844,7 @@ mod tests {
             assert!(replacement_state.turn_id.is_none());
             assert!(
                 chat_backend.load(&key).is_empty(),
-                "old ACP turn must not contaminate Chat transcript after {removal:?}"
+                "old session turn must not contaminate its replacement after {removal:?}"
             );
         }
     }
