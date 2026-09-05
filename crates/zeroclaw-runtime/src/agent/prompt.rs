@@ -5,11 +5,16 @@ use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
 use chrono::{Datelike, Local};
-use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
+use std::{borrow::Cow, collections::HashSet, sync::LazyLock};
 use zeroclaw_config::schema::IdentityConfig;
 use zeroclaw_providers::ChatMessage;
+use zeroclaw_tool_call_parser::{
+    ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
+    looks_like_malformed_json_tool_invocation, looks_like_malformed_tool_protocol_envelope,
+    tool_protocol_envelope_mentions_known_tool,
+};
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
 /// selects host-owned descriptive semantics; it never carries prompt prose or
@@ -145,10 +150,13 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 || (redact_text_protocol_result && is_text_protocol_result);
 
             if message.role == "assistant" {
-                // Provider adapters may retain JSON itself or its escaped text
-                // representation, so test the stable field name after the
-                // message is already known to name a sensitive tool.
-                let native_batch = message.content.contains("tool_calls");
+                // The runtime parser accepts both native JSON envelopes and
+                // text-protocol calls. The latter includes the plural
+                // `<tool_calls>` XML wrapper, whose text happens to contain
+                // `tool_calls` but whose following result is a `user` message.
+                // Derive result sequencing from the parsed envelope kind rather
+                // than a substring so export copies follow execution semantics.
+                let native_batch = session_prompt_native_tool_call_envelope(&message.content);
                 redact_native_tool_results = is_sensitive_call && native_batch;
                 redact_text_protocol_result = is_sensitive_call && !native_batch;
             } else if is_text_protocol_result {
@@ -187,16 +195,81 @@ pub(crate) fn redact_session_prompt_text_protocol_for_export(content: &str) -> C
 /// Identify a session-prompt invocation embedded in a provider tool envelope.
 ///
 /// Mentioning a tool name in normal user, assistant, or system prose is not a
-/// sensitive exchange. Provider adapters may retain native JSON as literal or
-/// escaped text, while malformed XML is still a log-sensitive tool envelope.
+/// sensitive exchange. The runtime parser is the source of truth for accepted
+/// call formats. A malformed tool invocation is withheld at export boundaries
+/// without tool-name recovery: a truncated name cannot safely prove whether
+/// opaque arguments came from a session-prompt call. This intentionally hides
+/// malformed ordinary tool diagnostics, but never changes parsing or provider
+/// history.
 pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool {
-    let has_tool_envelope = content.contains("<tool_call")
-        || content.contains("\"tool_calls\"")
-        || content.contains("\\\"tool_calls\\\"");
-    has_tool_envelope
-        && zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+    let malformed_xml_session_prompt_envelope = {
+        let lower = content.to_ascii_lowercase();
+        let names_session_prompt_tool = zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
             .iter()
-            .any(|name| content.contains(name))
+            .any(|name| lower.contains(name));
+        names_session_prompt_tool && contains_malformed_tool_call_tag_lower(&lower)
+    };
+
+    tool_protocol_envelope_mentions_known_tool(content, session_prompt_tool_names())
+        || escaped_json_tool_protocol(content).is_some_and(|decoded| {
+            tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
+        })
+        || malformed_xml_session_prompt_envelope
+        || looks_like_malformed_tool_protocol_envelope(content)
+        || looks_like_malformed_json_tool_invocation(content, session_prompt_tool_names())
+        || transport_escaped_json_candidate(content).is_some_and(|decoded| {
+            looks_like_malformed_tool_protocol_envelope(&decoded)
+                || looks_like_malformed_json_tool_invocation(&decoded, session_prompt_tool_names())
+        })
+}
+
+fn session_prompt_tool_names() -> &'static HashSet<String> {
+    static SESSION_PROMPT_TOOL_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+        zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect()
+    });
+    &SESSION_PROMPT_TOOL_NAMES
+}
+
+fn contains_malformed_tool_call_tag_lower(lower: &str) -> bool {
+    lower.contains("<tool_call") || lower.contains("<toolcall") || lower.contains("<tool-call")
+}
+
+fn session_prompt_native_tool_call_envelope(content: &str) -> bool {
+    let classify = |candidate: &str| {
+        matches!(
+            classify_tool_protocol_envelope(candidate),
+            Some(
+                ToolProtocolEnvelopeKind::ToolCalls
+                    | ToolProtocolEnvelopeKind::ToolCallsAlias
+                    | ToolProtocolEnvelopeKind::FunctionCall
+                    | ToolProtocolEnvelopeKind::ResponsesFunctionCall
+            )
+        )
+    };
+
+    classify(content)
+        || escaped_json_tool_protocol(content).is_some_and(|decoded| classify(&decoded))
+}
+
+/// Normalize a transport-escaped JSON fragment only when it becomes one
+/// complete JSON value. This is not a second parser: the shared tool parser
+/// still decides whether the normalized value is an accepted call.
+fn escaped_json_tool_protocol(content: &str) -> Option<String> {
+    let decoded = transport_escaped_json_candidate(content)?;
+    serde_json::from_str::<serde_json::Value>(&decoded).ok()?;
+    Some(decoded)
+}
+
+/// Normalize the transport quoting recognized by this runtime without claiming
+/// that the result is complete JSON. Export-only malformed-envelope redaction
+/// must inspect this candidate before the accepted-call path rejects it.
+fn transport_escaped_json_candidate(content: &str) -> Option<String> {
+    content
+        .contains(r#"\""#)
+        .then(|| content.replace(r#"\""#, "\""))
 }
 
 /// Whether a tool belongs in the model-visible catalog for this turn.
@@ -1738,6 +1811,13 @@ mod tests {
             ChatMessage::user("ordinary follow-up"),
         ];
 
+        assert!(escaped_json_tool_protocol(&messages[0].content).is_some());
+        assert!(session_prompt_tool_call_envelope_mentioned(
+            &messages[0].content
+        ));
+        assert!(session_prompt_native_tool_call_envelope(
+            &messages[0].content
+        ));
         let export = redact_session_prompt_tool_exchanges_for_export(&messages);
         assert!(
             export
@@ -1771,6 +1851,194 @@ mod tests {
                 .iter()
                 .all(|message| !message.content.contains(marker))
         );
+    }
+
+    #[test]
+    fn export_copy_redacts_bare_json_prompt_call_and_only_its_text_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{marker}"}}}}"#
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\\n<tool_result name=\"session_prompt_set\">{marker}</tool_result>"
+            )),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+
+        assert!(
+            export[..2]
+                .iter()
+                .all(|message| !message.content.contains(marker))
+        );
+        assert_eq!(export[2].content, "ordinary next-turn input");
+        assert!(
+            !redact_session_prompt_text_protocol_for_export(&messages[0].content).contains(marker)
+        );
+    }
+
+    #[test]
+    fn export_copy_preserves_business_json_named_like_a_session_prompt_tool() {
+        let business_json =
+            r#"{"name":"session_prompt_set","description":"Document this identifier for users"}"#;
+        let messages = vec![
+            ChatMessage::assistant(business_json),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert_eq!(export[0].content, business_json);
+        assert_eq!(export[1].content, "ordinary next-turn input");
+        assert_eq!(
+            redact_session_prompt_text_protocol_for_export(business_json),
+            business_json
+        );
+    }
+
+    #[test]
+    fn export_copy_redacts_call_id_only_responses_prompt_list_and_native_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            ),
+            ChatMessage::tool(format!("prompt list: {marker}")),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert!(
+            export[..2]
+                .iter()
+                .all(|message| !message.content.contains(marker))
+        );
+        assert_eq!(export[2].content, "ordinary next-turn input");
+    }
+
+    #[test]
+    fn export_copy_redacts_malformed_json_session_prompt_envelope() {
+        let marker = "session-prompt-private-marker";
+        let malformed = format!(
+            r#"{{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{marker}"}}}}]"#
+        );
+
+        assert!(session_prompt_tool_call_envelope_mentioned(&malformed));
+        assert!(
+            !redact_session_prompt_text_protocol_for_export(&malformed).contains(marker),
+            "parse-rejection exports must not expose opaque session-prompt content"
+        );
+
+        let ordinary_malformed = r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"pwd"}}]"#;
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(ordinary_malformed),
+            "malformed tool invocations are redacted at export boundaries even when their name is not sensitive"
+        );
+        assert!(
+            !redact_session_prompt_text_protocol_for_export(ordinary_malformed).contains("pwd"),
+            "the fail-closed malformed-tool boundary must redact ordinary tool arguments too"
+        );
+
+        let escaped_name = format!(
+            r#"{{"tool_calls":[{{"name":"session_prompt_\u0073et","arguments":{{"content":"{marker}"}}}}]"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&escaped_name),
+            "JSON-equivalent session-prompt names must remain redacted after parse failure"
+        );
+
+        let shell_argument_mention =
+            r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"echo session_prompt_set"}}]"#;
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(shell_argument_mention),
+            "the malformed-tool export boundary is name-independent"
+        );
+
+        let responses_whitespace = format!(
+            r#"{{"type": "function_call", "name": "session_prompt_set", "arguments": "{{\"content\":\"{marker}\"}}""#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&responses_whitespace),
+            "whitespace in a malformed Responses envelope must not expose session-prompt content"
+        );
+
+        let escaped_structural_keys = format!(
+            r#"{{"tool_\u0063alls":[{{"na\u006de":"session_prompt_set","argu\u006dents":{{"content":"{marker}"}}}}]"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&escaped_structural_keys),
+            "escaped structural keys in a malformed envelope must retain redaction"
+        );
+
+        let arguments_before_unterminated_name = format!(
+            r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"session_prompt_set"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&arguments_before_unterminated_name),
+            "a truncated sensitive name after opaque arguments must retain redaction"
+        );
+
+        let unterminated_name_with_closers = format!(
+            r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"session_prompt_set}}]}}"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&unterminated_name_with_closers),
+            "structural closers after a truncated sensitive name must retain redaction"
+        );
+
+        let unterminated_name_with_closers_and_prose = format!(
+            r#"{{"tool_calls":[{{"arguments":{{"content":"{marker}"}},"name":"session_prompt_set}}]}} Done"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&unterminated_name_with_closers_and_prose),
+            "trailing prose after a truncated sensitive name must retain redaction"
+        );
+
+        let truncated_responses_discriminator = format!(
+            r#"{{"name":"session_prompt_set","arguments":"{{\"content\":\"{marker}\"}}","type":"function_call"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&truncated_responses_discriminator),
+            "a truncated Responses discriminator after sensitive arguments must retain redaction"
+        );
+
+        let malformed_transport_escaped = format!(
+            r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{marker}\"}}}}]"#
+        );
+        assert!(
+            session_prompt_tool_call_envelope_mentioned(&malformed_transport_escaped),
+            "malformed transport-escaped session-prompt calls must retain redaction"
+        );
+    }
+
+    #[test]
+    fn export_copy_redacts_toolcall_alias_and_plural_wrapper_results_as_text_protocol() {
+        let marker = "session-prompt-private-marker";
+        for call in [
+            format!(
+                r#"<toolcall>{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{marker}"}}}}</toolcall>"#
+            ),
+            format!(
+                r#"<tool_calls>\n{{"name":"session_prompt_list","arguments":{{"marker":"{marker}"}}}}\n</tool_calls>"#
+            ),
+        ] {
+            let messages = vec![
+                ChatMessage::assistant(call),
+                ChatMessage::user(format!(
+                    "[Tool results]\\n<tool_result name=\"session_prompt_list\">{marker}</tool_result>"
+                )),
+                ChatMessage::user("ordinary next-turn input"),
+            ];
+
+            let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+            assert!(
+                export[..2]
+                    .iter()
+                    .all(|message| !message.content.contains(marker))
+            );
+            assert_eq!(export[2].content, "ordinary next-turn input");
+        }
     }
 
     #[test]

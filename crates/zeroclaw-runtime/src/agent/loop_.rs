@@ -16358,6 +16358,89 @@ Let me check the result."#;
 
     #[cfg(feature = "observability-otel")]
     #[test]
+    fn capture_llm_messages_redacts_supported_session_prompt_envelopes_and_results() {
+        const MARKER: &str = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{MARKER}\"}}}}]}}"#
+            )),
+            ChatMessage::tool(format!("native tool result: {MARKER}")),
+            ChatMessage::assistant(format!(
+                r#"{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}"#
+            )),
+            ChatMessage::user(format!("bare JSON result: {MARKER}")),
+            ChatMessage::assistant(format!(
+                r#"<toolcall>{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}</toolcall>"#
+            )),
+            ChatMessage::user(format!("text tool result: {MARKER}")),
+            ChatMessage::assistant(
+                r#"<tool_calls>{"name":"session_prompt_list","arguments":{}}</tool_calls>"#,
+            ),
+            ChatMessage::user(format!("plural wrapper result: {MARKER}")),
+            ChatMessage::assistant(
+                r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            ),
+            ChatMessage::tool(format!("call-id-only list result: {MARKER}")),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let malformed_outputs = [
+            format!(
+                r#"{{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"type": "function_call", "name": "session_prompt_set", "arguments": "{{\"content\":\"{MARKER}\"}}""#
+            ),
+            format!(
+                r#"{{"tool_\u0063alls":[{{"na\u006de":"session_prompt_\u0073et","argu\u006dents":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}}"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}} Done"#
+            ),
+            format!(
+                r#"{{"name":"session_prompt_set","arguments":"{{\"content\":\"{MARKER}\"}}","type":"function_call"#
+            ),
+            format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{MARKER}\"}}}}]"#
+            ),
+        ];
+        let snap =
+            super::capture_llm_messages(&messages, Some(&malformed_outputs[0]), &[]).expect("Some");
+
+        assert!(
+            snap.input
+                .iter()
+                .all(|message| !message.content.contains(MARKER)),
+            "snapshot input must not expose session-prompt content: {:#?}",
+            snap.input
+        );
+        assert_eq!(
+            snap.input.last().map(|message| message.content.as_str()),
+            Some("ordinary next-turn input"),
+            "the redaction boundary must not remove later ordinary input"
+        );
+        for malformed_output in malformed_outputs {
+            let snap =
+                super::capture_llm_messages(&messages, Some(&malformed_output), &[]).expect("Some");
+            assert!(
+                !snap
+                    .output_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(MARKER),
+                "malformed-tool parse-rejection output must not expose session-prompt content"
+            );
+        }
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
     fn capture_llm_messages_empty_output_and_no_system() {
         let messages = vec![ChatMessage::user("hi")];
         let snap = super::capture_llm_messages(&messages, Some(""), &[]).expect("Some");
