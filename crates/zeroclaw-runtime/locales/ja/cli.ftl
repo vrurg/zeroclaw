@@ -975,78 +975,8 @@ cli-daemon-started-gateway = ゲートウェイ: {$url}
 cli-daemon-started-socket = ソケット:     {$path}
 cli-daemon-started-pairing = ペアリング: 有効（現在の状態は上のゲートウェイ出力を確認してください）
 cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
-cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
-cli-agent-context-bar-unknown = ctx: 不明 / {$max}
-cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
-cli-doctor-ctxwin-no-model = {$provider_ref}: モデルが未設定のためスキップ
-cli-doctor-ctxwin-would-set = {$provider_ref}: context_window = {$ctx} を設定します (ドライラン)
-cli-doctor-ctxwin-set = {$provider_ref}: context_window = {$ctx} を設定しました
-cli-doctor-ctxwin-not-found = {$provider_ref}: 更新対象のエントリが見つかりません
-cli-doctor-ctxwin-fetch-failed = {$provider_ref}: コンテキストウィンドウを公開していないか、取得に失敗しました
-cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しました
-cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
-cli-doctor-ctxwin-none = 更新は必要ありません。
-cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
-cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン
-cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
-cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
-
-# Doctor probe timeout warning — shown when model probing times out but prior
-# diagnostics (config, workspace, daemon) are preserved and returned.
-cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
-
-# ── Degraded config sections (doctor diagnose, #8835) ──
-cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
-cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
-sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
-sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
-sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
-sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステップを解決する権限がありません。
-sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
-sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
-
-# ── ターミナルでのツール承認 ──
-# ASCII ショートカットは Rust 側の応答パーサーと一致させます。
-cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
-cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
 cli-approval-prompt-yesno = { "   " }[Y] はい / [N] いいえ:{ " " }
-
-# ── Tool approval (channels, #9409) ──
-# Human-visible copy for the operator-facing tool-approval prompt, shared
-# across the button adapters (Telegram, Discord, Slack) and the text-reply
-# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
-# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
-# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
-# always) stay hardcoded ASCII in Rust — only the surrounding prose is
-# localized here.
-channel-approval-heading = ツールの承認が必要です
-channel-approval-heading-shout = 承認が必要です
-channel-approval-tool-label = ツール
-channel-approval-args-label = 引数
-channel-approval-btn-approve = 承認
-channel-approval-btn-deny = 拒否
-channel-approval-btn-always = 常に
-channel-approval-tap-instruction = 下のボタンをタップしてください：
-channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
-channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
-channel-approval-group-visibility-warning =
-    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
-channel-telegram-approval-ack-approved = 承認しました
-channel-telegram-approval-ack-always-approved = 常に承認しました
-channel-telegram-approval-ack-denied = 拒否しました
-channel-telegram-approval-ack-not-accepted = 承認は受け付けられませんでした
-channel-telegram-approval-ack-unknown = 不明な操作です
-channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
-channel-discord-approval-btn-allow-once = 今回のみ許可
-channel-discord-approval-btn-allow-session = このセッションのみ許可
-channel-discord-approval-btn-allow-always = 常に許可
-channel-approval-title = { $tool } を承認しますか？
-channel-approval-opt-allow-once = 今回のみ許可
-channel-approval-opt-allow-always = 常に許可
-channel-approval-opt-reject = 拒否
-channel-approval-opt-reject-with-edit = 編集して拒否
 channel-runtime-session-prompt-budget-exceeded = ⚠️ 永続セッションコンテキストがシステムプロンプトの上限を超えているため、このリクエストはモデルに送信されませんでした。
-# ── Agent vision capability errors ──
 cli-relay-rotation-requested = リレー node-id のローテーションを要求しました。実行中のデーモンは~{$secs}s以内にローテーションします。新しい ID は、次回の証明書更新時にインバンドでクライアントへ届きます。
 cli-mtls-issued-client-cert = クライアント証明書を '{$name}' 用に発行しました:
 cli-mtls-issued-cert-path = {"  "}cert: {$path}

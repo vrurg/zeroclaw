@@ -976,78 +976,8 @@ cli-daemon-started-gateway = Gateway:  {$url}
 cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = 配对：已启用（当前状态请查看上方 gateway 输出）
 cli-daemon-started-stop = 按 Ctrl+C 或发送 SIGTERM 停止
-cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
-cli-agent-context-bar-unknown = ctx: 未知 / {$max}
-cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
-cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
-cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
-cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
-cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
-cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
-cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
-cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
-cli-doctor-ctxwin-none = 无需更新。
-cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
-cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
-cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
-cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
-
-# Doctor probe timeout warning — shown when model probing times out but prior
-# diagnostics (config, workspace, daemon) are preserved and returned.
-cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
-
-# ── Degraded config sections (doctor diagnose, #8835) ──
-cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
-cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
-sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
-sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
-sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
-sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
-sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
-sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
-
-# ── 终端工具审批 ──
-# ASCII 快捷键与 Rust 响应解析器保持一致。
-cli-approval-request = 🔧 代理想要执行：{$tool}
-cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
 cli-approval-prompt-yesno = { "   " }[Y] 是 / [N] 否：{ " " }
-
-# ── Tool approval (channels, #9409) ──
-# Human-visible copy for the operator-facing tool-approval prompt, shared
-# across the button adapters (Telegram, Discord, Slack) and the text-reply
-# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
-# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
-# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
-# always) stay hardcoded ASCII in Rust — only the surrounding prose is
-# localized here.
-channel-approval-heading = 需要工具批准
-channel-approval-heading-shout = 需要批准
-channel-approval-tool-label = 工具
-channel-approval-args-label = 参数
-channel-approval-btn-approve = 批准
-channel-approval-btn-deny = 拒绝
-channel-approval-btn-always = 始终
-channel-approval-tap-instruction = 点击下方按钮：
-channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
-channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
-channel-approval-group-visibility-warning =
-    这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
-channel-telegram-approval-ack-approved = 已批准
-channel-telegram-approval-ack-always-approved = 已始终批准
-channel-telegram-approval-ack-denied = 已拒绝
-channel-telegram-approval-ack-not-accepted = 审批未被接受
-channel-telegram-approval-ack-unknown = 未知操作
-channel-telegram-approval-ack-already-resolved = 审批已被处理
-channel-discord-approval-btn-allow-once = 仅本次允许
-channel-discord-approval-btn-allow-session = 本会话允许
-channel-discord-approval-btn-allow-always = 始终允许
-channel-approval-title = 批准 { $tool }？
-channel-approval-opt-allow-once = 仅本次允许
-channel-approval-opt-allow-always = 始终允许
-channel-approval-opt-reject = 拒绝
-channel-approval-opt-reject-with-edit = 编辑后拒绝
 channel-runtime-session-prompt-budget-exceeded = ⚠️ 持久会话上下文超出了系统提示词预算，因此此请求未发送给模型。
-# ── Agent vision capability errors ──
 cli-relay-rotation-requested = 已请求轮换中继 node-id。正在运行的守护进程将在 ~{$secs}s 内完成轮换；新 ID 将在客户端下次续订证书时通过带内方式传达。
 cli-mtls-issued-client-cert = 已为 '{$name}' 签发客户端证书：
 cli-mtls-issued-cert-path = {"  "}证书: {$path}
