@@ -775,7 +775,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         )
         .await
         .unwrap();
-    let GoalResponse::Started(started) = controller.submit(&settings, start).await.unwrap() else {
+    let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
         panic!("expected a started Goal");
     };
     assert_eq!(started.execution_epoch, 1);
@@ -784,7 +784,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
         .await
         .unwrap();
-    let GoalResponse::Paused(paused) = controller.submit(&settings, pause).await.unwrap() else {
+    let GoalResponse::Paused(paused) = controller.submit(&settings, &pause).await.unwrap() else {
         panic!("expected a paused Goal");
     };
     assert_eq!(paused.execution_epoch, 2);
@@ -793,7 +793,8 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .submit(ingress.clone(), driver.clone(), GoalCommand::Resume)
         .await
         .unwrap();
-    let GoalResponse::Resumed(resumed) = controller.submit(&settings, resume).await.unwrap() else {
+    let GoalResponse::Resumed(resumed) = controller.submit(&settings, &resume).await.unwrap()
+    else {
         panic!("expected a resumed Goal");
     };
     assert_eq!(resumed.execution_epoch, 3);
@@ -803,7 +804,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, cancel).await.unwrap(),
+        controller.submit(&settings, &cancel).await.unwrap(),
         GoalResponse::Cancelled(_)
     ));
 }
@@ -838,7 +839,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, start).await.unwrap(),
+        controller.submit(&settings, &start).await.unwrap(),
         GoalResponse::Started(_)
     ));
 
@@ -853,7 +854,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, status).await.unwrap(),
+        controller.submit(&settings, &status).await.unwrap(),
         GoalResponse::Status(_)
     ));
 
@@ -866,7 +867,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, cancel).await.unwrap(),
+        controller.submit(&settings, &cancel).await.unwrap(),
         GoalResponse::Cancelled(_)
     ));
 
@@ -882,7 +883,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, replacement).await.unwrap(),
+        controller.submit(&settings, &replacement).await.unwrap(),
         GoalResponse::Started(_)
     ));
 }
@@ -917,7 +918,7 @@ async fn session_lease_blocks_reconnect_until_controller_returns() {
         "the host must retain the driver's session lease"
     );
     assert!(matches!(
-        controller.submit(&settings, submission).await.unwrap(),
+        controller.submit(&settings, &submission).await.unwrap(),
         GoalResponse::Disabled
     ));
     assert!(
@@ -955,7 +956,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         .await
         .unwrap();
 
-    let GoalResponse::Paused(_) = controller.submit(&settings, submission).await.unwrap() else {
+    let GoalResponse::Paused(_) = controller.submit(&settings, &submission).await.unwrap() else {
         panic!("expected a paused Goal");
     };
     assert_eq!(registry.pause_observed.load(Ordering::SeqCst), 1);
