@@ -10,7 +10,9 @@ use super::outcome::{
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
-use crate::agent::cost::check_tool_loop_budget;
+use crate::agent::cost::{
+    GoalOperationRequest, admit_goal_operation_if_scoped, check_tool_loop_budget,
+};
 use crate::cost::types::BudgetCheck;
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
@@ -158,6 +160,8 @@ pub(crate) async fn call_provider(
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
+    admit_goal_operation_if_scoped(GoalOperationRequest::new(ctx.provider_name, active_model))
+        .await?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
