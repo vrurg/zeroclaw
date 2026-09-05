@@ -393,13 +393,18 @@ pub(crate) async fn record_accepted_chat_response(
         turn_id: Some(ctx.turn_id.to_string()),
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
-    let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    let cost_usd = (!crate::agent::cost::goal_operation_accounting_is_scoped())
+        .then(|| {
+            usage
+                .and_then(|usage| {
+                    record_tool_loop_cost_usage(effective_provider, effective_model, usage)
+                })
+                .map(|(_total_tokens, cost_usd)| cost_usd)
+        })
+        .flatten();
     // Exactly-one per accepted response, even when the provider returned no
-    // usage data, so terminal identity and context-window accounting always
-    // describe the accepted serving provider/model. The caller settles
-    // rejected physical attempts separately and never reaches this point.
+    // usage data, so terminal identity and context-window accounting remain
+    // coherent. Goal accounting settles the accepted attempt separately.
     if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
