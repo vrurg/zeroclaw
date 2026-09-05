@@ -216,6 +216,7 @@ impl CostTracker {
             usage,
             agent_alias,
             task_id,
+            None,
             conversation_id,
             true,
             File::sync_all,
@@ -231,6 +232,29 @@ impl CostTracker {
         self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, false)
     }
 
+    /// Persist a task-scoped event with the actual configured provider route,
+    /// even when ordinary cost tracking is disabled.
+    pub fn record_scoped_usage_with_owned_task_and_provider_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: impl Into<String>,
+    ) -> Result<()> {
+        let provider_ref = provider_ref.into();
+        anyhow::ensure!(
+            !provider_ref.trim().is_empty(),
+            "Task-scoped usage provider reference must be nonblank"
+        );
+        self.record_usage_with_owned_task_attribution_inner_with_provider(
+            usage,
+            agent_alias,
+            task_id,
+            Some(provider_ref),
+            false,
+        )
+    }
+
     fn record_usage_with_owned_task_attribution_inner(
         &self,
         usage: TokenUsage,
@@ -238,10 +262,28 @@ impl CostTracker {
         task_id: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_provider(
+            usage,
+            agent_alias,
+            task_id,
+            None,
+            honor_enabled,
+        )
+    }
+
+    fn record_usage_with_owned_task_attribution_inner_with_provider(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: Option<String>,
+        honor_enabled: bool,
+    ) -> Result<()> {
         self.record_usage_with_owned_task_attribution_inner_with_sync(
             usage,
             agent_alias,
             task_id,
+            provider_ref,
             None,
             honor_enabled,
             File::sync_all,
@@ -253,6 +295,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
+        provider_ref: Option<String>,
         conversation_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
@@ -283,9 +326,14 @@ impl CostTracker {
         };
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
-        let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
-                .with_conversation_id(conversation_id);
+        let record = CostRecord::with_attribution_and_provider(
+            &self.session_id,
+            effective_alias.clone(),
+            task_id,
+            provider_ref,
+            usage,
+        )
+        .with_conversation_id(conversation_id);
 
         let mut storage = self.lock_storage();
         let append_outcome = storage.add_record_with_sync(record, sync_file)?;
@@ -1418,6 +1466,7 @@ mod tests {
                 None,
                 Some("task-a".to_string()),
                 None,
+                None,
                 true,
                 fail_sync,
             )
@@ -1676,6 +1725,33 @@ mod tests {
                 .0,
             2
         );
+    }
+
+    #[test]
+    fn scoped_task_usage_retains_the_actual_provider_route() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                TokenUsage::new("served-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+                "openai.fallback",
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let record: CostRecord = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record.task_id.as_deref(), Some("goal-a"));
+        assert_eq!(record.provider_ref.as_deref(), Some("openai.fallback"));
     }
 
     #[test]
