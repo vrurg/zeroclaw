@@ -1199,7 +1199,6 @@ mod streaming_fallback_tests {
         let pacing = PacingConfig::default();
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let ctx = TurnCtx {
             observer: &observer,
             provider_name: "test-provider",
@@ -1210,13 +1209,17 @@ mod streaming_fallback_tests {
             channel_reply_target: None,
             cancellation_token: Some(&token),
             on_delta: None,
-            event_tx: Some(&event_tx),
+            event_tx: None,
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
-            draft_reasoning: StreamReasoningMode::Status,
+            // This fixture exercises pre-output semantic-empty recovery. A
+            // forwarded reasoning update is caller-visible progress and must
+            // suppress replay; that boundary has dedicated coverage in
+            // `stream_consume`.
+            draft_reasoning: StreamReasoningMode::Off,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
@@ -1243,17 +1246,6 @@ mod streaming_fallback_tests {
             .expect("provider call returns its terminal outcome");
 
         assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
-        assert!(matches!(
-            event_rx
-                .try_recv()
-                .expect("reasoning event must be forwarded once"),
-            zeroclaw_api::agent::TurnEvent::Thinking { delta }
-                if delta == "private reasoning"
-        ));
-        assert!(
-            event_rx.try_recv().is_err(),
-            "reasoning must be forwarded once"
-        );
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 0);
         assert_eq!(recorded.output_tokens, 0);
