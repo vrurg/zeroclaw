@@ -136,6 +136,11 @@ impl GoalExecutionEngine {
     ) -> Result<GoalExecutionOutcome> {
         let mut working_history = lease.canonical_history()?;
         loop {
+            // The driver may return from a previously admitted parent call
+            // after a pause, cancellation, or replacement fenced this epoch.
+            // That call is allowed to settle its already-incurred usage, but
+            // its result must never admit a new parent or verifier operation.
+            self.exact_running_task(scope).await?;
             let candidate = match lease
                 .run_parent_turn(
                     &GoalOperationScope::new(scope.clone()),
@@ -156,6 +161,11 @@ impl GoalExecutionEngine {
                     return Err(error).context("Goal parent operation failed");
                 }
             };
+
+            // A lifecycle transition can race with the parent call above.
+            // Recheck the exact durable task and epoch before the verifier so
+            // a drained parent result cannot start a second model operation.
+            self.exact_running_task(scope).await?;
 
             let verifier = match lease
                 .run_verifier(
