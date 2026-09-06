@@ -13,10 +13,10 @@ use zeroclaw_runtime::control_plane::{
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
+    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
+    GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -1021,6 +1021,66 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
             .status,
         TaskStatus::Completed
     );
+}
+
+#[tokio::test]
+async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: delivered.clone(),
+        complete_verifier: true,
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    ));
+    let scope = request.scope().clone();
+
+    supervisor.launch(settings.clone(), request).await.unwrap();
+    assert!(
+        supervisor.owns_scope(&scope).await,
+        "an accepted epoch remains supervisor-owned until it is drained"
+    );
+    assert_eq!(
+        supervisor.drain(&scope).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+    );
+    assert!(!supervisor.owns_scope(&scope).await);
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
