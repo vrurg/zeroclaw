@@ -30,7 +30,7 @@ use zeroclaw_commands::goal::{
 
 mod goal_execution;
 
-pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome};
+pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor};
 
 /// Compose transient verifier feedback as untrusted user-role input.
 ///
@@ -833,7 +833,7 @@ fn require_canonical_nonblank(name: &str, value: &str) -> Result<()> {
 }
 
 /// Process-local settings already validated from the active Goal configuration.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GoalHostSettings {
     enabled: bool,
     default_limits: GoalBudgetLimits,
