@@ -4005,6 +4005,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: "2026-06-21T00:00:00Z".into(),
             finished_at: None,
         }
