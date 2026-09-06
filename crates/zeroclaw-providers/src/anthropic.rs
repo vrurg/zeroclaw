@@ -2574,9 +2574,9 @@ impl AnthropicModelProvider {
                     // not admit an index into lifecycle state until that
                     // envelope is valid: otherwise a matching stop could make
                     // malformed framing look like a clean completion.
-                    let block_type = event
-                        .get("content_block")
-                        .filter(|block| block.is_object())
+                    let content_block =
+                        event.get("content_block").filter(|block| block.is_object());
+                    let block_type = content_block
                         .and_then(|block| block.get("type"))
                         .and_then(serde_json::Value::as_str)
                         .filter(|kind| {
@@ -2591,6 +2591,26 @@ impl AnthropicModelProvider {
                                     | "mcp_tool_use"
                                     | "mcp_tool_result"
                             )
+                        })
+                        .filter(|kind| {
+                            // A recognized kind alone is not a valid start
+                            // frame. Require the fields this adapter owns
+                            // before recording lifecycle state, so a malformed
+                            // start cannot be paired with a later stop and
+                            // become `Final`.
+                            match *kind {
+                                "text" => content_block
+                                    .and_then(|block| block.get("text"))
+                                    .is_some_and(serde_json::Value::is_string),
+                                "thinking" => content_block
+                                    .and_then(|block| block.get("thinking"))
+                                    .is_some_and(serde_json::Value::is_string),
+                                "redacted_thinking" => content_block
+                                    .and_then(|block| block.get("data"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|data| !data.is_empty()),
+                                _ => true,
+                            }
                         });
                     let started = match (content_block_index, block_type) {
                         (Some(index), Some(block_type))
@@ -4563,7 +4583,15 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     #[tokio::test]
     async fn streaming_rejects_malformed_content_block_start_envelopes() {
-        for content_block in ["null", "[]", "{}", "{\"type\":7}", "{\"type\":\"future\"}"] {
+        for content_block in [
+            "null",
+            "[]",
+            "{}",
+            "{\"type\":7}",
+            "{\"type\":\"future\"}",
+            "{\"type\":\"text\",\"text\":7}",
+            "{\"type\":\"thinking\",\"thinking\":7}",
+        ] {
             assert_malformed_content_block_start_is_rejected(content_block).await;
         }
     }
@@ -4895,7 +4923,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         use std::io::Cursor;
 
         let bytes = b"event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"<think>internal\"}}\n\n\
 event: content_block_delta\n\
@@ -5065,7 +5093,7 @@ data: {"type":"content_block_stop","index":0}
         use std::io::Cursor;
 
         let bytes = b"event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"visible partial\"}}\n\n\
 event: content_block_stop\n\
@@ -5329,7 +5357,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let bytes = b"event: message_start\n\\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\\
 event: content_block_start\n\\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\\
 event: content_block_delta\n\\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\\
 event: content_block_stop\n\\
@@ -5448,7 +5476,7 @@ data: {\"type\":\"message_stop\"}\n\n";
 data: {{"type":"message_start","message":{{"usage":{{"input_tokens":10}}}}}}
 
 event: content_block_start
-data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text"}}}}
+data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}
 
 event: content_block_delta
 data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"<eom><|eom|>"}}}}

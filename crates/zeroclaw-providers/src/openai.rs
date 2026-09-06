@@ -77,12 +77,13 @@ impl ResponseMessage {
 /// reasoning-only result is therefore a typed terminal failure, not a valid
 /// string result for direct callers that do not use the structured chat API.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::normalize_terminal_display_text(&content).is_empty() {
+    let normalized = zeroclaw_api::model_provider::normalize_terminal_display_text(&content);
+    if normalized.is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));
     }
-    Ok(content)
+    Ok(normalized)
 }
 
 #[derive(Debug, Serialize)]
@@ -1976,6 +1977,14 @@ mod tests {
     fn string_completion_keeps_visible_text() {
         assert_eq!(
             require_terminal_text("final answer".to_string()).unwrap(),
+            "final answer"
+        );
+    }
+
+    #[test]
+    fn string_completion_removes_terminal_markers_for_direct_callers() {
+        assert_eq!(
+            require_terminal_text("final answer<eom><|eom|>".to_string()).unwrap(),
             "final answer"
         );
     }

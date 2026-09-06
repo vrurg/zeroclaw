@@ -55,7 +55,10 @@ enum StreamInterruptionCause {
         message: String,
         usage: Option<zeroclaw_providers::traits::TokenUsage>,
     },
-    Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
+    Terminal {
+        failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+        policy: zeroclaw_providers::TerminalCompletionPolicy,
+    },
     SemanticEmpty(zeroclaw_api::model_provider::SemanticEmptyTerminalFailure),
     ReliableProvider {
         message: String,
@@ -79,10 +82,11 @@ impl StreamInterruptedAfterOutput {
     pub(crate) fn terminal(
         partial_text: String,
         failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+        policy: zeroclaw_providers::TerminalCompletionPolicy,
     ) -> Self {
         Self {
             partial_text,
-            cause: StreamInterruptionCause::Terminal(failure),
+            cause: StreamInterruptionCause::Terminal { failure, policy },
         }
     }
 
@@ -123,9 +127,22 @@ impl StreamInterruptedAfterOutput {
     pub(crate) fn usage(&self) -> Option<&zeroclaw_providers::traits::TokenUsage> {
         match &self.cause {
             StreamInterruptionCause::Transport { usage, .. } => usage.as_ref(),
-            StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
+            StreamInterruptionCause::Terminal { failure, .. } => failure.usage.as_ref(),
             StreamInterruptionCause::SemanticEmpty(failure) => failure.usage.as_ref(),
             StreamInterruptionCause::ReliableProvider { usage, .. } => usage.as_ref(),
+        }
+    }
+
+    /// The terminal policy is still authoritative for rejected-usage
+    /// accounting after an immutable event prevents replay. In particular,
+    /// readable thinking progress does not make a no-final-text refusal
+    /// billable.
+    pub(crate) fn terminal_policy(&self) -> Option<zeroclaw_providers::TerminalCompletionPolicy> {
+        match &self.cause {
+            StreamInterruptionCause::Terminal { policy, .. } => Some(*policy),
+            StreamInterruptionCause::Transport { .. }
+            | StreamInterruptionCause::SemanticEmpty(_)
+            | StreamInterruptionCause::ReliableProvider { .. } => None,
         }
     }
 }
@@ -134,7 +151,7 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.cause {
             StreamInterruptionCause::Transport { message, .. } => f.write_str(message),
-            StreamInterruptionCause::Terminal(failure) => failure.fmt(f),
+            StreamInterruptionCause::Terminal { failure, .. } => failure.fmt(f),
             StreamInterruptionCause::SemanticEmpty(failure) => failure.fmt(f),
             StreamInterruptionCause::ReliableProvider { message, .. } => f.write_str(message),
         }
@@ -145,7 +162,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
             StreamInterruptionCause::Transport { .. } => None,
-            StreamInterruptionCause::Terminal(failure) => Some(failure),
+            StreamInterruptionCause::Terminal { failure, .. } => Some(failure),
             StreamInterruptionCause::SemanticEmpty(failure) => Some(failure),
             StreamInterruptionCause::ReliableProvider { failure, .. } => Some(failure),
         }
@@ -856,6 +873,7 @@ mod tests {
                     cached_input_tokens: None,
                 }),
             ),
+            zeroclaw_providers::default_terminal_policy(TerminalCompletionError::OutputTokenLimit),
         ));
 
         assert_eq!(

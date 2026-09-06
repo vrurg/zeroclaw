@@ -214,24 +214,6 @@ pub(crate) async fn consume_provider_streaming_response(
                 if let Some(failure) =
                     zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
                 {
-                    if visible_event_output {
-                        let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
-                            failure.reason,
-                            outcome.usage.clone().or(failure.usage),
-                        );
-                        return Err(StreamInterruptedAfterOutput::terminal(
-                            forwarded_text,
-                            failure,
-                        )
-                        .into());
-                    }
-                    if outcome.saw_pre_executed_tool_activity {
-                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
-                            usage: outcome.usage.clone().or(failure.usage.clone()),
-                            cause: Some(StreamPreExecutedToolsCause::Terminal(failure)),
-                        }
-                        .into());
-                    }
                     let mut policy = zeroclaw_providers::terminal_completion_context(&err)
                         .map(zeroclaw_providers::TerminalCompletionContext::policy)
                         .unwrap_or_else(|| {
@@ -242,6 +224,33 @@ pub(crate) async fn consume_provider_streaming_response(
                             zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
                             policy.usage_chargeability(),
                         );
+                    }
+                    if visible_event_output {
+                        let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            failure.reason,
+                            outcome.usage.clone().or(failure.usage),
+                        );
+                        // Immutable progress (including readable thinking)
+                        // closes recovery, but must not overwrite the
+                        // provider-owned chargeability of this terminal
+                        // outcome. The wrapper remains the accounting handoff.
+                        policy = zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            policy.usage_chargeability(),
+                        );
+                        return Err(StreamInterruptedAfterOutput::terminal(
+                            forwarded_text,
+                            failure,
+                            policy,
+                        )
+                        .into());
+                    }
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
+                            cause: Some(StreamPreExecutedToolsCause::Terminal(failure)),
+                        }
+                        .into());
                     }
                     return Err(StreamTerminalCompletion { failure, policy }.into());
                 }
