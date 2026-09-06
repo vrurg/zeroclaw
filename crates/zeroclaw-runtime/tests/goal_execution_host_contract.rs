@@ -5,6 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use zeroclaw_commands::goal::GoalCommand;
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_runtime::control_plane::{
@@ -69,6 +70,76 @@ struct ExecutionDriver {
     execution_acquires: AtomicUsize,
     delivered: Arc<AtomicUsize>,
     complete_verifier: bool,
+}
+
+struct PausingExecutionLease {
+    parent_started: Arc<Notify>,
+    release_parent: Arc<Notify>,
+    verifier_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for PausingExecutionLease {
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalParentTurn,
+    ) -> anyhow::Result<String> {
+        self.parent_started.notify_one();
+        self.release_parent.notified().await;
+        Ok("candidate that settled before pause".to_owned())
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        self.verifier_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(r#"{"decision":"complete","reason":"done"}"#.to_owned())
+    }
+
+    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        anyhow::bail!("a paused Goal must not deliver a candidate")
+    }
+}
+
+struct PausingExecutionDriver {
+    binding: GoalSessionBinding,
+    parent_started: Arc<Notify>,
+    release_parent: Arc<Notify>,
+    verifier_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl GoalSessionDriver for PausingExecutionDriver {
+    fn surface(&self) -> GoalSurface {
+        self.binding.surface()
+    }
+
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(PausingExecutionLease {
+            parent_started: Arc::clone(&self.parent_started),
+            release_parent: Arc::clone(&self.release_parent),
+            verifier_calls: Arc::clone(&self.verifier_calls),
+        }))
+    }
 }
 
 #[async_trait]
@@ -967,6 +1038,72 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
             .unwrap()
             .status,
         TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    let run = tokio::spawn(async move { engine.run(&settings, &request).await });
+    parent_started.notified().await;
+
+    let pause = runtime
+        .submit(&host_settings(true), ingress, driver, GoalCommand::Pause)
+        .await
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(matches!(pause, GoalResponse::Paused(_)));
+
+    release_parent.notify_one();
+    assert!(run.await.unwrap().is_err());
+    assert_eq!(
+        verifier_calls.load(Ordering::SeqCst),
+        0,
+        "a pause may drain an admitted parent operation but cannot admit a verifier"
     );
 }
 
