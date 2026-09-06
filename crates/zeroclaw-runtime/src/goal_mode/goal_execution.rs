@@ -173,10 +173,11 @@ impl GoalExecutionSupervisor {
             }
         } else if matches!(
             &response,
-            GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) | GoalResponse::Cancelled(_)
+            GoalResponse::Paused(_) | GoalResponse::Cancelled(_)
         ) && let Some(scope) = previous.as_ref()
+            && let Some(response) = self.drain_lifecycle_fence(scope).await?
         {
-            self.drain_after_fence(scope).await?;
+            return Ok(response);
         }
 
         Ok(response)
@@ -382,6 +383,102 @@ impl GoalExecutionSupervisor {
                 Ok(())
             }
         }
+    }
+
+    /// Drain a command-fenced worker and fail closed if its durable pending
+    /// operation did not settle. Pausing with unknown spend becomes Failed;
+    /// explicit cancellation remains Cancelled but carries the same durable
+    /// accounting classification for audit.
+    async fn drain_lifecycle_fence(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<Option<GoalResponse>> {
+        let _ = self.drain(scope).await;
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared while classifying a fenced operation")?;
+        let Some((pending_id, admitted_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+        else {
+            return Ok(None);
+        };
+        match self
+            .engine
+            .registry
+            .settle_pending_operation(
+                &current.id,
+                scope.session_id(),
+                admitted_epoch,
+                pending_id,
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if current.id != scope.task_id() {
+            return Ok(None);
+        }
+        if current.status == TaskStatus::Paused {
+            match self
+                .engine
+                .registry
+                .finish_session_goal(
+                    &current.id,
+                    scope.session_id(),
+                    current.execution_epoch,
+                    TaskStatus::Failed,
+                    Some("accounting_outcome_unknown".to_owned()),
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+        }
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(scope.session_id())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&current.id)
+            .await?
+            .context("Goal extension disappeared after fenced-operation classification")?;
+        let projection = super::GoalStatusProjection::from_parts(&current, &goal);
+        Ok(Some(match current.status {
+            TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
+            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
+            _ => GoalResponse::Stale,
+        }))
     }
 }
 
