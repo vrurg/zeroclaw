@@ -278,15 +278,6 @@ impl LeaseObservingRegistry {
 
 #[async_trait]
 impl GoalTaskRegistry for LeaseObservingRegistry {
-    async fn create_goal(
-        &self,
-        _task: TaskRecord,
-        _goal: GoalTaskRecord,
-        _continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()> {
-        panic!("unexpected legacy create_goal call")
-    }
-
     async fn latest_active_goal_for_agent(
         &self,
         _agent: &str,
@@ -334,20 +325,6 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         panic!("unexpected legacy pause update")
     }
 
-    async fn pause_goal_task(&self, _task_id: &str, _pause: GoalPauseState) -> anyhow::Result<()> {
-        panic!("unexpected legacy pause")
-    }
-
-    async fn resume_goal_task(
-        &self,
-        _task_id: &str,
-        _owner_pid: u32,
-        _owner_boot_id: &str,
-        _continuation_context: Option<TaskContinuationContext>,
-    ) -> anyhow::Result<()> {
-        panic!("unexpected legacy resume")
-    }
-
     async fn set_continuation_context(
         &self,
         _task_id: &str,
@@ -369,6 +346,16 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
     ) -> anyhow::Result<Option<TaskRecord>> {
         assert_eq!(self.task.session_id.as_deref(), Some(session_id));
         Ok(Some(self.task.clone()))
+    }
+
+    async fn terminal_reason_for_session_goal(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        assert_eq!(task_id, self.task.id);
+        assert_eq!(self.task.session_id.as_deref(), Some(session_id));
+        Ok(None)
     }
 
     async fn create_or_replace_session_goal(
