@@ -1374,6 +1374,92 @@ async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_de
 }
 
 #[tokio::test]
+async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pending() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+
+    supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    parent_started.notified().await;
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("started Goal is current");
+    store
+        .admit_pending_operation(
+            &current.id,
+            &ingress.session_key().durable_id(),
+            current.execution_epoch,
+            "pause-pending-operation",
+        )
+        .await
+        .unwrap();
+
+    let pause_supervisor = Arc::clone(&supervisor);
+    let pause_settings = settings.clone();
+    let pause_ingress = ingress.clone();
+    let mut pause = tokio::spawn(async move {
+        pause_supervisor
+            .submit(pause_settings, pause_ingress, driver, GoalCommand::Pause)
+            .await
+    });
+    timeout(Duration::from_millis(20), &mut pause)
+        .await
+        .expect_err("pause must wait for the admitted operation to drain");
+    release_parent.notify_one();
+
+    let response = pause.await.unwrap().unwrap();
+    assert!(matches!(response, GoalResponse::Terminal(_)));
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("failed Goal remains current for audit");
+    let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Failed);
+    assert_eq!(goal.accounting_state, GoalAccountingState::OutcomeUnknown);
+    assert!(goal.pending_call_id.is_none());
+}
+
+#[tokio::test]
 async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
