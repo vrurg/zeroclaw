@@ -165,7 +165,7 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
     )?;
     tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+        "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
                  task_id          TEXT PRIMARY KEY
                                   REFERENCES tasks(id) ON DELETE CASCADE,
                  owner_pid        INTEGER NOT NULL,
@@ -178,15 +178,21 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
              );
              CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
                 ON terminal_settlement_intents(owner_pid, owner_boot_id);",
-        )
-        .context("ensure terminal settlement schema")?;
-    // Version 8 existed both as upstream terminal-settlement schema and as a
-    // provisional Goal schema. Reapply Goal's additive migration structurally
-    // instead of inferring object presence from the ambiguous user_version.
-    goal::migrate_schema(&tx, 0)?;
-    tx.execute_batch(&format!("PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"))
+    )
+    .context("ensure terminal settlement schema")?;
+    if version < CONTROL_PLANE_SCHEMA_VERSION {
+        // Version 8 existed both as upstream terminal-settlement schema and as
+        // a provisional Goal schema. Converge older databases through Goal's
+        // additive final schema, without recreating the superseded context
+        // uniqueness index on legacy rows that the final session index replaces.
+        goal::migrate_schema(&tx, 0, true)?;
+        tx.execute_batch(&format!(
+            "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
+        ))
         .context("mark final control-plane schema version")?;
-    tx.commit().context("commit control-plane schema migration")?;
+    }
+    tx.commit()
+        .context("commit control-plane schema migration")?;
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
