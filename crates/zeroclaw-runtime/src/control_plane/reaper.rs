@@ -242,6 +242,8 @@ mod tests {
         TaskKind, TaskRecord, TaskStatus, TerminalSettlementIntent,
     };
     use crate::control_plane::task_store_sqlite::SqliteTaskStore;
+    use crate::control_plane::{GoalTaskRecord, GoalTaskRegistry};
+    use rusqlite::Connection;
 
     fn rec(id: &str, boot: &str, pid: u32, beat_secs_ago: Option<i64>) -> TaskRecord {
         let beat = beat_secs_ago.map(|s| (Utc::now() - chrono::Duration::seconds(s)).to_rfc3339());
@@ -259,6 +261,8 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
+            session_id: None,
+            execution_epoch: 0,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
         }
