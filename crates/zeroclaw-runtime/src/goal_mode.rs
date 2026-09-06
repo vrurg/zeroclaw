@@ -636,7 +636,7 @@ impl GoalStatusProjection {
             pause_reason: goal.pause_reason,
             resumable: task.status == TaskStatus::Paused
                 && goal.accounting_state == GoalAccountingState::Complete
-                && goal.pending_operation_id.is_none()
+                && goal.pending_call_id.is_none()
                 && goal.tool_phase == crate::control_plane::GoalToolPhase::Clean,
         }
     }
