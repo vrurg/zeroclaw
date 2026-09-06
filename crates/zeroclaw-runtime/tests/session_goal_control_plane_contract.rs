@@ -54,6 +54,63 @@ fn session_goal_extension(task_id: &str) -> GoalTaskRecord {
 }
 
 #[test]
+fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let database = directory.path().join("control_plane.db");
+    let connection = Connection::open(&database).expect("open upstream-v8 fixture database");
+    connection
+        .execute_batch(
+            "CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, agent TEXT NOT NULL,
+                 status TEXT NOT NULL, owner_pid INTEGER NOT NULL DEFAULT 0,
+                 owner_boot_id TEXT NOT NULL DEFAULT '', heartbeat_at TEXT,
+                 depth INTEGER NOT NULL DEFAULT 0, parent_id TEXT,
+                 originator_route TEXT, delivered INTEGER NOT NULL DEFAULT 0,
+                 idem_key TEXT, principal_id TEXT, started_at TEXT NOT NULL,
+                 finished_at TEXT, output TEXT, error TEXT
+             );
+             CREATE TABLE terminal_settlement_intents (
+                 task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                 owner_pid INTEGER NOT NULL, owner_boot_id TEXT NOT NULL,
+                 desired_status TEXT NOT NULL, artifact_path TEXT NOT NULL,
+                 artifact_ref TEXT, artifact_sha256 TEXT NOT NULL, terminal_error TEXT
+             );
+             CREATE INDEX idx_terminal_settlement_intents_owner
+                 ON terminal_settlement_intents(owner_pid, owner_boot_id);
+             PRAGMA user_version = 8;",
+        )
+        .expect("write upstream-v8 fixture schema");
+    drop(connection);
+
+    SqliteTaskStore::new(directory.path()).expect("migrate upstream-v8 fixture");
+    let verify = Connection::open(&database).expect("open migrated fixture database");
+    assert_eq!(
+        verify
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read schema version"),
+        10
+    );
+    let columns: Vec<String> = verify
+        .prepare("PRAGMA table_info(tasks)")
+        .expect("inspect migrated task columns")
+        .query_map([], |row| row.get(1))
+        .expect("query migrated task columns")
+        .collect::<Result<_, _>>()
+        .expect("read migrated task columns");
+    assert!(columns.contains(&"session_id".to_string()));
+    assert!(columns.contains(&"execution_epoch".to_string()));
+    let terminal_table: String = verify
+        .query_row(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'table' AND name = 'terminal_settlement_intents'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("retain terminal settlement table");
+    assert_eq!(terminal_table, "terminal_settlement_intents");
+}
+
+#[test]
 fn independent_connections_admit_exactly_one_current_goal_for_a_session() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
@@ -751,8 +808,8 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
     assert_eq!(
-        schema_version, 8,
-        "migration records the v8 immutable Goal guard"
+        schema_version, 10,
+        "migration records the final control-plane schema"
     );
     let running: (String, Option<String>, Option<String>) = verify
         .query_row(
