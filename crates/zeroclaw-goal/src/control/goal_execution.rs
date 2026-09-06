@@ -9,6 +9,7 @@ use zeroclaw_api::{
     model_provider::ChatMessage,
     task::{TaskRecord, TaskStatus},
 };
+use zeroclaw_commands::goal::GoalCommand;
 
 use crate::{
     accounting::{GOAL_OPERATION_ACCOUNTING, GoalOperationAccountingFactory},
@@ -19,8 +20,9 @@ use crate::{
 };
 
 use super::{
-    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalParentTurn, GoalRuntime,
-    GoalSessionExecutionLease, GoalVerifierTurn, goal_verifier_feedback_message,
+    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext, GoalParentTurn,
+    GoalResponse, GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease, GoalVerifierTurn,
+    goal_verifier_feedback_message,
 };
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
@@ -103,7 +105,19 @@ impl GoalExecutionSupervisor {
 
         let engine = Arc::clone(&self.engine);
         let execution_epoch = scope.execution_epoch();
-        let handle = tokio::spawn(async move { engine.run(&settings, &request).await });
+        let handle = tokio::spawn(async move {
+            let result = engine.run(&settings, &request).await;
+
+            // The engine normally records its own expected execution failures.
+            // Acquisition and other unexpected failures can occur before that
+            // path. Do not leave their exact durable epoch Running without an
+            // owner: terminalize it while the scope still proves the fence.
+            if result.is_err() && engine.exact_running_task(&scope).await.is_ok() {
+                engine.fail(&scope, "executor_failed").await?;
+            }
+
+            result
+        });
         workers.insert(
             key,
             GoalWorker {
@@ -112,6 +126,47 @@ impl GoalExecutionSupervisor {
             },
         );
         Ok(())
+    }
+
+    /// Submit one typed Goal command and retain any execution it starts.
+    ///
+    /// This is the only runtime composition point that launches a Goal
+    /// worker. The controller keeps durable lifecycle authority; the
+    /// supervisor only retains the exact process-local handle needed to drain
+    /// a fenced epoch before a later execution can replace it.
+    pub async fn submit(
+        &self,
+        settings: GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+    ) -> Result<GoalResponse> {
+        let previous = self.scope_for_session(&ingress).await?;
+        let (response, execution) = self
+            .engine
+            .runtime
+            .submit(&settings, ingress, driver, command)
+            .await?
+            .into_parts();
+
+        if let Some(request) = execution {
+            if let Some(scope) = previous.as_ref() {
+                self.drain_after_fence(scope).await?;
+            }
+            let scope = request.scope().clone();
+            if let Err(error) = self.launch(settings, request).await {
+                self.engine.fail(&scope, "executor_start_failed").await?;
+                return Err(error).context("Goal executor launch failed");
+            }
+        } else if matches!(
+            &response,
+            GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) | GoalResponse::Cancelled(_)
+        ) && let Some(scope) = previous.as_ref()
+        {
+            self.drain_after_fence(scope).await?;
+        }
+
+        Ok(response)
     }
 
     /// Return whether the exact epoch still has a process-local owner.
@@ -149,6 +204,73 @@ impl GoalExecutionSupervisor {
             .handle
             .await
             .context("Goal execution worker join failed")?
+    }
+
+    async fn scope_for_session(
+        &self,
+        ingress: &GoalIngressContext,
+    ) -> Result<Option<GoalExecutionScope>> {
+        let session_id = ingress.session_key().durable_id();
+        let workers = self.workers.lock().await;
+        let mut matching = workers
+            .iter()
+            .filter(|(key, _)| key.session_id == session_id);
+        let first = matching.next();
+        ensure!(
+            matching.next().is_none(),
+            "Goal execution has more than one worker for one session"
+        );
+        first
+            .map(|(key, worker)| {
+                GoalExecutionScope::new(
+                    key.task_id.clone(),
+                    key.session_id.clone(),
+                    worker.execution_epoch,
+                )
+            })
+            .transpose()
+    }
+
+    /// Consume an epoch after its durable lifecycle has fenced it.
+    ///
+    /// A fenced worker normally returns an error once it observes that its
+    /// epoch is stale. That is expected only after its pending operation has
+    /// settled; otherwise the failure is surfaced so the caller can classify
+    /// the accounting state rather than silently discarding a possible spend.
+    async fn drain_after_fence(&self, scope: &GoalExecutionScope) -> Result<()> {
+        match self.drain(scope).await {
+            Ok(_) => Ok(()),
+            Err(_error) => {
+                let current = self
+                    .engine
+                    .registry
+                    .current_goal_for_session(scope.session_id())
+                    .await?;
+                let goal = self.engine.registry.get_goal_task(scope.task_id()).await?;
+                let Some(goal) = goal else {
+                    ensure!(
+                        current
+                            .as_ref()
+                            .is_none_or(|task| task.id != scope.task_id()),
+                        "Goal extension disappeared while its exact task remains current"
+                    );
+                    return Ok(());
+                };
+                ensure!(
+                    goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
+                    "Goal worker stopped with an unsettled operation"
+                );
+                if current.as_ref().is_some_and(|task| {
+                    task.id == scope.task_id()
+                        && task.status == TaskStatus::Running
+                        && task.execution_epoch == scope.execution_epoch()
+                }) {
+                    self.engine.fail(scope, "executor_failed").await?;
+                    bail!("Goal worker stopped while its exact epoch remained running");
+                }
+                Ok(())
+            }
+        }
     }
 }
 
