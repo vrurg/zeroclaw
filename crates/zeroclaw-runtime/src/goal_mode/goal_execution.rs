@@ -182,6 +182,100 @@ impl GoalExecutionSupervisor {
         Ok(response)
     }
 
+    /// Hard-dispose one trusted session's current Goal control state.
+    ///
+    /// The caller owns session-disposal authority. This method owns the Goal
+    /// ordering only: first fence the current task, then drain its exact
+    /// worker, classify an unsettled operation fail-closed, and finally delete
+    /// the terminal task and Goal extension. Canonical cost-ledger rows are
+    /// intentionally outside this deletion.
+    pub async fn dispose_session(&self, session_id: &str) -> Result<GoalTransitionResult> {
+        ensure!(
+            !session_id.trim().is_empty(),
+            "Goal disposal session id must be nonblank"
+        );
+        let Some(current) = self
+            .engine
+            .registry
+            .current_goal_for_session(session_id)
+            .await?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        let task_id = current.id.clone();
+        let fenced_epoch = current.execution_epoch;
+
+        if !current.status.is_terminal() {
+            match self
+                .engine
+                .registry
+                .finish_session_goal(
+                    &task_id,
+                    session_id,
+                    fenced_epoch,
+                    TaskStatus::Cancelled,
+                    Some("session_disposed".to_owned()),
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                result => return Ok(result),
+            }
+        }
+
+        if let Some(scope) = self.scope_for_session_id(session_id).await?
+            && scope.task_id() == task_id
+        {
+            // A cancellation fence must not interrupt the already-admitted
+            // logical operation. Its worker gets the opportunity to settle;
+            // any join error is classified from the durable pending slot
+            // below rather than trusted as evidence that no usage occurred.
+            let _ = self.drain(&scope).await;
+        }
+
+        let Some(reloaded) = self
+            .engine
+            .registry
+            .current_goal_for_session(session_id)
+            .await?
+        else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        if reloaded.id != task_id || !reloaded.status.is_terminal() {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let goal = self
+            .engine
+            .registry
+            .get_goal_task(&task_id)
+            .await?
+            .context("Goal extension disappeared during session disposal")?;
+        if let Some((pending_id, admitted_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+        {
+            match self
+                .engine
+                .registry
+                .settle_pending_operation(
+                    &task_id,
+                    session_id,
+                    admitted_epoch,
+                    pending_id,
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                result => return Ok(result),
+            }
+        }
+
+        self.engine
+            .registry
+            .delete_session_goal(&task_id, session_id, reloaded.execution_epoch)
+            .await
+    }
+
     /// Return whether the exact epoch still has a process-local owner.
     ///
     /// This stays true after a worker finishes and until [`Self::drain`]
@@ -223,7 +317,11 @@ impl GoalExecutionSupervisor {
         &self,
         ingress: &GoalIngressContext,
     ) -> Result<Option<GoalExecutionScope>> {
-        let session_id = ingress.session_key().durable_id();
+        self.scope_for_session_id(&ingress.session_key().durable_id())
+            .await
+    }
+
+    async fn scope_for_session_id(&self, session_id: &str) -> Result<Option<GoalExecutionScope>> {
         let workers = self.workers.lock().await;
         let mut matching = workers
             .iter()

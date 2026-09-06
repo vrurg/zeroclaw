@@ -1271,6 +1271,97 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
 }
 
 #[tokio::test]
+async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_deletion() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+
+    supervisor
+        .submit(
+            settings.clone(),
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    parent_started.notified().await;
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("started Goal is current");
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                &current.id,
+                &ingress.session_key().durable_id(),
+                current.execution_epoch,
+                "disposal-pending-operation",
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    let dispose_supervisor = Arc::clone(&supervisor);
+    let session_id = ingress.session_key().durable_id();
+    let mut dispose =
+        tokio::spawn(async move { dispose_supervisor.dispose_session(&session_id).await });
+    assert!(
+        timeout(Duration::from_millis(20), &mut dispose)
+            .await
+            .is_err(),
+        "disposal must drain an admitted operation before deleting Goal state"
+    );
+
+    release_parent.notify_one();
+    assert_eq!(
+        dispose.await.unwrap().unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .is_none(),
+        "session disposal hard-deletes Goal control state only after pending classification"
+    );
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
