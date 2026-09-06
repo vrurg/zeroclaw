@@ -51,7 +51,11 @@ fn reject_session_goal_legacy_mutation(conn: &Connection, task_id: &str) -> Resu
     Ok(())
 }
 
-pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
+pub(super) fn migrate_schema(
+    conn: &Connection,
+    version: i64,
+    skip_superseded_context_index: bool,
+) -> Result<()> {
     if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS goal_tasks (
@@ -101,7 +105,7 @@ pub(super) fn migrate_schema(conn: &Connection, version: i64) -> Result<()> {
         conn.execute_batch("PRAGMA user_version = 3;")
             .context("mark control-plane schema v3")?;
     }
-    if version < 4 {
+    if version < 4 && !skip_superseded_context_index {
         conn.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_goal_context
                 ON tasks(
