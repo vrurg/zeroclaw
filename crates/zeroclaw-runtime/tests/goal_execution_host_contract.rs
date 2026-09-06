@@ -5,12 +5,15 @@ use std::sync::{
 
 use async_trait::async_trait;
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::{
+    sync::Notify,
+    time::{Duration, timeout},
+};
 use zeroclaw_commands::goal::GoalCommand;
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
-    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
+    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskRegistry, TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
@@ -113,6 +116,33 @@ struct PausingExecutionDriver {
     parent_started: Arc<Notify>,
     release_parent: Arc<Notify>,
     verifier_calls: Arc<AtomicUsize>,
+}
+
+struct FailingExecutionDriver {
+    binding: GoalSessionBinding,
+}
+
+#[async_trait]
+impl GoalSessionDriver for FailingExecutionDriver {
+    fn surface(&self) -> GoalSurface {
+        self.binding.surface()
+    }
+
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        anyhow::bail!("simulated execution lease acquisition failure")
+    }
 }
 
 #[async_trait]
@@ -1081,6 +1111,157 @@ async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
     );
     assert!(!supervisor.owns_scope(&scope).await);
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn execution_supervisor_terminalizes_an_unexpected_worker_failure() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let driver = Arc::new(FailingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    ));
+    let scope = request.scope().clone();
+
+    supervisor.launch(settings, request).await.unwrap();
+    assert!(supervisor.drain(&scope).await.is_err());
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("failed Goal remains the current terminal Goal");
+    assert_eq!(current.status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .get_snapshot(&current.id)
+            .await
+            .unwrap()
+            .expect("failed Goal remains readable")
+            .error
+            .as_deref(),
+        Some("executor_failed")
+    );
+}
+
+#[tokio::test]
+async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+
+    assert!(matches!(
+        supervisor
+            .submit(
+                settings.clone(),
+                ingress.clone(),
+                driver.clone(),
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the task".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalResponse::Started(_)
+    ));
+    parent_started.notified().await;
+
+    let pause_supervisor = Arc::clone(&supervisor);
+    let pause_settings = settings.clone();
+    let pause_ingress = ingress.clone();
+    let pause_driver = driver.clone();
+    let mut pause = tokio::spawn(async move {
+        pause_supervisor
+            .submit(
+                pause_settings,
+                pause_ingress,
+                pause_driver,
+                GoalCommand::Pause,
+            )
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(20), &mut pause)
+            .await
+            .is_err(),
+        "pause must drain the admitted operation instead of interrupting it"
+    );
+
+    release_parent.notify_one();
+    assert!(matches!(
+        pause.await.unwrap().unwrap(),
+        GoalResponse::Paused(_)
+    ));
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .expect("paused Goal remains current")
+            .status,
+        TaskStatus::Paused
+    );
 }
 
 #[tokio::test]
