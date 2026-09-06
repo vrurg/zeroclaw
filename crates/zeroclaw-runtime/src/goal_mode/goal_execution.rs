@@ -118,7 +118,7 @@ impl GoalExecutionEngine {
             .await?
             .context("Goal extension disappeared before execution")?;
         ensure!(
-            goal.pending_operation_id.is_none(),
+            goal.pending_call_id.is_none(),
             "Goal execution begins with an unsettled operation"
         );
         ensure!(
@@ -496,7 +496,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             "Goal accounting is incomplete"
         );
         ensure!(
-            goal.pending_operation_id.is_none() && goal.pending_operation_epoch.is_none(),
+            goal.pending_call_id.is_none() && goal.pending_call_epoch.is_none(),
             "Goal already has a pending operation"
         );
         let (tokens, cost, pricing_complete) = self.strict_totals().await?;
@@ -804,7 +804,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
-                .pending_operation_id
+                .pending_call_id
                 .is_some()
         );
 
@@ -821,7 +821,7 @@ mod tests {
             .unwrap();
 
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_operation_id.is_none());
+        assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
     }
 
@@ -845,7 +845,7 @@ mod tests {
             .unwrap();
 
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
-        assert!(goal.pending_operation_id.is_none());
+        assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
     }
 }
