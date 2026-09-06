@@ -6,12 +6,15 @@
 //! logical model operation and the strict task-attributed ledger settlement
 //! which follows that operation.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
@@ -51,6 +54,115 @@ pub struct GoalExecutionEngine {
     tracker: Arc<CostTracker>,
     agent_alias: String,
     pricing: Arc<ModelProviderPricing>,
+}
+
+/// Process-local owner for the workers that execute durable Goal epochs.
+///
+/// The control plane remains the lifecycle source of truth. This supervisor
+/// owns only the matching join handles, which lets a session lifecycle path
+/// drain an exact fenced epoch before it permits a successor to launch.
+/// It deliberately knows neither transport routing nor provider policy.
+pub struct GoalExecutionSupervisor {
+    engine: Arc<GoalExecutionEngine>,
+    workers: Mutex<HashMap<GoalWorkerKey, GoalWorker>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GoalWorkerKey {
+    task_id: String,
+    session_id: String,
+}
+
+impl GoalWorkerKey {
+    fn from_scope(scope: &GoalExecutionScope) -> Self {
+        Self {
+            task_id: scope.task_id().to_owned(),
+            session_id: scope.session_id().to_owned(),
+        }
+    }
+}
+
+struct GoalWorker {
+    execution_epoch: i64,
+    handle: JoinHandle<Result<GoalExecutionOutcome>>,
+}
+
+impl GoalExecutionSupervisor {
+    pub fn new(engine: Arc<GoalExecutionEngine>) -> Self {
+        Self {
+            engine,
+            workers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Launch one newly admitted Goal epoch.
+    ///
+    /// A successor for the same task/session cannot start while a previous
+    /// epoch remains supervisor-owned. Lifecycle callers must drain the old
+    /// epoch first, preserving the durable epoch fence instead of relying on
+    /// a best-effort detached task.
+    pub async fn launch(
+        &self,
+        settings: GoalHostSettings,
+        request: GoalExecutionRequest,
+    ) -> Result<()> {
+        let scope = request.scope().clone();
+        let key = GoalWorkerKey::from_scope(&scope);
+        let mut workers = self.workers.lock().await;
+        ensure!(
+            !workers.contains_key(&key),
+            "Goal execution already has a live worker for this session"
+        );
+
+        let engine = Arc::clone(&self.engine);
+        let execution_epoch = scope.execution_epoch();
+        let handle = tokio::spawn(async move { engine.run(&settings, &request).await });
+        workers.insert(
+            key,
+            GoalWorker {
+                execution_epoch,
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return whether the exact epoch still has a process-local owner.
+    ///
+    /// This stays true after a worker finishes and until [`Self::drain`]
+    /// consumes its result. The durable task status—not this handle map—is the
+    /// source of truth for whether the Goal is currently running.
+    pub async fn owns_scope(&self, scope: &GoalExecutionScope) -> bool {
+        let key = GoalWorkerKey::from_scope(scope);
+        let workers = self.workers.lock().await;
+        workers
+            .get(&key)
+            .is_some_and(|worker| worker.execution_epoch == scope.execution_epoch())
+    }
+
+    /// Await the exact fenced epoch without interrupting its in-flight model
+    /// operation. A pause path uses this after durable fencing so the admitted
+    /// operation can settle its usage but cannot admit another operation.
+    pub async fn drain(&self, scope: &GoalExecutionScope) -> Result<GoalExecutionOutcome> {
+        let key = GoalWorkerKey::from_scope(scope);
+        let worker = {
+            let mut workers = self.workers.lock().await;
+            let Some(worker) = workers.get(&key) else {
+                bail!("Goal execution has no worker for this session");
+            };
+            ensure!(
+                worker.execution_epoch == scope.execution_epoch(),
+                "Goal execution worker epoch is stale"
+            );
+            workers
+                .remove(&key)
+                .context("Goal execution worker disappeared while draining")?
+        };
+        worker
+            .handle
+            .await
+            .context("Goal execution worker join failed")?
+    }
 }
 
 impl GoalExecutionEngine {
