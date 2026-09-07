@@ -328,18 +328,6 @@ impl MatrixGoalExecutionLease {
     }
 }
 
-fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
-    let turn_kind = match turn.kind {
-        GoalParentTurnKind::Start => "start",
-        GoalParentTurnKind::Resume => "resume",
-        GoalParentTurnKind::Continue => "continue",
-    };
-    ChatMessage::system(format!(
-        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-        turn.objective
-    ))
-}
-
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
@@ -365,7 +353,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let directive = goal_parent_directive(&turn);
+        let directive = turn.prompt_directive();
         let mut history = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 let mut history =
@@ -529,13 +517,15 @@ mod tests {
             (GoalParentTurnKind::Resume, "resume"),
             (GoalParentTurnKind::Continue, "continue"),
         ] {
-            let directive = goal_parent_directive(&GoalParentTurn {
+            let directive = GoalParentTurn {
                 kind,
-                objective: "the trusted success criterion".to_owned(),
+                objective: "the declared success criterion".to_owned(),
                 working_history: Vec::new(),
-            });
+            }
+            .prompt_directive();
             assert_eq!(directive.role, "system");
-            assert!(directive.content.contains("the trusted success criterion"));
+            assert!(directive.content.contains("the declared success criterion"));
+            assert!(directive.content.contains("untrusted user-declared data"));
             assert!(
                 directive
                     .content

@@ -232,18 +232,6 @@ struct ZeroCodeGoalExecutionLease {
     session_id: String,
 }
 
-fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
-    let kind = match turn.kind {
-        GoalParentTurnKind::Start => "start",
-        GoalParentTurnKind::Resume => "resume",
-        GoalParentTurnKind::Continue => "continue",
-    };
-    ChatMessage::system(format!(
-        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {kind}",
-        turn.objective
-    ))
-}
-
 #[async_trait]
 impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     fn canonical_history(&self) -> Result<Vec<ChatMessage>> {
@@ -255,7 +243,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
-        let directive = goal_parent_directive(&turn);
+        let directive = turn.prompt_directive();
         let source = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 IsolatedTranscriptSource::Canonical {
