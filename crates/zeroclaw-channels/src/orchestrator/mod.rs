@@ -6205,6 +6205,32 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
+/// Goal authority captured from the original Matrix event before hooks may
+/// rewrite the ordinary-message representation.
+struct MatrixGoalSnapshot {
+    history_key: String,
+    original: ChannelMessage,
+    command: Result<zeroclaw_commands::goal::GoalCommand, GoalCommandParseError>,
+}
+
+fn capture_matrix_goal_snapshot(
+    history_key: String,
+    message: &ChannelMessage,
+) -> Option<MatrixGoalSnapshot> {
+    if !is_matrix_channel_name(&message.channel) {
+        return None;
+    }
+    let command = parse_goal_command(&message.content);
+    if matches!(command, Err(GoalCommandParseError::NotGoalCommand)) {
+        return None;
+    }
+    Some(MatrixGoalSnapshot {
+        history_key,
+        original: message.clone(),
+        command,
+    })
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -6214,19 +6240,8 @@ async fn process_channel_message_body(
     // Capture Goal command authority before mutable hooks. A hook can cancel
     // the message, but it cannot rewrite its principal, session, route, or
     // command before admission.
-    let goal_snapshot = if is_matrix_channel_name(&msg.channel)
-        && !matches!(
-            parse_goal_command(&msg.content),
-            Err(GoalCommandParseError::NotGoalCommand)
-        ) {
-        Some((
-            runtime_conversation_history_key(ctx.as_ref(), &msg),
-            msg.clone(),
-            parse_goal_command(&msg.content),
-        ))
-    } else {
-        None
-    };
+    let goal_snapshot =
+        capture_matrix_goal_snapshot(runtime_conversation_history_key(ctx.as_ref(), &msg), &msg);
     let logged_content = if goal_snapshot.is_some() {
         "<goal command>"
     } else {
@@ -6292,12 +6307,12 @@ async fn process_channel_message_body(
         }
     }
 
-    if let Some((goal_history_key, original_goal_message, parsed_goal_command)) = goal_snapshot {
-        let response = match parsed_goal_command {
+    if let Some(goal_snapshot) = goal_snapshot {
+        let response = match goal_snapshot.command {
             Ok(command) => match submit_matrix_goal(
                 Arc::clone(&ctx),
-                goal_history_key,
-                original_goal_message.clone(),
+                goal_snapshot.history_key,
+                goal_snapshot.original.clone(),
                 command,
             )
             .await
@@ -6316,10 +6331,10 @@ async fn process_channel_message_body(
             }
         };
         if let Some(channel) =
-            find_channel_for_message(&ctx.channels_by_name, &original_goal_message)
+            find_channel_for_message(&ctx.channels_by_name, &goal_snapshot.original)
         {
             let _ = channel
-                .send(&SendMessage::reply_to(&original_goal_message, response))
+                .send(&SendMessage::reply_to(&goal_snapshot.original, response))
                 .await;
         }
         return;
@@ -8157,6 +8172,35 @@ mod goal_response_render_tests {
             render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::InvalidCommand),
             channel_runtime_cli_string("goal-mode-command-invalid")
         );
+    }
+}
+
+#[cfg(test)]
+mod matrix_goal_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn matrix_goal_snapshot_keeps_original_authority_before_later_mutation() {
+        let mut message = ChannelMessage::new(
+            "event-1",
+            "@original:example.org",
+            "!room:example.org",
+            "/goal status",
+            "matrix",
+            0,
+        );
+        let snapshot = capture_matrix_goal_snapshot("matrix:session-1".to_owned(), &message)
+            .expect("Goal command must be captured");
+
+        message.sender = "@rewritten:example.org".to_owned();
+        message.content = "/goal cancel".to_owned();
+
+        assert_eq!(snapshot.original.sender, "@original:example.org");
+        assert_eq!(snapshot.original.content, "/goal status");
+        assert!(matches!(
+            snapshot.command,
+            Ok(zeroclaw_commands::goal::GoalCommand::Status)
+        ));
     }
 }
 
