@@ -121,7 +121,11 @@ zc-zerocode-help-navigate-rows = Navigate rows
 zc-zerocode-help-back-to-sections = Back to sections
 
 zc-zerocode-agent-modal-title = Select Agent
-zc-goal-help = Goal command help is available.
+zc-goal-help = Goal commands:
+    /goal start [--tokens N] [--cost-usd D] -- OBJECTIVE
+    /goal start --unlimited -- OBJECTIVE
+    /goal status | budget | budget set [--tokens N] [--cost-usd D] | budget set --unlimited
+    /goal pause | resume | cancel | help
 zc-goal-disabled = Goal Mode is disabled.
 zc-goal-started = Goal started.
 zc-goal-status = Goal status updated.

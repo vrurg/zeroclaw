@@ -120,6 +120,13 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
     }
 }
 
+fn is_goal_command_submission(prompt: &str) -> bool {
+    prompt
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("/goal"))
+}
+
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
 enum ChatPhase {
@@ -3339,7 +3346,7 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
-                    if attachments.is_empty() && prompt.trim_start().starts_with("/goal") {
+                    if attachments.is_empty() && is_goal_command_submission(&prompt) {
                         let session_id = state.session_id.clone();
                         let rpc = Arc::clone(&self.rpc);
                         let tx = self.goal_completion_tx.clone();
@@ -19537,6 +19544,24 @@ mod tests {
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
         );
+    }
+
+    #[test]
+    fn goal_submission_requires_the_exact_leading_command_token() {
+        assert!(is_goal_command_submission("/goal status"));
+        assert!(is_goal_command_submission(" \t/GOAL help"));
+        assert!(is_goal_command_submission("/goal"));
+        assert!(!is_goal_command_submission("/goalpost status"));
+        assert!(!is_goal_command_submission("please run /goal status"));
+    }
+
+    #[test]
+    fn goal_submission_requires_the_exact_leading_command_token() {
+        assert!(is_goal_command_submission("/goal status"));
+        assert!(is_goal_command_submission(" \t/GOAL help"));
+        assert!(is_goal_command_submission("/goal"));
+        assert!(!is_goal_command_submission("/goalpost status"));
+        assert!(!is_goal_command_submission("please run /goal status"));
     }
 
     #[test]

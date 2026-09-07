@@ -1246,7 +1246,11 @@ channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 
 # Goal Mode V1 channel control responses.
-goal-mode-help = Goal commands: start, status, budget, pause, resume, cancel, help.
+goal-mode-help = Goal commands:
+    /goal start [--tokens N] [--cost-usd D] -- OBJECTIVE
+    /goal start --unlimited -- OBJECTIVE
+    /goal status | budget | budget set [--tokens N] [--cost-usd D] | budget set --unlimited
+    /goal pause | resume | cancel | help
 goal-mode-disabled = Goal Mode is disabled.
 goal-mode-started = Goal started.
 goal-mode-completed = Goal completed.
