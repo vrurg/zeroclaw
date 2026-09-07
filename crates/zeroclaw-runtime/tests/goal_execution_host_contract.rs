@@ -22,7 +22,8 @@ use zeroclaw_runtime::control_plane::{
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnResult, GoalResponse, GoalRuntime,
+    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
+    GoalRuntime,
     GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
@@ -84,6 +85,7 @@ struct TranscriptExecutionLease {
     delivered: Arc<AtomicUsize>,
     continue_once: bool,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+    parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
 
 #[async_trait]
@@ -105,6 +107,7 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             .lock()
             .unwrap()
             .push(turn.working_history.clone());
+        self.parent_turn_kinds.lock().unwrap().push(turn.kind);
         Ok(GoalParentTurnResult {
             candidate: format!("parent:{}", turn.objective),
             working_history: turn.working_history,
@@ -141,6 +144,7 @@ struct TranscriptExecutionDriver {
     binding: GoalSessionBinding,
     delivered: Arc<AtomicUsize>,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+    parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
 
 #[async_trait]
@@ -163,6 +167,7 @@ impl GoalSessionDriver for TranscriptExecutionDriver {
             delivered: Arc::clone(&self.delivered),
             continue_once: true,
             parent_histories: Arc::clone(&self.parent_histories),
+            parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
         }))
     }
 }
@@ -889,6 +894,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
             .run_parent_turn(
                 &scope,
                 GoalParentTurn {
+                    kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
                     working_history: Vec::new(),
                 }
@@ -1033,6 +1039,7 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
     let parent_debug = format!(
         "{:?}",
         GoalParentTurn {
+            kind: GoalParentTurnKind::Start,
             objective: "private stop condition".into(),
             working_history: Vec::new(),
         }
@@ -2168,10 +2175,12 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
+    let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(TranscriptExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         delivered: Arc::clone(&delivered),
         parent_histories: Arc::clone(&parent_histories),
+        parent_turn_kinds: Arc::clone(&parent_turn_kinds),
     });
     let request = runtime
         .submit(
@@ -2217,6 +2226,10 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     assert!(histories[1]
         .iter()
         .any(|message| message.content.contains("add the missing detail")));
+    assert_eq!(
+        parent_turn_kinds.lock().unwrap().as_slice(),
+        &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue]
+    );
     assert_eq!(
         store
             .current_goal_for_session(scope.session_id())
