@@ -1197,8 +1197,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         // When multiple tool calls are present and interactive CLI approval is not needed, run
         // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
+        let goal_child_batch = crate::agent::cost::goal_child_execution_scope().is_some()
+            && tool_calls
+                .iter()
+                .any(|call| matches!(call.name.as_str(), "delegate" | "spawn_subagent"));
+        let allow_parallel_execution = parallel_tools
+            && !goal_child_batch
+            && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,

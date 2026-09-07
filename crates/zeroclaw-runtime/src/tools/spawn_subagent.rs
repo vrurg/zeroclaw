@@ -86,6 +86,21 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let goal_child_scope = crate::agent::cost::goal_child_execution_scope();
+        if goal_child_scope
+            .as_ref()
+            .is_some_and(|scope| scope.child_depth != 0)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "spawn_subagent: recursive subagents are not supported during Goal execution"
+                        .into(),
+                ),
+            });
+        }
+
         // Depth-1 cap: a SubAgent may not spawn its own subagents.
         // The caller-side flag is set at registry construction time
         // from `AgentRunOverrides.is_subagent`, so the refusal fires
@@ -205,12 +220,14 @@ impl Tool for SpawnSubagentTool {
                     owner_boot_id: cp.boot_id.clone(),
                     heartbeat_at: None,
                     depth: u32::from(self.is_subagent_caller),
-                    parent_id: None,
+                    parent_id: goal_child_scope.as_ref().map(|scope| scope.task_id.clone()),
                     originator_route: None,
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
-                    session_id: None,
+                    session_id: goal_child_scope
+                        .as_ref()
+                        .map(|scope| scope.session_id.clone()),
                     execution_epoch: 0,
                     started_at: chrono::Utc::now().to_rfc3339(),
                     finished_at: None,
@@ -218,7 +235,7 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
-        let run_result = Box::pin(scope!(
+        let run = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
@@ -236,8 +253,17 @@ impl Tool for SpawnSubagentTool {
                 zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
-        ))
-        .await;
+        ));
+        let run_result = if let Some(scope) = goal_child_scope {
+            let child_scope = scope
+                .foreground_child()
+                .ok_or_else(|| anyhow::anyhow!("Goal child depth overflow"))?;
+            crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+                .scope(Some(child_scope), run)
+                .await
+        } else {
+            run.await
+        };
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
         if let Some(cp) = crate::control_plane::control_plane() {

@@ -25,9 +25,10 @@ use super::{
     GoalSessionDriver, GoalSessionExecutionLease, GoalVerifierTurn,
 };
 use crate::agent::cost::{
-    GOAL_OPERATION_ACCOUNTING, GOAL_TOOL_PHASE_FENCE, GoalOperationAccounting,
-    GoalOperationRequest, GoalOperationSettlement, GoalToolPhaseFence, GoalUsageEvent,
-    ModelProviderPricing, provider_pricing, resolve_rates_opt,
+    GOAL_CHILD_EXECUTION_SCOPE, GOAL_OPERATION_ACCOUNTING, GOAL_TOOL_PHASE_FENCE,
+    GoalChildExecutionScope, GoalOperationAccounting, GoalOperationRequest,
+    GoalOperationSettlement, GoalToolPhaseFence, GoalUsageEvent, ModelProviderPricing,
+    provider_pricing, resolve_rates_opt,
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -566,15 +567,23 @@ impl GoalExecutionEngine {
         GOAL_OPERATION_ACCOUNTING
             .scope(
                 Some(accountant),
-                GOAL_TOOL_PHASE_FENCE.scope(Some(tool_phase), async {
-                    self.run_scoped(
-                        &scope,
-                        &objective,
-                        request.initial_turn_kind(),
-                        lease.as_mut(),
-                    )
-                    .await
-                }),
+                GOAL_CHILD_EXECUTION_SCOPE.scope(
+                    Some(GoalChildExecutionScope {
+                        task_id: scope.task_id().to_owned(),
+                        session_id: scope.session_id().to_owned(),
+                        execution_epoch: scope.execution_epoch(),
+                        child_depth: 0,
+                    }),
+                    GOAL_TOOL_PHASE_FENCE.scope(Some(tool_phase), async {
+                        self.run_scoped(
+                            &scope,
+                            &objective,
+                            request.initial_turn_kind(),
+                            lease.as_mut(),
+                        )
+                        .await
+                    }),
+                ),
             )
             .await
     }

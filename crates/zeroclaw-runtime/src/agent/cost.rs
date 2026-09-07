@@ -289,6 +289,42 @@ tokio::task_local! {
     pub(crate) static GOAL_TOOL_PHASE_FENCE: Option<Arc<dyn GoalToolPhaseFence>>;
 }
 
+/// Process-local ancestry for a foreground child of a Goal execution.
+///
+/// This is deliberately not a second task or authority store: durable Goal
+/// identity remains in the control plane. Tool implementations use this only
+/// to reject child forms that cannot remain foreground and to attribute the
+/// child task they synchronously create.
+#[derive(Clone, Debug)]
+pub(crate) struct GoalChildExecutionScope {
+    pub(crate) task_id: String,
+    pub(crate) session_id: String,
+    pub(crate) execution_epoch: i64,
+    pub(crate) child_depth: u8,
+}
+
+impl GoalChildExecutionScope {
+    pub(crate) fn foreground_child(&self) -> Option<Self> {
+        self.child_depth.checked_add(1).map(|child_depth| Self {
+            task_id: self.task_id.clone(),
+            session_id: self.session_id.clone(),
+            execution_epoch: self.execution_epoch,
+            child_depth,
+        })
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_CHILD_EXECUTION_SCOPE: Option<GoalChildExecutionScope>;
+}
+
+pub(crate) fn goal_child_execution_scope() -> Option<GoalChildExecutionScope> {
+    GOAL_CHILD_EXECUTION_SCOPE
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
 /// Begins an exact Goal tool phase only inside a Goal-owned turn.  The caller
 /// must complete the returned fence only after the matching tool results have
 /// entered its transient working transcript.  Dropping it without completion

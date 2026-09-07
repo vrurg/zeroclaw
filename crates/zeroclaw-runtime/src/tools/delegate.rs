@@ -1657,6 +1657,22 @@ impl Tool for DelegateTool {
             DelegateAction::Delegate => {}
         }
 
+        if let Some(scope) = crate::agent::cost::goal_child_execution_scope() {
+            if scope.child_depth != 0 {
+                return Ok(goal_child_refusal("recursive delegation is not supported"));
+            }
+            if args.get("parallel").is_some() {
+                return Ok(goal_child_refusal("parallel delegation is not supported"));
+            }
+            if args
+                .get("background")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(goal_child_refusal("background delegation is not supported"));
+            }
+        }
+
         // --- Parallel mode ---
         if let Some(parallel_agents) = args.get("parallel").and_then(|v| v.as_array()) {
             return self.execute_parallel(parallel_agents, &args).await;
@@ -1722,6 +1738,14 @@ impl Tool for DelegateTool {
 
         // --- Synchronous delegation (original path) ---
         self.execute_sync(agent_name, prompt, &args).await
+    }
+}
+
+fn goal_child_refusal(reason: &str) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(format!("delegate: {reason} during Goal execution")),
     }
 }
 
@@ -4799,6 +4823,30 @@ mod tests {
             },
         );
         agents
+    }
+
+    #[tokio::test]
+    async fn goal_scope_rejects_background_and_parallel_before_child_creation() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let scope = crate::agent::cost::GoalChildExecutionScope {
+            task_id: "goal".into(),
+            session_id: "session".into(),
+            execution_epoch: 1,
+            child_depth: 0,
+        };
+
+        crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+            .scope(Some(scope), async {
+                for args in [
+                    serde_json::json!({"background": true, "agent": "main", "prompt": "x"}),
+                    serde_json::json!({"parallel": [], "prompt": "x"}),
+                ] {
+                    let result = tool.execute(args).await.unwrap();
+                    assert!(!result.success);
+                    assert!(result.error.unwrap_or_default().contains("Goal execution"));
+                }
+            })
+            .await;
     }
 
     async fn wait_for_terminal_background_result(
