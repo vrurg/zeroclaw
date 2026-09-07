@@ -642,15 +642,29 @@ async fn acquire_matrix_foreground_lease(
     msg: &ChannelMessage,
     history_key: &str,
     cancellation: &CancellationToken,
-) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+) -> Option<MatrixForegroundLease> {
     if !is_matrix_channel_name(&msg.channel) {
-        return None;
+        return Some(MatrixForegroundLease::NotMatrix);
     }
     wait_for_foreground_lease(
         foreground_lock(&ctx.persist_locks, history_key),
         cancellation.clone(),
     )
     .await
+    .map(|guard| MatrixForegroundLease::Acquired { _guard: guard })
+}
+
+/// Holds the per-conversation foreground lease for an ordinary channel turn.
+///
+/// `None` from [`acquire_matrix_foreground_lease`] is reserved for a cancelled
+/// queued Matrix turn. Keeping the non-Matrix case explicit prevents a caller
+/// from accidentally treating cancellation as an unlocked ordinary turn.
+enum MatrixForegroundLease {
+    NotMatrix,
+    Acquired {
+        // Retaining this guard, rather than inspecting it, is the contract.
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
 }
 
 /// A turn waiting for its conversation lane.
@@ -7264,11 +7278,26 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
         return;
     }
+
+    // Matrix ordinary turns and later Goal execution share this canonical
+    // conversation-key foreground domain. Acquire before any session mutation
+    // or observable work: a cancelled queued turn must not proceed unlocked.
+    let _matrix_foreground_lease = match acquire_matrix_foreground_lease(
+        ctx.as_ref(),
+        &msg,
+        &history_key,
+        &cancellation_token,
+    )
+    .await
+    {
+        Some(lease) => lease,
+        None => return,
+    };
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
 
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
@@ -8107,13 +8136,6 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
-    // Matrix ordinary turns and the later Goal driver share this canonical
-    // conversation-key foreground domain. Acquire only at the model boundary:
-    // ingress work remains concurrent, and a cancelled queued turn never owns
-    // the lease.
-    let _matrix_foreground_lease =
-        acquire_matrix_foreground_lease(ctx.as_ref(), &msg, &history_key, &cancellation_token)
-            .await;
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
