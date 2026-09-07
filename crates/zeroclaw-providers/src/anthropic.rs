@@ -2537,6 +2537,30 @@ impl AnthropicModelProvider {
                 .unwrap_or_default();
 
             match event_type {
+                "content_block_start" | "content_block_delta" | "content_block_stop"
+                    if last_stop_reason.is_some() =>
+                {
+                    // Anthropic's terminal message_delta follows every content
+                    // block lifecycle. Once it carries a terminal reason, later
+                    // block traffic is ambiguous framing: accepting it could
+                    // surface text or execute a tool after the provider has
+                    // already ended the message. Keep accepting later
+                    // message_delta frames for cumulative usage, but never
+                    // admit, mutate, or emit a post-terminal block event.
+                    terminal_completion_error
+                        .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "event_type": event_type,
+                                "stop_reason": last_stop_reason,
+                            })),
+                        "stream: content block after terminal message_delta; stream remains non-final"
+                    );
+                }
                 "message_start" => {
                     let model = event
                         .get("message")
@@ -4537,6 +4561,81 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
 
         assert_non_string_stop_reason_is_rejected(bytes).await;
+    }
+
+    async fn assert_post_terminal_content_block_is_rejected(block_events: &str) {
+        use std::io::Cursor;
+
+        let bytes = format!(
+            "event: message_start\n\\\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\\\n\
+event: message_delta\n\\\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":5}}}}\n\n\\\n\
+{block_events}\
+event: message_stop\n\\\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_text = false;
+        let mut saw_tool_call = false;
+        let mut saw_final = false;
+        let mut terminal = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::TextDelta(_)) => saw_text = true,
+                Ok(StreamEvent::ToolCall(_)) => saw_tool_call = true,
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => terminal = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert!(!saw_text, "post-terminal text must not be surfaced");
+        assert!(
+            !saw_tool_call,
+            "post-terminal tool use must not become executable"
+        );
+        assert!(!saw_final, "post-terminal content must not emit Final");
+        let terminal = terminal.expect("post-terminal content must fail");
+        assert_eq!(
+            terminal.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            terminal.usage.and_then(|usage| usage.output_tokens),
+            Some(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_text_lifecycle_after_terminal_reason() {
+        assert_post_terminal_content_block_is_rejected(
+            "event: content_block_start\n\\\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\\\n\
+event: content_block_delta\n\\\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n\\\n\
+event: content_block_stop\n\\\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn streaming_rejects_tool_lifecycle_after_terminal_reason() {
+        assert_post_terminal_content_block_is_rejected(
+            "event: content_block_start\n\\\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_late\",\"name\":\"search\",\"input\":{}}}\n\n\\\n\
+event: content_block_delta\n\\\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n\\\n\
+event: content_block_stop\n\\\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )
+        .await;
     }
 
     async fn assert_malformed_content_block_start_is_rejected(content_block: &str) {
