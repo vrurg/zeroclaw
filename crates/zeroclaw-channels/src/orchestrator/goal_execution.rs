@@ -3,6 +3,7 @@
 //! This module owns only live Matrix session mechanics. Durable lifecycle,
 //! accounting, and execution fencing remain in `zeroclaw-runtime`.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -11,6 +12,7 @@ use zeroclaw_api::{
     channel::ChannelMessage,
     model_provider::{ChatMessage, ChatRequest},
 };
+use zeroclaw_goal::control::goal_parent_turn_input;
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
     agent::execution_tree_budget::ExecutionTreeBudget,
@@ -27,11 +29,12 @@ use zeroclaw_runtime::{
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
-    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn, channel_ingress_context,
-    find_channel_for_message, get_or_create_provider, get_route_selection,
-    model_provider_entry_for_ref, outbound_content_format_for_channel,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection,
+    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
+    build_channel_system_prompt_for_message_with_signal,
+    callable_protocol_exposed_for_channel_turn, channel_ingress_context, find_channel_for_message,
+    get_or_create_provider, get_route_selection, model_provider_entry_for_ref,
+    outbound_content_format_for_channel, runtime_defaults_from_config, runtime_defaults_snapshot,
+    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
 
@@ -326,6 +329,62 @@ impl MatrixGoalExecutionLease {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn base_system_prompt(
+        &self,
+        provider: &dyn zeroclaw_providers::ModelProvider,
+        route: &ChannelRouteSelection,
+        thinking: &super::ChannelThinkingResolution,
+    ) -> String {
+        let excluded_tools = Self::excluded_tools(self.context.as_ref(), &self.message);
+        let native_tool_specs_present =
+            zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+                provider,
+                route.model.as_str(),
+                self.context.tools_registry.as_ref(),
+                excluded_tools,
+                self.context.activated_tools.as_ref(),
+            )
+            .unwrap_or(false);
+        let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
+            native_tool_specs_present,
+            self.context.agent_cfg.resolved.strict_tool_parsing,
+            self.context.system_prompt.as_str(),
+        );
+        let base_system_prompt = system_prompt_for_channel_turn(
+            self.context.as_ref(),
+            self.context.system_prompt.as_str(),
+            true,
+            callable_protocol_exposed,
+            excluded_tools,
+        );
+        let target_channel =
+            find_channel_for_message(&self.context.channels_by_name, &self.message);
+        let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_system_prompt,
+            &self.message,
+            target_channel,
+            native_tool_specs_present,
+        );
+        if super::send_message_to_peer_tool_available(self.context.as_ref(), &self.message)
+            && let Some(current_channel_ref) =
+                super::peer_prompt_channel_ref(self.context.as_ref(), &self.message)
+        {
+            let peer_map =
+                zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
+                    self.context.prompt_config.as_ref(),
+                    self.context.agent_alias.as_str(),
+                    &current_channel_ref,
+                );
+            if !peer_map.is_empty() {
+                let _ = write!(system_prompt, "\n\n{peer_map}");
+            }
+        }
+        if let Some(prefix) = thinking.params.system_prompt_prefix.as_ref() {
+            system_prompt = format!("{prefix}\n\n{system_prompt}");
+        }
+        system_prompt
+    }
 }
 
 #[async_trait]
@@ -340,6 +399,20 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
         let defaults = runtime_defaults_snapshot(self.context.as_ref());
+        let history_key = self.session_key.durable_id();
+        let thinking_override = self
+            .context
+            .thinking_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&history_key)
+            .copied();
+        let thinking = super::resolve_channel_thinking(
+            &self.message.content,
+            thinking_override,
+            &self.context.agent_cfg.resolved.thinking,
+            defaults.defaults.temperature,
+        );
         let route = get_route_selection(
             self.context.as_ref(),
             &self.message,
@@ -353,16 +426,18 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let mut history = turn.working_history;
-        let turn_kind = match turn.kind {
-            GoalParentTurnKind::Start => "start",
-            GoalParentTurnKind::Resume => "resume",
-            GoalParentTurnKind::Continue => "continue",
+        let input = goal_parent_turn_input(&turn);
+        let base_system_prompt = self.base_system_prompt(provider.as_ref(), &route, &thinking);
+        let mut history = match turn.kind {
+            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
+                input.goal_start_transcript(&base_system_prompt, turn.working_history)?
+            }
+            GoalParentTurnKind::Continue => {
+                let mut history = turn.working_history;
+                input.refresh_goal_continuation(&base_system_prompt, &mut history)?;
+                history
+            }
         };
-        history.push(ChatMessage::system(format!(
-            "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-            turn.objective
-        )));
         let turn_id = uuid::Uuid::new_v4().to_string();
         let loop_knobs = LoopKnobs::default();
         let execution_tree_budget = ExecutionTreeBudget::from_limit(
@@ -378,7 +453,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 self.context.observer.as_ref(),
                 &loop_knobs,
                 Self::excluded_tools(self.context.as_ref(), &self.message),
-                defaults.defaults.temperature,
+                thinking.effective_temperature,
             ),
             history: &mut history,
             channel_name: self.message.channel.as_str(),
@@ -400,6 +475,8 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             sop_reassembly: None,
         });
         let candidate = scope_session_key(Some(self.session_key.durable_id()), async {
+            let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(thinking.params.native_thinking, tool_loop);
             let thread_scope_id = self
                 .message
                 .interruption_scope_id
@@ -510,5 +587,33 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             ))
             .await
             .context("deliver Matrix Goal lifecycle notice")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_parent_input_keeps_lifecycle_phase_out_of_user_control() {
+        for (kind, expected) in [
+            (GoalParentTurnKind::Start, "start"),
+            (GoalParentTurnKind::Resume, "resume"),
+            (GoalParentTurnKind::Continue, "continue"),
+        ] {
+            let input = goal_parent_turn_input(&GoalParentTurn {
+                kind,
+                objective: "the trusted success criterion".to_owned(),
+                working_history: Vec::new(),
+            });
+            let directive = input.compose_goal_system_row("Ordinary policy");
+            assert_eq!(directive.role, "system");
+            assert!(directive.content.contains("the trusted success criterion"));
+            assert!(
+                directive
+                    .content
+                    .contains(&format!("Turn kind (trusted runtime fact): {expected}"))
+            );
+        }
     }
 }
