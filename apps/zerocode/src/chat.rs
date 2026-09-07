@@ -2640,17 +2640,24 @@ impl Chat {
                     }
                 }
                 Ok(notif) if notif.method == "session/goal_update" => {
-                    let Some(session_id) = notif.params.get("session_id").and_then(|v| v.as_str())
+                    let Some((kind, payload)) = notif
+                        .params
+                        .as_object()
+                        .and_then(|object| object.iter().next())
+                    else {
+                        continue;
+                    };
+                    let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str())
                     else {
                         continue;
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
                     };
-                    match notif.params.get("type").and_then(|v| v.as_str()) {
-                        Some("verified_candidate") => {
+                    match kind.as_str() {
+                        "verified_candidate" => {
                             if let Some(candidate) =
-                                notif.params.get("candidate").and_then(|v| v.as_str())
+                                payload.get("candidate").and_then(|v| v.as_str())
                             {
                                 state
                                     .entries
@@ -2658,7 +2665,7 @@ impl Chat {
                                 state.mark_dirty_append();
                             }
                         }
-                        Some("completed") => {
+                        "completed" => {
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -2666,7 +2673,7 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        Some("paused_for_blocker") => {
+                        "paused_for_blocker" => {
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
