@@ -6863,8 +6863,14 @@ mod tests {
             ChatMessage::user("run tool calls"),
         ];
         let observer = NoopObserver;
+        let fence = Arc::new(RecordingGoalToolPhaseFence {
+            events: Mutex::new(Vec::new()),
+        });
+        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
 
-        let result = run_tool_call_loop(ToolLoop {
+        let operation = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -6878,7 +6884,7 @@ mod tests {
                 observer: &observer,
                 silent: true,
                 approval: Some(&approval_mgr),
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                multimodal_config: &multimodal_config,
                 config: None,
                 max_tool_iterations: 4,
                 hooks: None,
@@ -6886,13 +6892,13 @@ mod tests {
                 dedup_exempt_tools: &[],
                 activated_tools: None,
                 model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                pacing: &pacing,
                 strict_tool_parsing: false,
                 parallel_tools: false,
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &knobs,
             },
             history: &mut history,
             channel_name: "telegram",
@@ -6912,9 +6918,14 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
-        })
-        .await
-        .expect("parallel execution should complete");
+        });
+        let result = crate::agent::cost::GOAL_TOOL_PHASE_FENCE
+            .scope(
+                Some(Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>),
+                operation,
+            )
+            .await
+            .expect("parallel execution should complete");
 
         assert!(
             result.ends_with("done"),
@@ -6940,6 +6951,11 @@ mod tests {
         assert!(
             idx_a < idx_b,
             "tool results should preserve input order for tool call mapping"
+        );
+        assert_eq!(
+            *fence.events.lock().unwrap(),
+            ["begin", "complete"],
+            "the shared loop must pair a Goal tool phase only after results enter history"
         );
     }
 
@@ -7395,6 +7411,23 @@ mod tests {
         wait_for: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
+    struct RecordingGoalToolPhaseFence {
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl crate::agent::cost::GoalToolPhaseFence for RecordingGoalToolPhaseFence {
+        async fn begin(&self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("begin");
+            Ok(())
+        }
+
+        async fn complete(&self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("complete");
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl Tool for CancelsTurnTool {
         fn name(&self) -> &str {
@@ -7457,8 +7490,14 @@ mod tests {
         let observer = NoopObserver;
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let fence = Arc::new(RecordingGoalToolPhaseFence {
+            events: Mutex::new(Vec::new()),
+        });
+        let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
 
-        let _ = run_tool_call_loop(ToolLoop {
+        let operation = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: ResolvedAgentExecution {
@@ -7472,7 +7511,7 @@ mod tests {
                 observer: &observer,
                 silent: true,
                 approval: Some(&approval_mgr),
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                multimodal_config: &multimodal_config,
                 config: None,
                 max_tool_iterations: 4,
                 hooks: None,
@@ -7480,13 +7519,13 @@ mod tests {
                 dedup_exempt_tools: &[],
                 activated_tools: None,
                 model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                pacing: &pacing,
                 strict_tool_parsing: false,
                 parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &knobs,
             },
             history: &mut history,
             channel_name: "telegram",
@@ -7506,8 +7545,13 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
-        })
-        .await;
+        });
+        let _ = crate::agent::cost::GOAL_TOOL_PHASE_FENCE
+            .scope(
+                Some(Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>),
+                operation,
+            )
+            .await;
 
         drop(tools_registry);
         let mut results_by_id: std::collections::HashMap<String, Vec<String>> =
@@ -7541,6 +7585,11 @@ mod tests {
         assert_eq!(
             cancel_results[0],
             crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result")
+        );
+        assert_eq!(
+            *fence.events.lock().unwrap(),
+            ["begin"],
+            "a cancelled Goal tool batch must remain durably incomplete"
         );
     }
 

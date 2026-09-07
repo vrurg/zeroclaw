@@ -275,6 +275,33 @@ tokio::task_local! {
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
+/// Private bridge from the shared tool loop to the exact Goal control-plane
+/// epoch that owns it.  It is deliberately independent from provider
+/// accounting: a tool call has no provider usage to settle, but its call/result
+/// pairing still determines whether a paused or restarted Goal is resumable.
+#[async_trait::async_trait]
+pub(crate) trait GoalToolPhaseFence: Send + Sync {
+    async fn begin(&self) -> anyhow::Result<()>;
+    async fn complete(&self) -> anyhow::Result<()>;
+}
+
+tokio::task_local! {
+    pub(crate) static GOAL_TOOL_PHASE_FENCE: Option<Arc<dyn GoalToolPhaseFence>>;
+}
+
+/// Begins an exact Goal tool phase only inside a Goal-owned turn.  The caller
+/// must complete the returned fence only after the matching tool results have
+/// entered its transient working transcript.  Dropping it without completion
+/// intentionally leaves the durable phase in flight for fail-closed recovery.
+pub(crate) async fn begin_goal_tool_phase_if_scoped()
+-> anyhow::Result<Option<Arc<dyn GoalToolPhaseFence>>> {
+    let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() else {
+        return Ok(None);
+    };
+    fence.begin().await?;
+    Ok(Some(fence))
+}
+
 /// Admit an operation only when the enclosing execution is Goal-scoped.
 /// Ordinary turns never enter this branch.
 pub(crate) async fn admit_goal_operation_if_scoped(

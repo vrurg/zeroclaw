@@ -1216,6 +1216,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
+        // The durable Goal phase starts only for calls that cleared ordinary
+        // preparation and are about to execute.  It stays in flight across
+        // execution and transcript pairing so restart/pause recovery never
+        // resumes a tool side effect without its corresponding result.
+        let goal_tool_phase = if executable_calls.is_empty() {
+            None
+        } else {
+            crate::agent::cost::begin_goal_tool_phase_if_scoped().await?
+        };
+
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -1383,6 +1393,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if let Some(fence) = goal_tool_phase {
+            fence.complete().await?;
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);

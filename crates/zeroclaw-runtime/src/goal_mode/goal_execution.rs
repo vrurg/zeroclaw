@@ -25,9 +25,9 @@ use super::{
     GoalSessionDriver, GoalSessionExecutionLease, GoalVerifierTurn,
 };
 use crate::agent::cost::{
-    GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
-    GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, provider_pricing,
-    resolve_rates_opt,
+    GOAL_OPERATION_ACCOUNTING, GOAL_TOOL_PHASE_FENCE, GoalOperationAccounting,
+    GoalOperationRequest, GoalOperationSettlement, GoalToolPhaseFence, GoalUsageEvent,
+    ModelProviderPricing, provider_pricing, resolve_rates_opt,
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -557,18 +557,25 @@ impl GoalExecutionEngine {
             Arc::clone(&self.pricing),
             scope.clone(),
         ));
+        let tool_phase: Arc<dyn GoalToolPhaseFence> = Arc::new(GoalToolPhaseController {
+            registry: Arc::clone(&self.registry),
+            scope: scope.clone(),
+        });
         let mut lease = self.runtime.acquire_execution(settings, request).await?;
 
         GOAL_OPERATION_ACCOUNTING
-            .scope(Some(accountant), async {
-                self.run_scoped(
-                    &scope,
-                    &objective,
-                    request.initial_turn_kind(),
-                    lease.as_mut(),
-                )
-                .await
-            })
+            .scope(
+                Some(accountant),
+                GOAL_TOOL_PHASE_FENCE.scope(Some(tool_phase), async {
+                    self.run_scoped(
+                        &scope,
+                        &objective,
+                        request.initial_turn_kind(),
+                        lease.as_mut(),
+                    )
+                    .await
+                }),
+            )
             .await
     }
 
@@ -780,6 +787,54 @@ impl GoalExecutionEngine {
 struct AdmittedOperation {
     id: String,
     _permit: OwnedSemaphorePermit,
+}
+
+/// Exact durable pairing fence for a Goal-owned tool batch.
+///
+/// The shared agent loop decides when a call is executable and when its result
+/// is paired into the working transcript.  This controller supplies only the
+/// exact task/session/epoch guard, so channels and ZeroCode cannot grow their
+/// own tool-lifecycle implementations.
+struct GoalToolPhaseController {
+    registry: Arc<dyn GoalTaskRegistry>,
+    scope: GoalExecutionScope,
+}
+
+#[async_trait]
+impl GoalToolPhaseFence for GoalToolPhaseController {
+    async fn begin(&self) -> Result<()> {
+        match self
+            .registry
+            .begin_goal_tool_phase(
+                self.scope.task_id(),
+                self.scope.session_id(),
+                self.scope.execution_epoch(),
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                bail!("Goal tool phase admission lost its execution fence")
+            }
+        }
+    }
+
+    async fn complete(&self) -> Result<()> {
+        match self
+            .registry
+            .complete_goal_tool_phase(
+                self.scope.task_id(),
+                self.scope.session_id(),
+                self.scope.execution_epoch(),
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                bail!("Goal tool phase settlement lost its execution fence")
+            }
+        }
+    }
 }
 
 /// One Goal execution epoch's private provider-accounting bridge.
@@ -1330,5 +1385,70 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+    }
+
+    #[tokio::test]
+    async fn tool_phase_controller_requires_exact_goal_pairing() {
+        let (store, _accountant, scope, _directory) = accountant_fixture().await;
+        let fence = GoalToolPhaseController {
+            registry: store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope: scope.clone(),
+        };
+
+        fence.begin().await.unwrap();
+        assert_eq!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_phase,
+            crate::control_plane::GoalToolPhase::InFlight
+        );
+
+        fence.complete().await.unwrap();
+        assert_eq!(
+            store
+                .get_goal_task(scope.task_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .tool_phase,
+            crate::control_plane::GoalToolPhase::Clean
+        );
+    }
+
+    #[tokio::test]
+    async fn pausing_an_unpaired_goal_tool_phase_fails_closed() {
+        let (store, _accountant, scope, _directory) = accountant_fixture().await;
+        let fence = GoalToolPhaseController {
+            registry: store.clone() as Arc<dyn GoalTaskRegistry>,
+            scope: scope.clone(),
+        };
+        fence.begin().await.unwrap();
+
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
     }
 }
