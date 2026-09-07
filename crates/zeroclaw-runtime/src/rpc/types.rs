@@ -289,6 +289,16 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// Asynchronous Goal execution update. Goal work never emits ordinary
+    /// prompt chunks: only verified candidate and terminal lifecycle updates.
+    pub enum SessionGoalUpdate {
+        VerifiedCandidate { session_id: String, candidate: String },
+        Completed { session_id: String },
+        PausedForBlocker { session_id: String },
+    }
+}
+
+rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
         #[serde(default)]
