@@ -345,6 +345,48 @@ fn config_with_disabled_telegram_and_invalid_api_url(config_dir: &std::path::Pat
     config
 }
 
+fn config_with_mcp_server(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config.mcp.enabled = true;
+    config
+        .mcp
+        .servers
+        .push(zeroclaw_config::schema::McpServerConfig {
+            name: "filesystem".into(),
+            transport: zeroclaw_config::schema::McpTransport::Stdio,
+            command: "/usr/bin/mcp-filesystem".into(),
+            tool_timeout_secs: Some(30),
+            ..Default::default()
+        });
+    let raw = toml::to_string(&config).expect("serialize MCP fixture");
+    std::fs::write(config_dir.join("config.toml"), raw).expect("write MCP fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
+fn config_with_malformed_plugin_egress_hosts(config_dir: &std::path::Path) -> Config {
+    let mut config = Config {
+        locale: Some("en".into()),
+        ..Default::default()
+    };
+    config
+        .plugins
+        .entries
+        .push(zeroclaw_config::schema::PluginEntryConfig {
+            name: "p".into(),
+            egress_hosts: vec!["**bad".into()],
+            ..Default::default()
+        });
+    let raw = toml::to_string(&config).expect("serialize malformed plugin egress fixture");
+    std::fs::write(config_dir.join("config.toml"), raw)
+        .expect("write malformed plugin egress fixture");
+    config.config_path = config_dir.join("config.toml");
+    config
+}
+
 fn config_with_mdns_intervals(config_dir: &std::path::Path) -> Config {
     let mut config = Config {
         locale: Some("en".into()),
@@ -772,6 +814,41 @@ async fn config_patch_http_rejects_a_dirty_helper_validated_field() {
         .expect("read unchanged config");
     let parsed: Config = toml::from_str(&saved).expect("unchanged config should parse");
     assert_eq!(parsed.channels.telegram["bad"].api_base_url, "not a URL");
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_a_dirty_natural_key_mcp_field() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, _) = run_http_patch_with_config(
+        config_with_mcp_server(config_dir.path()),
+        br#"[{"op":"replace","path":"/mcp/servers/filesystem/tool_timeout_secs","value":0}]"#,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    let parsed: Config = toml::from_str(&saved).expect("unchanged config should parse");
+    assert_eq!(parsed.mcp.servers[0].tool_timeout_secs, Some(30));
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn config_patch_http_rejects_dirty_plugin_carveout_behind_malformed_hosts() {
+    let config_dir = tempfile::tempdir().expect("temp http config dir");
+    let (status, _) = run_http_patch_with_config(
+        config_with_malformed_plugin_egress_hosts(config_dir.path()),
+        br#"[{"op":"replace","path":"/plugins/entries/p/egress_allow_private","value":["10.0.0.5"]}]"#,
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read unchanged config");
+    let parsed: Config = toml::from_str(&saved).expect("unchanged config should parse");
+    assert_eq!(parsed.plugins.entries[0].egress_hosts, ["**bad"]);
+    assert!(parsed.plugins.entries[0].egress_allow_private.is_empty());
 }
 
 #[cfg(feature = "gateway")]

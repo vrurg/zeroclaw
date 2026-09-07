@@ -10431,12 +10431,34 @@ fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    validate_mcp_config_for_repair(config, &std::collections::HashSet::new())
+}
+
+fn validate_mcp_config_for_repair(
+    config: &McpConfig,
+    ignored_errors: &std::collections::HashSet<ConfigApiError>,
+) -> Result<()> {
+    macro_rules! mcp_validation_bail {
+        ($code:ident, $path:expr, $($msg:tt)*) => {{
+            continue_or_return_repair_validation_error(
+                ConfigApiError::new(
+                    crate::api_error::ConfigApiCode::$code,
+                    format!($($msg)*),
+                )
+                .with_path($path)
+                .with_related_paths(["mcp.enabled"]),
+                ignored_errors,
+            )?;
+        }};
+    }
+
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
         let name = server.name.trim();
         if name.is_empty() {
-            validation_bail!(
+            mcp_validation_bail!(
                 RequiredFieldEmpty,
                 format!("mcp.servers[{i}].name"),
                 "mcp.servers[{i}].name must not be empty"
@@ -10448,7 +10470,7 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
 
         if let Some(timeout) = server.tool_timeout_secs {
             if timeout == 0 {
-                validation_bail!(
+                mcp_validation_bail!(
                     InvalidNumericRange,
                     format!("mcp.servers[{i}].tool_timeout_secs"),
                     "mcp.servers[{i}].tool_timeout_secs must be greater than 0"
@@ -10505,7 +10527,7 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                 }
                 if let Some(ca_path) = server.tls_ca_cert_path.as_deref() {
                     if ca_path.trim().is_empty() {
-                        validation_bail!(
+                        mcp_validation_bail!(
                             RequiredFieldEmpty,
                             format!("mcp.servers[{i}].tls_ca_cert_path"),
                             "mcp.servers[{i}].tls_ca_cert_path must not be empty"
@@ -10602,25 +10624,47 @@ fn with_validation_related_paths(
 /// once the alias is enabled (Telegram, Discord). `field_path` must be the
 /// `channels.<type>.<alias>.bot_token` leaf; the enabled-state message
 /// derives the sibling `.enabled` path from it.
-fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> Result<()> {
+fn continue_or_return_repair_validation_error(
+    error: ConfigApiError,
+    ignored_errors: &std::collections::HashSet<ConfigApiError>,
+) -> Result<()> {
+    if ignored_errors.contains(&error) {
+        Ok(())
+    } else {
+        Err(anyhow::Error::from(error))
+    }
+}
+
+fn validate_required_bot_token(
+    field_path: &str,
+    enabled: bool,
+    token: &str,
+    ignored_errors: &std::collections::HashSet<ConfigApiError>,
+) -> Result<()> {
     if token.trim() == crate::traits::UNSET_DISPLAY {
-        validation_bail!(
-            RequiredFieldEmpty,
-            field_path.to_string(),
-            "{field_path} must not contain the unset display placeholder",
-        );
+        continue_or_return_repair_validation_error(
+            ConfigApiError::new(
+                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                format!("{field_path} must not contain the unset display placeholder"),
+            )
+            .with_path(field_path),
+            ignored_errors,
+        )?;
     }
     if enabled && crate::traits::is_unset_display_value(token) {
         let enabled_path = field_path.strip_suffix("bot_token").map_or_else(
             || field_path.to_string(),
             |prefix| format!("{prefix}enabled"),
         );
-        validation_bail!(
-            RequiredFieldEmpty,
-            field_path.to_string(),
-            related[enabled_path],
-            "{field_path} is required when {enabled_path} = true",
-        );
+        continue_or_return_repair_validation_error(
+            ConfigApiError::new(
+                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                format!("{field_path} is required when {enabled_path} = true"),
+            )
+            .with_path(field_path)
+            .with_related_paths([enabled_path]),
+            ignored_errors,
+        )?;
     }
     Ok(())
 }
@@ -10638,21 +10682,28 @@ pub(crate) fn validate_required_field(
     enabled_path: &str,
     enabled: bool,
     value: &str,
+    ignored_errors: &std::collections::HashSet<ConfigApiError>,
 ) -> Result<()> {
     if value.trim() == crate::traits::UNSET_DISPLAY {
-        validation_bail!(
-            RequiredFieldEmpty,
-            field_path.to_string(),
-            "{field_path} must not contain the unset display placeholder",
-        );
+        continue_or_return_repair_validation_error(
+            ConfigApiError::new(
+                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                format!("{field_path} must not contain the unset display placeholder"),
+            )
+            .with_path(field_path),
+            ignored_errors,
+        )?;
     }
     if enabled && crate::traits::is_unset_display_value(value) {
-        validation_bail!(
-            RequiredFieldEmpty,
-            field_path.to_string(),
-            related[enabled_path],
-            "{field_path} is required when {enabled_path} = true",
-        );
+        continue_or_return_repair_validation_error(
+            ConfigApiError::new(
+                crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                format!("{field_path} is required when {enabled_path} = true"),
+            )
+            .with_path(field_path)
+            .with_related_paths([enabled_path]),
+            ignored_errors,
+        )?;
     }
     Ok(())
 }
@@ -15075,10 +15126,19 @@ impl Default for TelegramConfig {
 impl TelegramConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
+        self.validate_bot_token_for_repair(alias, &std::collections::HashSet::new())
+    }
+
+    fn validate_bot_token_for_repair(
+        &self,
+        alias: &str,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
+    ) -> Result<()> {
         validate_required_bot_token(
             &format!("channels.telegram.{alias}.bot_token"),
             self.enabled,
             &self.bot_token,
+            ignored_errors,
         )
     }
 }
@@ -15278,10 +15338,19 @@ impl DiscordConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     /// Mirrors `TelegramConfig::validate_bot_token`.
     pub fn validate_bot_token(&self, alias: &str) -> Result<()> {
+        self.validate_bot_token_for_repair(alias, &std::collections::HashSet::new())
+    }
+
+    fn validate_bot_token_for_repair(
+        &self,
+        alias: &str,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
+    ) -> Result<()> {
         validate_required_bot_token(
             &format!("channels.discord.{alias}.bot_token"),
             self.enabled,
             &self.bot_token,
+            ignored_errors,
         )
     }
 }
@@ -16126,18 +16195,28 @@ impl SignalConfig {
     /// never connects and crashloops its per-channel supervisor, so reject
     /// it at config-load time instead.
     pub fn validate_required(&self, alias: &str) -> Result<()> {
+        self.validate_required_for_repair(alias, &std::collections::HashSet::new())
+    }
+
+    fn validate_required_for_repair(
+        &self,
+        alias: &str,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
+    ) -> Result<()> {
         let enabled_path = format!("channels.signal.{alias}.enabled");
         validate_required_field(
             &format!("channels.signal.{alias}.http_url"),
             &enabled_path,
             self.enabled,
             &self.http_url,
+            ignored_errors,
         )?;
         validate_required_field(
             &format!("channels.signal.{alias}.account"),
             &enabled_path,
             self.enabled,
             &self.account,
+            ignored_errors,
         )
     }
 }
@@ -19082,6 +19161,13 @@ impl Default for CloudOpsConfig {
 
 impl CloudOpsConfig {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_repair(&std::collections::HashSet::new())
+    }
+
+    fn validate_for_repair(
+        &self,
+        ignored_errors: &std::collections::HashSet<ConfigApiError>,
+    ) -> Result<()> {
         if self.enabled {
             if self.default_cloud.trim().is_empty() {
                 anyhow::bail!(
@@ -19095,11 +19181,14 @@ impl CloudOpsConfig {
             }
             for (i, cloud) in self.supported_clouds.iter().enumerate() {
                 if cloud.trim().is_empty() {
-                    validation_bail!(
-                        RequiredFieldEmpty,
-                        format!("cloud_ops.supported_clouds[{i}]"),
-                        "cloud_ops.supported_clouds[{i}] must not be empty"
-                    );
+                    continue_or_return_repair_validation_error(
+                        ConfigApiError::new(
+                            crate::api_error::ConfigApiCode::RequiredFieldEmpty,
+                            format!("cloud_ops.supported_clouds[{i}] must not be empty"),
+                        )
+                        .with_path(format!("cloud_ops.supported_clouds[{i}]")),
+                        ignored_errors,
+                    )?;
                 }
             }
             if !self.supported_clouds.contains(&self.default_cloud) {
@@ -21528,12 +21617,13 @@ impl Config {
             }};
         }
 
-        // Helpers use the exported `validation_bail!` macro and therefore
-        // return a structured `ConfigApiError` before this local macro can
-        // observe it. During repair, let an *already classified* unrelated
-        // helper diagnostic take the same continue path as a local
-        // diagnostic. Errors without that exact structured identity remain
-        // fatal: they cannot be safely attributed to an unrelated field.
+        // Caller-side suppression is safe only when every reachable
+        // structured failure has the same affected-path set: retaining one
+        // cannot hide a later dirty causal path. `validate_http_base_url`
+        // satisfies that rule (and Gitea adds the same related paths before
+        // suppression). Multi-check helpers receive `ignored_errors`
+        // directly. Errors without an exact structured identity remain fatal:
+        // they cannot be safely attributed to an unrelated field.
         macro_rules! validation_try {
             ($result:expr) => {
                 if let Err(error) = $result {
@@ -21547,7 +21637,7 @@ impl Config {
             };
         }
 
-        validation_try!(validate_memory_rerank_config(&self.memory));
+        validate_memory_rerank_config(&self.memory)?;
 
         // TOML deserialization inserts provider aliases directly into their
         // maps. Preserve legacy aliases that are broader than the mutation
@@ -21674,7 +21764,7 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
-            validation_try!(tg.validate_bot_token(alias));
+            tg.validate_bot_token_for_repair(alias, ignored_errors)?;
             validation_try!(validate_http_base_url(
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
@@ -21682,9 +21772,9 @@ impl Config {
         }
 
         for (alias, matrix) in &self.channels.matrix {
-            validation_try!(matrix.validate_stream_tool_arguments().with_context(|| {
+            matrix.validate_stream_tool_arguments().with_context(|| {
                 format!("invalid channels.matrix.{alias}.stream_tool_arguments")
-            }));
+            })?;
         }
 
         for (alias, slack) in &self.channels.slack {
@@ -21700,7 +21790,7 @@ impl Config {
         }
 
         for (alias, dc) in &self.channels.discord {
-            validation_try!(dc.validate_bot_token(alias));
+            dc.validate_bot_token_for_repair(alias, ignored_errors)?;
         }
 
         // Signal and Voice Call: like Telegram/Discord's bot_token, these
@@ -21709,29 +21799,32 @@ impl Config {
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
         for (alias, sig) in &self.channels.signal {
-            validation_try!(sig.validate_required(alias));
+            sig.validate_required_for_repair(alias, ignored_errors)?;
         }
 
         for (alias, vc) in &self.channels.voice_call {
             let enabled_path = format!("channels.voice_call.{alias}.enabled");
-            validation_try!(validate_required_field(
+            validate_required_field(
                 &format!("channels.voice_call.{alias}.account_id"),
                 &enabled_path,
                 vc.enabled,
                 &vc.account_id,
-            ));
-            validation_try!(validate_required_field(
+                ignored_errors,
+            )?;
+            validate_required_field(
                 &format!("channels.voice_call.{alias}.auth_token"),
                 &enabled_path,
                 vc.enabled,
                 &vc.auth_token,
-            ));
-            validation_try!(validate_required_field(
+                ignored_errors,
+            )?;
+            validate_required_field(
                 &format!("channels.voice_call.{alias}.from_number"),
                 &enabled_path,
                 vc.enabled,
                 &vc.from_number,
-            ));
+                ignored_errors,
+            )?;
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -22481,15 +22574,12 @@ impl Config {
             }
         }
 
-        validation_try!(validate_plugin_entries(&self.plugins));
-        validation_try!(validate_plugin_channel_instances(&self.channels));
+        validate_plugin_entries(&self.plugins)?;
+        validate_plugin_channel_instances(&self.channels)?;
 
         // MCP
         if self.mcp.enabled {
-            validation_try!(
-                validate_mcp_config(&self.mcp)
-                    .map_err(|error| with_validation_related_paths(error, ["mcp.enabled"]))
-            );
+            validate_mcp_config_for_repair(&self.mcp, ignored_errors)?;
         }
 
         // Knowledge graph
@@ -22680,8 +22770,8 @@ impl Config {
         }
 
         // Proxy (delegate to existing validation)
-        validation_try!(self.proxy.validate());
-        validation_try!(self.cloud_ops.validate());
+        self.proxy.validate()?;
+        self.cloud_ops.validate_for_repair(ignored_errors)?;
 
         // Skills — extra registries
         {
@@ -23357,7 +23447,17 @@ impl Config {
                 ) {
                     Ok(patterns) => patterns,
                     Err(e) => {
-                        validation_bail!(InvalidFormat, path, "{}", e);
+                        // A malformed host grant prevents the dependent
+                        // carveout checks below from running. Declare that
+                        // dependency so config repair cannot retain this
+                        // diagnostic while admitting a dirty carveout.
+                        validation_bail!(
+                            InvalidFormat,
+                            path,
+                            related[format!("plugins.entries.{}.egress_allow_private", entry.name)],
+                            "{}",
+                            e
+                        );
                         // The ignored malformed host list cannot safely feed
                         // the dependent private-carveout validation below.
                         continue;
@@ -23415,15 +23515,27 @@ impl Config {
     pub fn validate_for_config_repair(
         &self,
     ) -> Result<Vec<crate::validation_warnings::ValidationWarning>> {
-        fn paths_overlap(left: &str, right: &str) -> bool {
+        // Public mutations address `#[natural_key]` list entries by key
+        // (`mcp.servers.filesystem.tool_timeout_secs`), but validators retain
+        // their stable positional display paths (`mcp.servers[0]...`). Capture
+        // the live natural-key metadata once per repair attempt, then compare
+        // the two spellings against that stable view. Calling
+        // `map_key_sections()` per comparison would repeatedly materialize
+        // generated schema metadata. A centralized validation model should
+        // eventually own this translation instead.
+        let natural_key_sections = config_repair_natural_key_sections(self);
+
+        let paths_overlap = |left: &str, right: &str| -> bool {
+            let left = canonical_config_repair_path(&natural_key_sections, left);
+            let right = canonical_config_repair_path(&natural_key_sections, right);
             left == right
                 || left
-                    .strip_prefix(right)
+                    .strip_prefix(right.as_ref())
                     .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
                 || right
-                    .strip_prefix(left)
+                    .strip_prefix(left.as_ref())
                     .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
-        }
+        };
 
         let excluded_legacy_alias_paths: std::collections::HashSet<String> = self
             .providers
@@ -23901,6 +24013,55 @@ impl Config {
         self.clear_dirty();
         Ok(outcome)
     }
+}
+
+/// Snapshot the current names of list-backed config entries addressed by a
+/// natural key. A repair validation uses one snapshot so every comparison sees
+/// the same mutation state without repeatedly materializing schema metadata.
+fn config_repair_natural_key_sections(config: &Config) -> Vec<(&'static str, Vec<String>)> {
+    Config::map_key_sections()
+        .into_iter()
+        .filter(|section| {
+            section.kind == crate::traits::MapKeyKind::List && section.natural_key.is_some()
+        })
+        .map(|section| {
+            (
+                section.path,
+                config.get_map_keys(section.path).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Translate a validator's positional list path into the public natural-key
+/// spelling used by persistent config mutations. Paths that do not identify a
+/// current non-empty natural key remain unchanged.
+fn canonical_config_repair_path<'a>(
+    natural_key_sections: &[(&str, Vec<String>)],
+    path: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    for (section_path, keys) in natural_key_sections {
+        let Some(after_section) = path.strip_prefix(section_path) else {
+            continue;
+        };
+        let Some(index_and_suffix) = after_section.strip_prefix('[') else {
+            continue;
+        };
+        let Some((index, suffix)) = index_and_suffix.split_once(']') else {
+            continue;
+        };
+        if !suffix.is_empty() && !suffix.starts_with('.') {
+            continue;
+        }
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        let Some(key) = keys.get(index).filter(|key| !key.is_empty()) else {
+            continue;
+        };
+        return std::borrow::Cow::Owned(format!("{section_path}.{key}{suffix}"));
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -44276,6 +44437,127 @@ model_provider = \"ollama.default\"
             error.path.as_deref(),
             Some("channels.git.gitea.api_base_url")
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_does_not_hide_a_dirty_signal_field_after_an_unrelated_one() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "bad".into(),
+            SignalConfig {
+                enabled: true,
+                http_url: " ".into(),
+                account: " ".into(),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("channels.signal.bad.account");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty Signal account must remain fatal after retaining http_url");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(error.path.as_deref(), Some("channels.signal.bad.account"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_does_not_hide_a_dirty_channel_enable_after_a_placeholder_error() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "bad".into(),
+            TelegramConfig {
+                enabled: true,
+                bot_token: crate::traits::UNSET_DISPLAY.into(),
+                ..Default::default()
+            },
+        );
+        config.mark_dirty("channels.telegram.bad.enabled");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("enabling a channel with an unset token must remain fatal");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("channels.telegram.bad.bot_token")
+        );
+        assert_eq!(error.related_paths, vec!["channels.telegram.bad.enabled"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_does_not_hide_a_dirty_mcp_field_after_an_unrelated_one() {
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![
+            stdio_server("", "/usr/bin/mcp-first"),
+            McpServerConfig {
+                name: "later".into(),
+                transport: McpTransport::Stdio,
+                command: "/usr/bin/mcp-later".into(),
+                tool_timeout_secs: Some(30),
+                ..Default::default()
+            },
+        ];
+        // Exercise the public natural-key mutation grammar. Validators report
+        // `mcp.servers[1]...`, so repair classification must canonicalize that
+        // display path back to this dirty path rather than demoting this new
+        // invalid value to a pre-existing warning.
+        config
+            .set_prop_persistent("mcp.servers.later.tool_timeout_secs", "0")
+            .expect("natural-key MCP edit applies before validation");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty MCP timeout must remain fatal after retaining another server");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(
+            error.path.as_deref(),
+            Some("mcp.servers[1].tool_timeout_secs")
+        );
+        assert_eq!(error.related_paths, vec!["mcp.enabled"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_canonicalizes_model_route_validator_paths_by_hint() {
+        let mut config = Config::default();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "openai.default".into(),
+            model: "gpt-4.1-mini".into(),
+            api_key: None,
+        });
+        config
+            .set_prop_persistent("model_routes.fast.model_provider", "openai.default")
+            .expect("public natural-key model-route mutation applies before validation");
+
+        let natural_key_sections = config_repair_natural_key_sections(&config);
+        assert_eq!(
+            canonical_config_repair_path(&natural_key_sections, "model_routes[0].model_provider"),
+            "model_routes.fast.model_provider",
+            "validator display paths must match the public natural-key dirty path"
+        );
+
+        config.model_routes[0].hint.clear();
+        let empty_key_sections = config_repair_natural_key_sections(&config);
+        assert_eq!(
+            canonical_config_repair_path(&empty_key_sections, "model_routes[0].model_provider"),
+            "model_routes[0].model_provider",
+            "an empty natural key must not create a degenerate public path"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_repair_does_not_hide_a_dirty_cloud_ops_field_after_an_unrelated_one() {
+        let mut config = Config::default();
+        config.cloud_ops.enabled = true;
+        config.cloud_ops.supported_clouds = vec![" ".into(), " ".into()];
+        config.mark_dirty("cloud_ops.supported_clouds[1]");
+
+        let error = config
+            .validate_for_config_repair()
+            .expect_err("a dirty CloudOps entry must remain fatal after retaining another entry");
+        let error = ConfigApiError::from_validation(error);
+        assert_eq!(error.path.as_deref(), Some("cloud_ops.supported_clouds[1]"));
     }
 
     #[::core::prelude::v1::test]
