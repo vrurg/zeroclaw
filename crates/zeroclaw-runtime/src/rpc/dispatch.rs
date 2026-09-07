@@ -824,7 +824,7 @@ impl RpcDispatcher {
                 });
                 return;
             }
-            Method::SessionGoal => self.handle_session_goal(&req.params).await,
+            Method::SessionGoal => Box::pin(self.handle_session_goal(&req.params)).await,
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
