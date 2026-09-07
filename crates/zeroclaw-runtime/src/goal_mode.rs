@@ -352,6 +352,17 @@ pub struct GoalVerifierTurn {
     pub candidate: String,
 }
 
+/// A lifecycle result which occurs after the synchronous Goal command reply.
+///
+/// The executor supplies semantics only. Each admitted surface renders the
+/// message through its own Fluent boundary and must not substitute ordinary
+/// turn-progress output for these notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalExecutionNotice {
+    Completed,
+    PausedForBlocker,
+}
+
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
 /// ledger authority; the later executor owns both around these calls.
@@ -369,6 +380,7 @@ pub trait GoalSessionExecutionLease: Send {
         turn: GoalVerifierTurn,
     ) -> Result<String>;
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()>;
+    async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()>;
 }
 
 /// A driver's owned proof that a live session remains authoritative.
