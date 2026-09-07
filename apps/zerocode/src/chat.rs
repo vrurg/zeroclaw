@@ -21307,6 +21307,55 @@ mod tests {
     }
 
     #[test]
+    fn goal_updates_require_one_canonical_variant_for_the_target_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        for params in [
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                },
+                "completed": { "session_id": "sess-1" }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "other-session",
+                    "candidate": "must not be displayed"
+                }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                }
+            }),
+            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+        ] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".to_string(),
+                    params,
+                })
+                .unwrap();
+        }
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
+        );
+        assert!(
+            matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+    }
+
+    #[test]
     fn restored_session_state_is_idle() {
         let mut active = state();
         active.push_user_message(Some("old prompt".to_string()), Vec::new());
