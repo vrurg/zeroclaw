@@ -31,6 +31,7 @@ use zeroclaw_commands::goal::{
 
 mod deferred;
 mod goal_execution;
+mod parent_input;
 
 pub use deferred::{GoalControlClass, GoalQueuedControl, GoalTurnBoundary, classify_goal_control};
 
@@ -40,6 +41,7 @@ pub use goal_execution::{
     GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
     GoalExecutionSupervisor, GoalSupervisorRetired,
 };
+pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 
 /// Compose transient verifier feedback as untrusted user-role input.
 ///
