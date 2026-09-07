@@ -26,7 +26,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{self, ChatMessage, ChatRequest, ModelProvider, ProviderDispatch};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -1946,6 +1946,24 @@ impl DelegateTool {
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
+        // A Goal-scoped delegate must use the structured provider boundary: the
+        // legacy string convenience call cannot carry accepted-response usage.
+        // Keep the ordinary path below intact so delegation outside Goal Mode
+        // retains its established provider behavior.
+        if crate::agent::cost::goal_operation_accounting_is_scoped() {
+            return self
+                .execute_goal_scoped_non_agentic_delegate(
+                    agent_name,
+                    &provider_type,
+                    &model,
+                    &*model_provider,
+                    system_prompt_ref,
+                    &full_prompt,
+                    temperature,
+                )
+                .await;
+        }
+
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
@@ -1974,6 +1992,90 @@ impl DelegateTool {
             agent_name,
             &provider_type,
             &model,
+            result,
+        ))
+    }
+
+    /// Execute the non-agentic delegate through the normal structured dispatch
+    /// boundary when it is a foreground child of a Goal.  This is deliberately
+    /// local to Goal scope: ordinary delegates preserve their historical
+    /// `chat_with_system` behavior, while Goal calls must settle the immutable
+    /// Reliable attempt report before the tool can return a result.
+    async fn execute_goal_scoped_non_agentic_delegate(
+        &self,
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        model_provider: &dyn ModelProvider,
+        system_prompt: Option<&str>,
+        prompt: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ToolResult> {
+        use crate::agent::cost::{GoalOperationRequest, admit_goal_operation_if_scoped};
+        use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
+
+        admit_goal_operation_if_scoped(GoalOperationRequest::new(provider_type, model)).await?;
+
+        let mut messages = Vec::with_capacity(usize::from(system_prompt.is_some()) + 1);
+        if let Some(system_prompt) = system_prompt {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+        messages.push(ChatMessage::user(prompt));
+
+        let timeout_secs = self
+            .resolve_delegation_timeout(&self.agents[agent_name].runtime_profile)
+            .unwrap_or(self.delegate_config.timeout_secs);
+        let dispatcher = ProviderDispatch::from_ref(model_provider);
+        let scope = AccountedChatScope::new();
+        let dispatch = scope.scope(with_exact_dispatch_route(
+            provider_type.to_string(),
+            model.to_string(),
+            dispatcher.chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                model,
+                temperature,
+            ),
+        ));
+        let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), dispatch).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Agent '{agent_name}' timed out after {timeout_secs}s"
+            )),
+        };
+
+        let accepted = result.as_ref().ok().filter(|response| {
+            !zeroclaw_api::model_provider::strip_think_tags(response.text_or_empty()).is_empty()
+        });
+        if accepted.is_some() {
+            scope.mark_logical_success();
+        }
+        let accounting = scope.take();
+        let attempts = accounting.attempts();
+        let accepted_route = accounting.accepted_route().cloned();
+        crate::agent::cost::settle_provider_attempts(
+            attempts,
+            accepted.map(|_| attempts.len().saturating_sub(1)),
+        )
+        .await?;
+
+        let result = match result {
+            Ok(response) if accepted.is_some() => {
+                zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+                Ok(response.text.unwrap_or_default())
+            }
+            Ok(_) => Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+            Err(error) => Err(error),
+        };
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            provider_type,
+            model,
             result,
         ))
     }
@@ -7509,6 +7611,118 @@ mod tests {
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
         }
+    }
+
+    struct GoalUsageModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for GoalUsageModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused Goal string path".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("accounted foreground result".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GoalUsageModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GoalUsageModelProvider"
+        }
+    }
+
+    struct GoalAccountingProbe {
+        requests: std::sync::Mutex<Vec<crate::agent::cost::GoalOperationRequest>>,
+        settlements: std::sync::Mutex<Vec<crate::agent::cost::GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl crate::agent::cost::GoalOperationAccounting for GoalAccountingProbe {
+        async fn admit(
+            &self,
+            request: crate::agent::cost::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.requests.lock().unwrap().push(request);
+            Ok(())
+        }
+
+        async fn settle(
+            &self,
+            settlement: crate::agent::cost::GoalOperationSettlement,
+        ) -> anyhow::Result<()> {
+            self.settlements.lock().unwrap().push(settlement);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_non_agentic_delegate_uses_structured_attempt_accounting() {
+        let tool = DelegateTool::new(sample_agents(), None, security_allowing());
+        let accounting = Arc::new(GoalAccountingProbe {
+            requests: std::sync::Mutex::new(Vec::new()),
+            settlements: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let result = crate::agent::cost::GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(
+                    Arc::clone(&accounting) as Arc<dyn crate::agent::cost::GoalOperationAccounting>
+                ),
+                tool.execute_goal_scoped_non_agentic_delegate(
+                    "researcher",
+                    "configured.provider",
+                    "configured-model",
+                    &GoalUsageModelProvider,
+                    Some("system"),
+                    "child task",
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("accounted foreground result"));
+        let requests = accounting.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_provider, "configured.provider");
+        drop(requests);
+        let settlements = accounting.settlements.lock().unwrap();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].events.len(), 1);
+        assert_eq!(settlements[0].events[0].provider_ref, "configured.provider");
+        assert_eq!(settlements[0].events[0].model, "configured-model");
+        assert_eq!(settlements[0].events[0].usage.input_tokens, Some(11));
+        assert_eq!(settlements[0].events[0].usage.output_tokens, Some(7));
     }
 
     #[async_trait]
