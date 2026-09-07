@@ -570,7 +570,7 @@ impl GoalExecutionEngine {
             // That call is allowed to settle its already-incurred usage, but
             // its result must never admit a new parent or verifier operation.
             self.exact_running_task(scope).await?;
-            let candidate = match lease
+            let parent = match lease
                 .run_parent_turn(
                     &GoalOperationScope::new(scope.clone()),
                     GoalParentTurn {
@@ -580,7 +580,7 @@ impl GoalExecutionEngine {
                 )
                 .await
             {
-                Ok(candidate) if !candidate.trim().is_empty() => candidate,
+                Ok(parent) if !parent.candidate.trim().is_empty() => parent,
                 Ok(_) => {
                     self.fail(scope, "candidate_empty").await?;
                     bail!("Goal parent returned an empty candidate");
@@ -590,6 +590,8 @@ impl GoalExecutionEngine {
                     return Err(error).context("Goal parent operation failed");
                 }
             };
+            let candidate = parent.candidate;
+            working_history = parent.working_history;
 
             // A lifecycle transition can race with the parent call above.
             // Recheck the exact durable task and epoch before the verifier so
