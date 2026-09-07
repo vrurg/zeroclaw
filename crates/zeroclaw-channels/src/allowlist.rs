@@ -21,6 +21,24 @@ pub fn is_user_allowed(allowed: &[String], user: &str, mode: Match) -> bool {
     }
 }
 
+/// Matrix-compatible user authorization: wildcard or ASCII case-insensitive
+/// MXID comparison. Kept here so persisted-policy checks compile even when
+/// the live Matrix listener feature is not selected.
+#[must_use]
+pub fn is_matrix_user_allowed(allowed: &[String], user: &str) -> bool {
+    is_user_allowed(allowed, user, Match::CaseInsensitive)
+}
+
+/// Matrix-compatible room authorization. An empty allowlist means all rooms,
+/// matching the live Matrix listener contract.
+#[must_use]
+pub fn is_matrix_room_allowed(allowed: &[String], room_id: &str) -> bool {
+    allowed.is_empty()
+        || allowed
+            .iter()
+            .any(|room| room == room_id || room.eq_ignore_ascii_case(room_id))
+}
+
 #[must_use]
 pub fn is_user_allowed_by(
     allowed: &[String],

@@ -141,7 +141,9 @@ use self::foreground::{
     ConversationLocks, foreground_lock, pause_goal_supervisors_for_runtime_interruption,
     persist_lock, wait_for_foreground_lease,
 };
-use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
+use self::goal_execution::{
+    dispose_matrix_goal, revoke_matrix_goals_for_policy, submit_matrix_goal,
+};
 use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -1891,6 +1893,7 @@ async fn maybe_apply_runtime_config_update_locked(ctx: &ChannelRuntimeContext) -
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
+    revoke_matrix_goals_for_policy(ctx, next_config.as_ref()).await?;
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,

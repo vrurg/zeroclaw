@@ -193,22 +193,13 @@ mod mention {
 }
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
-mod allowlist {
-    pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
-        crate::allowlist::is_user_allowed(
-            allowed_users,
-            sender,
-            crate::allowlist::Match::CaseInsensitive,
-        )
+pub(crate) mod allowlist {
+    pub(crate) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
+        crate::allowlist::is_matrix_user_allowed(allowed_users, sender)
     }
 
-    pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
-        if allowed_rooms.is_empty() {
-            return true;
-        }
-        allowed_rooms
-            .iter()
-            .any(|r| r == room_id || r.eq_ignore_ascii_case(room_id))
+    pub(crate) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
+        crate::allowlist::is_matrix_room_allowed(allowed_rooms, room_id)
     }
 }
 

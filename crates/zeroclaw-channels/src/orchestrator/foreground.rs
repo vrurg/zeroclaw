@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_runtime::goal_mode::GoalExecutionSupervisor;
+use zeroclaw_runtime::goal_mode::{GoalExecutionScope, GoalExecutionSupervisor};
 
 #[derive(Clone)]
 pub(crate) struct ConversationLocks {
@@ -96,6 +96,23 @@ pub(crate) async fn pause_goal_supervisors_for_runtime_interruption(
     }
     for supervisor in supervisors {
         supervisor.pause_all_for_runtime_interruption().await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn drain_policy_revoked_goal(
+    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    scope: &GoalExecutionScope,
+) -> Result<()> {
+    let slot = goal_supervisor_slot(locks, scope.session_id());
+    let Some(supervisor) = slot.lock().await.as_ref().cloned() else {
+        return Ok(());
+    };
+    if supervisor.owns_scope(scope).await {
+        supervisor.drain_policy_revoked(scope).await?;
+        if !supervisor.owns_scope(scope).await {
+            *slot.lock().await = None;
+        }
     }
     Ok(())
 }

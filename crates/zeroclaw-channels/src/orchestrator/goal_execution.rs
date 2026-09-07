@@ -14,7 +14,9 @@ use zeroclaw_api::{
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
     agent::loop_::{LoopKnobs, ToolLoop, run_tool_call_loop, scope_session_key, scope_thread_id},
-    control_plane::control_plane,
+    control_plane::{
+        GoalPolicyRevocationTarget, GoalTransitionResult, TaskKind, TaskRecord, control_plane,
+    },
     cost::CostTracker,
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
@@ -24,7 +26,176 @@ use zeroclaw_runtime::{
     },
 };
 
-use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
+const DEFAULT_MATRIX_ALIAS: &str = "default";
+
+/// Canonical Matrix route stored with a Goal. The room id is intentionally
+/// split only once: Matrix room ids themselves contain a colon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MatrixGoalRoute {
+    alias: String,
+    room_id: String,
+}
+
+impl MatrixGoalRoute {
+    fn from_ingress(alias: Option<&str>, room_id: &str) -> Result<Self> {
+        let alias = alias
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(DEFAULT_MATRIX_ALIAS);
+        ensure!(
+            !room_id.trim().is_empty(),
+            "Matrix Goal route requires a room id"
+        );
+        Ok(Self {
+            alias: alias.to_owned(),
+            room_id: room_id.to_owned(),
+        })
+    }
+
+    fn parse(route: &str) -> Option<Self> {
+        let (alias, room_id) = route.strip_prefix("matrix:")?.split_once(':')?;
+        let alias = if alias.trim().is_empty() {
+            DEFAULT_MATRIX_ALIAS
+        } else {
+            alias
+        };
+        (!room_id.trim().is_empty()).then(|| Self {
+            alias: alias.to_owned(),
+            room_id: room_id.to_owned(),
+        })
+    }
+
+    fn encode(&self) -> String {
+        format!("matrix:{}:{}", self.alias, self.room_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixGoalPolicyEligibility {
+    Eligible,
+    Revoked(&'static str),
+}
+
+/// Classify a persisted Matrix Goal against the prospective canonical config.
+/// It consumes only durable task bindings and shared Matrix policy predicates;
+/// hooks and current inbound message data are deliberately not authorities.
+fn classify_matrix_goal_policy(
+    config: &zeroclaw_config::schema::Config,
+    task: &TaskRecord,
+) -> MatrixGoalPolicyEligibility {
+    if task.kind != TaskKind::Goal || task.status.is_terminal() {
+        return MatrixGoalPolicyEligibility::Eligible;
+    }
+    let Some(raw_route) = task.originator_route.as_deref() else {
+        return MatrixGoalPolicyEligibility::Eligible;
+    };
+    if !raw_route.starts_with("matrix:") {
+        return MatrixGoalPolicyEligibility::Eligible;
+    }
+    let Some(route) = MatrixGoalRoute::parse(raw_route) else {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_binding_invalid");
+    };
+    if !config.goal.enabled {
+        return MatrixGoalPolicyEligibility::Revoked("goal_disabled");
+    }
+    let Some(principal) = task
+        .principal_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_binding_invalid");
+    };
+    if task
+        .session_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_binding_invalid");
+    }
+    let Some(agent) = config.agents.get(&task.agent) else {
+        return MatrixGoalPolicyEligibility::Revoked("agent_unavailable");
+    };
+    if !agent.is_dispatchable() {
+        return MatrixGoalPolicyEligibility::Revoked("agent_unavailable");
+    }
+    let Some(matrix) = config.channels.matrix.get(&route.alias) else {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_channel_unavailable");
+    };
+    if !matrix.enabled
+        || config.agent_for_channel(&format!("matrix.{}", route.alias)) != Some(task.agent.as_str())
+    {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_channel_unavailable");
+    }
+    if !crate::allowlist::is_matrix_room_allowed(&matrix.allowed_rooms, &route.room_id) {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_room_revoked");
+    }
+    let peers = config.channel_external_peers("matrix", &route.alias);
+    if !crate::allowlist::is_matrix_user_allowed(&peers, principal) {
+        return MatrixGoalPolicyEligibility::Revoked("matrix_principal_revoked");
+    }
+    if config
+        .resolved_model_provider_for_agent(&task.agent)
+        .is_none()
+    {
+        return MatrixGoalPolicyEligibility::Revoked("agent_provider_unavailable");
+    }
+    if config
+        .goal
+        .verifier
+        .model_provider
+        .as_str()
+        .trim()
+        .is_empty()
+    {
+        return MatrixGoalPolicyEligibility::Revoked("verifier_unavailable");
+    }
+    MatrixGoalPolicyEligibility::Eligible
+}
+
+pub(super) async fn revoke_matrix_goals_for_policy(
+    context: &ChannelRuntimeContext,
+    next_config: &zeroclaw_config::schema::Config,
+) -> Result<()> {
+    let control_plane = control_plane().context("Goal control plane is unavailable")?;
+    let registry = control_plane.goal_store()?;
+    let targets = registry
+        .list_nonterminal_session_goals_for_agent(context.agent_alias.as_str())
+        .await?
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                classify_matrix_goal_policy(next_config, task),
+                MatrixGoalPolicyEligibility::Revoked(_)
+            )
+        })
+        .map(|task| GoalPolicyRevocationTarget {
+            task_id: task.id,
+            session_id: task.session_id.unwrap_or_default(),
+            expected_epoch: task.execution_epoch,
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    match registry
+        .cancel_goals_for_policy_revocation(&targets)
+        .await?
+    {
+        GoalTransitionResult::Applied => {}
+        GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+            bail!("Goal policy changed during revocation cutover")
+        }
+    }
+    for target in targets {
+        let scope =
+            GoalExecutionScope::new(target.task_id, target.session_id, target.expected_epoch)?;
+        drain_policy_revoked_goal(&context.persist_locks, &scope).await?;
+    }
+    Ok(())
+}
+
+use super::foreground::{
+    drain_policy_revoked_goal, foreground_lock, goal_command_lock, goal_supervisor_slot,
+};
 use super::{
     ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
     build_channel_system_prompt_for_message_with_signal,
@@ -102,11 +273,9 @@ pub(super) async fn submit_matrix_goal(
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
 ) -> Result<zeroclaw_runtime::goal_mode::GoalResponse> {
-    let route = format!(
-        "matrix:{}:{}",
-        original.channel_alias.as_deref().unwrap_or_default(),
-        original.reply_target
-    );
+    let route =
+        MatrixGoalRoute::from_ingress(original.channel_alias.as_deref(), &original.reply_target)?
+            .encode();
     let driver = Arc::new(MatrixGoalSessionDriver::new(
         Arc::clone(&context),
         history_key.clone(),
@@ -514,6 +683,41 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_goal_route_preserves_colons_in_room_ids_and_legacy_empty_aliases() {
+        let parsed = MatrixGoalRoute::parse("matrix::!room:example.org").unwrap();
+        assert_eq!(parsed.alias, DEFAULT_MATRIX_ALIAS);
+        assert_eq!(parsed.room_id, "!room:example.org");
+        assert_eq!(parsed.encode(), "matrix:default:!room:example.org");
+    }
+
+    #[test]
+    fn matrix_cutover_does_not_revoke_non_matrix_goals() {
+        let task = TaskRecord {
+            id: "goal-zerocode".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("zerocode:local".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("local".to_owned()),
+            session_id: Some("zc-session".to_owned()),
+            execution_epoch: 1,
+            started_at: "2026-09-07T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        assert_eq!(
+            classify_matrix_goal_policy(&zeroclaw_config::schema::Config::default(), &task),
+            MatrixGoalPolicyEligibility::Eligible
+        );
+    }
 
     #[test]
     fn goal_parent_directive_keeps_lifecycle_phase_out_of_user_control() {
