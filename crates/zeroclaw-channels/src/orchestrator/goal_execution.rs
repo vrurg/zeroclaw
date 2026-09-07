@@ -114,6 +114,8 @@ pub(super) async fn submit_matrix_goal(
         route.clone(),
         original,
     )?);
+    let _policy_cutover = context.goal_policy_cutover.lock().await;
+    super::maybe_apply_runtime_config_update_locked(context.as_ref()).await?;
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let defaults = runtime_defaults_snapshot(context.as_ref());
