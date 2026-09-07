@@ -13449,13 +13449,30 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
-    let shutdown_router = router.clone();
+    let cancellation_router = router.clone();
+    let fallback_router = router.clone();
+    let cancellation = cancel.clone();
+    let goal_cutover = zeroclaw_spawn::spawn!(async move {
+        cancellation.cancelled().await;
+        cancellation_router
+            .pause_goals_for_runtime_interruption()
+            .await
+    });
     run_message_dispatch_loop(rx, router, max_in_flight).await;
 
-    shutdown_router
-        .pause_goals_for_runtime_interruption()
-        .await
-        .context("pause Goal work before channel runtime interruption")?;
+    if cancel.is_cancelled() {
+        goal_cutover
+            .await
+            .context("join Goal runtime-interruption cutover")?
+            .context("pause Goal work before channel runtime interruption")?;
+    } else {
+        goal_cutover.abort();
+        let _ = goal_cutover.await;
+        fallback_router
+            .pause_goals_for_runtime_interruption()
+            .await
+            .context("pause Goal work before channel runtime exit")?;
+    }
 
     for h in listener_handles {
         let _ = h.await;
