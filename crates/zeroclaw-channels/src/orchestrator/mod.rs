@@ -1848,6 +1848,9 @@ async fn load_runtime_config_and_defaults(
     let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
     parsed.env_overridden_paths = applied.paths;
     parsed.pre_override_snapshots = applied.snapshots;
+    parsed
+        .validate()
+        .with_context(|| format!("Rejected invalid runtime config {}", path.display()))?;
 
     let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
     let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
@@ -16665,9 +16668,17 @@ schema_version = 3
 
 [agents.agent_a]
 model_provider = "openrouter.hot"
+risk_profile = "default"
+runtime_profile = "default"
 
 [agents.agent_b]
 model_provider = "anthropic.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
 
 [providers.models.openrouter.hot]
 model = "hot-model"
@@ -16706,6 +16717,12 @@ api_key = "cold-key"
             r#"
 [agents.agent_a]
 model_provider = "openrouter.missing"
+risk_profile = "default"
+runtime_profile = "default"
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
 
 [providers.models.anthropic.default]
 model = "cold-model"
@@ -16720,8 +16737,8 @@ api_key = "cold-key"
             .expect_err("unresolved agent provider should reject reload");
 
         assert!(
-            err.to_string()
-                .contains("model_provider `openrouter.missing` does not resolve")
+            format!("{err:#}").contains("providers.models.openrouter.missing"),
+            "unexpected validation error: {err:#}"
         );
     }
 
@@ -16734,6 +16751,12 @@ api_key = "cold-key"
             r#"
 [agents.agent_b]
 model_provider = "anthropic.default"
+risk_profile = "default"
+runtime_profile = "default"
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
 
 [providers.models.anthropic.default]
 model = "cold-model"
@@ -16759,6 +16782,12 @@ api_key = "cold-key"
             r#"
 [agents.agent_a]
 model_provider = ""
+risk_profile = "default"
+runtime_profile = "default"
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
 
 [providers.models.anthropic.default]
 model = "first-model"
@@ -16776,7 +16805,10 @@ api_key = "second-key"
             .await
             .expect_err("empty agent provider should reject reload");
 
-        assert!(err.to_string().contains("model_provider is empty"));
+        assert!(
+            format!("{err:#}").contains("agents.agent_a.model_provider"),
+            "unexpected validation error: {err:#}"
+        );
     }
 
     #[test]

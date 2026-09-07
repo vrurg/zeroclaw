@@ -32,7 +32,7 @@ use crate::agent::cost::{
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalPolicyRevocationTarget, GoalTaskRegistry, GoalTransitionResult, TaskStatus,
+    GoalTaskRegistry, GoalTransitionResult, TaskStatus,
 };
 use zeroclaw_commands::goal::GoalCommand;
 
@@ -1347,7 +1347,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::control_plane::{GoalTaskRecord, SqliteTaskStore, TaskKind, TaskRecord};
+    use crate::control_plane::{
+        GoalPolicyRevocationTarget, GoalTaskRecord, SqliteTaskStore, TaskKind, TaskRecord,
+    };
 
     async fn accountant_fixture() -> (
         Arc<SqliteTaskStore>,
