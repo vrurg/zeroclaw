@@ -420,6 +420,27 @@ pub fn tool_protocol_envelope_mentions_known_tool(
         .is_ok_and(|value| json_value_mentions_known_tool(&value, known_tool_names))
 }
 
+/// Return whether the runtime would accept any call to one of `known_tool_names`.
+///
+/// This deliberately follows [`parse_tool_calls`] for legacy text formats
+/// rather than maintaining a second list of provider spellings. Complete JSON
+/// stays with [`tool_protocol_envelope_mentions_known_tool`], whose structural
+/// discriminator distinguishes an invocation from business JSON that happens
+/// to carry a `name` field. Callers at export-only boundaries use both helpers
+/// to preserve accepted-call identity without changing parsing or model-visible
+/// history.
+pub fn parsed_tool_protocol_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    !known_tool_names.is_empty()
+        && serde_json::from_str::<serde_json::Value>(text.trim()).is_err()
+        && parse_tool_calls(text)
+            .1
+            .iter()
+            .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
+}
+
 fn has_malformed_tool_protocol_json_signal(value: &serde_json::Value) -> bool {
     // Empty `tool_calls: []` is a valid strict-provider compatibility case;
     // similar business JSON must also carry protocol-shaped fields before it
@@ -3458,6 +3479,30 @@ mod tests {
         assert!(tool_protocol_envelope_mentions_known_tool(
             r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
             &HashSet::from(["session_prompt_list".to_owned()]),
+        ));
+    }
+
+    #[test]
+    fn parsed_known_tool_detection_tracks_accepted_legacy_text_formats() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        for response in [
+            r#"<minimax:tool_call>{"name":"session_prompt_set","arguments":{"content":"opaque"}}</minimax:tool_call>"#,
+            r#"<invoke name="session_prompt_set"><parameter name="content">opaque</parameter></invoke>"#,
+            r#"TOOL_CALL
+{tool => "session_prompt_set", args => { --content "opaque" }}}
+/TOOL_CALL"#,
+            "session_prompt_set/content>opaque",
+        ] {
+            assert!(
+                parsed_tool_protocol_mentions_known_tool(response, &known),
+                "accepted parser representation must retain known-tool identity: {response}"
+            );
+        }
+
+        assert!(!parsed_tool_protocol_mentions_known_tool(
+            r#"{"name":"session_prompt_set","description":"A documented identifier"}"#,
+            &known,
         ));
     }
 

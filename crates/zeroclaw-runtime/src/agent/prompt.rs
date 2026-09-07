@@ -13,7 +13,7 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::{
     ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
     looks_like_malformed_json_tool_invocation, looks_like_malformed_tool_protocol_envelope,
-    tool_protocol_envelope_mentions_known_tool,
+    parsed_tool_protocol_mentions_known_tool, tool_protocol_envelope_mentions_known_tool,
 };
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
@@ -210,9 +210,16 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
         names_session_prompt_tool && contains_malformed_tool_call_tag_lower(&lower)
     };
 
-    tool_protocol_envelope_mentions_known_tool(content, session_prompt_tool_names())
+    // The runtime accepts multiple provider text protocols, including MiniMax
+    // invoke blocks, Perl-style TOOL_CALL blocks, and GLM shorthand. Export
+    // redaction must track that accepted-call identity rather than a subset of
+    // wrapper spellings, or a newly supported parser format can leak opaque
+    // attachment content before approval.
+    parsed_tool_protocol_mentions_known_tool(content, session_prompt_tool_names())
+        || tool_protocol_envelope_mentions_known_tool(content, session_prompt_tool_names())
         || escaped_json_tool_protocol(content).is_some_and(|decoded| {
-            tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
+            parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
+                || tool_protocol_envelope_mentions_known_tool(&decoded, session_prompt_tool_names())
         })
         || malformed_xml_session_prompt_envelope
         || looks_like_malformed_tool_protocol_envelope(content)
@@ -2036,6 +2043,52 @@ mod tests {
                 export[..2]
                     .iter()
                     .all(|message| !message.content.contains(marker))
+            );
+            assert_eq!(export[2].content, "ordinary next-turn input");
+        }
+    }
+
+    #[test]
+    fn export_copy_redacts_every_accepted_non_json_session_prompt_format() {
+        let marker = "session-prompt-private-marker";
+        let calls = [
+            format!(
+                r#"<minimax:tool_call>{{"name":"session_prompt_set","arguments":{{"content":"{marker}"}}}}</minimax:tool_call>"#
+            ),
+            format!(
+                r#"<invoke name="session_prompt_set"><parameter name="content">{marker}</parameter></invoke>"#
+            ),
+            format!(
+                r#"TOOL_CALL
+{{tool => "session_prompt_set", args => {{ --content "{marker}" }}}}
+/TOOL_CALL"#
+            ),
+            format!("session_prompt_set/content>{marker}"),
+        ];
+
+        for call in calls {
+            assert!(
+                session_prompt_tool_call_envelope_mentioned(&call),
+                "the runtime-accepted call must be redacted: {call}"
+            );
+            assert!(
+                !redact_session_prompt_text_protocol_for_export(&call).contains(marker),
+                "response snapshots and raw-response logs must omit accepted call bodies"
+            );
+            let messages = vec![
+                ChatMessage::assistant(call),
+                ChatMessage::user(format!(
+                    "[Tool results]\\n<tool_result name=\"session_prompt_set\">{marker}</tool_result>"
+                )),
+                ChatMessage::user("ordinary next-turn input"),
+            ];
+
+            let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+            assert!(
+                export[..2]
+                    .iter()
+                    .all(|message| !message.content.contains(marker)),
+                "accepted call and its result must not cross export boundaries"
             );
             assert_eq!(export[2].content, "ordinary next-turn input");
         }
