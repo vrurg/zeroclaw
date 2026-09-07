@@ -118,7 +118,7 @@ impl GoalExecutionSupervisor {
 
         let engine = Arc::clone(&self.engine);
         let execution_epoch = scope.execution_epoch();
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine.run(&settings, &request).await;
 
             // The engine normally records its own expected execution failures.
