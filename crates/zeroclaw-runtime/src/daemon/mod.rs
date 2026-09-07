@@ -604,11 +604,18 @@ pub async fn run(
         crate::health::mark_component_ok("control-plane");
     }
 
+    // Goal policy validation and revocation must fence every exposed Goal
+    // transport together. The coordinator belongs to this daemon iteration;
+    // it is intentionally not a process-global singleton.
+    let goal_policy_cutover =
+        std::sync::Arc::new(crate::goal_mode::GoalPolicyCutoverCoordinator::new());
+
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
+            let goal_policy_cutover = std::sync::Arc::clone(&goal_policy_cutover);
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
@@ -618,7 +625,8 @@ pub async fn run(
                     let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
+                    let goal_policy_cutover = std::sync::Arc::clone(&goal_policy_cutover);
+                    async move { start(cfg, cancel, goal_policy_cutover).await }
                 },
             ));
         } else {
@@ -799,7 +807,11 @@ pub async fn run(
             sop_audit,
             hooks,
             cert_audit,
-            goal_runtime: std::sync::Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
+            goal_runtime: std::sync::Arc::new(
+                crate::rpc::goal::RpcGoalRuntime::with_policy_cutover(std::sync::Arc::clone(
+                    &goal_policy_cutover,
+                )),
+            ),
         }))
     } else {
         None

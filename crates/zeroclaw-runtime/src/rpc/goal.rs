@@ -339,6 +339,16 @@ pub struct RpcGoalRuntime {
 }
 
 impl RpcGoalRuntime {
+    /// Construct an RPC Goal runtime using the daemon iteration's shared
+    /// transport-admission barrier.
+    pub fn with_policy_cutover(policy_cutover: Arc<GoalPolicyCutoverCoordinator>) -> Self {
+        Self {
+            policy_cutover,
+            supervisors: Mutex::new(HashMap::new()),
+            command_locks: Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Fence and dispose the current Goal before its RPC session disappears.
     ///
     /// This must run before the caller waits on `SessionActorQueue`: an active

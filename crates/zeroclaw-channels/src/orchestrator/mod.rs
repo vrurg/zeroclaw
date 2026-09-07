@@ -588,7 +588,7 @@ struct ChannelRuntimeContext {
     /// Serializes Matrix Goal command admission with a prospective runtime
     /// policy cutover. It is process-local coordination only; exact durable
     /// task/session/epoch predicates remain the lifecycle authority.
-    goal_policy_cutover: Arc<tokio::sync::Mutex<()>>,
+    goal_policy_cutover: Arc<dyn zeroclaw_runtime::goal_mode::GoalPolicyGate>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -1865,7 +1865,7 @@ async fn load_runtime_config_and_defaults(
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
-    let _cutover = ctx.goal_policy_cutover.lock().await;
+    let _cutover = Arc::clone(&ctx.goal_policy_cutover).cutover().await;
     maybe_apply_runtime_config_update_locked(ctx).await
 }
 
@@ -12703,9 +12703,12 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    goal_policy_cutover: Arc<zeroclaw_runtime::goal_mode::GoalPolicyCutoverCoordinator>,
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
+    let goal_policy_cutover: Arc<dyn zeroclaw_runtime::goal_mode::GoalPolicyGate> =
+        goal_policy_cutover;
     revoke_matrix_goals_at_startup(&config).await?;
     let any_agent_provider_resolves = config
         .agents
@@ -13368,7 +13371,7 @@ pub async fn start_channels(
             show_receipts_in_response: agent.resolved.tool_receipts.show_in_response,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
             runtime_defaults_override: Arc::new(Mutex::new(None)),
-            goal_policy_cutover: Arc::new(tokio::sync::Mutex::new(())),
+            goal_policy_cutover: Arc::clone(&goal_policy_cutover),
             persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sop_engine: sop_engine.clone(),
             sop_audit: sop_audit.clone(),

@@ -151,6 +151,45 @@ fn classify_matrix_goal_policy(
     MatrixGoalPolicyEligibility::Eligible
 }
 
+/// Reauthorize immutable Matrix ingress after the config-update gate has
+/// completed. The reconstructed row is not persisted or used for lifecycle
+/// mutation: it gives the durable-policy classifier the exact trusted facts
+/// that a new Goal would store if admitted.
+fn authorize_matrix_goal_ingress(
+    config: &zeroclaw_config::schema::Config,
+    ingress: &GoalIngressContext,
+) -> Result<()> {
+    let raw_mxid = match ingress.principal() {
+        zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix { raw_mxid } => raw_mxid,
+        _ => bail!("Goal ingress is not Matrix"),
+    };
+    let task = TaskRecord {
+        id: String::new(),
+        kind: TaskKind::Goal,
+        agent: ingress.agent().to_owned(),
+        status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+        owner_pid: 0,
+        owner_boot_id: String::new(),
+        heartbeat_at: None,
+        depth: 0,
+        parent_id: None,
+        originator_route: Some(ingress.route().to_owned()),
+        delivered: false,
+        idem_key: None,
+        principal_id: Some(raw_mxid.clone()),
+        session_id: Some(ingress.session_key().durable_id()),
+        execution_epoch: 1,
+        started_at: String::new(),
+        finished_at: None,
+    };
+    match classify_matrix_goal_policy(config, &task) {
+        MatrixGoalPolicyEligibility::Eligible => Ok(()),
+        MatrixGoalPolicyEligibility::Revoked(reason) => {
+            bail!("Matrix Goal ingress is no longer authorized: {reason}")
+        }
+    }
+}
+
 fn policy_revocation_target(task: TaskRecord) -> Result<GoalPolicyRevocationTarget> {
     let session_id = task
         .session_id
@@ -327,11 +366,23 @@ pub(super) async fn submit_matrix_goal(
         route.clone(),
         original,
     )?);
-    let _policy_cutover = context.goal_policy_cutover.lock().await;
-    super::maybe_apply_runtime_config_update_locked(context.as_ref()).await?;
+    let ingress = GoalIngressContext::trusted(
+        GoalSessionKey::matrix(history_key.clone())?,
+        context.agent_alias.to_string(),
+        route,
+        zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix {
+            raw_mxid: driver.raw_mxid.clone(),
+        },
+    )?;
+    {
+        let _policy_cutover = Arc::clone(&context.goal_policy_cutover).cutover().await;
+        super::maybe_apply_runtime_config_update_locked(context.as_ref()).await?;
+    }
+    let _policy_admission = Arc::clone(&context.goal_policy_cutover).admit().await;
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let defaults = runtime_defaults_snapshot(context.as_ref());
+    authorize_matrix_goal_ingress(defaults.config.as_ref(), &ingress)?;
     let configured_limits =
         defaults.config.goal.effective_limits().map_err(|error| {
             anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
@@ -383,14 +434,6 @@ pub(super) async fn submit_matrix_goal(
             supervisor
         }
     };
-    let ingress = GoalIngressContext::trusted(
-        GoalSessionKey::matrix(history_key)?,
-        context.agent_alias.to_string(),
-        route,
-        zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix {
-            raw_mxid: driver.raw_mxid.clone(),
-        },
-    )?;
     let response = supervisor
         .submit(settings, ingress, driver, command)
         .await?;

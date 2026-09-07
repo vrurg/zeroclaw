@@ -35,7 +35,19 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+///
+/// The coordinator is created once by the daemon and also injected into the
+/// RPC runtime. This keeps Goal-policy replacement from interleaving a stale
+/// admission through one transport while another transport is being cut over.
+pub type ChannelsStarter = Box<
+    dyn Fn(
+            Config,
+            CancellationToken,
+            Arc<crate::goal_mode::GoalPolicyCutoverCoordinator>,
+        ) -> StarterFuture
+        + Send
+        + Sync,
+>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -206,7 +218,7 @@ mod tests {
     }
 
     fn channels_starter() -> ChannelsStarter {
-        Box::new(|_, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn socket_starter() -> SocketStarter {

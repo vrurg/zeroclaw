@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use async_trait::async_trait;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use zeroclaw_config::schema::Config;
 
 use super::{GoalIngressContext, GoalSurface};
@@ -56,7 +57,7 @@ impl GoalPolicyCutoverCoordinator {
     /// submission, and supervisor registration. It must not retain the lease
     /// for the lifetime of a Goal worker.
     pub async fn admit(&self) -> GoalPolicyAdmissionLease {
-        GoalPolicyAdmissionLease {
+        GoalPolicyAdmissionLease::Coordinator {
             _guard: Arc::clone(&self.barrier).read_owned().await,
         }
     }
@@ -68,20 +69,71 @@ impl GoalPolicyCutoverCoordinator {
     /// controller boundary, but it never interrupts an already-admitted model
     /// operation.
     pub async fn cutover(&self) -> GoalPolicyCutoverLease {
-        GoalPolicyCutoverLease {
+        GoalPolicyCutoverLease::Coordinator {
             _guard: Arc::clone(&self.barrier).write_owned().await,
         }
     }
 }
 
 /// Owned read lease returned by [`GoalPolicyCutoverCoordinator::admit`].
-pub struct GoalPolicyAdmissionLease {
-    _guard: OwnedRwLockReadGuard<()>,
+pub enum GoalPolicyAdmissionLease {
+    Coordinator {
+        _guard: OwnedRwLockReadGuard<()>,
+    },
+    /// Compatibility implementation used only by existing isolated context
+    /// fixtures. Production construction supplies a coordinator.
+    Fixture {
+        _guard: OwnedMutexGuard<()>,
+    },
 }
 
 /// Owned write lease returned by [`GoalPolicyCutoverCoordinator::cutover`].
-pub struct GoalPolicyCutoverLease {
-    _guard: OwnedRwLockWriteGuard<()>,
+pub enum GoalPolicyCutoverLease {
+    Coordinator {
+        _guard: OwnedRwLockWriteGuard<()>,
+    },
+    /// Compatibility implementation used only by existing isolated context
+    /// fixtures. Production construction supplies a coordinator.
+    Fixture {
+        _guard: OwnedMutexGuard<()>,
+    },
+}
+
+/// Narrow process-local policy gate shared by Goal-capable runtime contexts.
+///
+/// V1 has no open channel-policy registry. Production wiring supplies the
+/// single coordinator created for the daemon iteration; the mutex
+/// implementation preserves the existing isolated context fixtures.
+#[async_trait]
+pub trait GoalPolicyGate: Send + Sync {
+    async fn admit(self: Arc<Self>) -> GoalPolicyAdmissionLease;
+    async fn cutover(self: Arc<Self>) -> GoalPolicyCutoverLease;
+}
+
+#[async_trait]
+impl GoalPolicyGate for GoalPolicyCutoverCoordinator {
+    async fn admit(self: Arc<Self>) -> GoalPolicyAdmissionLease {
+        GoalPolicyCutoverCoordinator::admit(self.as_ref()).await
+    }
+
+    async fn cutover(self: Arc<Self>) -> GoalPolicyCutoverLease {
+        GoalPolicyCutoverCoordinator::cutover(self.as_ref()).await
+    }
+}
+
+#[async_trait]
+impl GoalPolicyGate for Mutex<()> {
+    async fn admit(self: Arc<Self>) -> GoalPolicyAdmissionLease {
+        GoalPolicyAdmissionLease::Fixture {
+            _guard: self.lock_owned().await,
+        }
+    }
+
+    async fn cutover(self: Arc<Self>) -> GoalPolicyCutoverLease {
+        GoalPolicyCutoverLease::Fixture {
+            _guard: self.lock_owned().await,
+        }
+    }
 }
 
 /// Closed V1 surface extension point for policy-only checks.

@@ -5998,7 +5998,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |config, cancel| {
+                    move |config, cancel, goal_policy_cutover| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -6009,6 +6009,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 cancel,
                                 sop_engine,
                                 sop_audit,
+                                goal_policy_cutover,
                             ))
                             .await
                         })
@@ -7320,7 +7321,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     config.sop.maintenance_interval_secs,
                 );
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    Arc::new(zeroclaw_runtime::goal_mode::GoalPolicyCutoverCoordinator::new()),
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {

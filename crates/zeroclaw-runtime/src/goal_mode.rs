@@ -32,7 +32,7 @@ pub use goal_execution::{
     dispose_unowned_session_goal,
 };
 pub use policy::{
-    GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalPolicyRevocationReason,
+    GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalPolicyGate, GoalPolicyRevocationReason,
     GoalSurfacePolicy, classify_common_goal_policy,
 };
 
