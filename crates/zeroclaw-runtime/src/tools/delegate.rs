@@ -3701,10 +3701,7 @@ mod tests {
     }
 
     fn task_control_plane(store: Arc<dyn TaskRegistry>) -> ControlPlaneHandle {
-        ControlPlaneHandle {
-            store,
-            boot_id: "test-boot".into(),
-        }
+        ControlPlaneHandle::task_only(store, "test-boot")
     }
 
     #[tokio::test]
