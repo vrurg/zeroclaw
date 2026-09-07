@@ -25,14 +25,18 @@ use crate::control_plane::{
 use zeroclaw_config::cost::CostTracker;
 
 mod goal_execution;
+mod policy;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor,
     dispose_unowned_session_goal,
 };
+pub use policy::{
+    GoalPolicyDecision, GoalPolicyRevocationReason, GoalSurfacePolicy, classify_common_goal_policy,
+};
 
 /// The only V1 surfaces permitted to admit a Goal command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GoalSurface {
     Matrix,
     ZeroCode,
