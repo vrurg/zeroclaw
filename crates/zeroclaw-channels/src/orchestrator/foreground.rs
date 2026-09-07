@@ -10,18 +10,23 @@ use std::{
 };
 
 use tokio_util::sync::CancellationToken;
+use zeroclaw_runtime::goal_mode::GoalExecutionSupervisor;
 
 #[derive(Clone)]
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
+    goal_command: Arc<tokio::sync::Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
+    goal_supervisor: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
 }
 
 impl ConversationLocks {
     pub(crate) fn new() -> Self {
         Self {
             persist: Arc::new(Mutex::new(())),
+            goal_command: Arc::new(tokio::sync::Mutex::new(())),
             foreground: Arc::new(tokio::sync::Mutex::new(())),
+            goal_supervisor: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -49,6 +54,20 @@ pub(crate) fn foreground_lock(
     key: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
     locks_for_key(locks, key).foreground
+}
+
+pub(crate) fn goal_command_lock(
+    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    key: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    locks_for_key(locks, key).goal_command
+}
+
+pub(crate) fn goal_supervisor_slot(
+    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    key: &str,
+) -> Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>> {
+    locks_for_key(locks, key).goal_supervisor
 }
 
 pub(crate) async fn wait_for_foreground_lease(

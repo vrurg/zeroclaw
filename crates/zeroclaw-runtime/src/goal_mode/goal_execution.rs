@@ -20,9 +20,9 @@ use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 
 use super::{
-    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
-    GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalVerifierTurn,
+    GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalHostSettings,
+    GoalIngressContext, GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalVerifierTurn,
 };
 use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
@@ -628,6 +628,9 @@ impl GoalExecutionEngine {
                 }
                 Ok(VerifierDecision::Blocked { reason, blockers }) => {
                     self.pause_verifier_blocked(scope, reason, blockers).await?;
+                    lease
+                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker)
+                        .await?;
                     return Ok(GoalExecutionOutcome::VerifierBlocked);
                 }
                 Err(error) => {
@@ -684,7 +687,10 @@ impl GoalExecutionEngine {
         }
         // Delivery failure is intentionally observable but does not rewrite
         // the verified Completed lifecycle state.
-        lease.append_verified_candidate(candidate).await
+        lease.append_verified_candidate(candidate).await?;
+        lease
+            .publish_goal_notice(GoalExecutionNotice::Completed)
+            .await
     }
 
     async fn pause_verifier_blocked(
