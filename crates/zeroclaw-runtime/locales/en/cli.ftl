@@ -1263,6 +1263,7 @@ goal-mode-accounting-incomplete = incomplete
 goal-mode-budget-updated = Goal budget updated.
 goal-mode-paused = Goal paused.
 goal-mode-paused-blocked = Goal paused: resolution is required before it can continue.
+goal-mode-paused-blocked-detail = Goal paused: { $detail }. Use /goal resume after resolving it, or /goal cancel to dismiss the current Goal.
 goal-mode-already-paused = Goal is already paused.
 goal-mode-resumed = Goal resumed.
 goal-mode-cancelled = Goal cancelled.

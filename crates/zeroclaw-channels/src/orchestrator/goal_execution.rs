@@ -382,42 +382,41 @@ pub(super) async fn submit_matrix_goal(
         control_plane.boot_id.clone(),
     )?;
     let current = registry.current_goal_for_session(&history_key).await?;
-    let supervisor_slot = goal_supervisor_slot(&context.persist_locks, &history_key);
-    let supervisor = {
-        let mut slot = supervisor_slot.lock().await;
-        if current
-            .as_ref()
-            .is_some_and(|task| task.status.is_terminal())
-        {
-            // A completed worker remains in the supervisor until drained. A
-            // successor must instead receive a fresh engine resolved from the
-            // current runtime configuration.
-            *slot = None;
-        }
-        if let Some(supervisor) = slot.as_ref() {
-            Arc::clone(supervisor)
-        } else {
-            let tracker = CostTracker::get_or_init_global_required(
-                defaults.config.cost.clone(),
-                &defaults.config.data_dir,
-            )?;
-            let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::with_tracker(
-                Arc::clone(&registry),
-                Arc::clone(&tracker),
-            );
-            let engine = Arc::new(runtime.execution_engine(
-                tracker,
-                context.agent_alias.to_string(),
-                Arc::new(build_type_level_model_provider_pricing(
-                    defaults.config.as_ref(),
-                )),
-            )?);
-            let supervisor = Arc::new(zeroclaw_runtime::goal_mode::GoalExecutionSupervisor::new(
-                engine,
-            ));
-            *slot = Some(Arc::clone(&supervisor));
-            supervisor
-        }
+    let mut supervisor_slot = goal_supervisor_slot(&context.persist_locks, &history_key)
+        .lock_owned()
+        .await;
+    if current
+        .as_ref()
+        .is_some_and(|task| task.status.is_terminal())
+    {
+        // A completed worker remains in the supervisor until drained. A
+        // successor must instead receive a fresh engine resolved from the
+        // current runtime configuration.
+        *supervisor_slot = None;
+    }
+    let supervisor = if let Some(supervisor) = supervisor_slot.as_ref() {
+        Arc::clone(supervisor)
+    } else {
+        let tracker = CostTracker::get_or_init_global_required(
+            defaults.config.cost.clone(),
+            &defaults.config.data_dir,
+        )?;
+        let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::with_tracker(
+            Arc::clone(&registry),
+            Arc::clone(&tracker),
+        );
+        let engine = Arc::new(runtime.execution_engine(
+            tracker,
+            context.agent_alias.to_string(),
+            Arc::new(build_type_level_model_provider_pricing(
+                defaults.config.as_ref(),
+            )),
+        )?);
+        let supervisor = Arc::new(zeroclaw_runtime::goal_mode::GoalExecutionSupervisor::new(
+            engine,
+        ));
+        *supervisor_slot = Some(Arc::clone(&supervisor));
+        supervisor
     };
     let response = supervisor
         .submit(settings, ingress, driver, command)
@@ -433,7 +432,12 @@ pub(super) async fn submit_matrix_goal(
         // Pause and cancellation drain the old worker before the supervisor
         // returns. Rebuilding on an explicit resume picks up live policy and
         // pricing instead of keeping a stale configuration snapshot.
-        *supervisor_slot.lock().await = None;
+        if supervisor_slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &supervisor))
+        {
+            *supervisor_slot = None;
+        }
     }
     Ok(response)
 }
@@ -448,10 +452,17 @@ pub(super) async fn dispose_matrix_goal(
     context: &ChannelRuntimeContext,
     history_key: &str,
 ) -> Result<()> {
-    let slot = goal_supervisor_slot(&context.persist_locks, history_key);
-    if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
+    let mut slot = goal_supervisor_slot(&context.persist_locks, history_key)
+        .lock_owned()
+        .await;
+    if let Some(supervisor) = slot.as_ref().cloned() {
         supervisor.dispose_session(history_key).await?;
-        *slot.lock().await = None;
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &supervisor))
+        {
+            *slot = None;
+        }
         return Ok(());
     }
 
@@ -600,16 +611,19 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         )
         .await?;
         let directive = turn.prompt_directive();
+        let objective = turn.objective_message();
         let mut history = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 let mut history =
                     self.initial_working_history(provider.as_ref(), &route, turn.working_history);
                 history.insert(1, directive);
+                history.insert(2, objective);
                 history
             }
             GoalParentTurnKind::Continue => {
                 let mut history = turn.working_history;
                 history.push(directive);
+                history.push(objective);
                 history
             }
         };
@@ -736,16 +750,36 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 
     async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()> {
-        let key = match notice {
-            GoalExecutionNotice::Completed => "goal-mode-completed",
-            GoalExecutionNotice::PausedForBlocker => "goal-mode-paused-blocked",
+        let message = match notice {
+            GoalExecutionNotice::Completed => {
+                zeroclaw_runtime::i18n::get_required_cli_string("goal-mode-completed")
+            }
+            GoalExecutionNotice::PausedForBlocker {
+                description,
+                blockers,
+            } => {
+                let details = blockers
+                    .iter()
+                    .map(|blocker| blocker.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let detail = if details.is_empty() {
+                    description.unwrap_or_default()
+                } else {
+                    details
+                };
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "goal-mode-paused-blocked-detail",
+                    &[("detail", detail.as_str())],
+                )
+            }
         };
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
         channel
             .send(&zeroclaw_api::channel::SendMessage::reply_to(
                 &self.message,
-                zeroclaw_runtime::i18n::get_required_cli_string(key),
+                message,
             ))
             .await
             .context("deliver Matrix Goal lifecycle notice")
@@ -798,20 +832,22 @@ mod tests {
             (GoalParentTurnKind::Resume, "resume"),
             (GoalParentTurnKind::Continue, "continue"),
         ] {
-            let directive = GoalParentTurn {
+            let turn = GoalParentTurn {
                 kind,
                 objective: "the declared success criterion".to_owned(),
                 working_history: Vec::new(),
-            }
-            .prompt_directive();
+            };
+            let directive = turn.prompt_directive();
+            let objective = turn.objective_message();
             assert_eq!(directive.role, "system");
-            assert!(directive.content.contains("the declared success criterion"));
             assert!(directive.content.contains("untrusted user-declared data"));
             assert!(
                 directive
                     .content
                     .contains(&format!("Turn kind: {expected}"))
             );
+            assert_eq!(objective.role, "user");
+            assert!(objective.content.contains("the declared success criterion"));
         }
     }
 }

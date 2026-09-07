@@ -228,6 +228,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
         let directive = turn.prompt_directive();
+        let objective = turn.objective_message();
         let source = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 IsolatedTranscriptSource::Canonical {
@@ -242,7 +243,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .agent
             .lock()
             .await
-            .run_isolated_turn(source, directive)
+            .run_isolated_turn(source, directive, objective)
             .await?;
         Ok(GoalParentTurnResult {
             candidate: outcome.response,
@@ -312,11 +313,14 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             GoalExecutionNotice::Completed => crate::rpc::types::SessionGoalUpdate::Completed {
                 session_id: self.session_id.clone(),
             },
-            GoalExecutionNotice::PausedForBlocker => {
-                crate::rpc::types::SessionGoalUpdate::PausedForBlocker {
-                    session_id: self.session_id.clone(),
-                }
-            }
+            GoalExecutionNotice::PausedForBlocker {
+                description,
+                blockers,
+            } => crate::rpc::types::SessionGoalUpdate::PausedForBlocker {
+                session_id: self.session_id.clone(),
+                description,
+                blockers,
+            },
         };
         ensure!(
             self.outbound
@@ -336,6 +340,10 @@ pub struct RpcGoalRuntime {
     /// coordinator with channel admission before a policy replacement begins.
     policy_cutover: Arc<GoalPolicyCutoverCoordinator>,
     supervisors: Mutex<HashMap<String, Arc<GoalExecutionSupervisor>>>,
+    /// Serializes host-side supervisor selection, launch/drain, and cleanup
+    /// for one RPC session. The driver command lease remains narrower: it
+    /// only protects durable controller transitions.
+    supervisor_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     command_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -346,6 +354,7 @@ impl RpcGoalRuntime {
         Self {
             policy_cutover,
             supervisors: Mutex::new(HashMap::new()),
+            supervisor_locks: Mutex::new(HashMap::new()),
             command_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -355,6 +364,7 @@ impl RpcGoalRuntime {
     /// This must run before the caller waits on `SessionActorQueue`: an active
     /// Goal owns that queue until its admitted operation has settled.
     pub async fn dispose_session(&self, session_id: &str) -> Result<()> {
+        let _workflow = self.supervisor_lock(session_id).await.lock_owned().await;
         if let Some(supervisor) = self.supervisor(session_id).await {
             supervisor
                 .dispose_session(&GoalSessionKey::zero_code(session_id)?.durable_id())
@@ -401,6 +411,7 @@ impl RpcGoalRuntime {
             return Ok(GoalResponse::Disabled);
         }
         let session_id = driver.raw_session_id().to_owned();
+        let _workflow = self.supervisor_lock(&session_id).await.lock_owned().await;
         let ingress = GoalIngressContext::trusted(
             driver.session_key().clone(),
             driver.agent_alias().to_owned(),
@@ -462,13 +473,24 @@ impl RpcGoalRuntime {
                 | GoalResponse::AlreadyCancelled(_)
                 | GoalResponse::Terminal(_)
         ) {
-            self.remove_supervisor(&session_id).await;
+            self.remove_supervisor_if_same(&session_id, &supervisor)
+                .await;
         }
         Ok(response)
     }
     /// Return the command lease for one raw RPC session identifier.
     pub async fn command_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.command_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(session_id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// Return the host workflow lease for one raw RPC session identifier.
+    pub async fn supervisor_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.supervisor_locks.lock().await;
         Arc::clone(
             locks
                 .entry(session_id.to_owned())
@@ -493,5 +515,22 @@ impl RpcGoalRuntime {
     /// Remove the resident supervisor after its worker has drained.
     pub async fn remove_supervisor(&self, session_id: &str) {
         self.supervisors.lock().await.remove(session_id);
+    }
+
+    /// Remove a resident supervisor only when it is the exact drained
+    /// instance this caller used; a successor must never be erased by stale
+    /// response cleanup.
+    pub async fn remove_supervisor_if_same(
+        &self,
+        session_id: &str,
+        supervisor: &Arc<GoalExecutionSupervisor>,
+    ) {
+        let mut supervisors = self.supervisors.lock().await;
+        if supervisors
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, supervisor))
+        {
+            supervisors.remove(session_id);
+        }
     }
 }

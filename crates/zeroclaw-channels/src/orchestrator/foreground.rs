@@ -104,14 +104,21 @@ pub(crate) async fn drain_policy_revoked_goal(
     locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
     scope: &GoalExecutionScope,
 ) -> Result<()> {
-    let slot = goal_supervisor_slot(locks, scope.session_id());
-    let Some(supervisor) = slot.lock().await.as_ref().cloned() else {
+    let mut slot = goal_supervisor_slot(locks, scope.session_id())
+        .lock_owned()
+        .await;
+    let Some(supervisor) = slot.as_ref().cloned() else {
         return Ok(());
     };
     if supervisor.owns_scope(scope).await {
         supervisor.drain_policy_revoked(scope).await?;
         if !supervisor.owns_scope(scope).await {
-            *slot.lock().await = None;
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &supervisor))
+            {
+                *slot = None;
+            }
         }
     }
     Ok(())

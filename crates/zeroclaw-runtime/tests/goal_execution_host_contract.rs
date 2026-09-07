@@ -555,6 +555,16 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         panic!("unexpected finish")
     }
 
+    async fn mark_session_goal_delivered(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        assert_eq!(task_id, self.task.id);
+        assert_eq!(self.task.session_id.as_deref(), Some(session_id));
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn admit_pending_operation(
         &self,
         _task_id: &str,
