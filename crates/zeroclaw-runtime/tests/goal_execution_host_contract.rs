@@ -107,6 +107,13 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct ExecutionDriver {
@@ -156,12 +163,22 @@ impl GoalSessionExecutionLease for TranscriptExecutionLease {
             self.continue_once = false;
             Ok(r#"{\"decision\":\"continue\",\"reason\":\"add the missing detail\"}"#.to_owned())
         } else {
-            Ok(r#"{\"decision\":\"complete\",\"reason\":\"candidate satisfies the objective\"}"#.to_owned())
+            Ok(
+                r#"{\"decision\":\"complete\",\"reason\":\"candidate satisfies the objective\"}"#
+                    .to_owned(),
+            )
         }
     }
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         self.delivered.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -241,6 +258,13 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
     async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct PausingExecutionDriver {
@@ -301,9 +325,12 @@ impl GoalSessionExecutionLease for UserInputExecutionLease {
         &mut self,
         _scope: &GoalExecutionScope,
         _turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalParentTurnResult> {
         self.events.lock().unwrap().push("parent");
-        Ok("Which option should I use?".to_owned())
+        Ok(GoalParentTurnResult {
+            candidate: "Which option should I use?".to_owned(),
+            working_history: Vec::new(),
+        })
     }
 
     async fn run_verifier(
@@ -321,6 +348,16 @@ impl GoalSessionExecutionLease for UserInputExecutionLease {
     async fn append_parent_candidate(&mut self, candidate: String) -> anyhow::Result<()> {
         self.events.lock().unwrap().push("candidate");
         self.candidates.lock().unwrap().push(candidate);
+        Ok(())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        if notice == zeroclaw_goal::GoalExecutionNotice::PausedForBlocker {
+            self.events.lock().unwrap().push("paused");
+        }
         Ok(())
     }
 }
@@ -516,6 +553,13 @@ impl GoalSessionExecutionLease for ReconnectLease {
 
     async fn append_parent_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
         anyhow::bail!("lease execution test does not deliver candidates")
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_goal::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -2364,9 +2408,11 @@ async fn verifier_continue_preserves_the_process_local_parent_transcript() {
     assert!(histories[1].iter().any(|message| {
         message.role == "assistant" && message.content == "parent:finish the task"
     }));
-    assert!(histories[1]
-        .iter()
-        .any(|message| message.content.contains("add the missing detail")));
+    assert!(
+        histories[1]
+            .iter()
+            .any(|message| message.content.contains("add the missing detail"))
+    );
     assert_eq!(
         store
             .current_goal_for_session(scope.session_id())
@@ -2589,7 +2635,7 @@ async fn verifier_block_publishes_the_parent_request_before_goal_pause() {
     );
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        &["parent", "candidate", "verifier"]
+        &["parent", "candidate", "verifier", "paused"]
     );
 }
 

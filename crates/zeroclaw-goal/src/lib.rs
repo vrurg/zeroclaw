@@ -24,14 +24,15 @@ pub use checkpoint::{
 pub use control::{
     GoalControlAbandonReason, GoalControlAdmission, GoalControlClass, GoalController,
     GoalDeferredClosed, GoalDeferredCommit, GoalDeferredControl, GoalDeferredReady,
-    GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost, GoalExecutionOutcome,
-    GoalExecutionRequest, GoalExecutionRestartCoordinator, GoalExecutionScope,
-    GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext,
-    GoalIngressPrincipal, GoalParentTurn, GoalPendingAction, GoalQueuedControl, GoalResponse,
-    GoalRuntime, GoalRuntimeSubmission, GoalSessionBinding, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalStatusProjection,
-    GoalSubmission, GoalSupervisorRetired, GoalSurface, GoalTurnBoundary, GoalVerifierAttribution,
-    GoalVerifierResult, GoalVerifierTurn, classify_goal_control,
+    GoalDiagnosticTextGuard, GoalExecutionEngine, GoalExecutionHost, GoalExecutionNotice,
+    GoalExecutionOutcome, GoalExecutionRequest, GoalExecutionRestartCoordinator,
+    GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor, GoalHostSettings,
+    GoalIngressContext, GoalIngressPrincipal, GoalParentTurn, GoalParentTurnResult,
+    GoalPendingAction, GoalQueuedControl, GoalResponse, GoalRuntime, GoalRuntimeSubmission,
+    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSupervisorRetired, GoalSurface,
+    GoalTurnBoundary, GoalVerifierAttribution, GoalVerifierResult, GoalVerifierTurn,
+    classify_goal_control,
 };
 pub use task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
