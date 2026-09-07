@@ -142,7 +142,8 @@ use self::foreground::{
     persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{
-    dispose_matrix_goal, revoke_matrix_goals_for_policy, submit_matrix_goal,
+    dispose_matrix_goal, revoke_matrix_goals_at_startup, revoke_matrix_goals_for_policy,
+    submit_matrix_goal,
 };
 use self::turn_execution::resolved_channel_execution;
 
@@ -12705,6 +12706,7 @@ pub async fn start_channels(
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
+    revoke_matrix_goals_at_startup(&config).await?;
     let any_agent_provider_resolves = config
         .agents
         .iter()

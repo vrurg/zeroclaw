@@ -715,6 +715,22 @@ fn upsert_continuation_context(
 
 #[async_trait::async_trait]
 impl GoalTaskRegistry for SqliteTaskStore {
+    async fn list_nonterminal_session_goals(&self) -> Result<Vec<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT * FROM tasks
+                  WHERE kind = 'goal' AND status IN ('running', 'paused')
+                    AND session_id IS NOT NULL AND length(trim(session_id)) > 0
+                  ORDER BY started_at ASC, rowid ASC",
+            )
+            .context("prepare nonterminal session goals for startup policy reconciliation")?;
+        stmt.query_map([], row_to_record)
+            .context("query nonterminal session goals for startup policy reconciliation")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read nonterminal session goals for startup policy reconciliation")
+    }
+
     async fn list_nonterminal_session_goals_for_agent(
         &self,
         agent: &str,

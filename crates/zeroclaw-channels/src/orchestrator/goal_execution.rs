@@ -193,6 +193,46 @@ pub(super) async fn revoke_matrix_goals_for_policy(
     Ok(())
 }
 
+/// Apply the persisted Matrix policy before channel listeners start. Boot
+/// recovery has already classified interrupted pending operations, so there
+/// is no resident executor to drain on this path.
+pub(super) async fn revoke_matrix_goals_at_startup(
+    config: &zeroclaw_config::schema::Config,
+) -> Result<()> {
+    let Some(control_plane) = control_plane() else {
+        return Ok(());
+    };
+    let registry = control_plane.goal_store()?;
+    let targets = registry
+        .list_nonterminal_session_goals()
+        .await?
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                classify_matrix_goal_policy(config, task),
+                MatrixGoalPolicyEligibility::Revoked(_)
+            )
+        })
+        .map(|task| GoalPolicyRevocationTarget {
+            task_id: task.id,
+            session_id: task.session_id.unwrap_or_default(),
+            expected_epoch: task.execution_epoch,
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    match registry
+        .cancel_goals_for_policy_revocation(&targets)
+        .await?
+    {
+        GoalTransitionResult::Applied => Ok(()),
+        GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+            bail!("Goal policy changed during startup reconciliation")
+        }
+    }
+}
+
 use super::foreground::{
     drain_policy_revoked_goal, foreground_lock, goal_command_lock, goal_supervisor_slot,
 };

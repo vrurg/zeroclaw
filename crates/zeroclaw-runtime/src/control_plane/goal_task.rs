@@ -296,6 +296,13 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// List every canonical non-terminal session Goal for startup policy
+    /// reconciliation. The caller classifies durable ingress facts before it
+    /// requests a guarded lifecycle mutation.
+    async fn list_nonterminal_session_goals(&self) -> anyhow::Result<Vec<TaskRecord>> {
+        anyhow::bail!("goal registry does not support startup policy lookup")
+    }
+
     /// List the canonical non-terminal session Goals owned by an agent for a
     /// prospective policy cutover. The caller must classify their durable
     /// ingress facts before requesting a mutation.
