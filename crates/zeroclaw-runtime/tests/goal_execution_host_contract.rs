@@ -18,8 +18,8 @@ use zeroclaw_config::{
 use zeroclaw_goal::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalParentTurn, GoalParentTurnCheckpoint, GoalPauseReason, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalParentTurn, GoalParentTurnCheckpoint, GoalParentTurnResult, GoalPauseReason, GoalResponse,
+    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalVerifierResult, GoalVerifierTurn,
 };
 use zeroclaw_runtime::control_plane::{
@@ -85,8 +85,11 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         &mut self,
         _scope: &GoalExecutionScope,
         turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
-        Ok(format!("parent:{}", turn.objective))
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        Ok(GoalParentTurnResult {
+            candidate: format!("parent:{}", turn.objective),
+            working_history: turn.working_history,
+        })
     }
 
     async fn run_verifier(
@@ -133,10 +136,13 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         &mut self,
         _operation: &GoalExecutionScope,
         _turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalParentTurnResult> {
         self.parent_started.notify_one();
         self.release_parent.notified().await;
-        Ok("candidate that settled before pause".to_owned())
+        Ok(GoalParentTurnResult {
+            candidate: "candidate that settled before pause".to_owned(),
+            working_history: Vec::new(),
+        })
     }
 
     async fn run_verifier(
@@ -415,7 +421,7 @@ impl GoalSessionExecutionLease for ReconnectLease {
         &mut self,
         _operation: &GoalExecutionScope,
         _turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalParentTurnResult> {
         anyhow::bail!("lease execution test does not run parent turns")
     }
 
@@ -928,7 +934,8 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                 }
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .candidate,
         "parent:finish the task"
     );
     assert_eq!(
