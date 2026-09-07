@@ -146,11 +146,14 @@ pub(super) async fn submit_matrix_goal(
         if let Some(supervisor) = slot.as_ref() {
             Arc::clone(supervisor)
         } else {
-            let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::new(Arc::clone(&registry));
             let tracker = CostTracker::get_or_init_global_required(
                 defaults.config.cost.clone(),
                 &defaults.config.data_dir,
             )?;
+            let runtime = zeroclaw_runtime::goal_mode::GoalRuntime::with_tracker(
+                Arc::clone(&registry),
+                Arc::clone(&tracker),
+            );
             let engine = Arc::new(runtime.execution_engine(
                 tracker,
                 context.agent_alias.to_string(),

@@ -22,6 +22,7 @@ use crate::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
 };
+use zeroclaw_config::cost::CostTracker;
 
 mod goal_execution;
 
@@ -670,6 +671,13 @@ impl GoalRuntime {
         }
     }
 
+    pub fn with_tracker(registry: Arc<dyn GoalTaskRegistry>, tracker: Arc<CostTracker>) -> Self {
+        Self {
+            host: GoalExecutionHost::new(),
+            controller: GoalController::with_tracker(registry, tracker),
+        }
+    }
+
     /// Create an execution engine bound to this runtime's canonical task
     /// registry. This prevents an adapter from admitting a Goal through one
     /// control plane and running/accounting it through another.
@@ -841,10 +849,22 @@ pub struct GoalStatusProjection {
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
     pub resumable: bool,
+    pub known_tokens: Option<u64>,
+    pub known_cost_usd: Option<f64>,
+    pub cost_accounting_complete: bool,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
 }
 
 impl GoalStatusProjection {
-    fn from_parts(task: &TaskRecord, goal: &GoalTaskRecord) -> Self {
+    fn from_parts(
+        task: &TaskRecord,
+        goal: &GoalTaskRecord,
+        usage: Option<(u64, f64, bool)>,
+    ) -> Self {
+        let (known_tokens, known_cost_usd, cost_accounting_complete) = usage
+            .map(|(tokens, cost, pricing)| (Some(tokens), Some(cost), pricing))
+            .unwrap_or((None, None, false));
         Self {
             task_id: task.id.clone(),
             status: task.status,
@@ -857,6 +877,17 @@ impl GoalStatusProjection {
                 && goal.accounting_state == GoalAccountingState::Complete
                 && goal.pending_call_id.is_none()
                 && goal.tool_phase == crate::control_plane::GoalToolPhase::Clean,
+            known_tokens,
+            known_cost_usd,
+            cost_accounting_complete,
+            remaining_tokens: goal
+                .effective_token_limit
+                .zip(known_tokens)
+                .map(|(limit, used)| limit.saturating_sub(used)),
+            remaining_cost_usd: goal
+                .effective_cost_limit_usd
+                .zip(known_cost_usd)
+                .map(|(limit, used)| (limit - used).max(0.0)),
         }
     }
 }
@@ -866,11 +897,22 @@ impl GoalStatusProjection {
 #[derive(Clone)]
 pub struct GoalController {
     registry: Arc<dyn GoalTaskRegistry>,
+    tracker: Option<Arc<CostTracker>>,
 }
 
 impl GoalController {
     pub fn new(registry: Arc<dyn GoalTaskRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            tracker: None,
+        }
+    }
+
+    pub fn with_tracker(registry: Arc<dyn GoalTaskRegistry>, tracker: Arc<CostTracker>) -> Self {
+        Self {
+            registry,
+            tracker: Some(tracker),
+        }
     }
 
     /// Apply a previously host-validated Goal submission through guarded
@@ -1163,7 +1205,12 @@ impl GoalController {
             .get_goal_task(&task.id)
             .await?
             .ok_or_else(|| anyhow::Error::msg("Goal task extension is missing"))?;
-        Ok(GoalStatusProjection::from_parts(task, &goal))
+        let usage = self
+            .tracker
+            .as_ref()
+            .map(|tracker| tracker.get_usage_totals_for_task_with_pricing(&task.id))
+            .transpose()?;
+        Ok(GoalStatusProjection::from_parts(task, &goal, usage))
     }
 }
 

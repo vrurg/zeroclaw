@@ -391,11 +391,12 @@ impl RpcGoalRuntime {
         let supervisor = match self.supervisor(&session_id).await {
             Some(supervisor) => supervisor,
             None => {
-                let runtime = GoalRuntime::new(Arc::clone(&registry));
                 let tracker = CostTracker::get_or_init_global_required(
                     config.cost.clone(),
                     &config.data_dir,
                 )?;
+                let runtime =
+                    GoalRuntime::with_tracker(Arc::clone(&registry), Arc::clone(&tracker));
                 let engine = Arc::new(runtime.execution_engine(
                     tracker,
                     driver.agent_alias().to_owned(),
