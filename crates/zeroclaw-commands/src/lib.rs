@@ -38,6 +38,8 @@ pub enum BuiltinCommandId {
     Config,
     /// Show or change model thinking/reasoning effort.
     Thinking,
+    /// Manage the session-bound Goal lifecycle.
+    Goal,
 }
 
 impl BuiltinCommandId {
@@ -51,6 +53,7 @@ impl BuiltinCommandId {
             Self::Models => "models",
             Self::Config => "config",
             Self::Thinking => "thinking",
+            Self::Goal => "goal",
         }
     }
 }
@@ -187,6 +190,15 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         surfaces: CHANNEL_ONLY,
         execution: CommandExecution::RuntimeCommand,
     },
+    CommandSpec {
+        id: BuiltinCommandId::Goal,
+        name: "goal",
+        aliases: &[],
+        usage: "/goal start [--tokens N] [--cost-usd D] -- OBJECTIVE",
+        description_key: "command-goal-description",
+        surfaces: CHANNEL_AND_TUI,
+        execution: CommandExecution::RuntimeCommand,
+    },
 ];
 
 pub fn builtin_commands() -> &'static [CommandSpec] {
@@ -301,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_surface_advertises_help_model_and_new_only() {
+    fn tui_surface_advertises_help_model_new_and_goal() {
         let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
             .map(|spec| spec.id)
             .collect();
@@ -311,18 +323,30 @@ mod tests {
                 BuiltinCommandId::Help,
                 BuiltinCommandId::New,
                 BuiltinCommandId::Model,
+                BuiltinCommandId::Goal,
             ]
         );
         assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/model", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
+        assert_eq!(
+            parse_command_token("/goal", CommandSurface::Tui).map(|parsed| parsed.command.id),
+            Some(BuiltinCommandId::Goal)
+        );
         assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
     }
 
     #[test]
-    fn dormant_goal_parser_does_not_advertise_an_unwired_command() {
-        assert!(parse_command_token("/goal", CommandSurface::Channel).is_none());
-        assert!(command_by_name("/goal").is_none());
+    fn goal_is_advertised_only_on_its_channel_and_tui_surfaces() {
+        for surface in [CommandSurface::Channel, CommandSurface::Tui] {
+            assert_eq!(
+                parse_command_token("/goal", surface).map(|parsed| parsed.command.id),
+                Some(BuiltinCommandId::Goal)
+            );
+        }
+        for surface in [CommandSurface::Cli, CommandSurface::Web] {
+            assert!(parse_command_token("/goal", surface).is_none());
+        }
     }
 }
