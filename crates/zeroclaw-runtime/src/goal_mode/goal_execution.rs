@@ -1145,6 +1145,20 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             accounting_state = GoalAccountingState::Missing;
         }
 
+        // A priced configured route does not make an unpriced Reliable
+        // fallback safe for a cost-limited Goal. Preserve its known token
+        // usage in the canonical ledger, but fence further budgeted work.
+        let cost_limited = self
+            .registry
+            .get_goal_task(self.scope.task_id())
+            .await?
+            .context("Goal extension disappeared during accounting settlement")?
+            .effective_cost_limit_usd
+            .is_some();
+        if cost_limited && events.iter().any(|(_, usage)| !usage.pricing_available) {
+            accounting_state = GoalAccountingState::Invalid;
+        }
+
         // A ledger write failure deliberately leaves the durable pending slot
         // uncleared. Restart recovery then classifies the operation as unknown
         // instead of replaying a possibly billed provider call.
@@ -1437,6 +1451,46 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+    }
+
+    #[tokio::test]
+    async fn accountant_marks_an_unpriced_actual_route_incomplete_for_a_cost_limited_goal() {
+        let (store, accountant, scope, _directory) = accountant_fixture().await;
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .update_session_goal_limits(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    None,
+                    Some(1.0),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert!(
+            accountant
+                .settle(GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Complete,
+                    events: vec![GoalUsageEvent {
+                        provider_ref: "unpriced-fallback".to_owned(),
+                        model: "model".to_owned(),
+                        usage: usage(10, 5),
+                    }],
+                })
+                .await
+                .is_err()
+        );
+
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+        assert!(goal.pending_call_id.is_none());
     }
 
     #[tokio::test]
