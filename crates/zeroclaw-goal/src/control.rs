@@ -40,6 +40,7 @@ pub use goal_execution::{
     GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
     GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
     GoalExecutionSupervisor, GoalLaunchFailureReported, GoalSupervisorRetired,
+    dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 
