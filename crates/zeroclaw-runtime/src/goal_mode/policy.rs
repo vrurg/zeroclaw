@@ -269,40 +269,47 @@ pub async fn reconcile_common_goal_policy_at_startup(config: &Config) -> Result<
         return Ok(());
     };
     let registry = control_plane.goal_store()?;
-    let targets = registry
-        .list_nonterminal_session_goals()
-        .await?
-        .into_iter()
-        .filter(|task| {
-            matches!(
-                classify_common_goal_policy(config, task),
-                GoalPolicyDecision::Revoked(_)
-            )
-        })
-        .map(|task| {
-            let session_id = task
-                .session_id
-                .filter(|session_id| !session_id.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Goal policy target lost its session binding"))?;
-            Ok(GoalPolicyRevocationTarget {
-                task_id: task.id,
-                session_id,
-                expected_epoch: task.execution_epoch,
+    // A natural terminal transition racing revocation must not preserve every
+    // other revoked Goal by rolling back the exact batch. Reclassify under the
+    // same prospective configuration and retry a bounded number of times.
+    let initial_count = registry.list_nonterminal_session_goals().await?.len();
+    for _ in 0..=initial_count {
+        let targets = registry
+            .list_nonterminal_session_goals()
+            .await?
+            .into_iter()
+            .filter(|task| {
+                matches!(
+                    classify_common_goal_policy(config, task),
+                    GoalPolicyDecision::Revoked(_)
+                )
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if targets.is_empty() {
-        return Ok(());
-    }
-    match registry
-        .cancel_goals_for_policy_revocation(&targets)
-        .await?
-    {
-        GoalTransitionResult::Applied => Ok(()),
-        GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-            anyhow::bail!("Goal policy changed during startup reconciliation")
+            .map(|task| {
+                let session_id = task
+                    .session_id
+                    .filter(|session_id| !session_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Goal policy target lost its session binding")
+                    })?;
+                Ok(GoalPolicyRevocationTarget {
+                    task_id: task.id,
+                    session_id,
+                    expected_epoch: task.execution_epoch,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+        match registry
+            .cancel_goals_for_policy_revocation(&targets)
+            .await?
+        {
+            GoalTransitionResult::Applied => return Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => continue,
         }
     }
+    anyhow::bail!("Goal policy reconciliation did not converge")
 }
 
 #[cfg(test)]
