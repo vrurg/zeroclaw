@@ -32,7 +32,7 @@ use crate::agent::cost::{
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalTaskRegistry, GoalTransitionResult, TaskStatus,
+    GoalPolicyRevocationTarget, GoalTaskRegistry, GoalTransitionResult, TaskStatus,
 };
 use zeroclaw_commands::goal::GoalCommand;
 
@@ -303,6 +303,15 @@ impl GoalExecutionSupervisor {
         for scope in &scopes {
             let _ = self.drain_lifecycle_fence(scope).await?;
         }
+        Ok(())
+    }
+
+    /// Drain one Goal whose lifecycle was terminally fenced by a policy
+    /// cutover. Unlike runtime interruption, policy revocation deliberately
+    /// preserves `Cancelled`; an admitted operation may finish only to settle
+    /// its accounting, never to revive or advance the Goal.
+    pub async fn drain_policy_revoked(&self, scope: &GoalExecutionScope) -> Result<()> {
+        let _ = self.drain_lifecycle_fence(scope).await?;
         Ok(())
     }
 
@@ -1456,6 +1465,53 @@ mod tests {
             goal.pause_reason,
             Some(GoalPauseReason::DaemonRestart)
         ));
+        assert!(!supervisor.owns_scope(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_drain_preserves_cancellation_after_worker_settles() {
+        let (store, accountant, scope, _directory) = accountant_fixture().await;
+        let runtime = GoalRuntime::with_tracker(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            Arc::clone(&accountant.tracker),
+        );
+        let engine = Arc::new(
+            runtime
+                .execution_engine(
+                    Arc::clone(&accountant.tracker),
+                    "main",
+                    Arc::clone(&accountant.pricing),
+                )
+                .unwrap(),
+        );
+        let supervisor = GoalExecutionSupervisor::new(engine);
+        supervisor.workers.lock().await.insert(
+            GoalWorkerKey::from_scope(&scope),
+            GoalWorker {
+                execution_epoch: scope.execution_epoch(),
+                handle: zeroclaw_spawn::spawn!(async { Ok(GoalExecutionOutcome::Completed) }),
+            },
+        );
+        assert_eq!(
+            store
+                .cancel_goals_for_policy_revocation(&[GoalPolicyRevocationTarget {
+                    task_id: scope.task_id().to_owned(),
+                    session_id: scope.session_id().to_owned(),
+                    expected_epoch: scope.execution_epoch(),
+                }])
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        supervisor.drain_policy_revoked(&scope).await.unwrap();
+
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Cancelled);
         assert!(!supervisor.owns_scope(&scope).await);
     }
 
