@@ -940,6 +940,7 @@ pub async fn run(
             hooks,
             cert_audit,
             auth: rpc_auth,
+            goal_runtime: std::sync::Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         }))
     } else {
         None
