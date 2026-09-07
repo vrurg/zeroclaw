@@ -33,7 +33,7 @@ pub use goal_execution::{
 };
 pub use policy::{
     GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalPolicyGate, GoalPolicyRevocationReason,
-    GoalSurfacePolicy, classify_common_goal_policy,
+    GoalSurfacePolicy, authorize_common_goal_ingress, classify_common_goal_policy,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.

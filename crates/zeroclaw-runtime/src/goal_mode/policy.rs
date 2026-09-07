@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use zeroclaw_config::schema::Config;
 
-use super::{GoalIngressContext, GoalSurface};
-use crate::control_plane::{TaskKind, TaskRecord};
+use super::{GoalIngressContext, GoalIngressPrincipal, GoalSurface};
+use crate::control_plane::{TaskKind, TaskRecord, TaskStatus};
 
 /// Why prospective policy revokes an otherwise nonterminal Goal.
 ///
@@ -26,6 +26,20 @@ pub enum GoalPolicyRevocationReason {
     AgentProviderUnavailable,
     VerifierUnavailable,
     SurfaceUnavailable,
+}
+
+impl GoalPolicyRevocationReason {
+    /// Stable internal key for tracing and durable cancellation reasons.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::GoalDisabled => "goal_disabled",
+            Self::BindingInvalid => "binding_invalid",
+            Self::AgentUnavailable => "agent_unavailable",
+            Self::AgentProviderUnavailable => "agent_provider_unavailable",
+            Self::VerifierUnavailable => "verifier_unavailable",
+            Self::SurfaceUnavailable => "surface_unavailable",
+        }
+    }
 }
 
 /// Typed result of prospective Goal policy evaluation.
@@ -208,6 +222,40 @@ pub fn classify_common_goal_policy(config: &Config, task: &TaskRecord) -> GoalPo
     GoalPolicyDecision::Eligible
 }
 
+/// Classify immutable trusted ingress with the policy shared by both V1
+/// surfaces. The temporary task shape is never persisted and cannot become an
+/// authority source; it simply guarantees admission and later durable
+/// revocation use the same common predicates.
+pub fn authorize_common_goal_ingress(
+    config: &Config,
+    ingress: &GoalIngressContext,
+) -> GoalPolicyDecision {
+    let principal_id = match ingress.principal() {
+        GoalIngressPrincipal::Matrix { raw_mxid } => Some(raw_mxid.clone()),
+        GoalIngressPrincipal::ZeroCode { .. } => None,
+    };
+    let task = TaskRecord {
+        id: String::new(),
+        kind: TaskKind::Goal,
+        agent: ingress.agent().to_owned(),
+        status: TaskStatus::Running,
+        owner_pid: 0,
+        owner_boot_id: String::new(),
+        heartbeat_at: None,
+        depth: 0,
+        parent_id: None,
+        originator_route: Some(ingress.route().to_owned()),
+        delivered: false,
+        idem_key: None,
+        principal_id,
+        session_id: Some(ingress.session_key().durable_id()),
+        execution_epoch: 1,
+        started_at: String::new(),
+        finished_at: None,
+    };
+    classify_common_goal_policy(config, &task)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +300,24 @@ mod tests {
         assert_eq!(
             classify_common_goal_policy(&config, &task),
             GoalPolicyDecision::Eligible
+        );
+    }
+
+    #[test]
+    fn common_ingress_policy_applies_to_zerocode_before_a_supervisor_is_created() {
+        let ingress = GoalIngressContext::trusted(
+            super::super::GoalSessionKey::zero_code("session-1").unwrap(),
+            "main",
+            "zerocode:session-1",
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: "tui-1".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorize_common_goal_ingress(&Config::default(), &ingress),
+            GoalPolicyDecision::Revoked(GoalPolicyRevocationReason::GoalDisabled)
         );
     }
 

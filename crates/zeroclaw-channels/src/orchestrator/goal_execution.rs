@@ -20,9 +20,10 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
-        GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
-        GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
+        GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalPolicyDecision,
+        GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+        GoalSessionLease, GoalSurface, GoalVerifierTurn, authorize_common_goal_ingress,
+        classify_common_goal_policy, dispose_unowned_session_goal,
     },
 };
 
@@ -94,8 +95,8 @@ fn classify_matrix_goal_policy(
     let Some(route) = MatrixGoalRoute::parse(raw_route) else {
         return MatrixGoalPolicyEligibility::Revoked("matrix_binding_invalid");
     };
-    if !config.goal.enabled {
-        return MatrixGoalPolicyEligibility::Revoked("goal_disabled");
+    if let GoalPolicyDecision::Revoked(reason) = classify_common_goal_policy(config, task) {
+        return MatrixGoalPolicyEligibility::Revoked(reason.key());
     }
     let Some(principal) = task
         .principal_id
@@ -110,12 +111,6 @@ fn classify_matrix_goal_policy(
         .is_none_or(|value| value.trim().is_empty())
     {
         return MatrixGoalPolicyEligibility::Revoked("matrix_binding_invalid");
-    }
-    let Some(agent) = config.agents.get(&task.agent) else {
-        return MatrixGoalPolicyEligibility::Revoked("agent_unavailable");
-    };
-    if !agent.is_dispatchable() {
-        return MatrixGoalPolicyEligibility::Revoked("agent_unavailable");
     }
     let Some(matrix) = config.channels.matrix.get(&route.alias) else {
         return MatrixGoalPolicyEligibility::Revoked("matrix_channel_unavailable");
@@ -132,29 +127,13 @@ fn classify_matrix_goal_policy(
     if !crate::allowlist::is_matrix_user_allowed(&peers, principal) {
         return MatrixGoalPolicyEligibility::Revoked("matrix_principal_revoked");
     }
-    if config
-        .resolved_model_provider_for_agent(&task.agent)
-        .is_none()
-    {
-        return MatrixGoalPolicyEligibility::Revoked("agent_provider_unavailable");
-    }
-    if config
-        .goal
-        .verifier
-        .model_provider
-        .as_str()
-        .trim()
-        .is_empty()
-    {
-        return MatrixGoalPolicyEligibility::Revoked("verifier_unavailable");
-    }
     MatrixGoalPolicyEligibility::Eligible
 }
 
 /// Reauthorize immutable Matrix ingress after the config-update gate has
-/// completed. The reconstructed row is not persisted or used for lifecycle
-/// mutation: it gives the durable-policy classifier the exact trusted facts
-/// that a new Goal would store if admitted.
+/// completed. The shared policy helper never persists its temporary task
+/// shape, and the Matrix classifier then applies the raw-MXID and room facts
+/// that only this surface owns.
 fn authorize_matrix_goal_ingress(
     config: &zeroclaw_config::schema::Config,
     ingress: &GoalIngressContext,
@@ -163,6 +142,12 @@ fn authorize_matrix_goal_ingress(
         zeroclaw_runtime::goal_mode::GoalIngressPrincipal::Matrix { raw_mxid } => raw_mxid,
         _ => bail!("Goal ingress is not Matrix"),
     };
+    if let GoalPolicyDecision::Revoked(reason) = authorize_common_goal_ingress(config, ingress) {
+        bail!(
+            "Matrix Goal ingress is no longer authorized: {}",
+            reason.key()
+        );
+    }
     let task = TaskRecord {
         id: String::new(),
         kind: TaskKind::Goal,

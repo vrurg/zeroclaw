@@ -23,9 +23,10 @@ use crate::{
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
         GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
-        GoalParentTurnResult, GoalPolicyCutoverCoordinator, GoalResponse, GoalRuntime,
-        GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-        GoalSessionLease, GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
+        GoalParentTurnResult, GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalResponse,
+        GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
+        GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+        authorize_common_goal_ingress, dispose_unowned_session_goal,
     },
     rpc::context::RpcContext,
 };
@@ -383,6 +384,23 @@ impl RpcGoalRuntime {
         if !config.goal.enabled {
             return Ok(GoalResponse::Disabled);
         }
+        let session_id = driver.raw_session_id().to_owned();
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key().clone(),
+            driver.agent_alias().to_owned(),
+            format!("zerocode:{session_id}"),
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: driver.tui_id.clone(),
+            },
+        )?;
+        if let GoalPolicyDecision::Revoked(reason) =
+            authorize_common_goal_ingress(&config, &ingress)
+        {
+            bail!(
+                "ZeroCode Goal ingress is no longer authorized: {}",
+                reason.key()
+            );
+        }
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
         let limits = config.goal.effective_limits().map_err(|error| {
@@ -397,7 +415,6 @@ impl RpcGoalRuntime {
             std::process::id(),
             control_plane.boot_id.clone(),
         )?;
-        let session_id = driver.raw_session_id().to_owned();
         let supervisor = match self.supervisor(&session_id).await {
             Some(supervisor) => supervisor,
             None => {
@@ -418,14 +435,6 @@ impl RpcGoalRuntime {
                 supervisor
             }
         };
-        let ingress = GoalIngressContext::trusted(
-            driver.session_key().clone(),
-            driver.agent_alias().to_owned(),
-            format!("zerocode:{session_id}"),
-            GoalIngressPrincipal::ZeroCode {
-                tui_id: driver.tui_id.clone(),
-            },
-        )?;
         let response = supervisor
             .submit(settings, ingress, driver, command)
             .await?;
