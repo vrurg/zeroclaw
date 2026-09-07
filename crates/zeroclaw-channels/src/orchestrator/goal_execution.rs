@@ -20,7 +20,7 @@ use zeroclaw_runtime::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn,
+        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
     },
 };
 
@@ -236,40 +236,7 @@ pub(super) async fn dispose_matrix_goal(
         return Ok(());
     };
     let registry = control_plane.goal_store()?;
-    let Some(current) = registry.current_goal_for_session(history_key).await? else {
-        return Ok(());
-    };
-    if !current.status.is_terminal() {
-        let _ = registry
-            .finish_session_goal(
-                &current.id,
-                history_key,
-                current.execution_epoch,
-                zeroclaw_runtime::control_plane::TaskStatus::Cancelled,
-                Some("session_disposed".to_owned()),
-            )
-            .await?;
-    }
-    let Some(reloaded) = registry.current_goal_for_session(history_key).await? else {
-        return Ok(());
-    };
-    if let Some(goal) = registry.get_goal_task(&reloaded.id).await?
-        && let Some((pending_id, pending_epoch)) =
-            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-    {
-        let _ = registry
-            .settle_pending_operation(
-                &reloaded.id,
-                history_key,
-                pending_epoch,
-                pending_id,
-                zeroclaw_runtime::control_plane::GoalAccountingState::OutcomeUnknown,
-            )
-            .await?;
-    }
-    let _ = registry
-        .delete_session_goal(&reloaded.id, history_key, reloaded.execution_epoch)
-        .await?;
+    let _ = dispose_unowned_session_goal(registry.as_ref(), history_key).await?;
     Ok(())
 }
 

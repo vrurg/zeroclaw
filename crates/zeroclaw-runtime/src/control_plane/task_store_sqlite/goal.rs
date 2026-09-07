@@ -1297,6 +1297,7 @@ mod tests {
     use super::*;
     use crate::control_plane::goal_task::{GoalBlockerKind, GoalTaskRegistry};
     use crate::control_plane::task_registry::{TaskKind, TaskRegistry, TaskStatus};
+    use crate::goal_mode::dispose_unowned_session_goal;
     use rusqlite::params;
 
     fn rec(id: &str, agent: &str, owner_pid: u32, boot: &str) -> TaskRecord {
@@ -1835,5 +1836,50 @@ mod tests {
             )
             .expect_err("SQLite must reject continuation contexts for non-goal tasks");
         assert!(format!("{err:#}").contains("goal task"));
+    }
+
+    #[tokio::test]
+    async fn unowned_session_disposal_deletes_clean_and_pending_goal_control_state() {
+        for (task_id, session_id, pending) in [
+            ("goal-dispose-clean", "rpc_dispose_clean", false),
+            ("goal-dispose-pending", "rpc_dispose_pending", true),
+        ] {
+            let store = SqliteTaskStore::new_in_memory().unwrap();
+            let mut task = rec(task_id, "main", 1, "boot-1");
+            task.kind = TaskKind::Goal;
+            task.session_id = Some(session_id.to_owned());
+            let goal = goal_record(task_id, "complete the task");
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(task, goal)
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            if pending {
+                assert_eq!(
+                    store
+                        .admit_pending_operation(task_id, session_id, 1, "pending-op")
+                        .await
+                        .unwrap(),
+                    GoalTransitionResult::Applied
+                );
+            }
+
+            assert_eq!(
+                dispose_unowned_session_goal(&store, session_id)
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            assert!(
+                store
+                    .current_goal_for_session(session_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "durable Goal control state must not outlive its disposed session"
+            );
+        }
     }
 }

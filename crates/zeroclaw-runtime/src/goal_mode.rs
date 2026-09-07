@@ -29,7 +29,7 @@ mod goal_execution;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
-    GoalExecutionSupervisor,
+    GoalExecutionSupervisor, dispose_unowned_session_goal,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.
