@@ -18,8 +18,9 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
-        GoalParentTurn, GoalParentTurnResult, GoalSessionBinding, GoalSessionDriver,
-        GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+        GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
+        GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
+        GoalSurface, GoalVerifierTurn,
     },
 };
 
@@ -338,8 +339,13 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         )
         .await?;
         let mut history = turn.working_history;
+        let turn_kind = match turn.kind {
+            GoalParentTurnKind::Start => "start",
+            GoalParentTurnKind::Resume => "resume",
+            GoalParentTurnKind::Continue => "continue",
+        };
         history.push(ChatMessage::system(format!(
-            "Goal success criterion (trusted runtime directive): {}\nTurn kind: goal",
+            "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
             turn.objective
         )));
         let turn_id = uuid::Uuid::new_v4().to_string();
