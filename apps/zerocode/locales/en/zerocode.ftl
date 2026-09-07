@@ -132,6 +132,7 @@ zc-goal-status = Goal status updated.
 zc-goal-budget = Goal budget updated.
 zc-goal-budget-updated = Goal budget updated.
 zc-goal-paused = Goal paused.
+zc-goal-paused-blocked = Goal paused: resolution is required before it can continue.
 zc-goal-resumed = Goal resumed.
 zc-goal-cancelled = Goal cancelled.
 zc-goal-completed = Goal completed.

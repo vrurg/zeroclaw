@@ -2110,7 +2110,7 @@ impl Chat {
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-paused",
+                                    "zc-goal-paused-blocked",
                                 ))));
                             state.mark_dirty_append();
                         }
@@ -19526,6 +19526,7 @@ mod tests {
                 }
             }),
             serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+            serde_json::json!({ "paused_for_blocker": { "session_id": "sess-1" } }),
         ] {
             notif_tx
                 .send(RpcNotification {
@@ -19538,12 +19539,15 @@ mod tests {
         chat.drain_notifications();
 
         let entries = active_state(&mut chat).entries();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(
             matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
         );
         assert!(
             matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
+        );
+        assert!(
+            matches!(&entries[2], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-paused-blocked"))
         );
     }
 
