@@ -151,6 +151,18 @@ fn classify_matrix_goal_policy(
     MatrixGoalPolicyEligibility::Eligible
 }
 
+fn policy_revocation_target(task: TaskRecord) -> Result<GoalPolicyRevocationTarget> {
+    let session_id = task
+        .session_id
+        .filter(|value| !value.trim().is_empty())
+        .context("Matrix Goal policy target lost its session binding")?;
+    Ok(GoalPolicyRevocationTarget {
+        task_id: task.id,
+        session_id,
+        expected_epoch: task.execution_epoch,
+    })
+}
+
 pub(super) async fn revoke_matrix_goals_for_policy(
     context: &ChannelRuntimeContext,
     next_config: &zeroclaw_config::schema::Config,
@@ -167,12 +179,8 @@ pub(super) async fn revoke_matrix_goals_for_policy(
                 MatrixGoalPolicyEligibility::Revoked(_)
             )
         })
-        .map(|task| GoalPolicyRevocationTarget {
-            task_id: task.id,
-            session_id: task.session_id.unwrap_or_default(),
-            expected_epoch: task.execution_epoch,
-        })
-        .collect::<Vec<_>>();
+        .map(policy_revocation_target)
+        .collect::<Result<Vec<_>>>()?;
     if targets.is_empty() {
         return Ok(());
     }
@@ -213,12 +221,8 @@ pub(super) async fn revoke_matrix_goals_at_startup(
                 MatrixGoalPolicyEligibility::Revoked(_)
             )
         })
-        .map(|task| GoalPolicyRevocationTarget {
-            task_id: task.id,
-            session_id: task.session_id.unwrap_or_default(),
-            expected_epoch: task.execution_epoch,
-        })
-        .collect::<Vec<_>>();
+        .map(policy_revocation_target)
+        .collect::<Result<Vec<_>>>()?;
     if targets.is_empty() {
         return Ok(());
     }
