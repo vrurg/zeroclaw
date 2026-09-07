@@ -1124,7 +1124,12 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             )
             .await?
         {
-            GoalTransitionResult::Applied => Ok(()),
+            GoalTransitionResult::Applied if accounting_state == GoalAccountingState::Complete => {
+                Ok(())
+            }
+            GoalTransitionResult::Applied => {
+                bail!("Goal operation accounting is incomplete")
+            }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
                 bail!("Goal operation settlement lost its execution fence")
             }
@@ -1370,7 +1375,7 @@ mod tests {
             .admit(GoalOperationRequest::new("primary", "model"))
             .await
             .unwrap();
-        accountant
+        let settlement = accountant
             .settle(GoalOperationSettlement {
                 accounting_state: GoalAccountingState::Complete,
                 events: vec![GoalUsageEvent {
@@ -1379,8 +1384,9 @@ mod tests {
                     usage: usage(0, 0),
                 }],
             })
-            .await
-            .unwrap();
+            .await;
+
+        assert!(settlement.is_err());
 
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
@@ -1416,6 +1422,30 @@ mod tests {
                 .tool_phase,
             crate::control_plane::GoalToolPhase::Clean
         );
+    }
+
+    #[tokio::test]
+    async fn tool_phase_controller_rejects_incomplete_goal_accounting() {
+        let (store, accountant, scope, _directory) = accountant_fixture().await;
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        assert!(
+            accountant
+                .settle(GoalOperationSettlement {
+                    accounting_state: GoalAccountingState::Missing,
+                    events: Vec::new(),
+                })
+                .await
+                .is_err()
+        );
+
+        let fence = GoalToolPhaseController {
+            registry: store as Arc<dyn GoalTaskRegistry>,
+            scope,
+        };
+        assert!(fence.begin().await.is_err());
     }
 
     #[tokio::test]

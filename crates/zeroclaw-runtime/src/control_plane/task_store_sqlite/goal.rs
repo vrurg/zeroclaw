@@ -1201,7 +1201,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let conn = self.conn.lock();
         let updated = conn.execute(
             "UPDATE goal_tasks SET tool_phase = 'in_flight'
-              WHERE task_id = ?1 AND tool_phase = 'clean'
+              WHERE task_id = ?1 AND tool_phase = 'clean' AND accounting_state = 'complete'
                 AND EXISTS (
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
