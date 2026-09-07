@@ -145,7 +145,7 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
-use self::goal_execution::submit_matrix_goal;
+use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
 use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -7339,6 +7339,33 @@ async fn process_channel_message_body(
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
+        return;
+    }
+
+    if is_matrix_channel_name(&msg.channel)
+        && matches!(
+            parse_runtime_command(&msg.channel, &msg.content),
+            Some(ChannelRuntimeCommand::NewSession)
+        )
+    {
+        if let Err(error) = dispose_matrix_goal(ctx.as_ref(), &history_key).await {
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(&SendMessage::reply_to(
+                        &msg,
+                        channel_runtime_cli_string_with_args(
+                            "goal-mode-command-failed",
+                            &[(
+                                "error",
+                                zeroclaw_providers::sanitize_api_error(&error.to_string()).as_str(),
+                            )],
+                        ),
+                    ))
+                    .await;
+            }
+            return;
+        }
+        let _ = handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await;
         return;
     }
 

@@ -189,6 +189,66 @@ pub(super) async fn submit_matrix_goal(
     Ok(response)
 }
 
+/// Dispose a Matrix session's Goal before the channel resets its history.
+///
+/// A resident supervisor performs the required fence-and-drain ordering. If
+/// this process has no worker (for example after restart), the durable row is
+/// already the sole live authority and can be fenced, classified, and deleted
+/// directly without recreating a worker merely to dispose it.
+pub(super) async fn dispose_matrix_goal(
+    context: &ChannelRuntimeContext,
+    history_key: &str,
+) -> Result<()> {
+    let slot = goal_supervisor_slot(&context.persist_locks, history_key);
+    if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
+        supervisor.dispose_session(history_key).await?;
+        *slot.lock().await = None;
+        return Ok(());
+    }
+
+    let Some(control_plane) = control_plane() else {
+        // Without the canonical control plane no Goal could have been
+        // admitted, so ordinary Matrix `/new` keeps its historical behavior.
+        return Ok(());
+    };
+    let registry = control_plane.goal_store()?;
+    let Some(current) = registry.current_goal_for_session(history_key).await? else {
+        return Ok(());
+    };
+    if !current.status.is_terminal() {
+        let _ = registry
+            .finish_session_goal(
+                &current.id,
+                history_key,
+                current.execution_epoch,
+                zeroclaw_runtime::control_plane::TaskStatus::Cancelled,
+                Some("session_disposed".to_owned()),
+            )
+            .await?;
+    }
+    let Some(reloaded) = registry.current_goal_for_session(history_key).await? else {
+        return Ok(());
+    };
+    if let Some(goal) = registry.get_goal_task(&reloaded.id).await?
+        && let Some((pending_id, pending_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+    {
+        let _ = registry
+            .settle_pending_operation(
+                &reloaded.id,
+                history_key,
+                pending_epoch,
+                pending_id,
+                zeroclaw_runtime::control_plane::GoalAccountingState::OutcomeUnknown,
+            )
+            .await?;
+    }
+    let _ = registry
+        .delete_session_goal(&reloaded.id, history_key, reloaded.execution_epoch)
+        .await?;
+    Ok(())
+}
+
 #[async_trait]
 impl GoalSessionDriver for MatrixGoalSessionDriver {
     fn surface(&self) -> GoalSurface {
