@@ -432,47 +432,7 @@ impl GoalExecutionSupervisor {
             let _ = self.drain(&scope).await;
         }
 
-        let Some(reloaded) = self
-            .engine
-            .registry
-            .current_goal_for_session(session_id)
-            .await?
-        else {
-            return Ok(GoalTransitionResult::Missing);
-        };
-        if reloaded.id != task_id || !reloaded.status.is_terminal() {
-            return Ok(GoalTransitionResult::Stale);
-        }
-        let goal = self
-            .engine
-            .registry
-            .get_goal_task(&task_id)
-            .await?
-            .context("Goal extension disappeared during session disposal")?;
-        if let Some((pending_id, admitted_epoch)) =
-            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-        {
-            match self
-                .engine
-                .registry
-                .settle_pending_operation(
-                    &task_id,
-                    session_id,
-                    admitted_epoch,
-                    pending_id,
-                    GoalAccountingState::OutcomeUnknown,
-                )
-                .await?
-            {
-                GoalTransitionResult::Applied => {}
-                result => return Ok(result),
-            }
-        }
-
-        self.engine
-            .registry
-            .delete_session_goal(&task_id, session_id, reloaded.execution_epoch)
-            .await
+        dispose_unowned_session_goal(self.engine.registry.as_ref(), session_id).await
     }
 
     /// Fence and drain every resident epoch for daemon restart.
@@ -803,6 +763,73 @@ impl GoalExecutionSupervisor {
             _ => GoalResponse::Stale,
         }))
     }
+}
+
+/// Dispose the durable Goal control state for a session with no resident
+/// executor.
+///
+/// A process restart leaves no join handle to drain, but the durable Goal row
+/// still has to be fenced, any pending logical operation classified
+/// fail-closed, and the control state removed before its session disappears.
+/// Session adapters use this only after proving that no local supervisor owns
+/// the session; a live worker must go through [`GoalExecutionSupervisor`].
+pub async fn dispose_unowned_session_goal(
+    registry: &dyn GoalTaskRegistry,
+    session_id: &str,
+) -> Result<GoalTransitionResult> {
+    ensure!(
+        !session_id.trim().is_empty(),
+        "Goal disposal session id must be nonblank"
+    );
+    let Some(current) = registry.current_goal_for_session(session_id).await? else {
+        return Ok(GoalTransitionResult::Missing);
+    };
+    if !current.status.is_terminal() {
+        match registry
+            .finish_session_goal(
+                &current.id,
+                session_id,
+                current.execution_epoch,
+                TaskStatus::Cancelled,
+                Some("session_disposed".to_owned()),
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            result => return Ok(result),
+        }
+    }
+
+    let Some(reloaded) = registry.current_goal_for_session(session_id).await? else {
+        return Ok(GoalTransitionResult::Missing);
+    };
+    if reloaded.id != current.id || !reloaded.status.is_terminal() {
+        return Ok(GoalTransitionResult::Stale);
+    }
+    let goal = registry
+        .get_goal_task(&reloaded.id)
+        .await?
+        .context("Goal extension disappeared during session disposal")?;
+    if let Some((pending_id, admitted_epoch)) =
+        goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+    {
+        match registry
+            .settle_pending_operation(
+                &reloaded.id,
+                session_id,
+                admitted_epoch,
+                pending_id,
+                GoalAccountingState::OutcomeUnknown,
+            )
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            result => return Ok(result),
+        }
+    }
+    registry
+        .delete_session_goal(&reloaded.id, session_id, reloaded.execution_epoch)
+        .await
 }
 
 impl GoalExecutionEngine {
