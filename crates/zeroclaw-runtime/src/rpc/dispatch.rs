@@ -33486,6 +33486,7 @@ mod tests {
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
             ),
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -33537,6 +33538,7 @@ mod tests {
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
             ),
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -33647,6 +33649,7 @@ mod tests {
             auth: crate::rpc::auth::RpcInboundAuth::for_tests(
                 &zeroclaw_config::schema::Config::default(),
             ),
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());
