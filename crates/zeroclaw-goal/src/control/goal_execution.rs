@@ -1163,7 +1163,7 @@ impl GoalExecutionEngine {
             if self.exact_running_task_or_fenced(scope).await?.is_none() {
                 return Ok(GoalExecutionOutcome::Fenced);
             }
-            let candidate = match lease
+            let parent = match lease
                 .run_parent_turn(
                     scope,
                     GoalParentTurn {
@@ -1173,8 +1173,8 @@ impl GoalExecutionEngine {
                 )
                 .await
             {
-                Ok(candidate) => {
-                    if candidate.trim().is_empty() {
+                Ok(parent) => {
+                    if parent.candidate.trim().is_empty() {
                         self.fail(scope, "candidate_empty").await?;
                         bail!("Goal parent returned an empty candidate");
                     }
@@ -1183,18 +1183,20 @@ impl GoalExecutionEngine {
                     // metadata. Persist and deliver it before any verifier
                     // decision can pause or terminate this execution.
                     lease
-                        .append_parent_candidate(candidate.clone())
+                        .append_parent_candidate(parent.candidate.clone())
                         .await
                         .context("publish Goal parent candidate before verification")?;
                     self.require_complete_accounting(scope, accountant.as_ref())
                         .await?;
-                    candidate
+                    parent
                 }
                 Err(error) => {
                     self.fail(scope, "parent_operation_failed").await?;
                     return Err(error).context("Goal parent operation failed");
                 }
             };
+            let candidate = parent.candidate;
+            working_history = parent.working_history;
             drop(parent_operation);
 
             // A lifecycle transition can race with the parent call above.
