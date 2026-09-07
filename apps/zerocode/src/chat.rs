@@ -64,6 +64,27 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
     message
 }
 
+fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
+    use crate::wire::GoalResponse;
+
+    let key = match response {
+        GoalResponse::Help => "zc-goal-help",
+        GoalResponse::Disabled => "zc-goal-disabled",
+        GoalResponse::Started(_) => "zc-goal-started",
+        GoalResponse::Status(_) => "zc-goal-status",
+        GoalResponse::Budget(_) => "zc-goal-budget",
+        GoalResponse::BudgetUpdated(_) => "zc-goal-budget-updated",
+        GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) => "zc-goal-paused",
+        GoalResponse::Resumed(_) => "zc-goal-resumed",
+        GoalResponse::Cancelled(_) | GoalResponse::AlreadyCancelled(_) => "zc-goal-cancelled",
+        GoalResponse::NoCurrentGoal => "zc-goal-none",
+        GoalResponse::AlreadyActive => "zc-goal-already-active",
+        GoalResponse::Terminal(_) => "zc-goal-terminal",
+        GoalResponse::Stale => "zc-goal-stale",
+    };
+    crate::i18n::t(key)
+}
+
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
 enum ChatPhase {
@@ -278,6 +299,10 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Typed completions for Goal control commands. Unlike prompt completions,
+    /// these never alter turn or queue state.
+    goal_completion_tx: mpsc::Sender<GoalCompletion>,
+    goal_completion_rx: mpsc::Receiver<GoalCompletion>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// Live but unfocused sessions of this pane. Each keeps its full
@@ -511,6 +536,11 @@ struct PromptCompletion {
     transport_closed: bool,
 }
 
+struct GoalCompletion {
+    session_id: String,
+    result: Result<crate::wire::GoalResponse, String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -524,6 +554,7 @@ impl Chat {
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (goal_completion_tx, goal_completion_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -541,6 +572,8 @@ impl Chat {
             session_resync_in_flight: HashSet::new(),
             prompt_completion_tx,
             prompt_completion_rx,
+            goal_completion_tx,
+            goal_completion_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -2171,6 +2204,22 @@ impl Chat {
         }
     }
 
+    fn drain_goal_completions(&mut self) {
+        while let Ok(completion) = self.goal_completion_rx.try_recv() {
+            let Some(state) = self.state_for_session_mut(&completion.session_id) else {
+                continue;
+            };
+            let message = match completion.result {
+                Ok(response) => goal_response_message(&response),
+                Err(error) => crate::i18n::t_args("zc-goal-command-failed", &[("error", &error)]),
+            };
+            state
+                .entries
+                .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
+            state.mark_dirty_append();
+        }
+    }
+
     fn begin_session_resync(&mut self, session_id: String) {
         if !self.session_resync_in_flight.insert(session_id.clone()) {
             return;
@@ -2821,6 +2870,7 @@ impl Chat {
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
+        self.drain_goal_completions();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
@@ -3326,6 +3376,20 @@ impl Chat {
                     state.clear_info_notice();
                     state.resume_queue();
                     let prompt = text.unwrap_or_default();
+                    if attachments.is_empty() && prompt.trim_start().starts_with("/goal") {
+                        let session_id = state.session_id.clone();
+                        let rpc = Arc::clone(&self.rpc);
+                        let tx = self.goal_completion_tx.clone();
+                        tokio::spawn(async move {
+                            let result = rpc
+                                .session_goal(&session_id, &prompt)
+                                .await
+                                .map(|result| result.response)
+                                .map_err(|error| error.to_string());
+                            let _ = tx.send(GoalCompletion { session_id, result }).await;
+                        });
+                        return false;
+                    }
                     let enq = state.enqueue_message(prompt, attachments);
                     self.after_enqueue(enq);
                     return false;
