@@ -32,7 +32,8 @@ pub use goal_execution::{
     dispose_unowned_session_goal,
 };
 pub use policy::{
-    GoalPolicyDecision, GoalPolicyRevocationReason, GoalSurfacePolicy, classify_common_goal_policy,
+    GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalPolicyRevocationReason,
+    GoalSurfacePolicy, classify_common_goal_policy,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.

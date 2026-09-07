@@ -4,7 +4,10 @@
 //! a canonical task against a prospective runtime configuration; Matrix and
 //! ZeroCode retain their own surface-specific facts and checks.
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use zeroclaw_config::schema::Config;
 
 use super::{GoalIngressContext, GoalSurface};
@@ -29,6 +32,56 @@ pub enum GoalPolicyRevocationReason {
 pub enum GoalPolicyDecision {
     Eligible,
     Revoked(GoalPolicyRevocationReason),
+}
+
+/// Process-local admission and policy-cutover barrier for one daemon runtime.
+///
+/// This has no durable authority: the task registry remains the source of
+/// lifecycle truth. An admission lease spans trusted ingress validation and
+/// durable command submission; a cutover lease excludes new admissions while
+/// the caller performs exact, guarded policy transitions and drains workers.
+#[derive(Clone, Default)]
+pub struct GoalPolicyCutoverCoordinator {
+    barrier: Arc<RwLock<()>>,
+}
+
+impl GoalPolicyCutoverCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Permit one command admission to retain the current runtime policy.
+    ///
+    /// The caller must retain this through driver binding, controller
+    /// submission, and supervisor registration. It must not retain the lease
+    /// for the lifetime of a Goal worker.
+    pub async fn admit(&self) -> GoalPolicyAdmissionLease {
+        GoalPolicyAdmissionLease {
+            _guard: Arc::clone(&self.barrier).read_owned().await,
+        }
+    }
+
+    /// Exclude new Goal admissions while a runtime replacement applies policy.
+    ///
+    /// A caller acquires this only after prospective configuration validation.
+    /// It may wait for already-admitted commands to reach their durable
+    /// controller boundary, but it never interrupts an already-admitted model
+    /// operation.
+    pub async fn cutover(&self) -> GoalPolicyCutoverLease {
+        GoalPolicyCutoverLease {
+            _guard: Arc::clone(&self.barrier).write_owned().await,
+        }
+    }
+}
+
+/// Owned read lease returned by [`GoalPolicyCutoverCoordinator::admit`].
+pub struct GoalPolicyAdmissionLease {
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+/// Owned write lease returned by [`GoalPolicyCutoverCoordinator::cutover`].
+pub struct GoalPolicyCutoverLease {
+    _guard: OwnedRwLockWriteGuard<()>,
 }
 
 /// Closed V1 surface extension point for policy-only checks.
@@ -148,5 +201,26 @@ mod tests {
             classify_common_goal_policy(&config, &task),
             GoalPolicyDecision::Eligible
         );
+    }
+
+    #[tokio::test]
+    async fn cutover_barrier_waits_for_existing_admission_before_excluding_successors() {
+        let coordinator = GoalPolicyCutoverCoordinator::new();
+        let admission = coordinator.admit().await;
+        let cutover = std::sync::Arc::new(coordinator);
+        let waiting_cutover = std::sync::Arc::clone(&cutover);
+        let cutover_ready = tokio::spawn(async move {
+            let _cutover = waiting_cutover.cutover().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !cutover_ready.is_finished(),
+            "a cutover must wait for an already-admitted command rather than racing its durable submission"
+        );
+        drop(admission);
+        cutover_ready
+            .await
+            .expect("cutover task must complete once admission releases its lease");
     }
 }
