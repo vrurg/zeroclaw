@@ -56,6 +56,26 @@ impl SpawnSubagentTool {
     }
 }
 
+fn render_subagent_completion(response: String, goal_scoped: bool) -> ToolResult {
+    if goal_scoped && response.trim().is_empty() {
+        return ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some("subagent completed without output during Goal execution".into()),
+        };
+    }
+
+    ToolResult {
+        success: true,
+        output: if response.trim().is_empty() {
+            "subagent completed without output".to_string().into()
+        } else {
+            response.into()
+        },
+        error: None,
+    }
+}
+
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str {
@@ -87,6 +107,7 @@ impl Tool for SpawnSubagentTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
         let goal_child_scope = crate::agent::cost::goal_child_execution_scope();
+        let goal_scoped = goal_child_scope.is_some();
         if goal_child_scope
             .as_ref()
             .is_some_and(|scope| scope.child_depth != 0)
@@ -286,15 +307,7 @@ impl Tool for SpawnSubagentTool {
         }
 
         match run_result {
-            Ok(response) => Ok(ToolResult {
-                success: true,
-                output: if response.trim().is_empty() {
-                    "subagent completed without output".to_string().into()
-                } else {
-                    response.into()
-                },
-                error: None,
-            }),
+            Ok(response) => Ok(render_subagent_completion(response, goal_scoped)),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -322,6 +335,23 @@ mod tests {
             },
         );
         config
+    }
+
+    #[test]
+    fn goal_scoped_blank_completion_is_a_failure_but_legacy_completion_is_preserved() {
+        let goal_result = render_subagent_completion(" \n ".to_string(), true);
+        assert!(!goal_result.success);
+        assert!(
+            goal_result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Goal execution")
+        );
+
+        let ordinary_result = render_subagent_completion(" \n ".to_string(), false);
+        assert!(ordinary_result.success);
+        assert_eq!(ordinary_result.output, "subagent completed without output");
     }
 
     #[tokio::test]
