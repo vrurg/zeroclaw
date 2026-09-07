@@ -2695,19 +2695,6 @@ impl RpcDispatcher {
             .tui_id
             .clone()
             .ok_or_else(|| rpc_err(AUTH_REQUIRED, "Goal commands require an initialized TUI"))?;
-        let owns_session = matches!(
-            self.ctx
-                .sessions
-                .session_owner_tui_id(&req.session_id)
-                .await,
-            Some(Some(owner)) if owner == tui_id
-        );
-        if !owns_session {
-            return Err(rpc_err(
-                SESSION_NOT_OWNED,
-                "Caller does not own this session",
-            ));
-        }
         let command = match zeroclaw_commands::goal::parse_goal_command(&req.command) {
             Ok(command) => command,
             Err(_) => {
@@ -2716,6 +2703,18 @@ impl RpcDispatcher {
                 });
             }
         };
+        // Goal commands inherit the permission semantics of their existing
+        // session counterpart. Only lifecycle cancellation is owner-gated;
+        // read/help/start/configure operations must not acquire a stricter
+        // Goal-specific authority rule.
+        if matches!(
+            command,
+            zeroclaw_commands::goal::GoalCommand::Pause
+                | zeroclaw_commands::goal::GoalCommand::Cancel
+        ) {
+            self.ensure_session_cancel_permission(&req.session_id)
+                .await?;
+        }
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
@@ -2879,13 +2878,8 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
-        let req: SessionIdParams = parse_params(params)?;
-        let owner = self
-            .ctx
-            .sessions
-            .session_owner_tui_id(&req.session_id)
-            .await;
+    async fn ensure_session_cancel_permission(&self, session_id: &str) -> Result<(), JsonRpcError> {
+        let owner = self.ctx.sessions.session_owner_tui_id(session_id).await;
         let allowed = match (
             owner.as_ref().and_then(|o| o.as_deref()),
             self.tui_id.as_deref(),
@@ -2895,14 +2889,14 @@ impl RpcDispatcher {
         };
         if !allowed {
             let (agent_alias, model_provider, model) =
-                match self.ctx.sessions.get_agent(&req.session_id).await {
+                match self.ctx.sessions.get_agent(session_id).await {
                     Some(agent) => agent.lock().await.attribution_fields(),
                     None => (String::new(), String::new(), String::new()),
                 };
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
                 "zeroclaw_scope",
-                session_key = %req.session_id,
+                session_key = %session_id,
                 agent_alias = %agent_alias,
                 model_provider = %model_provider,
                 model = %model,
@@ -2929,6 +2923,13 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
+        Ok(())
+    }
+
+    async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        self.ensure_session_cancel_permission(&req.session_id)
+            .await?;
         if self.ctx.sessions.cancel_session(&req.session_id) {
             to_result(SessionCancelResult {
                 session_id: req.session_id,
@@ -12560,6 +12561,53 @@ mod tests {
             !token.is_cancelled(),
             "anonymous cancel must not fire the token"
         );
+    }
+
+    #[tokio::test]
+    async fn session_goal_help_uses_existing_read_session_permissions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+
+        create_session_with_owner(&mut dispatcher_a, &sessions, "sess-owned-by-tui-A", "tui-A")
+            .await;
+        dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
+
+        let result = dispatcher_b
+            .handle_session_goal(&json!({
+                "session_id": "sess-owned-by-tui-A",
+                "command": "/goal help",
+            }))
+            .await
+            .expect("Goal help must use the existing read-session permission semantics");
+
+        assert_eq!(
+            result["response"]["kind"], "disabled",
+            "the disabled-mode response proves the non-owner reached the shared Goal controller; the prior blanket Goal-owner gate rejected before that boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_goal_pause_reuses_session_cancel_permission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+
+        create_session_with_owner(&mut dispatcher_a, &sessions, "sess-owned-by-tui-A", "tui-A")
+            .await;
+        dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
+
+        let error = dispatcher_b
+            .handle_session_goal(&json!({
+                "session_id": "sess-owned-by-tui-A",
+                "command": "/goal pause",
+            }))
+            .await
+            .expect_err("Goal pause must preserve session/cancel ownership enforcement");
+
+        assert_eq!(error.code, SESSION_NOT_OWNED);
     }
 
     #[tokio::test]

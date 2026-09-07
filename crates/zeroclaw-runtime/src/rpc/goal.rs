@@ -63,13 +63,6 @@ impl ZeroCodeGoalSessionDriver {
             .get_generation(raw_session_id)
             .await
             .context("ZeroCode Goal session is absent")?;
-        ensure!(
-            matches!(
-                context.sessions.session_owner_tui_id(raw_session_id).await,
-                Some(Some(owner)) if owner == tui_id
-            ),
-            "ZeroCode Goal caller does not own the session"
-        );
         let agent_alias = context
             .sessions
             .get_agent_alias(raw_session_id)
@@ -149,16 +142,6 @@ impl ZeroCodeGoalSessionDriver {
                 .as_deref()
                 == Some(self.agent_alias.as_str()),
             "ZeroCode Goal session agent changed"
-        );
-        ensure!(
-            matches!(
-                self.context
-                    .sessions
-                    .session_owner_tui_id(self.raw_session_id())
-                    .await,
-                Some(Some(owner)) if owner == self.tui_id
-            ),
-            "ZeroCode Goal caller no longer owns the session"
         );
         Ok(agent)
     }
