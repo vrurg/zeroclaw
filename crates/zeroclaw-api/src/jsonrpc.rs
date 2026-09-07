@@ -330,11 +330,15 @@ impl RpcOutbound {
     }
 
     /// Send a JSON-RPC notification (no `id`, no response expected).
-    pub async fn notify(&self, method: &'static str, params: Value) {
+    ///
+    /// `true` only proves that the local writer queue accepted the frame; it
+    /// does not claim that the peer has received or acted on it.
+    pub async fn notify(&self, method: &'static str, params: Value) -> bool {
         let n = JsonRpcNotification::new(method, params);
-        if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.writer_tx.send(s).await;
-        }
+        let Ok(serialized) = serde_json::to_string(&n) else {
+            return false;
+        };
+        self.writer_tx.send(serialized).await.is_ok()
     }
 
     /// Send a JSON-RPC request and await the response.
@@ -582,6 +586,21 @@ pub struct FsStatError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn notify_reports_whether_the_local_writer_queue_accepts_the_frame() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let outbound = RpcOutbound::new(sender);
+
+        assert!(outbound.notify("session/update", json!({"ok": true})).await);
+        assert!(receiver.recv().await.unwrap().contains("session/update"));
+        drop(receiver);
+        assert!(
+            !outbound
+                .notify("session/update", json!({"ok": false}))
+                .await
+        );
+    }
 
     #[test]
     fn frame_parses_success_response() {

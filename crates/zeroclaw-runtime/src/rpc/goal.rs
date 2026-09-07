@@ -306,15 +306,20 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .lock()
             .await
             .seed_history(&[ChatMessage::assistant(&candidate)]);
-        self.outbound
-            .notify(
-                GOAL_UPDATE_METHOD,
-                serde_json::to_value(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
-                    session_id: self.session_id.clone(),
-                    candidate,
-                })?,
-            )
-            .await;
+        ensure!(
+            self.outbound
+                .notify(
+                    GOAL_UPDATE_METHOD,
+                    serde_json::to_value(
+                        crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
+                            session_id: self.session_id.clone(),
+                            candidate,
+                        }
+                    )?,
+                )
+                .await,
+            "queue verified Goal candidate for ZeroCode delivery"
+        );
         Ok(())
     }
 
@@ -329,9 +334,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 }
             }
         };
-        self.outbound
-            .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
-            .await;
+        ensure!(
+            self.outbound
+                .notify(GOAL_UPDATE_METHOD, serde_json::to_value(update)?)
+                .await,
+            "queue ZeroCode Goal lifecycle notice"
+        );
         Ok(())
     }
 }
