@@ -340,8 +340,26 @@ impl GoalExecutionScope {
 /// Trusted input for a parent Goal turn.
 #[derive(Debug, Clone)]
 pub struct GoalParentTurn {
+    /// Why the executor is asking the parent to work now.
+    ///
+    /// This is controller-owned lifecycle context. Drivers use it solely to
+    /// construct the trusted runtime directive; they must not infer it from
+    /// a mutable transport session or expose it as model authority.
+    pub kind: GoalParentTurnKind,
     pub objective: String,
     pub working_history: Vec<ChatMessage>,
+}
+
+/// The lifecycle phase of a parent Goal turn.
+///
+/// A resumed Goal deliberately starts a fresh process-local transcript while
+/// retaining its durable objective. A verifier continuation instead retains
+/// the current process-local working transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalParentTurnKind {
+    Start,
+    Resume,
+    Continue,
 }
 
 /// Process-local result of one Goal parent turn.
@@ -589,6 +607,7 @@ impl GoalRuntimeSubmission {
 pub struct GoalExecutionRequest {
     submission: GoalSubmission,
     scope: GoalExecutionScope,
+    initial_turn_kind: GoalParentTurnKind,
 }
 
 impl GoalExecutionRequest {
@@ -598,6 +617,11 @@ impl GoalExecutionRequest {
 
     pub fn scope(&self) -> &GoalExecutionScope {
         &self.scope
+    }
+
+    /// The controller-derived lifecycle phase for this new executor.
+    pub const fn initial_turn_kind(&self) -> GoalParentTurnKind {
+        self.initial_turn_kind
     }
 
     pub fn into_parts(self) -> (GoalSubmission, GoalExecutionScope) {
@@ -646,6 +670,11 @@ impl GoalRuntime {
             .await?;
         let execution = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
+                let initial_turn_kind = if matches!(&response, GoalResponse::Started(_)) {
+                    GoalParentTurnKind::Start
+                } else {
+                    GoalParentTurnKind::Resume
+                };
                 Some(GoalExecutionRequest {
                     scope: GoalExecutionScope::new(
                         projection.task_id.clone(),
@@ -653,6 +682,7 @@ impl GoalRuntime {
                         projection.execution_epoch,
                     )?,
                     submission,
+                    initial_turn_kind,
                 })
             }
             _ => None,
