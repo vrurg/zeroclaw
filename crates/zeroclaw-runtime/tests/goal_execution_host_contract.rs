@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -31,6 +31,8 @@ struct RecordingDriver {
 struct RecordingExecutionLease {
     delivered: Arc<AtomicUsize>,
     complete_verifier: bool,
+    continue_once: bool,
+    parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
 }
 
 #[async_trait]
@@ -44,6 +46,10 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> anyhow::Result<GoalParentTurnResult> {
+        self.parent_histories
+            .lock()
+            .unwrap()
+            .push(turn.working_history.clone());
         Ok(GoalParentTurnResult {
             candidate: format!("parent:{}", turn.objective),
             working_history: turn.working_history,
@@ -55,6 +61,10 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> anyhow::Result<String> {
+        if self.continue_once {
+            self.continue_once = false;
+            return Ok(r#"{"decision":"continue","reason":"add the missing detail"}"#.to_owned());
+        }
         if self.complete_verifier {
             Ok(
                 r#"{"decision":"complete","reason":"candidate satisfies the objective"}"#
@@ -76,6 +86,8 @@ struct ExecutionDriver {
     execution_acquires: AtomicUsize,
     delivered: Arc<AtomicUsize>,
     complete_verifier: bool,
+    continue_once: bool,
+    parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
 }
 
 struct PausingExecutionLease {
@@ -201,6 +213,8 @@ impl GoalSessionDriver for ExecutionDriver {
         Ok(Box::new(RecordingExecutionLease {
             delivered: self.delivered.clone(),
             complete_verifier: self.complete_verifier,
+            continue_once: self.continue_once,
+            parent_histories: Arc::clone(&self.parent_histories),
         }))
     }
 }
@@ -660,6 +674,8 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
     });
     let scope =
         zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
@@ -754,6 +770,8 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: false,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
     let operation = GoalOperationScope::new(scope.clone());
@@ -963,6 +981,8 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
     });
 
     let submission = runtime
@@ -1007,12 +1027,15 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
+    let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(ExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
             .unwrap(),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
+        continue_once: true,
+        parent_histories: Arc::clone(&parent_histories),
     });
     let request = runtime
         .submit(
@@ -1049,6 +1072,18 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
         zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
     );
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    {
+        let histories = parent_histories.lock().unwrap();
+        assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
+        assert!(histories[1].iter().any(|message| {
+            message.role == "assistant" && message.content == "parent:finish the task"
+        }));
+        assert!(
+            histories[1]
+                .iter()
+                .any(|message| message.content.contains("add the missing detail"))
+        );
+    }
     assert_eq!(
         store
             .current_goal_for_session(request.scope().session_id())
@@ -1073,6 +1108,8 @@ async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
     });
     let request = runtime
         .submit(
@@ -1237,7 +1274,7 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
     let pause_driver = driver.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(
                 pause_settings,
@@ -1338,7 +1375,9 @@ async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_de
     let dispose_supervisor = Arc::clone(&supervisor);
     let session_id = ingress.session_key().durable_id();
     let mut dispose =
-        tokio::spawn(async move { dispose_supervisor.dispose_session(&session_id).await });
+        zeroclaw_spawn::spawn!(
+            async move { dispose_supervisor.dispose_session(&session_id).await }
+        );
     assert!(
         timeout(Duration::from_millis(20), &mut dispose)
             .await
@@ -1425,7 +1464,7 @@ async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pendin
     let pause_supervisor = Arc::clone(&supervisor);
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(pause_settings, pause_ingress, driver, GoalCommand::Pause)
             .await
@@ -1494,7 +1533,7 @@ async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier()
         .execution_engine(tracker, "main", Arc::default())
         .unwrap();
 
-    let run = tokio::spawn(async move { engine.run(&settings, &request).await });
+    let run = zeroclaw_spawn::spawn!(async move { engine.run(&settings, &request).await });
     parent_started.notified().await;
 
     let pause = runtime
@@ -1526,6 +1565,8 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
     });
 
     let (response, execution) = runtime
