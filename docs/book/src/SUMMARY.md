@@ -63,6 +63,7 @@
 - [Reference](./reference/index.md)
   - [CLI](./reference/cli.md)
   - [Config](./reference/config.md)
+  - [Goal Mode](./reference/goal-mode.md)
   - [Environment variables](./reference/env-vars.md)
   - [Feature and support matrix](./reference/feature-matrix.md)
   - [API (rustdoc)](./api.md)

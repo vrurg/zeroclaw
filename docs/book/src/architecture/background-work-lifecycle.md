@@ -1,6 +1,6 @@
 # Background work lifecycle
 
-ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode defines a related target contract that is not yet wired end to end.
+ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, runtime-spawned subagents, and Goal Mode share some execution machinery, but they do not share one lifecycle or one durable store.
 
 Use this page when a change adds scheduled or autonomous work, introduces a wait or approval state, changes cancellation or restart behavior, or connects child work to an owning task. The first design question is not "how does it run in the background?" but "which subsystem owns its lifecycle?"
 
@@ -60,11 +60,13 @@ cannot be cancelled or otherwise mutated through the legacy exception, and a
 nonterminal NULL-origin row remains hidden. New rows always require the matching
 originating alias for reads and mutations.
 
-## Goal-mode target contract
+## Goal Mode
 
-[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the future authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. The repository contains goal storage and control-plane APIs, but production goal admission and execution are not yet wired end to end.
+[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) makes the durable task control plane authoritative for Goal Mode lifecycle, session ownership, route, principal, and recovery eligibility. Goal-only state extends the canonical task; consumed usage remains in the canonical ledger and remaining budget is derived.
 
-A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
+V1 admits explicit commands from Matrix and ZeroCode only. It is disabled by default. A running goal owns the foreground session turn: parent, verifier, and eligible foreground child calls are serialized and attributed to the same goal. Restart pauses a settled running goal for an explicit resume; an unsettled operation fails closed and is never replayed. Session disposal fences and quiesces the work before deleting Goal control state, while retained audit/ledger records follow their applicable lifecycle.
+
+Only synchronous, foreground `delegate` and `spawn_subagent` cooperation is eligible. Background, detached, parallel, and recursive goal-owned work is rejected. A mandatory configured verifier receives the declared success criterion and exact candidate, and the controller alone commits completion. See [Goal Mode](../reference/goal-mode.md) for the operator contract.
 
 ## Change checklist
 
