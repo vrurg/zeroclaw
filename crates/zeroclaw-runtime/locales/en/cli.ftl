@@ -1267,5 +1267,5 @@ goal-mode-no-current = There is no current Goal for this session.
 goal-mode-already-active = A Goal is already active for this session.
 goal-mode-terminal = This Goal is terminal.
 goal-mode-stale = Goal state changed; try the command again.
-goal-mode-command-invalid = Invalid Goal command: { $error }.
+goal-mode-command-invalid = Invalid Goal command. Use /goal help for the exact syntax.
 goal-mode-command-failed = Goal command failed: { $error }.

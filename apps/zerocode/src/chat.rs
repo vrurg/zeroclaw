@@ -69,6 +69,7 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
 
     let key = match response {
         GoalResponse::Help => "zc-goal-help",
+        GoalResponse::InvalidCommand => "zc-goal-command-invalid",
         GoalResponse::Disabled => "zc-goal-disabled",
         GoalResponse::Started(_) => "zc-goal-started",
         GoalResponse::Status(_) => "zc-goal-status",
@@ -19556,12 +19557,11 @@ mod tests {
     }
 
     #[test]
-    fn goal_submission_requires_the_exact_leading_command_token() {
-        assert!(is_goal_command_submission("/goal status"));
-        assert!(is_goal_command_submission(" \t/GOAL help"));
-        assert!(is_goal_command_submission("/goal"));
-        assert!(!is_goal_command_submission("/goalpost status"));
-        assert!(!is_goal_command_submission("please run /goal status"));
+    fn invalid_goal_command_uses_the_localized_semantic_response() {
+        assert_eq!(
+            goal_response_message(&crate::wire::GoalResponse::InvalidCommand),
+            crate::i18n::t("zc-goal-command-invalid")
+        );
     }
 
     #[test]

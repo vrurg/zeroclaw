@@ -139,6 +139,7 @@ zc-goal-none = No current goal.
 zc-goal-already-active = A goal is already active.
 zc-goal-terminal = Goal is no longer resumable.
 zc-goal-stale = Goal state changed; try again.
+zc-goal-command-invalid = Invalid Goal command. Use /goal help for the exact syntax.
 zc-goal-command-failed = Goal command failed: { $error }
 zc-zerocode-agent-modal-pick = Pick agent, then choose a theme
 zc-zerocode-agent-theme-loading = Loading agents…

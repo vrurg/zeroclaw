@@ -22,6 +22,7 @@ pub struct GoalStatusProjection {
 #[serde(tag = "kind", content = "status", rename_all = "snake_case")]
 pub enum GoalResponse {
     Help,
+    InvalidCommand,
     Disabled,
     Started(GoalStatusProjection),
     Status(GoalStatusProjection),
@@ -40,6 +41,22 @@ pub enum GoalResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionGoalResult {
     pub response: GoalResponse,
+}
+
+#[cfg(test)]
+mod goal_wire_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_goal_command_uses_the_canonical_semantic_wire_shape() {
+        let response = SessionGoalResult {
+            response: GoalResponse::InvalidCommand,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"response": {"kind": "invalid_command"}})
+        );
+    }
 }
 
 // ── Initialize shapes ───────────────────────────────────────────

@@ -788,6 +788,8 @@ impl GoalHostSettings {
 #[serde(tag = "kind", content = "status", rename_all = "snake_case")]
 pub enum GoalResponse {
     Help,
+    /// The shared parser rejected the command before any lifecycle admission.
+    InvalidCommand,
     Disabled,
     Started(GoalStatusProjection),
     Status(GoalStatusProjection),

@@ -6311,10 +6311,9 @@ async fn process_channel_message_body(
                     )],
                 ),
             },
-            Err(error) => channel_runtime_cli_string_with_args(
-                "goal-mode-command-invalid",
-                &[("error", &format!("{error:?}"))],
-            ),
+            Err(_) => {
+                render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::InvalidCommand)
+            }
         };
         if let Some(channel) =
             find_channel_for_message(&ctx.channels_by_name, &original_goal_message)
@@ -8129,6 +8128,7 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
     use zeroclaw_runtime::goal_mode::GoalResponse;
     let key = match response {
         GoalResponse::Help => "goal-mode-help",
+        GoalResponse::InvalidCommand => "goal-mode-command-invalid",
         GoalResponse::Disabled => "goal-mode-disabled",
         GoalResponse::Started(_) => "goal-mode-started",
         GoalResponse::Status(_) => "goal-mode-status",
@@ -8145,6 +8145,19 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
         GoalResponse::Stale => "goal-mode-stale",
     };
     channel_runtime_cli_string(key)
+}
+
+#[cfg(test)]
+mod goal_response_render_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_goal_command_uses_the_localized_semantic_response() {
+        assert_eq!(
+            render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::InvalidCommand),
+            channel_runtime_cli_string("goal-mode-command-invalid")
+        );
+    }
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path

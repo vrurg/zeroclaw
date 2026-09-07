@@ -2708,8 +2708,14 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
-        let command = zeroclaw_commands::goal::parse_goal_command(&req.command)
-            .map_err(|error| rpc_err(INVALID_PARAMS, format!("invalid Goal command: {error:?}")))?;
+        let command = match zeroclaw_commands::goal::parse_goal_command(&req.command) {
+            Ok(command) => command,
+            Err(_) => {
+                return to_result(SessionGoalResult {
+                    response: crate::goal_mode::GoalResponse::InvalidCommand,
+                });
+            }
+        };
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
