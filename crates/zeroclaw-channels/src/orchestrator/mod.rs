@@ -8,6 +8,7 @@ mod foreground;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod turn_execution;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -126,8 +127,7 @@ use zeroclaw_providers::{
     SafeguardFallbackNotice, scope_safeguard_fallback, take_last_safeguard_fallback,
 };
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    LoopKnobs, ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
@@ -143,6 +143,7 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
+use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
@@ -8171,40 +8172,14 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider: active_model_provider.as_ref(),
-                        provider_name: route.model_provider.as_str(),
-                        model: route.model.as_str(),
-                        temperature: thinking.effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
-                        silent: true,
-                        approval: Some(&*ctx.approval_manager),
-                        multimodal_config: &ctx.multimodal,
-                        // Full config for the vision route to resolve the
-                        // configured `vision_model_provider`'s alias options - the
-                        // same canonical `prompt_config` snapshot this path already
-                        // uses for provider construction.
-                        config: Some(ctx.prompt_config.as_ref()),
-                        hooks: ctx.hooks.as_deref(),
-                        activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        receipt_generator: ctx.receipt_generator.as_ref(),
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
-                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                        pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
-                        parallel_tools: ctx.agent_cfg.resolved.parallel_tools,
-                        max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
-                        knobs: &loop_knobs,
-                    },
+                exec: resolved_channel_execution(
+                    ctx.as_ref(),
+                    active_model_provider.as_ref(),
+                    &route,
+                    notify_observer.as_ref(),
+                    &loop_knobs,
+                    excluded_tools,
+                    thinking.effective_temperature,
                 ),
                 history: &mut history,
                 channel_name: msg.channel.as_str(),
