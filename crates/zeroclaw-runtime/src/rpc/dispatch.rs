@@ -1794,6 +1794,18 @@ impl RpcDispatcher {
                 .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
                 .await;
             if !evicted.is_empty() {
+                // `evict_same_mode_sibling` excludes both registered prompt
+                // work and any session that owns the actor queue. The
+                // remaining sessions are idle, so their Goals have no live
+                // execution lease and can be disposed through the durable
+                // no-worker path without interrupting work.
+                for (sid, _) in &evicted {
+                    self.ctx
+                        .goal_runtime
+                        .dispose_session(sid)
+                        .await
+                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                }
                 if let Some(ref hooks) = self.ctx.hooks {
                     for (sid, _) in &evicted {
                         hooks.fire_session_end(sid, "rpc").await;
