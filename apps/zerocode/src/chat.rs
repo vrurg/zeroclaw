@@ -85,6 +85,41 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     crate::i18n::t(key)
 }
 
+/// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
+/// Reject ambiguous or malformed notifications instead of treating an
+/// arbitrary object member as an update chosen by the daemon.
+enum GoalUpdate<'a> {
+    VerifiedCandidate {
+        session_id: &'a str,
+        candidate: &'a str,
+    },
+    Completed {
+        session_id: &'a str,
+    },
+    PausedForBlocker {
+        session_id: &'a str,
+    },
+}
+
+fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
+    let object = params.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let (kind, payload) = object.iter().next()?;
+    let payload = payload.as_object()?;
+    let session_id = payload.get("session_id")?.as_str()?;
+    match kind.as_str() {
+        "verified_candidate" => Some(GoalUpdate::VerifiedCandidate {
+            session_id,
+            candidate: payload.get("candidate")?.as_str()?,
+        }),
+        "completed" => Some(GoalUpdate::Completed { session_id }),
+        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        _ => None,
+    }
+}
+
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
 enum ChatPhase {
@@ -2143,32 +2178,25 @@ impl Chat {
                     }
                 }
                 Ok(notif) if notif.method == "session/goal_update" => {
-                    let Some((kind, payload)) = notif
-                        .params
-                        .as_object()
-                        .and_then(|object| object.iter().next())
-                    else {
+                    let Some(update) = parse_goal_update(&notif.params) else {
                         continue;
                     };
-                    let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str())
-                    else {
-                        continue;
+                    let session_id = match &update {
+                        GoalUpdate::VerifiedCandidate { session_id, .. }
+                        | GoalUpdate::Completed { session_id }
+                        | GoalUpdate::PausedForBlocker { session_id } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
                     };
-                    match kind.as_str() {
-                        "verified_candidate" => {
-                            if let Some(candidate) =
-                                payload.get("candidate").and_then(|v| v.as_str())
-                            {
-                                state
-                                    .entries
-                                    .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
-                                state.mark_dirty_append();
-                            }
+                    match update {
+                        GoalUpdate::VerifiedCandidate { candidate, .. } => {
+                            state
+                                .entries
+                                .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
+                            state.mark_dirty_append();
                         }
-                        "completed" => {
+                        GoalUpdate::Completed { .. } => {
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -2176,7 +2204,7 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        "paused_for_blocker" => {
+                        GoalUpdate::PausedForBlocker { .. } => {
                             state
                                 .entries
                                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
@@ -2184,7 +2212,6 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        _ => {}
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
@@ -21185,6 +21212,55 @@ mod tests {
         assert!(
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
+        );
+    }
+
+    #[test]
+    fn goal_updates_require_one_canonical_variant_for_the_target_session() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        for params in [
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                },
+                "completed": { "session_id": "sess-1" }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "other-session",
+                    "candidate": "must not be displayed"
+                }
+            }),
+            serde_json::json!({
+                "verified_candidate": {
+                    "session_id": "sess-1",
+                    "candidate": "accepted result"
+                }
+            }),
+            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
+        ] {
+            notif_tx
+                .send(RpcNotification {
+                    method: "session/goal_update".to_string(),
+                    params,
+                })
+                .unwrap();
+        }
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
+        );
+        assert!(
+            matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
         );
     }
 
