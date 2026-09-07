@@ -2150,6 +2150,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_policy_listing_returns_only_session_bound_nonterminal_goals() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        for (task_id, session_id, pause) in [
+            ("goal-startup-running", "matrix_running", false),
+            ("goal-startup-paused", "matrix_paused", true),
+        ] {
+            let mut task = rec(task_id, "main", 1, "boot-1");
+            task.kind = TaskKind::Goal;
+            task.session_id = Some(session_id.to_owned());
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(task, goal_record(task_id, "finish"))
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            if pause {
+                store
+                    .pause_session_goal(
+                        task_id,
+                        session_id,
+                        1,
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut terminal = rec("goal-startup-terminal", "main", 1, "boot-1");
+        terminal.kind = TaskKind::Goal;
+        terminal.session_id = Some("matrix_terminal".to_owned());
+        store
+            .create_or_replace_session_goal(
+                terminal,
+                goal_record("goal-startup-terminal", "finish"),
+            )
+            .await
+            .unwrap();
+        store
+            .finish_session_goal(
+                "goal-startup-terminal",
+                "matrix_terminal",
+                1,
+                TaskStatus::Cancelled,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list_nonterminal_session_goals().await.unwrap();
+        let ids = listed.into_iter().map(|task| task.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["goal-startup-running", "goal-startup-paused"]);
+    }
+
+    #[tokio::test]
     async fn completed_goal_records_delivery_only_for_its_exact_current_task() {
         let store = SqliteTaskStore::new_in_memory().unwrap();
         let mut task = rec("goal-delivery", "main", 1, "boot-1");
