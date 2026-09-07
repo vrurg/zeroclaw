@@ -31,9 +31,10 @@ use crate::{
 };
 
 use super::{
-    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext, GoalParentTurn,
-    GoalResponse, GoalRuntime, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease,
-    GoalVerifierAttribution, GoalVerifierTurn, goal_verifier_feedback_message,
+    GoalExecutionNotice, GoalExecutionRequest, GoalExecutionScope, GoalHostSettings,
+    GoalIngressContext, GoalParentTurn, GoalParentTurnResult, GoalResponse, GoalRuntime,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionLease, GoalVerifierAttribution,
+    GoalVerifierTurn, goal_verifier_feedback_message,
 };
 
 const MAX_VERIFIER_REASON_CHARS: usize = 2_000;
@@ -1404,6 +1405,9 @@ impl GoalExecutionEngine {
                         "completed",
                         "after_controller_action",
                     );
+                    lease
+                        .publish_goal_notice(GoalExecutionNotice::Completed)
+                        .await?;
                     return Ok(GoalExecutionOutcome::Completed);
                 }
                 VerifierDecision::Continue { reason } => {
@@ -1444,6 +1448,9 @@ impl GoalExecutionEngine {
                         "paused_for_blocker",
                         "after_controller_action",
                     );
+                    lease
+                        .publish_goal_notice(GoalExecutionNotice::PausedForBlocker)
+                        .await?;
                     return Ok(GoalExecutionOutcome::VerifierBlocked);
                 }
             }

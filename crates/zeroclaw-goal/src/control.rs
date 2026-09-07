@@ -475,6 +475,17 @@ impl fmt::Debug for GoalVerifierTurn {
     }
 }
 
+/// A lifecycle result which occurs after the synchronous Goal command reply.
+///
+/// The executor supplies semantics only. Each admitted surface renders the
+/// message through its own Fluent boundary and must not substitute ordinary
+/// turn-progress output for these notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalExecutionNotice {
+    Completed,
+    PausedForBlocker,
+}
+
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
 /// ledger authority; the later executor owns both around these calls.
@@ -509,6 +520,7 @@ pub trait GoalSessionExecutionLease: Send {
     /// and deliver it through the surface's ordinary response path before the
     /// verifier runs. Implementations must retain normal egress scrubbing.
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()>;
+    async fn publish_goal_notice(&mut self, notice: GoalExecutionNotice) -> Result<()>;
 }
 
 /// A driver's owned proof that a live session remains authoritative.

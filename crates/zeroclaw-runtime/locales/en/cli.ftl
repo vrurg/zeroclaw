@@ -1428,3 +1428,24 @@ cron-agent-job-failed = The scheduled task could not be completed. Please try ag
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+
+# Goal Mode V1 channel control responses.
+goal-mode-help = Goal commands: start, status, budget, pause, resume, cancel, help.
+goal-mode-disabled = Goal Mode is disabled.
+goal-mode-started = Goal started.
+goal-mode-completed = Goal completed.
+goal-mode-status = Goal status is available.
+goal-mode-budget = Goal budget is available.
+goal-mode-budget-updated = Goal budget updated.
+goal-mode-paused = Goal paused.
+goal-mode-paused-blocked = Goal paused: resolution is required before it can continue.
+goal-mode-already-paused = Goal is already paused.
+goal-mode-resumed = Goal resumed.
+goal-mode-cancelled = Goal cancelled.
+goal-mode-already-cancelled = Goal is already cancelled.
+goal-mode-no-current = There is no current Goal for this session.
+goal-mode-already-active = A Goal is already active for this session.
+goal-mode-terminal = This Goal is terminal.
+goal-mode-stale = Goal state changed; try the command again.
+goal-mode-command-invalid = Invalid Goal command: { $error }.
+goal-mode-command-failed = Goal command failed: { $error }.
