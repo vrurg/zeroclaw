@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -77,6 +77,87 @@ struct ExecutionDriver {
     binding: GoalSessionBinding,
     execution_acquires: AtomicUsize,
     delivered: Arc<AtomicUsize>,
+}
+
+struct TranscriptExecutionLease {
+    session_key: GoalSessionKey,
+    delivered: Arc<AtomicUsize>,
+    continue_once: bool,
+    parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+}
+
+#[async_trait]
+impl GoalSessionExecutionLease for TranscriptExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
+    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn run_parent_turn(
+        &mut self,
+        _operation: &GoalOperationScope,
+        turn: GoalParentTurn,
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        self.parent_histories
+            .lock()
+            .unwrap()
+            .push(turn.working_history.clone());
+        Ok(GoalParentTurnResult {
+            candidate: format!("parent:{}", turn.objective),
+            working_history: turn.working_history,
+        })
+    }
+
+    async fn run_verifier(
+        &mut self,
+        _operation: &GoalOperationScope,
+        _turn: GoalVerifierTurn,
+    ) -> anyhow::Result<String> {
+        if self.continue_once {
+            self.continue_once = false;
+            Ok(r#"{\"decision\":\"continue\",\"reason\":\"add the missing detail\"}"#.to_owned())
+        } else {
+            Ok(r#"{\"decision\":\"complete\",\"reason\":\"candidate satisfies the objective\"}"#.to_owned())
+        }
+    }
+
+    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct TranscriptExecutionDriver {
+    binding: GoalSessionBinding,
+    delivered: Arc<AtomicUsize>,
+    parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+}
+
+#[async_trait]
+impl GoalSessionDriver for TranscriptExecutionDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        Ok(Box::new(TranscriptExecutionLease {
+            session_key: self.binding.session_key().clone(),
+            delivered: Arc::clone(&self.delivered),
+            continue_once: true,
+            parent_histories: Arc::clone(&self.parent_histories),
+        }))
+    }
 }
 
 struct PausingExecutionLease {
@@ -2063,6 +2144,74 @@ async fn execution_acquisition_releases_the_admission_lease_first() {
     );
     drop(execution);
     assert!(driver.reconnect_is_allowed());
+}
+
+#[tokio::test]
+async fn verifier_continue_preserves_the_process_local_parent_transcript() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let parent_histories = Arc::new(Mutex::new(Vec::new()));
+    let driver = Arc::new(TranscriptExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        delivered: Arc::clone(&delivered),
+        parent_histories: Arc::clone(&parent_histories),
+    });
+    let request = runtime
+        .submit(
+            &settings,
+            ingress,
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_parts()
+        .1
+        .expect("start must yield an execution request");
+    let scope = request.scope().clone();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let engine = runtime
+        .execution_engine(tracker, "main", Arc::default())
+        .unwrap();
+
+    assert_eq!(
+        engine.run(&settings, request).await.unwrap(),
+        zeroclaw_runtime::goal_mode::GoalExecutionOutcome::Completed
+    );
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    let histories = parent_histories.lock().unwrap();
+    assert_eq!(histories.len(), 2, "Continue must run a second parent turn");
+    assert!(histories[1].iter().any(|message| {
+        message.role == "assistant" && message.content == "parent:finish the task"
+    }));
+    assert!(histories[1]
+        .iter()
+        .any(|message| message.content.contains("add the missing detail")));
+    assert_eq!(
+        store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Completed
+    );
 }
 
 #[tokio::test]
