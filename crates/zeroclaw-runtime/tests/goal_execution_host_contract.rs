@@ -79,6 +79,13 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         self.delivered.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 struct ExecutionDriver {
@@ -122,6 +129,13 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
     ) -> anyhow::Result<String> {
         self.verifier_calls.fetch_add(1, Ordering::SeqCst);
         Ok(r#"{"decision":"complete","reason":"done"}"#.to_owned())
+    }
+
+    async fn publish_goal_notice(
+        &mut self,
+        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
