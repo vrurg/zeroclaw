@@ -34,6 +34,7 @@ mod goal_execution;
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
     GoalExecutionSubmission, GoalExecutionSupervisor,
+    dispose_unowned_session_goal,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
