@@ -603,6 +603,7 @@ pub async fn run(
         );
         crate::health::mark_component_ok("control-plane");
     }
+    crate::goal_mode::reconcile_common_goal_policy_at_startup(&config).await?;
 
     // Goal policy validation and revocation must fence every exposed Goal
     // transport together. The coordinator belongs to this daemon iteration;

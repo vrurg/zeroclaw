@@ -12,7 +12,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWrite
 use zeroclaw_config::schema::Config;
 
 use super::{GoalIngressContext, GoalIngressPrincipal, GoalSurface};
-use crate::control_plane::{TaskKind, TaskRecord, TaskStatus};
+use crate::control_plane::{
+    GoalPolicyRevocationTarget, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
+    control_plane,
+};
 
 /// Why prospective policy revokes an otherwise nonterminal Goal.
 ///
@@ -254,6 +257,52 @@ pub fn authorize_common_goal_ingress(
         finished_at: None,
     };
     classify_common_goal_policy(config, &task)
+}
+
+/// Apply common V1 policy revocation before transport listeners start.
+///
+/// This deliberately lives in the runtime rather than a channel adapter: a
+/// daemon may expose ZeroCode without Matrix, and feature/agent/provider
+/// revocation must still make retained ZeroCode Goals non-resumable.
+pub async fn reconcile_common_goal_policy_at_startup(config: &Config) -> Result<()> {
+    let Some(control_plane) = control_plane() else {
+        return Ok(());
+    };
+    let registry = control_plane.goal_store()?;
+    let targets = registry
+        .list_nonterminal_session_goals()
+        .await?
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                classify_common_goal_policy(config, task),
+                GoalPolicyDecision::Revoked(_)
+            )
+        })
+        .map(|task| {
+            let session_id = task
+                .session_id
+                .filter(|session_id| !session_id.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Goal policy target lost its session binding"))?;
+            Ok(GoalPolicyRevocationTarget {
+                task_id: task.id,
+                session_id,
+                expected_epoch: task.execution_epoch,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    match registry
+        .cancel_goals_for_policy_revocation(&targets)
+        .await?
+    {
+        GoalTransitionResult::Applied => Ok(()),
+        GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+            anyhow::bail!("Goal policy changed during startup reconciliation")
+        }
+    }
 }
 
 #[cfg(test)]

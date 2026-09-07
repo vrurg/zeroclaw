@@ -187,22 +187,6 @@ fn policy_revocation_target(task: TaskRecord) -> Result<GoalPolicyRevocationTarg
     })
 }
 
-/// Startup reconciliation owns all persisted V1 records, not only Matrix
-/// ones. Common policy revocations therefore cover both Matrix and ZeroCode;
-/// Matrix-only route, room, and MXID checks remain in this adapter.
-fn revoked_by_startup_goal_policy(
-    config: &zeroclaw_config::schema::Config,
-    task: &TaskRecord,
-) -> bool {
-    matches!(
-        classify_common_goal_policy(config, task),
-        GoalPolicyDecision::Revoked(_)
-    ) || matches!(
-        classify_matrix_goal_policy(config, task),
-        MatrixGoalPolicyEligibility::Revoked(_)
-    )
-}
-
 pub(super) async fn revoke_matrix_goals_for_policy(
     context: &ChannelRuntimeContext,
     next_config: &zeroclaw_config::schema::Config,
@@ -255,7 +239,12 @@ pub(super) async fn revoke_matrix_goals_at_startup(
         .list_nonterminal_session_goals()
         .await?
         .into_iter()
-        .filter(|task| revoked_by_startup_goal_policy(config, task))
+        .filter(|task| {
+            matches!(
+                classify_matrix_goal_policy(config, task),
+                MatrixGoalPolicyEligibility::Revoked(_)
+            )
+        })
         .map(policy_revocation_target)
         .collect::<Result<Vec<_>>>()?;
     if targets.is_empty() {
@@ -799,10 +788,6 @@ mod tests {
         assert_eq!(
             classify_matrix_goal_policy(&zeroclaw_config::schema::Config::default(), &task),
             MatrixGoalPolicyEligibility::Eligible
-        );
-        assert!(
-            revoked_by_startup_goal_policy(&zeroclaw_config::schema::Config::default(), &task),
-            "shared disablement must also cancel a persisted ZeroCode Goal"
         );
     }
 
