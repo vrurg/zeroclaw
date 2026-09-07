@@ -19,9 +19,9 @@ use zeroclaw_runtime::control_plane::{
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
-    GoalOperationScope, GoalParentTurn, GoalParentTurnResult, GoalResponse, GoalRuntime,
-    GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-    GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
+    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
+    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -35,6 +35,7 @@ struct RecordingExecutionLease {
     complete_verifier: bool,
     continue_once: bool,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+    parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
 
 #[async_trait]
@@ -52,6 +53,7 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
             .lock()
             .unwrap()
             .push(turn.working_history.clone());
+        self.parent_turn_kinds.lock().unwrap().push(turn.kind);
         Ok(GoalParentTurnResult {
             candidate: format!("parent:{}", turn.objective),
             working_history: turn.working_history,
@@ -97,6 +99,7 @@ struct ExecutionDriver {
     complete_verifier: bool,
     continue_once: bool,
     parent_histories: Arc<Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+    parent_turn_kinds: Arc<Mutex<Vec<GoalParentTurnKind>>>,
 }
 
 struct PausingExecutionLease {
@@ -231,6 +234,7 @@ impl GoalSessionDriver for ExecutionDriver {
             complete_verifier: self.complete_verifier,
             continue_once: self.continue_once,
             parent_histories: Arc::clone(&self.parent_histories),
+            parent_turn_kinds: Arc::clone(&self.parent_turn_kinds),
         }))
     }
 }
@@ -690,6 +694,7 @@ async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
         complete_verifier: false,
         continue_once: false,
         parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
     let scope =
         zeroclaw_runtime::goal_mode::GoalExecutionScope::new("goal-1", "rpc_wrong-session", 1)
@@ -785,6 +790,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
         complete_verifier: false,
         continue_once: false,
         parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
     let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
     let operation = GoalOperationScope::new(scope.clone());
@@ -801,6 +807,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
             .run_parent_turn(
                 &operation,
                 GoalParentTurn {
+                    kind: GoalParentTurnKind::Start,
                     objective: "finish the task".into(),
                     working_history: Vec::new(),
                 }
@@ -1010,6 +1017,7 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
         complete_verifier: false,
         continue_once: false,
         parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
 
     let submission = runtime
@@ -1035,6 +1043,11 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
         ingress.session_key().durable_id()
     );
     assert_eq!(execution.scope().execution_epoch(), started.execution_epoch);
+    assert_eq!(
+        execution.initial_turn_kind(),
+        GoalParentTurnKind::Start,
+        "a freshly created Goal must receive a start directive"
+    );
     let lease = runtime
         .acquire_execution(&settings, &execution)
         .await
@@ -1043,8 +1056,33 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
     assert!(Arc::ptr_eq(
         execution.driver(),
-        &(driver as Arc<dyn GoalSessionDriver>)
+        &(driver.clone() as Arc<dyn GoalSessionDriver>)
     ));
+
+    let pause = runtime
+        .submit(
+            &settings,
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Pause,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(pause.response(), GoalResponse::Paused(_)));
+    drop(pause);
+    let resume = runtime
+        .submit(&settings, ingress, driver, GoalCommand::Resume)
+        .await
+        .unwrap();
+    let (response, execution) = resume.into_parts();
+    assert!(matches!(response, GoalResponse::Resumed(_)));
+    assert_eq!(
+        execution
+            .expect("a resumed Goal must launch an execution request")
+            .initial_turn_kind(),
+        GoalParentTurnKind::Resume,
+        "a resumed Goal must not masquerade as a fresh Goal"
+    );
 }
 
 #[tokio::test]
@@ -1055,6 +1093,7 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
+    let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(ExecutionDriver {
         binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
@@ -1062,6 +1101,7 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
         complete_verifier: true,
         continue_once: true,
         parent_histories: Arc::clone(&parent_histories),
+        parent_turn_kinds: Arc::clone(&parent_turn_kinds),
     });
     let request = runtime
         .submit(
@@ -1111,6 +1151,11 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
         );
     }
     assert_eq!(
+        parent_turn_kinds.lock().unwrap().as_slice(),
+        &[GoalParentTurnKind::Start, GoalParentTurnKind::Continue],
+        "a verifier Continue must be distinguishable from the initial Goal turn"
+    );
+    assert_eq!(
         store
             .current_goal_for_session(request.scope().session_id())
             .await
@@ -1135,6 +1180,7 @@ async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
         complete_verifier: true,
         continue_once: false,
         parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
     let request = runtime
         .submit(
@@ -1991,6 +2037,7 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
         complete_verifier: false,
         continue_once: false,
         parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
 
     let (response, execution) = runtime
