@@ -1210,18 +1210,24 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
             );
             Ok(VerifierDecision::Continue { reason })
         }
-        VerifierDecisionKind::Blocked => Ok(VerifierDecision::Blocked {
-            reason,
-            blockers: response
-                .blockers
-                .into_iter()
-                .map(|blocker| GoalBlocker {
-                    kind: blocker.kind,
-                    message: blocker.message,
-                    payload: blocker.payload,
-                })
-                .collect(),
-        }),
+        VerifierDecisionKind::Blocked => {
+            ensure!(
+                !response.blockers.is_empty(),
+                "blocked verifier response has no actionable blockers"
+            );
+            Ok(VerifierDecision::Blocked {
+                reason,
+                blockers: response
+                    .blockers
+                    .into_iter()
+                    .map(|blocker| GoalBlocker {
+                        kind: blocker.kind,
+                        message: blocker.message,
+                        payload: blocker.payload,
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 
@@ -1323,6 +1329,10 @@ mod tests {
             r#"{"decision":"blocked","reason":"wait","blockers":[{"kind":"budget","message":"x","extra":true}]}"#
         )
         .is_err());
+        assert!(
+            parse_verifier_response(r#"{"decision":"blocked","reason":"wait","blockers":[]}"#)
+                .is_err()
+        );
     }
 
     #[test]
