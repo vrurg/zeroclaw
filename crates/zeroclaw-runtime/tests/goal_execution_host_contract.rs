@@ -18,8 +18,8 @@ use zeroclaw_runtime::control_plane::{
 use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
     GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
-    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+    GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -43,8 +43,11 @@ impl GoalSessionExecutionLease for RecordingExecutionLease {
         &mut self,
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
-        Ok(format!("parent:{}", turn.objective))
+    ) -> anyhow::Result<GoalParentTurnResult> {
+        Ok(GoalParentTurnResult {
+            candidate: format!("parent:{}", turn.objective),
+            working_history: turn.working_history,
+        })
     }
 
     async fn run_verifier(
@@ -91,10 +94,13 @@ impl GoalSessionExecutionLease for PausingExecutionLease {
         &mut self,
         _operation: &GoalOperationScope,
         _turn: GoalParentTurn,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<GoalParentTurnResult> {
         self.parent_started.notify_one();
         self.release_parent.notified().await;
-        Ok("candidate that settled before pause".to_owned())
+        Ok(GoalParentTurnResult {
+            candidate: "candidate that settled before pause".to_owned(),
+            working_history: Vec::new(),
+        })
     }
 
     async fn run_verifier(
@@ -769,7 +775,8 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
                 }
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .candidate,
         "parent:finish the task"
     );
     assert_eq!(
