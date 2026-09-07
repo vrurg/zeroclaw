@@ -67,11 +67,6 @@ impl GitOperationsTool {
                 args.get("action").and_then(|value| value.as_str()),
                 Some("list")
             ))
-            || (operation == "worktree"
-                && !matches!(
-                    args.get("subcommand").and_then(|value| value.as_str()),
-                    Some("list")
-                ))
     }
 
     /// Return whether a repository's Git metadata is within any authorized root.
@@ -219,113 +214,6 @@ impl GitOperationsTool {
             && (!requires_write_access || self.security.is_resolved_path_allowed(path))
     }
 
-    fn candidate_path(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
-        if raw_path.contains('\0') {
-            anyhow::bail!("Path not allowed: contains null byte");
-        }
-        if Path::new(raw_path)
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("Path not allowed: parent-directory traversal is not allowed");
-        }
-        let path = Path::new(raw_path);
-        Ok(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.security.workspace_dir.join(path)
-        })
-    }
-
-    fn ensure_worktree_add_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
-        let candidate = self.candidate_path(raw_path)?;
-        let parent = candidate.parent().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
-                "git_operations: worktree path has no parent"
-            );
-            anyhow::Error::msg("Worktree path must have a parent directory")
-        })?;
-        let name = candidate.file_name().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
-                "git_operations: worktree path has no file name"
-            );
-            anyhow::Error::msg("Worktree path must include a final path component")
-        })?;
-        let parent = parent.canonicalize().map_err(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "parent": parent.display().to_string(),
-                        "error": error.to_string(),
-                    })),
-                "git_operations: cannot resolve worktree parent"
-            );
-            anyhow::Error::msg(format!(
-                "Cannot resolve worktree parent '{}': {error}",
-                parent.display()
-            ))
-        })?;
-        let target = parent.join(name);
-        if !self.security.is_resolved_path_allowed(&target) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
-                "git_operations: worktree add target is not authorized"
-            );
-            anyhow::bail!(
-                "Worktree path '{}' resolves outside the workspace or allowed roots",
-                raw_path
-            );
-        }
-        Ok(target)
-    }
-
-    fn ensure_worktree_remove_target_allowed(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
-        let candidate = self.candidate_path(raw_path)?;
-        let resolved = candidate.canonicalize().map_err(|error| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "raw_path": raw_path,
-                        "error": error.to_string(),
-                    })),
-                "git_operations: cannot resolve worktree path"
-            );
-            anyhow::Error::msg(format!(
-                "Cannot resolve worktree path '{}': {error}",
-                raw_path
-            ))
-        })?;
-        if !self.security.is_resolved_path_allowed(&resolved) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"raw_path": raw_path})),
-                "git_operations: worktree remove target is not authorized"
-            );
-            anyhow::bail!(
-                "Worktree path '{}' resolves outside the workspace or allowed roots",
-                raw_path
-            );
-        }
-        Ok(resolved)
-    }
-
     /// Resolve an explicit path through the security policy, or return the
     /// policy's canonical workspace directory when no path is provided.
     fn resolve_working_dir(
@@ -398,8 +286,10 @@ impl GitOperationsTool {
     }
 
     /// Run a read-classified Git command without repository-configured command
-    /// hooks. `status` can invoke `core.fsmonitor`; `diff` also disables its
-    /// external-diff and text-conversion paths at the call site below.
+    /// hooks. `status` can invoke `core.fsmonitor`; `log` and `stash list` can
+    /// invoke `gpg.program` for signature display; `diff` also disables its
+    /// external-diff, text-conversion, and nested submodule-diff paths at the
+    /// call site below.
     async fn run_git_read_command(
         &self,
         args: &[&str],
@@ -410,7 +300,14 @@ impl GitOperationsTool {
         let mut command = tokio::process::Command::new("git");
         Self::bind_git_worktree(command.as_std_mut(), &repository_root);
         command
-            .args(["-c", "core.fsmonitor=false", "-c", "core.pager=cat"])
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.pager=cat",
+                "-c",
+                "log.showSignature=false",
+            ])
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
         Self::disable_filter_drivers(command.as_std_mut(), &filter_drivers);
@@ -512,14 +409,6 @@ impl GitOperationsTool {
         let inherited_non_git_env = std::env::vars_os()
             .filter(|(name, _)| !Self::is_git_environment_variable(name))
             .collect::<Vec<_>>();
-        let configured_git_env = command
-            .get_envs()
-            .filter(|(name, _)| Self::is_git_environment_variable(name))
-            .map(|(name, _)| name.to_os_string())
-            .collect::<Vec<_>>();
-        for name in configured_git_env {
-            command.env_remove(name);
-        }
         command.env_clear().envs(inherited_non_git_env);
         command
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -721,6 +610,9 @@ impl GitOperationsTool {
             "--no-optional-locks",
             "diff",
             "--ignore-submodules=dirty",
+            // Override repository `diff.submodule=diff`, whose nested Git
+            // process does not inherit this command's external-diff guards.
+            "--submodule=short",
             "--no-ext-diff",
             "--no-textconv",
             "--unified=3",
@@ -1142,163 +1034,6 @@ impl GitOperationsTool {
             }),
         }
     }
-
-    fn parse_worktree_list(&self, output: &str, active_worktree: &Path) -> serde_json::Value {
-        let mut worktrees = Vec::new();
-        let mut current_path = String::new();
-        let mut current_branch = String::new();
-        let mut current_head = String::new();
-        let mut is_detached = false;
-        for line in output.lines().map(str::trim) {
-            if line.is_empty() {
-                if !current_path.is_empty() {
-                    worktrees.push((
-                        std::mem::take(&mut current_path),
-                        std::mem::take(&mut current_branch),
-                        std::mem::take(&mut current_head),
-                        is_detached,
-                    ));
-                    is_detached = false;
-                }
-            } else if let Some(path) = line.strip_prefix("worktree ") {
-                current_path = path.to_string();
-            } else if let Some(head) = line.strip_prefix("HEAD ") {
-                current_head = head.to_string();
-            } else if let Some(branch) = line.strip_prefix("branch ") {
-                current_branch = branch.trim_start_matches("refs/heads/").to_string();
-            } else if line == "detached" {
-                is_detached = true;
-            }
-        }
-        if !current_path.is_empty() {
-            worktrees.push((current_path, current_branch, current_head, is_detached));
-        }
-        let active_index = worktrees
-            .iter()
-            .enumerate()
-            .filter(|(_, (path, ..))| active_worktree.starts_with(Path::new(path)))
-            .max_by_key(|(_, (path, ..))| Path::new(path).components().count())
-            .map(|(index, _)| index);
-        let worktrees = worktrees
-            .into_iter()
-            .enumerate()
-            .map(|(index, (path, branch, head, detached))| {
-                json!({
-                    "path": path,
-                    "branch": if detached { "HEAD" } else { &branch },
-                    "head": head,
-                    "detached": detached,
-                    "active": active_index == Some(index)
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({ "worktrees": worktrees })
-    }
-
-    async fn git_worktree(
-        &self,
-        args: serde_json::Value,
-        working_dir: &Path,
-    ) -> anyhow::Result<ToolResult> {
-        let subcommand = args
-            .get("subcommand")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                anyhow::Error::msg("Missing 'subcommand' parameter. Use: list, add, remove, prune")
-            })?;
-
-        match subcommand {
-            "list" => {
-                let output = self
-                    .run_git_read_command(
-                        &["--no-optional-locks", "worktree", "list", "--porcelain"],
-                        working_dir,
-                    )
-                    .await?;
-                Ok(ToolResult {
-                    success: true,
-                    output: serde_json::to_string_pretty(
-                        &self.parse_worktree_list(&output, working_dir),
-                    )
-                    .unwrap_or_default()
-                    .into(),
-                    error: None,
-                })
-            }
-            "add" => {
-                let worktree_path = args
-                    .get("worktree_path")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        anyhow::Error::msg("Missing 'worktree_path' parameter for worktree add")
-                    })?;
-                self.sanitize_git_args(worktree_path)?;
-                let worktree_path = self.ensure_worktree_add_target_allowed(worktree_path)?;
-                let worktree_path = worktree_path.to_str().ok_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "git_operations: worktree path is not valid UTF-8"
-                    );
-                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
-                })?;
-                let branch = args
-                    .get("branch")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default();
-                let mut git_args = vec!["worktree", "add", worktree_path];
-                if !branch.is_empty() {
-                    self.sanitize_git_args(branch)?;
-                    git_args.push(branch);
-                }
-                self.run_git_command(&git_args, working_dir).await?;
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("Worktree added at: {worktree_path}").into(),
-                    error: None,
-                })
-            }
-            "remove" => {
-                let worktree_path = args
-                    .get("worktree_path")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        anyhow::Error::msg("Missing 'worktree_path' parameter for worktree remove")
-                    })?;
-                self.sanitize_git_args(worktree_path)?;
-                let worktree_path = self.ensure_worktree_remove_target_allowed(worktree_path)?;
-                let worktree_path = worktree_path.to_str().ok_or_else(|| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "git_operations: worktree path is not valid UTF-8"
-                    );
-                    anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
-                })?;
-                self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
-                    .await?;
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("Worktree removed: {worktree_path}").into(),
-                    error: None,
-                })
-            }
-            "prune" => {
-                self.run_git_command(&["worktree", "prune"], working_dir)
-                    .await?;
-                Ok(ToolResult {
-                    success: true,
-                    output: "Worktree prune completed".into(),
-                    error: None,
-                })
-            }
-            _ => anyhow::bail!(
-                "Unknown worktree subcommand: {subcommand}. Use: list, add, remove, prune"
-            ),
-        }
-    }
 }
 
 #[async_trait]
@@ -1308,7 +1043,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1317,13 +1052,8 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash"],
                     "description": "Git operation to perform"
-                },
-                "subcommand": {
-                    "type": "string",
-                    "enum": ["list", "add", "remove", "prune"],
-                    "description": "Worktree subcommand"
                 },
                 "message": {
                     "type": "string",
@@ -1335,11 +1065,7 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name for the 'checkout' operation or 'worktree add' subcommand"
-                },
-                "worktree_path": {
-                    "type": "string",
-                    "description": "Filesystem path for the worktree (for 'worktree add' and 'worktree remove' subcommands). Relative paths resolve under the workspace; absolute paths must stay inside the workspace or configured allowed roots."
+                    "description": "Branch name for the 'checkout' operation"
                 },
                 "files": {
                     "type": "string",
@@ -1390,6 +1116,16 @@ impl Tool for GitOperationsTool {
                 });
             }
         };
+
+        if operation == "worktree" {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_tool_string(
+                    "tool-git-operations-error-worktree-disabled",
+                )),
+            });
+        }
 
         let requires_write_access = self.requires_write_access(operation, &args);
         let path = args.get("path").and_then(|v| v.as_str());
@@ -1496,7 +1232,6 @@ impl Tool for GitOperationsTool {
             "add" => self.git_add(args, &working_dir).await,
             "checkout" => self.git_checkout(args, &working_dir).await,
             "stash" => self.git_stash(args, &working_dir).await,
-            "worktree" => self.git_worktree(args, &working_dir).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -1509,6 +1244,10 @@ impl Tool for GitOperationsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -1634,27 +1373,6 @@ mod tests {
         // Exact `-c` flag (config injection)
         assert!(tool.sanitize_git_args("-c core.sshCommand=evil").is_err());
         assert!(tool.sanitize_git_args("-c=core.pager=less").is_err());
-    }
-
-    #[test]
-    fn worktree_targets_reject_paths_outside_authorized_roots() {
-        let workspace = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
-        let tool = test_tool(workspace.path());
-
-        assert!(
-            tool.ensure_worktree_add_target_allowed(
-                outside.path().join("new-worktree").to_str().unwrap()
-            )
-            .is_err()
-        );
-
-        let existing = outside.path().join("old-worktree");
-        std::fs::create_dir(&existing).unwrap();
-        assert!(
-            tool.ensure_worktree_remove_target_allowed(existing.to_str().unwrap())
-                .is_err()
-        );
     }
 
     #[test]
@@ -1824,148 +1542,75 @@ mod tests {
         assert!(tool.requires_write_access("checkout", &json!({})));
         assert!(tool.requires_write_access("stash", &json!({})));
         assert!(tool.requires_write_access("stash", &json!({"action": "push"})));
-        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "add"})));
-        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "remove"})));
-        assert!(tool.requires_write_access("worktree", &json!({"subcommand": "prune"})));
 
         assert!(!tool.requires_write_access("status", &json!({})));
         assert!(!tool.requires_write_access("diff", &json!({})));
         assert!(!tool.requires_write_access("log", &json!({})));
         assert!(!tool.requires_write_access("branch", &json!({})));
         assert!(!tool.requires_write_access("stash", &json!({"action": "list"})));
-        assert!(!tool.requires_write_access("worktree", &json!({"subcommand": "list"})));
         assert!(!tool.requires_write_access("status", &json!({"subcommand": "add"})));
     }
 
     #[tokio::test]
-    async fn git_operations_preserve_authorized_linked_worktree_lifecycle() {
+    async fn git_operations_reject_worktree_operations() {
         let tmp = TempDir::new().unwrap();
+        let uninitialized_tool = test_tool(tmp.path());
+        let result = uninitialized_tool
+            .execute(json!({"operation": "worktree"}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success
+                && result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error == "Git worktree operations are disabled."),
+            "worktree must be rejected before repository discovery: {result:?}"
+        );
+
         bootstrap_repo(tmp.path(), &[]).await;
         let tool = test_tool(tmp.path());
 
         let schema = tool.parameters_schema();
-        let operations = schema["properties"]["operation"]["enum"]
-            .as_array()
-            .unwrap();
+        let properties = schema["properties"].as_object().unwrap();
         assert!(
-            operations.iter().any(|operation| operation == "worktree"),
-            "the public Git operation schema must advertise worktree"
+            !properties.contains_key("subcommand") && !properties.contains_key("worktree_path"),
+            "worktree-only schema properties must not be advertised"
         );
-
-        let linked_worktree = tmp.path().join("linked-worktree");
-        let added = tool
-            .execute(json!({
-                "operation": "worktree",
-                "subcommand": "add",
-                "worktree_path": &linked_worktree
-            }))
-            .await
-            .unwrap();
-        assert!(added.success, "worktree add failed: {added:?}");
-        assert!(linked_worktree.join(".git").is_file());
-        let linked_worktree_subdir = linked_worktree.join("nested");
-        std::fs::create_dir(&linked_worktree_subdir).unwrap();
-
-        let worktrees = tool
-            .execute(json!({
-                "operation": "worktree",
-                "subcommand": "list",
-                "path": &linked_worktree_subdir
-            }))
-            .await
-            .unwrap();
-        assert!(worktrees.success, "worktree list failed: {worktrees:?}");
-        let worktrees: serde_json::Value = serde_json::from_str(&worktrees.output.to_string())
-            .expect("worktree list output must be JSON");
-        assert_eq!(
-            worktrees["worktrees"].as_array().map(Vec::len),
-            Some(2),
-            "worktree list must include the main and linked worktrees: {worktrees}"
+        assert!(
+            !schema["properties"]["operation"]["enum"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().any(|value| value == "worktree")),
+            "worktree must not be an advertised operation"
         );
-        #[cfg(unix)]
-        {
-            let main_worktree = tmp.path().canonicalize().unwrap();
-            let linked_worktree = linked_worktree.canonicalize().unwrap();
+        for catalogue in [
+            include_str!("../locales/en/tools.ftl"),
+            include_str!("../../zeroclaw-runtime/locales/en/tools.ftl"),
+        ] {
+            let description = catalogue
+                .lines()
+                .find(|line| line.starts_with("tool-git-operations ="))
+                .unwrap();
             assert!(
-                worktrees["worktrees"]
-                    .as_array()
-                    .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
-                        == linked_worktree.to_string_lossy().as_ref()
-                        && entry["active"] == true)),
-                "the requested linked worktree must be active: {worktrees}"
-            );
-            assert!(
-                worktrees["worktrees"]
-                    .as_array()
-                    .is_some_and(|entries| entries.iter().any(|entry| entry["path"]
-                        == main_worktree.to_string_lossy().as_ref()
-                        && entry["active"] == false)),
-                "only the deepest matching worktree may be active: {worktrees}"
+                !description.contains("worktree"),
+                "Git operation catalogue must not advertise worktree: {description}"
             );
         }
 
-        let status = tool
-            .execute(json!({"operation": "status", "path": &linked_worktree}))
-            .await
-            .unwrap();
-        assert!(status.success, "linked worktree status failed: {status:?}");
-
-        let removed = tool
-            .execute(json!({
-                "operation": "worktree",
-                "subcommand": "remove",
-                "worktree_path": &linked_worktree
-            }))
-            .await
-            .unwrap();
-        assert!(removed.success, "worktree remove failed: {removed:?}");
-        assert!(
-            !linked_worktree.exists(),
-            "worktree remove must remove the linked worktree"
-        );
-    }
-
-    #[tokio::test]
-    async fn git_operations_preserve_linked_worktree_lifecycle_across_authorized_roots() {
-        let workspace = TempDir::new().unwrap();
-        let allowed_root = TempDir::new().unwrap();
-        bootstrap_repo(workspace.path(), &[]).await;
-        let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
-        let linked_worktree = allowed_root.path().join("linked-worktree");
-
-        let added = tool
-            .execute(json!({
-                "operation": "worktree",
-                "subcommand": "add",
-                "worktree_path": &linked_worktree
-            }))
-            .await
-            .unwrap();
-        assert!(added.success, "worktree add failed: {added:?}");
-        assert!(linked_worktree.join(".git").is_file());
-
-        let status = tool
-            .execute(json!({"operation": "status", "path": &linked_worktree}))
-            .await
-            .unwrap();
-        assert!(
-            status.success,
-            "linked worktree status across authorized roots failed: {status:?}"
-        );
-
-        let removed = tool
-            .execute(json!({
-                "operation": "worktree",
-                "subcommand": "remove",
-                "worktree_path": &linked_worktree
-            }))
-            .await
-            .unwrap();
-        assert!(removed.success, "worktree remove failed: {removed:?}");
-        assert!(
-            !linked_worktree.exists(),
-            "worktree remove must remove the separately authorized linked worktree"
-        );
+        for subcommand in ["list", "add", "remove", "prune"] {
+            let result = tool
+                .execute(json!({"operation": "worktree", "subcommand": subcommand}))
+                .await
+                .unwrap();
+            assert!(
+                !result.success
+                    && result
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error == "Git worktree operations are disabled."),
+                "worktree {subcommand} must be rejected: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2073,10 +1718,7 @@ mod tests {
         });
         let tool = GitOperationsTool::new(security);
 
-        for args in [
-            json!({"operation": "branch"}),
-            json!({"operation": "worktree", "subcommand": "list"}),
-        ] {
+        for args in [json!({"operation": "branch"})] {
             let result = tool.execute(args).await.unwrap();
             assert!(
                 result.success,
@@ -2874,6 +2516,91 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn git_read_only_log_commands_do_not_run_repository_gpg_program() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &["tracked.txt"]).await;
+
+        let marker = workspace.path().join("gpg-program-ran");
+        let gpg_program = workspace.path().join("fake-gpg");
+        std::fs::write(
+            &gpg_program,
+            format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gpg_program, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tree = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD^{tree}"])
+            .current_dir(read_only_root.path())
+            .output()
+            .unwrap();
+        assert!(tree.status.success(), "test setup must resolve HEAD tree");
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let signed_commit = format!(
+            "tree {}\nauthor Test <test@test.com> 0 +0000\ncommitter Test <test@test.com> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n fake-signature\n -----END PGP SIGNATURE-----\n\nsigned probe\n",
+            tree.trim()
+        );
+        let mut hasher = std::process::Command::new("git")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(read_only_root.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        hasher
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(signed_commit.as_bytes())
+            .unwrap();
+        let signed_commit = hasher.wait_with_output().unwrap();
+        assert!(
+            signed_commit.status.success(),
+            "test setup must write signed commit"
+        );
+        let signed_commit = String::from_utf8(signed_commit.stdout).unwrap();
+        let signed_commit = signed_commit.trim();
+        for reference in ["refs/heads/master", "refs/stash"] {
+            let update = std::process::Command::new("git")
+                .args(["update-ref", reference, signed_commit])
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(update.success(), "test setup must update {reference}");
+        }
+        for args in [
+            ["config", "gpg.program", gpg_program.to_str().unwrap()].as_slice(),
+            ["config", "log.showSignature", "true"].as_slice(),
+        ] {
+            let config = std::process::Command::new("git")
+                .args(args)
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(
+                config.success(),
+                "test repository configuration must succeed"
+            );
+        }
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        for args in [
+            json!({"operation": "log", "path": read_only_root.path()}),
+            json!({"operation": "stash", "action": "list", "path": read_only_root.path()}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "read command failed: {:?}", result.error);
+            assert!(
+                !marker.exists(),
+                "read-only log commands must not execute repository gpg.program"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn git_read_only_commands_do_not_run_repository_clean_filters() {
         let workspace = TempDir::new().unwrap();
         let read_only_root = TempDir::new().unwrap();
@@ -3084,6 +2811,235 @@ mod tests {
             diff.contains("Subproject commit"),
             "read diff must retain staged superproject gitlink changes: {diff:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_read_only_diff_does_not_run_parent_external_diff_or_textconv() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &["tracked.txt"]).await;
+        std::fs::write(
+            read_only_root.path().join(".gitattributes"),
+            "tracked.txt diff=marker\n",
+        )
+        .unwrap();
+        for args in [
+            ["add", ".gitattributes"].as_slice(),
+            ["commit", "-m", "attributes"].as_slice(),
+        ] {
+            let setup = std::process::Command::new("git")
+                .args(args)
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(setup.success(), "test setup must succeed");
+        }
+
+        let external_marker = workspace.path().join("parent-external-diff-ran");
+        let textconv_marker = workspace.path().join("parent-textconv-ran");
+        for (key, value) in [
+            (
+                "diff.external",
+                format!("sh -c 'touch {}'", external_marker.display()),
+            ),
+            (
+                "diff.marker.textconv",
+                format!("sh -c 'touch {}; cat'", textconv_marker.display()),
+            ),
+        ] {
+            let config = std::process::Command::new("git")
+                .args(["config", key, &value])
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(
+                config.success(),
+                "test repository configuration must succeed"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(read_only_root.path().join("tracked.txt"), "changed").unwrap();
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        for args in [
+            json!({"operation": "diff", "path": read_only_root.path()}),
+            json!({"operation": "diff", "cached": true, "path": read_only_root.path()}),
+        ] {
+            if args.get("cached").is_some() {
+                let stage = std::process::Command::new("git")
+                    .args(["add", "tracked.txt"])
+                    .current_dir(read_only_root.path())
+                    .status()
+                    .unwrap();
+                assert!(stage.success(), "test setup must stage tracked file");
+            }
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "read diff failed: {:?}", result.error);
+            assert!(
+                !external_marker.exists() && !textconv_marker.exists(),
+                "read-only diff must not execute parent external diff or textconv"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_read_only_diff_does_not_run_submodule_external_diff() {
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        let source_submodule = workspace.path().join("source-submodule");
+        std::fs::create_dir(&source_submodule).unwrap();
+        bootstrap_repo(&source_submodule, &["tracked.txt"]).await;
+        bootstrap_repo(read_only_root.path(), &[]).await;
+
+        let submodule_add = std::process::Command::new("git")
+            .args(["-c", "protocol.file.allow=always", "submodule", "add"])
+            .arg(&source_submodule)
+            .arg("submodule")
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(submodule_add.success(), "test setup must add submodule");
+        let submodule_commit = std::process::Command::new("git")
+            .args(["commit", "-am", "submodule"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(
+            submodule_commit.success(),
+            "test setup must commit submodule"
+        );
+
+        let cloned_submodule = read_only_root.path().join("submodule");
+        let initial_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&cloned_submodule)
+            .output()
+            .unwrap();
+        assert!(
+            initial_head.status.success(),
+            "test setup must resolve the initial submodule commit"
+        );
+        let initial_head = String::from_utf8(initial_head.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        for args in [
+            ["config", "user.email", "test@test.com"].as_slice(),
+            ["config", "user.name", "Test"].as_slice(),
+            ["config", "commit.gpgsign", "false"].as_slice(),
+        ] {
+            let identity = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&cloned_submodule)
+                .status()
+                .unwrap();
+            assert!(
+                identity.success(),
+                "test setup must configure clone identity"
+            );
+        }
+        let marker = workspace.path().join("submodule-external-diff-ran");
+        let external_diff = format!("sh -c 'touch {}'", marker.display());
+        let external_config = std::process::Command::new("git")
+            .args(["config", "diff.external", &external_diff])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            external_config.success(),
+            "test setup must configure external diff"
+        );
+        let parent_config = std::process::Command::new("git")
+            .args(["config", "diff.submodule", "diff"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(
+            parent_config.success(),
+            "test setup must configure inline submodule diff"
+        );
+
+        std::fs::write(cloned_submodule.join("tracked.txt"), "changed").unwrap();
+        let submodule_update = std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            submodule_update.success(),
+            "test setup must stage submodule update"
+        );
+        let submodule_update = std::process::Command::new("git")
+            .args(["commit", "-m", "next"])
+            .current_dir(&cloned_submodule)
+            .status()
+            .unwrap();
+        assert!(
+            submodule_update.success(),
+            "test setup must commit submodule update"
+        );
+        let updated_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&cloned_submodule)
+            .output()
+            .unwrap();
+        assert!(
+            updated_head.status.success(),
+            "test setup must resolve the updated submodule commit"
+        );
+        let updated_head = String::from_utf8(updated_head.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        let assert_safe_diff = |result: &ToolResult| {
+            assert!(result.success, "read diff failed: {:?}", result.error);
+            assert!(
+                result.output.to_string().contains("Subproject commit"),
+                "read diff must retain the changed submodule commit: {:?}",
+                result.output
+            );
+            assert!(
+                result.output.to_string().contains(&initial_head)
+                    && result.output.to_string().contains(&updated_head),
+                "read diff must retain both submodule commit IDs: {:?}",
+                result.output
+            );
+            assert!(
+                !marker.exists(),
+                "read-only diff must not execute submodule external diff"
+            );
+        };
+
+        let unstaged = tool
+            .execute(json!({"operation": "diff", "path": read_only_root.path()}))
+            .await
+            .unwrap();
+        assert_safe_diff(&unstaged);
+
+        let stage_gitlink = std::process::Command::new("git")
+            .args(["add", "submodule"])
+            .current_dir(read_only_root.path())
+            .status()
+            .unwrap();
+        assert!(
+            stage_gitlink.success(),
+            "test setup must stage gitlink update"
+        );
+        let staged = tool
+            .execute(json!({
+                "operation": "diff",
+                "cached": true,
+                "path": read_only_root.path()
+            }))
+            .await
+            .unwrap();
+        assert_safe_diff(&staged);
     }
 
     #[cfg(unix)]

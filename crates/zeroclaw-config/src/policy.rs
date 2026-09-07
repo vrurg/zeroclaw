@@ -6467,6 +6467,44 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolved_write_check_does_not_follow_symlinks_to_the_null_device() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let null_alias = tmp.path().join("null-alias");
+        symlink("/dev/null", &null_alias).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(policy.is_resolved_path_readable(Path::new("/dev/null")));
+        assert!(policy.is_resolved_path_allowed(Path::new("/dev/null")));
+        // Reads retain the longstanding resolved-target exception for POSIX
+        // devices; writes only exempt a literal null-device spelling.
+        assert!(policy.is_resolved_path_readable(&null_alias));
+        assert!(
+            !policy.is_resolved_path_allowed(&null_alias),
+            "a symlink to the null device must remain subject to write authorization"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolved_path_checks_allow_the_windows_null_device() {
+        let policy = SecurityPolicy {
+            workspace_dir: PathBuf::from(r"C:\\workspace"),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(policy.is_resolved_path_readable(Path::new("nul")));
+        assert!(policy.is_resolved_path_allowed(Path::new("nul")));
+    }
+
     #[test]
     fn readable_includes_read_only_allowlist_paths() {
         let tmp = tempfile::tempdir().unwrap();
