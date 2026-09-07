@@ -355,6 +355,26 @@ impl fmt::Debug for GoalParentTurn {
     }
 }
 
+/// Process-local result of one Goal parent turn.
+///
+/// The transcript is returned to the controller rather than persisted in
+/// canonical session history. It survives verifier `Continue` within this
+/// process only; pause and restart deliberately discard it.
+#[derive(Clone)]
+pub struct GoalParentTurnResult {
+    pub candidate: String,
+    pub working_history: Vec<ChatMessage>,
+}
+
+impl fmt::Debug for GoalParentTurnResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalParentTurnResult")
+            .field("working_history_len", &self.working_history.len())
+            .finish()
+    }
+}
+
 /// Trusted, isolated input for the mandatory Goal verifier.
 #[derive(Clone)]
 pub struct GoalVerifierTurn {
@@ -380,7 +400,7 @@ pub trait GoalSessionExecutionLease: Send {
         &mut self,
         scope: &GoalExecutionScope,
         turn: GoalParentTurn,
-    ) -> Result<String>;
+    ) -> Result<GoalParentTurnResult>;
     async fn run_verifier(
         &mut self,
         scope: &GoalExecutionScope,
