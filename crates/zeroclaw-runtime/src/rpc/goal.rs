@@ -23,9 +23,9 @@ use crate::{
     goal_mode::{
         GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
         GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
-        GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
-        GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
-        dispose_unowned_session_goal,
+        GoalParentTurnResult, GoalPolicyCutoverCoordinator, GoalResponse, GoalRuntime,
+        GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+        GoalSessionLease, GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
     },
     rpc::context::RpcContext,
 };
@@ -330,6 +330,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
 /// ZeroCode's process-local Goal worker and command-lock registry.
 #[derive(Default)]
 pub struct RpcGoalRuntime {
+    /// One admission/cutover barrier shared by local IPC and WSS dispatchers
+    /// for this RPC runtime. Daemon construction later shares this same
+    /// coordinator with channel admission before a policy replacement begins.
+    policy_cutover: Arc<GoalPolicyCutoverCoordinator>,
     supervisors: Mutex<HashMap<String, Arc<GoalExecutionSupervisor>>>,
     command_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
@@ -360,6 +364,11 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
+        // Retain the read lease from current-policy inspection through the
+        // guarded controller mutation and any supervisor registration. A
+        // future cutover therefore cannot interleave a stale ZeroCode command
+        // between those two boundaries.
+        let _admission = self.policy_cutover.admit().await;
         let config = context.config.read().clone();
         if !config.goal.enabled {
             return Ok(GoalResponse::Disabled);
