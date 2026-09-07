@@ -128,8 +128,12 @@ zc-goal-help = Goal commands:
     /goal pause | resume | cancel | help
 zc-goal-disabled = Goal Mode is disabled.
 zc-goal-started = Goal started.
-zc-goal-status = Goal status updated.
-zc-goal-budget = Goal budget updated.
+zc-goal-status = Goal status: { $status }. Usage: { $tokens } tokens, { $cost } USD. Remaining: { $remaining_tokens } tokens, { $remaining_cost } USD. Token accounting: { $token_accounting }. Cost accounting: { $cost_accounting }.
+zc-goal-budget = Goal budget: { $tokens } tokens, { $cost } USD. Remaining: { $remaining_tokens } tokens, { $remaining_cost } USD. Token accounting: { $token_accounting }. Cost accounting: { $cost_accounting }.
+zc-goal-unlimited = unlimited
+zc-goal-unknown = unknown
+zc-goal-accounting-complete = complete
+zc-goal-accounting-incomplete = incomplete
 zc-goal-budget-updated = Goal budget updated.
 zc-goal-paused = Goal paused.
 zc-goal-paused-blocked = Goal paused: resolution is required before it can continue.

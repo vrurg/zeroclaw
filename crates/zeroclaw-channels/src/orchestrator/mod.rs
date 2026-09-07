@@ -8141,6 +8141,15 @@ async fn process_channel_message_body(
 
 fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
     use zeroclaw_runtime::goal_mode::GoalResponse;
+    match response {
+        GoalResponse::Status(projection) => {
+            return render_goal_status(projection, "goal-mode-status");
+        }
+        GoalResponse::Budget(projection) => {
+            return render_goal_status(projection, "goal-mode-budget");
+        }
+        _ => {}
+    }
     let key = match response {
         GoalResponse::Help => "goal-mode-help",
         GoalResponse::InvalidCommand => "goal-mode-command-invalid",
@@ -8162,9 +8171,70 @@ fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) ->
     channel_runtime_cli_string(key)
 }
 
+fn render_goal_status(
+    projection: &zeroclaw_runtime::goal_mode::GoalStatusProjection,
+    key: &str,
+) -> String {
+    let tokens = projection
+        .known_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unknown"));
+    let cost = projection
+        .known_cost_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unknown"));
+    let remaining_tokens = projection
+        .remaining_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            if projection.token_limit.is_some() {
+                channel_runtime_cli_string("goal-mode-unknown")
+            } else {
+                channel_runtime_cli_string("goal-mode-unlimited")
+            }
+        });
+    let remaining_cost = projection
+        .remaining_cost_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| {
+            if projection.cost_limit_usd.is_some() {
+                channel_runtime_cli_string("goal-mode-unknown")
+            } else {
+                channel_runtime_cli_string("goal-mode-unlimited")
+            }
+        });
+    let token_accounting = channel_runtime_cli_string(if projection.token_accounting_complete {
+        "goal-mode-accounting-complete"
+    } else {
+        "goal-mode-accounting-incomplete"
+    });
+    let cost_accounting = channel_runtime_cli_string(if projection.cost_accounting_complete {
+        "goal-mode-accounting-complete"
+    } else {
+        "goal-mode-accounting-incomplete"
+    });
+    let status = format!("{:?}", projection.status).to_lowercase();
+    channel_runtime_cli_string_with_args(
+        key,
+        &[
+            ("status", status.as_str()),
+            ("tokens", tokens.as_str()),
+            ("cost", cost.as_str()),
+            ("remaining_tokens", remaining_tokens.as_str()),
+            ("remaining_cost", remaining_cost.as_str()),
+            ("token_accounting", token_accounting.as_str()),
+            ("cost_accounting", cost_accounting.as_str()),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod goal_response_render_tests {
     use super::*;
+    use zeroclaw_runtime::{
+        control_plane::{GoalAccountingState, TaskStatus},
+        goal_mode::GoalStatusProjection,
+    };
 
     #[test]
     fn invalid_goal_command_uses_the_localized_semantic_response() {
@@ -8172,6 +8242,33 @@ mod goal_response_render_tests {
             render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::InvalidCommand),
             channel_runtime_cli_string("goal-mode-command-invalid")
         );
+    }
+
+    #[test]
+    fn goal_status_renders_ledger_totals_without_controller_identifiers() {
+        let projection = GoalStatusProjection {
+            task_id: "must-not-appear".to_string(),
+            status: TaskStatus::Running,
+            execution_epoch: 2,
+            token_limit: Some(100),
+            cost_limit_usd: Some(2.0),
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: None,
+            resumable: false,
+            known_tokens: Some(40),
+            known_cost_usd: Some(0.5),
+            token_accounting_complete: true,
+            cost_accounting_complete: true,
+            remaining_tokens: Some(60),
+            remaining_cost_usd: Some(1.5),
+        };
+
+        let rendered = render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::Status(
+            projection,
+        ));
+        assert!(rendered.contains("40 tokens"));
+        assert!(rendered.contains("60 tokens"));
+        assert!(!rendered.contains("must-not-appear"));
     }
 }
 

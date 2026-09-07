@@ -66,7 +66,15 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
 
 fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     use crate::wire::GoalResponse;
-
+    match response {
+        GoalResponse::Status(projection) => {
+            return goal_status_message(projection, "zc-goal-status");
+        }
+        GoalResponse::Budget(projection) => {
+            return goal_status_message(projection, "zc-goal-budget");
+        }
+        _ => {}
+    }
     let key = match response {
         GoalResponse::Help => "zc-goal-help",
         GoalResponse::InvalidCommand => "zc-goal-command-invalid",
@@ -84,6 +92,59 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         GoalResponse::Stale => "zc-goal-stale",
     };
     crate::i18n::t(key)
+}
+
+fn goal_status_message(projection: &crate::wire::GoalStatusProjection, key: &str) -> String {
+    let tokens = projection
+        .known_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unknown"));
+    let cost = projection
+        .known_cost_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unknown"));
+    let remaining_tokens = projection
+        .remaining_tokens
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| {
+            if projection.token_limit.is_some() {
+                crate::i18n::t("zc-goal-unknown")
+            } else {
+                crate::i18n::t("zc-goal-unlimited")
+            }
+        });
+    let remaining_cost = projection
+        .remaining_cost_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| {
+            if projection.cost_limit_usd.is_some() {
+                crate::i18n::t("zc-goal-unknown")
+            } else {
+                crate::i18n::t("zc-goal-unlimited")
+            }
+        });
+    let token_accounting = crate::i18n::t(if projection.token_accounting_complete {
+        "zc-goal-accounting-complete"
+    } else {
+        "zc-goal-accounting-incomplete"
+    });
+    let cost_accounting = crate::i18n::t(if projection.cost_accounting_complete {
+        "zc-goal-accounting-complete"
+    } else {
+        "zc-goal-accounting-incomplete"
+    });
+    crate::i18n::t_args(
+        key,
+        &[
+            ("status", projection.status.as_str()),
+            ("tokens", tokens.as_str()),
+            ("cost", cost.as_str()),
+            ("remaining_tokens", remaining_tokens.as_str()),
+            ("remaining_cost", remaining_cost.as_str()),
+            ("token_accounting", token_accounting.as_str()),
+            ("cost_accounting", cost_accounting.as_str()),
+        ],
+    )
 }
 
 /// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
@@ -19566,6 +19627,31 @@ mod tests {
             goal_response_message(&crate::wire::GoalResponse::InvalidCommand),
             crate::i18n::t("zc-goal-command-invalid")
         );
+    }
+
+    #[test]
+    fn goal_status_renders_ledger_totals_without_controller_identifiers() {
+        let projection = crate::wire::GoalStatusProjection {
+            task_id: "must-not-appear".to_string(),
+            status: "running".to_string(),
+            execution_epoch: 2,
+            token_limit: Some(100),
+            cost_limit_usd: Some(2.0),
+            accounting_state: "complete".to_string(),
+            pause_reason: None,
+            resumable: false,
+            known_tokens: Some(40),
+            known_cost_usd: Some(0.5),
+            token_accounting_complete: true,
+            cost_accounting_complete: true,
+            remaining_tokens: Some(60),
+            remaining_cost_usd: Some(1.5),
+        };
+
+        let rendered = goal_response_message(&crate::wire::GoalResponse::Status(projection));
+        assert!(rendered.contains("40 tokens"));
+        assert!(rendered.contains("60 tokens"));
+        assert!(!rendered.contains("must-not-appear"));
     }
 
     #[test]

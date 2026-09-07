@@ -17,6 +17,12 @@ pub struct GoalStatusProjection {
     pub accounting_state: String,
     pub pause_reason: Option<String>,
     pub resumable: bool,
+    pub known_tokens: Option<u64>,
+    pub known_cost_usd: Option<f64>,
+    pub token_accounting_complete: bool,
+    pub cost_accounting_complete: bool,
+    pub remaining_tokens: Option<u64>,
+    pub remaining_cost_usd: Option<f64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "status", rename_all = "snake_case")]
@@ -56,6 +62,34 @@ mod goal_wire_tests {
             serde_json::to_value(response).unwrap(),
             serde_json::json!({"response": {"kind": "invalid_command"}})
         );
+    }
+
+    #[test]
+    fn status_projection_preserves_ledger_derived_budget_fields() {
+        let projection: GoalStatusProjection = serde_json::from_value(serde_json::json!({
+            "task_id": "not-rendered",
+            "status": "running",
+            "execution_epoch": 4,
+            "token_limit": 100,
+            "cost_limit_usd": 2.5,
+            "accounting_state": "complete",
+            "pause_reason": null,
+            "resumable": false,
+            "known_tokens": 40,
+            "known_cost_usd": 1.25,
+            "token_accounting_complete": true,
+            "cost_accounting_complete": true,
+            "remaining_tokens": 60,
+            "remaining_cost_usd": 1.25
+        }))
+        .expect("the Goal RPC mirror must retain ledger-derived budget fields");
+
+        assert_eq!(projection.known_tokens, Some(40));
+        assert_eq!(projection.known_cost_usd, Some(1.25));
+        assert!(projection.token_accounting_complete);
+        assert!(projection.cost_accounting_complete);
+        assert_eq!(projection.remaining_tokens, Some(60));
+        assert_eq!(projection.remaining_cost_usd, Some(1.25));
     }
 }
 
