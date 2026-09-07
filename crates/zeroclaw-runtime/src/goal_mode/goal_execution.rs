@@ -156,7 +156,24 @@ impl GoalExecutionSupervisor {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
-        let previous = self.scope_for_session(&ingress).await?;
+        let mut previous = self.scope_for_session(&ingress).await?;
+        // A completed epoch becomes terminal before its adapter appends and
+        // delivers the verified candidate. A replacement must wait for that
+        // exact worker to finish its final delivery path; otherwise it could
+        // delete the predecessor control row underneath that delivery.
+        if matches!(&command, GoalCommand::Start { .. })
+            && let Some(scope) = previous.as_ref()
+            && let Some(current) = self
+                .engine
+                .registry
+                .current_goal_for_session(scope.session_id())
+                .await?
+            && current.id == scope.task_id()
+            && current.status.is_terminal()
+        {
+            self.drain_after_fence(scope).await?;
+            previous = None;
+        }
         let (response, execution) = self
             .engine
             .runtime
@@ -740,6 +757,16 @@ impl GoalExecutionEngine {
         // Delivery failure is intentionally observable but does not rewrite
         // the verified Completed lifecycle state.
         lease.append_verified_candidate(candidate).await?;
+        match self
+            .registry
+            .mark_session_goal_delivered(scope.task_id(), scope.session_id())
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                bail!("Goal delivery lost its exact task binding")
+            }
+        }
         lease
             .publish_goal_notice(GoalExecutionNotice::Completed)
             .await

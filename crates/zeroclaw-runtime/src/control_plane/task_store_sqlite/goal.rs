@@ -1132,6 +1132,25 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn mark_session_goal_delivered(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE tasks
+                SET delivered = 1
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'completed' AND delivered = 0",
+            params![task_id, session_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&conn, task_id, session_id);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn admit_pending_operation(
         &self,
         task_id: &str,
@@ -1880,5 +1899,50 @@ mod tests {
                 "durable Goal control state must not outlive its disposed session"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn completed_goal_records_delivery_only_for_its_exact_current_task() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("goal-delivery", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.session_id = Some("rpc_delivery".to_owned());
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(task, goal_record("goal-delivery", "finish"))
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    "goal-delivery",
+                    "rpc_delivery",
+                    1,
+                    TaskStatus::Completed,
+                    None,
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(
+            store
+                .mark_session_goal_delivered("goal-delivery", "rpc_delivery")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(store.get("goal-delivery").await.unwrap().unwrap().delivered);
+        assert_eq!(
+            store
+                .mark_session_goal_delivered("goal-delivery", "rpc_delivery")
+                .await
+                .unwrap(),
+            GoalTransitionResult::Stale,
+            "a second callback cannot claim a second delivery"
+        );
     }
 }

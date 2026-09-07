@@ -393,6 +393,15 @@ pub trait GoalTaskRegistry: Send + Sync {
         error: Option<String>,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Record successful user-visible delivery for the exact completed Goal.
+    /// This is a delivery fact on the canonical task row; it does not store or
+    /// recreate the candidate payload.
+    async fn mark_session_goal_delivered(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult>;
+
     /// Reserve the one durable pending-operation slot for the exact running
     /// Goal epoch. This is an execution fence, not a usage reservation.
     async fn admit_pending_operation(
