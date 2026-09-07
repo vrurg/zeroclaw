@@ -97,7 +97,7 @@ pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser as MarkdownParser, Tag};
@@ -1894,7 +1894,6 @@ async fn maybe_apply_runtime_config_update_locked(ctx: &ChannelRuntimeContext) -
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
-    revoke_matrix_goals_for_policy(ctx, next_config.as_ref()).await?;
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
@@ -1916,7 +1915,7 @@ async fn maybe_apply_runtime_config_update_locked(ctx: &ChannelRuntimeContext) -
     {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
-            return Ok(());
+            bail!("runtime config update rejected: model provider warmup failed");
         }
         ::zeroclaw_log::record!(
             WARN,
@@ -1928,6 +1927,11 @@ async fn maybe_apply_runtime_config_update_locked(ctx: &ChannelRuntimeContext) -
             "ModelProvider warmup failed after config reload (retryable, applying anyway)"
         );
     }
+    // Policy cancellation is irreversible. Do not fence retained Goals until
+    // the replacement provider has passed the non-retryable readiness gate;
+    // otherwise the triggering command could continue through old defaults
+    // after the durable cancellation has already committed.
+    revoke_matrix_goals_for_policy(ctx, next_config.as_ref()).await?;
 
     {
         let mut override_guard = ctx
