@@ -1156,7 +1156,8 @@ fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
 }
 
 /// Controller response before a transport renders it through Fluent.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "status", rename_all = "snake_case")]
 pub enum GoalResponse {
     Help,
     Disabled,
@@ -1189,7 +1190,8 @@ pub enum GoalPendingAction {
 }
 
 /// Durable state visible to the future Matrix and ZeroCode renderers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct GoalStatusProjection {
     pub task_id: String,
     pub status: TaskStatus,
