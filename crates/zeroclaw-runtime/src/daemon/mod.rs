@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::Utc;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -1057,6 +1057,14 @@ pub async fn run(
             },
         ),
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
+    }
+
+    if let Some(rpc_ctx) = &rpc_ctx {
+        rpc_ctx
+            .goal_runtime
+            .pause_all_for_runtime_interruption()
+            .await
+            .context("pause ZeroCode Goal work before daemon runtime interruption")?;
     }
 
     channels_cancel.cancel();

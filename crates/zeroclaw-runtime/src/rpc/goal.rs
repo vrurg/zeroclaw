@@ -368,6 +368,22 @@ impl RpcGoalRuntime {
         Ok(())
     }
 
+    /// Fence resident ZeroCode Goal workers before the daemon tears down the
+    /// RPC transports that own their live session drivers.
+    pub async fn pause_all_for_runtime_interruption(&self) -> Result<()> {
+        let supervisors = self
+            .supervisors
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for supervisor in supervisors {
+            supervisor.pause_all_for_runtime_interruption().await?;
+        }
+        Ok(())
+    }
+
     /// Submit one parsed Goal command through the current ZeroCode session.
     pub async fn submit(
         &self,
