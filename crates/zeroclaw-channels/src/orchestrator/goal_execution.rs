@@ -11,6 +11,7 @@ use zeroclaw_api::{
     channel::ChannelMessage,
     model_provider::{ChatMessage, ChatRequest},
 };
+use zeroclaw_goal::control::goal_parent_turn_input;
 use zeroclaw_runtime::{
     agent::cost::build_type_level_model_provider_pricing,
     agent::execution_tree_budget::ExecutionTreeBudget,
@@ -27,11 +28,12 @@ use zeroclaw_runtime::{
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
-    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn, channel_ingress_context,
-    find_channel_for_message, get_or_create_provider, get_route_selection,
-    model_provider_entry_for_ref, outbound_content_format_for_channel,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection,
+    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
+    build_channel_system_prompt_for_message_with_signal,
+    callable_protocol_exposed_for_channel_turn, channel_ingress_context, find_channel_for_message,
+    get_or_create_provider, get_route_selection, model_provider_entry_for_ref,
+    outbound_content_format_for_channel, runtime_defaults_from_config, runtime_defaults_snapshot,
+    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
 
@@ -326,6 +328,43 @@ impl MatrixGoalExecutionLease {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn base_system_prompt(
+        &self,
+        provider: &dyn zeroclaw_providers::ModelProvider,
+        route: &ChannelRouteSelection,
+    ) -> String {
+        let excluded_tools = Self::excluded_tools(self.context.as_ref(), &self.message);
+        let native_tool_specs_present =
+            zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+                provider,
+                route.model.as_str(),
+                self.context.tools_registry.as_ref(),
+                excluded_tools,
+                self.context.activated_tools.as_ref(),
+            )
+            .unwrap_or(false);
+        let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
+            native_tool_specs_present,
+            self.context.agent_cfg.resolved.strict_tool_parsing,
+            self.context.system_prompt.as_str(),
+        );
+        let base_system_prompt = system_prompt_for_channel_turn(
+            self.context.as_ref(),
+            self.context.system_prompt.as_str(),
+            true,
+            callable_protocol_exposed,
+            excluded_tools,
+        );
+        let target_channel =
+            find_channel_for_message(&self.context.channels_by_name, &self.message);
+        build_channel_system_prompt_for_message_with_signal(
+            &base_system_prompt,
+            &self.message,
+            target_channel,
+            native_tool_specs_present,
+        )
+    }
 }
 
 #[async_trait]
@@ -353,16 +392,18 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let mut history = turn.working_history;
-        let turn_kind = match turn.kind {
-            GoalParentTurnKind::Start => "start",
-            GoalParentTurnKind::Resume => "resume",
-            GoalParentTurnKind::Continue => "continue",
+        let input = goal_parent_turn_input(&turn);
+        let base_system_prompt = self.base_system_prompt(provider.as_ref(), &route);
+        let mut history = match turn.kind {
+            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
+                input.goal_start_transcript(&base_system_prompt, turn.working_history)?
+            }
+            GoalParentTurnKind::Continue => {
+                let mut history = turn.working_history;
+                input.refresh_goal_continuation(&base_system_prompt, &mut history)?;
+                history
+            }
         };
-        history.push(ChatMessage::system(format!(
-            "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-            turn.objective
-        )));
         let turn_id = uuid::Uuid::new_v4().to_string();
         let loop_knobs = LoopKnobs::default();
         let execution_tree_budget = ExecutionTreeBudget::from_limit(
@@ -504,5 +545,33 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             ))
             .await
             .context("deliver Matrix Goal lifecycle notice")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_parent_input_keeps_lifecycle_phase_out_of_user_control() {
+        for (kind, expected) in [
+            (GoalParentTurnKind::Start, "start"),
+            (GoalParentTurnKind::Resume, "resume"),
+            (GoalParentTurnKind::Continue, "continue"),
+        ] {
+            let input = goal_parent_turn_input(&GoalParentTurn {
+                kind,
+                objective: "the trusted success criterion".to_owned(),
+                working_history: Vec::new(),
+            });
+            let directive = input.compose_goal_system_row("Ordinary policy");
+            assert_eq!(directive.role, "system");
+            assert!(directive.content.contains("the trusted success criterion"));
+            assert!(
+                directive
+                    .content
+                    .contains(&format!("Turn kind (trusted runtime fact): {expected}"))
+            );
+        }
     }
 }
