@@ -63,6 +63,13 @@ impl ZeroCodeGoalSessionDriver {
             .get_generation(raw_session_id)
             .await
             .context("ZeroCode Goal session is absent")?;
+        ensure!(
+            matches!(
+                context.sessions.session_owner_tui_id(raw_session_id).await,
+                Some(Some(owner)) if owner == tui_id
+            ),
+            "ZeroCode Goal caller does not own the session"
+        );
         let agent_alias = context
             .sessions
             .get_agent_alias(raw_session_id)
@@ -142,6 +149,16 @@ impl ZeroCodeGoalSessionDriver {
                 .as_deref()
                 == Some(self.agent_alias.as_str()),
             "ZeroCode Goal session agent changed"
+        );
+        ensure!(
+            matches!(
+                self.context
+                    .sessions
+                    .session_owner_tui_id(self.raw_session_id())
+                    .await,
+                Some(Some(owner)) if owner == self.tui_id
+            ),
+            "ZeroCode Goal caller no longer owns the session"
         );
         Ok(agent)
     }
@@ -364,9 +381,12 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
+        let config = context.config.read().clone();
+        if !config.goal.enabled {
+            return Ok(GoalResponse::Disabled);
+        }
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
-        let config = context.config.read().clone();
         let limits = config.goal.effective_limits().map_err(|error| {
             anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
         })?;

@@ -2842,6 +2842,19 @@ impl RpcDispatcher {
             .tui_id
             .clone()
             .ok_or_else(|| rpc_err(AUTH_REQUIRED, "Goal commands require an initialized TUI"))?;
+        let owns_session = matches!(
+            self.ctx
+                .sessions
+                .session_owner_tui_id(&req.session_id)
+                .await,
+            Some(Some(owner)) if owner == tui_id
+        );
+        if !owns_session {
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Caller does not own this session",
+            ));
+        }
         let command = zeroclaw_commands::goal::parse_goal_command(&req.command)
             .map_err(|error| rpc_err(INVALID_PARAMS, format!("invalid Goal command: {error:?}")))?;
         let driver = Arc::new(
