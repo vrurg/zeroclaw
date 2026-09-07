@@ -93,6 +93,18 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// Exact durable identity captured before a policy cutover fences a Goal.
+///
+/// Policy evaluation stays in the runtime/channel layer. The storage boundary
+/// receives only the canonical task, session, and executor-fence facts it
+/// needs to make the cancellation atomic and stale-safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPolicyRevocationTarget {
+    pub task_id: String,
+    pub session_id: String,
+    pub expected_epoch: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -284,6 +296,28 @@ pub enum TaskContinuationConversationScope {
 
 #[async_trait::async_trait]
 pub trait GoalTaskRegistry: Send + Sync {
+    /// List the canonical non-terminal session Goals owned by an agent for a
+    /// prospective policy cutover. The caller must classify their durable
+    /// ingress facts before requesting a mutation.
+    async fn list_nonterminal_session_goals_for_agent(
+        &self,
+        agent: &str,
+    ) -> anyhow::Result<Vec<TaskRecord>> {
+        let _ = agent;
+        anyhow::bail!("goal registry does not support policy-revocation lookup")
+    }
+
+    /// Atomically terminal-cancel the exact Goals selected by a policy
+    /// cutover. Pending-operation state deliberately remains intact so an
+    /// already admitted operation can settle its accounting after the fence.
+    async fn cancel_goals_for_policy_revocation(
+        &self,
+        targets: &[GoalPolicyRevocationTarget],
+    ) -> anyhow::Result<GoalTransitionResult> {
+        let _ = targets;
+        anyhow::bail!("goal registry does not support policy-revocation cancellation")
+    }
+
     /// Resolve an observational latest non-terminal goal for `agent`.
     ///
     /// This is not a V1 control or attribution authority: multiple sessions
