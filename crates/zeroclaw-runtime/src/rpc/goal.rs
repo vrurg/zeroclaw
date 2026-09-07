@@ -338,6 +338,20 @@ pub struct RpcGoalRuntime {
 }
 
 impl RpcGoalRuntime {
+    /// Fence and dispose the current Goal before its RPC session disappears.
+    ///
+    /// This must run before the caller waits on `SessionActorQueue`: an active
+    /// Goal owns that queue until its admitted operation has settled.
+    pub async fn dispose_session(&self, session_id: &str) -> Result<()> {
+        if let Some(supervisor) = self.supervisor(session_id).await {
+            supervisor
+                .dispose_session(&GoalSessionKey::zero_code(session_id)?.durable_id())
+                .await?;
+            self.remove_supervisor(session_id).await;
+        }
+        Ok(())
+    }
+
     /// Submit one parsed Goal command through the current ZeroCode session.
     pub async fn submit(
         &self,
