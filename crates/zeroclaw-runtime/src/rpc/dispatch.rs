@@ -8444,6 +8444,12 @@ mod tests {
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
     }
 
+    #[test]
+    fn session_goal_method_is_registered() {
+        assert_eq!(Method::from_wire("session/goal"), Some(Method::SessionGoal));
+        assert_eq!(Method::SessionGoal.wire_name(), "session/goal");
+    }
+
     #[tokio::test]
     async fn config_reload_shuts_down_gateway_before_daemon_reload() {
         use zeroclaw_infra::session_queue::SessionActorQueue;
@@ -13305,6 +13311,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -13349,6 +13356,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -13452,6 +13460,7 @@ mod tests {
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());

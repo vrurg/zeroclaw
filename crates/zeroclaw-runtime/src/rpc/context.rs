@@ -413,6 +413,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 
@@ -440,6 +441,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            goal_runtime: Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         })
     }
 }
