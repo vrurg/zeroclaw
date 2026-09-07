@@ -7,6 +7,41 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoalStatusProjection {
+    pub task_id: String,
+    pub status: String,
+    pub execution_epoch: i64,
+    pub token_limit: Option<u64>,
+    pub cost_limit_usd: Option<f64>,
+    pub accounting_state: String,
+    pub pause_reason: Option<String>,
+    pub resumable: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "status", rename_all = "snake_case")]
+pub enum GoalResponse {
+    Help,
+    Disabled,
+    Started(GoalStatusProjection),
+    Status(GoalStatusProjection),
+    Budget(GoalStatusProjection),
+    BudgetUpdated(GoalStatusProjection),
+    Paused(GoalStatusProjection),
+    AlreadyPaused(GoalStatusProjection),
+    Resumed(GoalStatusProjection),
+    Cancelled(GoalStatusProjection),
+    AlreadyCancelled(GoalStatusProjection),
+    NoCurrentGoal,
+    AlreadyActive,
+    Terminal(GoalStatusProjection),
+    Stale,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionGoalResult {
+    pub response: GoalResponse,
+}
+
 // ── Initialize shapes ───────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
