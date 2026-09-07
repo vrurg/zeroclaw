@@ -109,6 +109,7 @@ pub enum Method {
     SessionNew,
     SessionClose,
     SessionPrompt,
+    SessionGoal,
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
@@ -248,6 +249,7 @@ impl Method {
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
         (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionGoal, "session/goal"),
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
@@ -3553,6 +3555,7 @@ impl RpcDispatcher {
                 self.prompt_tasks.push(task);
                 return;
             }
+            Method::SessionGoal => self.handle_session_goal(params).await,
             Method::SessionConfigure => self.handle_session_configure(params).await,
             Method::SessionCancel => self.handle_session_cancel(params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(params).await,
@@ -7380,6 +7383,33 @@ impl RpcDispatcher {
         )
         .await;
         denied
+    }
+
+    async fn handle_session_goal(&self, params: &Value) -> RpcResult {
+        let req: SessionGoalParams = parse_params(params)?;
+        let tui_id = self
+            .tui_id
+            .clone()
+            .ok_or_else(|| rpc_err(AUTH_REQUIRED, "Goal commands require an initialized TUI"))?;
+        let command = zeroclaw_commands::goal::parse_goal_command(&req.command)
+            .map_err(|error| rpc_err(INVALID_PARAMS, format!("invalid Goal command: {error:?}")))?;
+        let driver = Arc::new(
+            crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
+                Arc::clone(&self.ctx),
+                Arc::clone(&self.rpc),
+                req.session_id.clone(),
+                tui_id,
+            )
+            .await
+            .map_err(|error| rpc_err(SESSION_NOT_FOUND, error.to_string()))?,
+        );
+        let response = self
+            .ctx
+            .goal_runtime
+            .submit(Arc::clone(&self.ctx), driver, command)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        to_result(SessionGoalResult { response })
     }
 
     /// Emit the terminal `session/update` notification for a turn.
