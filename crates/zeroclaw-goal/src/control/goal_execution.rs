@@ -1097,6 +1097,7 @@ impl GoalExecutionEngine {
     ) -> Result<GoalExecutionOutcome> {
         let scope = request.scope().clone();
         let resume_response = request.resume_response().map(ToOwned::to_owned);
+        let initial_turn_kind = request.initial_turn_kind();
         let Some(objective) = self.current_objective(&scope).await? else {
             return Ok(GoalExecutionOutcome::Fenced);
         };
@@ -1123,8 +1124,14 @@ impl GoalExecutionEngine {
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
-                self.run_scoped(&scope, &objective, lease.as_mut(), &checkpoint)
-                    .await
+                self.run_scoped(
+                    &scope,
+                    &objective,
+                    initial_turn_kind,
+                    lease.as_mut(),
+                    &checkpoint,
+                )
+                .await
             })
             .await
     }
@@ -1153,6 +1160,7 @@ impl GoalExecutionEngine {
         &self,
         scope: &GoalExecutionScope,
         objective: &str,
+        mut parent_turn_kind: super::GoalParentTurnKind,
         lease: &mut dyn GoalSessionExecutionLease,
         checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<GoalExecutionOutcome> {
@@ -1181,6 +1189,7 @@ impl GoalExecutionEngine {
                 .run_parent_turn(
                     scope,
                     GoalParentTurn {
+                        kind: parent_turn_kind,
                         objective: objective.to_owned(),
                         working_history: working_history.clone(),
                     },
@@ -1426,6 +1435,7 @@ impl GoalExecutionEngine {
                 VerifierDecision::Continue { reason } => {
                     working_history.push(ChatMessage::assistant(candidate));
                     working_history.push(goal_verifier_feedback_message(&reason));
+                    parent_turn_kind = super::GoalParentTurnKind::Continue;
                     log_verifier_diagnostic(
                         scope,
                         &candidate_fingerprint,
