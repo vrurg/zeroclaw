@@ -1132,6 +1132,7 @@ pub async fn run_with_authority(
             hooks,
             cert_audit,
             auth: rpc_auth,
+            goal_runtime: std::sync::Arc::new(crate::rpc::goal::RpcGoalRuntime::default()),
         }))
     } else {
         None
