@@ -5,6 +5,7 @@ pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 mod foreground;
+pub(crate) mod goal_execution;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -114,6 +115,7 @@ use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
+use zeroclaw_commands::goal::{GoalCommandParseError, parse_goal_command};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
 #[cfg(test)]
@@ -143,6 +145,7 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 use self::foreground::{
     ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
 };
+use self::goal_execution::submit_matrix_goal;
 use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -7211,6 +7214,27 @@ async fn process_channel_message_body(
     cancellation_token: CancellationToken,
     channel_composite: String,
 ) {
+    // Capture Goal command authority before mutable hooks. A hook can cancel
+    // the message, but it cannot rewrite its principal, session, route, or
+    // command before admission.
+    let goal_snapshot = if is_matrix_channel_name(&msg.channel)
+        && !matches!(
+            parse_goal_command(&msg.content),
+            Err(GoalCommandParseError::NotGoalCommand)
+        ) {
+        Some((
+            runtime_conversation_history_key(ctx.as_ref(), &msg),
+            msg.clone(),
+            parse_goal_command(&msg.content),
+        ))
+    } else {
+        None
+    };
+    let logged_content = if goal_snapshot.is_some() {
+        "<goal command>"
+    } else {
+        msg.content.as_str()
+    };
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -7219,7 +7243,7 @@ async fn process_channel_message_body(
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content": logged_content,
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -7257,6 +7281,40 @@ async fn process_channel_message_body(
             );
             return;
         }
+    }
+
+    if let Some((goal_history_key, original_goal_message, parsed_goal_command)) = goal_snapshot {
+        let response = match parsed_goal_command {
+            Ok(command) => match submit_matrix_goal(
+                Arc::clone(&ctx),
+                goal_history_key,
+                original_goal_message.clone(),
+                command,
+            )
+            .await
+            {
+                Ok(response) => render_goal_response(&response),
+                Err(error) => channel_runtime_cli_string_with_args(
+                    "goal-mode-command-failed",
+                    &[(
+                        "error",
+                        zeroclaw_providers::sanitize_api_error(&error.to_string()).as_str(),
+                    )],
+                ),
+            },
+            Err(error) => channel_runtime_cli_string_with_args(
+                "goal-mode-command-invalid",
+                &[("error", &format!("{error:?}"))],
+            ),
+        };
+        if let Some(channel) =
+            find_channel_for_message(&ctx.channels_by_name, &original_goal_message)
+        {
+            let _ = channel
+                .send(&SendMessage::reply_to(&original_goal_message, response))
+                .await;
+        }
+        return;
     }
 
     if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
@@ -9051,6 +9109,28 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+}
+
+fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
+    use zeroclaw_runtime::goal_mode::GoalResponse;
+    let key = match response {
+        GoalResponse::Help => "goal-mode-help",
+        GoalResponse::Disabled => "goal-mode-disabled",
+        GoalResponse::Started(_) => "goal-mode-started",
+        GoalResponse::Status(_) => "goal-mode-status",
+        GoalResponse::Budget(_) => "goal-mode-budget",
+        GoalResponse::BudgetUpdated(_) => "goal-mode-budget-updated",
+        GoalResponse::Paused(_) => "goal-mode-paused",
+        GoalResponse::AlreadyPaused(_) => "goal-mode-already-paused",
+        GoalResponse::Resumed(_) => "goal-mode-resumed",
+        GoalResponse::Cancelled(_) => "goal-mode-cancelled",
+        GoalResponse::AlreadyCancelled(_) => "goal-mode-already-cancelled",
+        GoalResponse::NoCurrentGoal => "goal-mode-no-current",
+        GoalResponse::AlreadyActive => "goal-mode-already-active",
+        GoalResponse::Terminal(_) => "goal-mode-terminal",
+        GoalResponse::Stale => "goal-mode-stale",
+    };
+    channel_runtime_cli_string(key)
 }
 
 /// Claim the sender's interruption slot for a message that is about to be
