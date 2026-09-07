@@ -1992,6 +1992,11 @@ impl RpcDispatcher {
         // owns this permit until its terminal state and transcript writes are
         // complete. Removal then happens under the same incarnation fence.
         self.ctx.sessions.signal_session_removal(&req.session_id);
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -2072,6 +2077,11 @@ impl RpcDispatcher {
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
         self.ctx.sessions.signal_session_kill(sid);
+        self.ctx
+            .goal_runtime
+            .dispose_session(sid)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -3279,6 +3289,11 @@ impl RpcDispatcher {
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         self.ctx.sessions.signal_session_removal(&req.session_id);
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
