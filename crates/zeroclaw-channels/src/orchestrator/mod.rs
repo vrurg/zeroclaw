@@ -138,7 +138,8 @@ use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
 
 use self::foreground::{
-    ConversationLocks, foreground_lock, persist_lock, wait_for_foreground_lease,
+    ConversationLocks, foreground_lock, pause_goal_supervisors_for_runtime_interruption,
+    persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{dispose_matrix_goal, submit_matrix_goal};
 use self::turn_execution::resolved_channel_execution;
@@ -8421,6 +8422,23 @@ impl AgentRouter {
         }
         None
     }
+
+    /// Fence Goal work before this channel runtime loses its live session
+    /// drivers during daemon shutdown or reload.
+    async fn pause_goals_for_runtime_interruption(&self) -> Result<()> {
+        let mut contexts = self.by_agent.values().cloned().collect::<Vec<_>>();
+        if let Some(context) = self.single_ctx.as_ref()
+            && !contexts
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, context))
+        {
+            contexts.push(Arc::clone(context));
+        }
+        for context in contexts {
+            pause_goal_supervisors_for_runtime_interruption(&context.persist_locks).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Split an inbound gate reference into its run part and revision. A reference
@@ -13431,7 +13449,13 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+    let shutdown_router = router.clone();
     run_message_dispatch_loop(rx, router, max_in_flight).await;
+
+    shutdown_router
+        .pause_goals_for_runtime_interruption()
+        .await
+        .context("pause Goal work before channel runtime interruption")?;
 
     for h in listener_handles {
         let _ = h.await;

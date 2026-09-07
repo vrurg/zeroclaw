@@ -256,6 +256,56 @@ impl GoalExecutionSupervisor {
         dispose_unowned_session_goal(self.engine.registry.as_ref(), session_id).await
     }
 
+    /// Fence and drain every worker owned by this runtime before it is
+    /// replaced. This is intentionally transport-neutral: a host owns the
+    /// shutdown trigger, while the supervisor owns the exact Goal epochs.
+    ///
+    /// An already-admitted model operation is never aborted by this method.
+    /// The durable pause fence prevents its result from admitting follow-up
+    /// work, then draining lets it settle its observed usage.
+    pub async fn pause_all_for_runtime_interruption(&self) -> Result<()> {
+        let scopes = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .map(|(key, worker)| {
+                    GoalExecutionScope::new(
+                        key.task_id.clone(),
+                        key.session_id.clone(),
+                        worker.execution_epoch,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for scope in &scopes {
+            match self
+                .engine
+                .registry
+                .pause_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    GoalPauseState {
+                        reason: GoalPauseReason::DaemonRestart,
+                        description: Some("runtime interruption".to_owned()),
+                        blockers: Vec::new(),
+                    },
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied
+                | GoalTransitionResult::Stale
+                | GoalTransitionResult::Missing => {}
+            }
+        }
+
+        for scope in &scopes {
+            let _ = self.drain_lifecycle_fence(scope).await?;
+        }
+        Ok(())
+    }
+
     /// Return whether the exact epoch still has a process-local owner.
     ///
     /// This stays true after a worker finishes and until [`Self::drain`]
@@ -1363,6 +1413,50 @@ mod tests {
             output_tokens: Some(output),
             cached_input_tokens: None,
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_interruption_fences_and_drains_each_owned_goal_epoch() {
+        let (store, accountant, scope, _directory) = accountant_fixture().await;
+        let runtime = GoalRuntime::with_tracker(
+            store.clone() as Arc<dyn GoalTaskRegistry>,
+            Arc::clone(&accountant.tracker),
+        );
+        let engine = Arc::new(
+            runtime
+                .execution_engine(
+                    Arc::clone(&accountant.tracker),
+                    "main",
+                    Arc::clone(&accountant.pricing),
+                )
+                .unwrap(),
+        );
+        let supervisor = GoalExecutionSupervisor::new(engine);
+        supervisor.workers.lock().await.insert(
+            GoalWorkerKey::from_scope(&scope),
+            GoalWorker {
+                execution_epoch: scope.execution_epoch(),
+                handle: zeroclaw_spawn::spawn!(async { Ok(GoalExecutionOutcome::Completed) }),
+            },
+        );
+
+        supervisor
+            .pause_all_for_runtime_interruption()
+            .await
+            .unwrap();
+
+        let task = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert!(matches!(
+            goal.pause_reason,
+            Some(GoalPauseReason::DaemonRestart)
+        ));
+        assert!(!supervisor.owns_scope(&scope).await);
     }
 
     #[test]

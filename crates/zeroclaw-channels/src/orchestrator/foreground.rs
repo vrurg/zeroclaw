@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_runtime::goal_mode::GoalExecutionSupervisor;
 
@@ -68,6 +69,35 @@ pub(crate) fn goal_supervisor_slot(
     key: &str,
 ) -> Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>> {
     locks_for_key(locks, key).goal_supervisor
+}
+
+/// Pause and drain every Goal worker registered by one channel runtime before
+/// that runtime is replaced. The slots are process-local ownership handles,
+/// not a second source of Goal lifecycle truth.
+pub(crate) async fn pause_goal_supervisors_for_runtime_interruption(
+    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+) -> Result<()> {
+    let slots = {
+        let locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+        locks
+            .values()
+            .map(|conversation| Arc::clone(&conversation.goal_supervisor))
+            .collect::<Vec<_>>()
+    };
+    let mut supervisors = Vec::new();
+    for slot in slots {
+        if let Some(supervisor) = slot.lock().await.as_ref().cloned()
+            && !supervisors
+                .iter()
+                .any(|existing: &Arc<GoalExecutionSupervisor>| Arc::ptr_eq(existing, &supervisor))
+        {
+            supervisors.push(supervisor);
+        }
+    }
+    for supervisor in supervisors {
+        supervisor.pause_all_for_runtime_interruption().await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn wait_for_foreground_lease(
