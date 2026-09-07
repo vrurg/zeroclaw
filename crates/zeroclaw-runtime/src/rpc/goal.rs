@@ -17,16 +17,20 @@ use zeroclaw_api::{
 
 use crate::{
     agent::agent::{Agent, IsolatedTranscriptSource, build_session_model_provider},
+    agent::cost::build_type_level_model_provider_pricing,
+    control_plane::control_plane,
+    cost::CostTracker,
     goal_mode::{
-        GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalIngressPrincipal,
-        GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult,
-        GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
-        GoalSessionLease, GoalSurface, GoalVerifierTurn,
+        GoalExecutionNotice, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
+        GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
+        GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
+        GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
     },
     rpc::context::RpcContext,
 };
 
 use crate::goal_mode::GoalExecutionSupervisor;
+use zeroclaw_commands::goal::GoalCommand;
 
 const GOAL_UPDATE_METHOD: &str = "session/goal_update";
 
@@ -85,6 +89,10 @@ impl ZeroCodeGoalSessionDriver {
             GoalSessionKey::ZeroCode { raw_session_id } => raw_session_id,
             GoalSessionKey::Matrix { .. } => unreachable!("ZeroCode driver has a typed key"),
         }
+    }
+
+    pub fn agent_alias(&self) -> &str {
+        &self.agent_alias
     }
 
     fn assert_ingress(&self, ingress: &GoalIngressContext) -> Result<()> {
@@ -330,6 +338,77 @@ pub struct RpcGoalRuntime {
 }
 
 impl RpcGoalRuntime {
+    /// Submit one parsed Goal command through the current ZeroCode session.
+    pub async fn submit(
+        &self,
+        context: Arc<RpcContext>,
+        driver: Arc<ZeroCodeGoalSessionDriver>,
+        command: GoalCommand,
+    ) -> Result<GoalResponse> {
+        let control_plane = control_plane().context("Goal control plane is unavailable")?;
+        let registry = control_plane.goal_store()?;
+        let config = context.config.read().clone();
+        let limits = config.goal.effective_limits().map_err(|error| {
+            anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
+        })?;
+        let settings = GoalHostSettings::new(
+            config.goal.enabled,
+            zeroclaw_commands::goal::GoalBudgetLimits {
+                token_limit: limits.token_limit,
+                cost_limit_usd: limits.cost_limit_usd,
+            },
+            std::process::id(),
+            control_plane.boot_id.clone(),
+        )?;
+        let session_id = driver.raw_session_id().to_owned();
+        let current = registry
+            .current_goal_for_session(&driver.session_key().durable_id())
+            .await?;
+        let supervisor = match (self.supervisor(&session_id).await, current) {
+            (Some(supervisor), _) => supervisor,
+            (None, Some(task)) if !task.status.is_terminal() => {
+                bail!("Goal session has durable work without a local supervisor")
+            }
+            (None, _) => {
+                let runtime = GoalRuntime::new(Arc::clone(&registry));
+                let tracker = CostTracker::get_or_init_global_required(
+                    config.cost.clone(),
+                    &config.data_dir,
+                )?;
+                let engine = Arc::new(runtime.execution_engine(
+                    tracker,
+                    driver.agent_alias().to_owned(),
+                    Arc::new(build_type_level_model_provider_pricing(&config)),
+                )?);
+                let supervisor = Arc::new(GoalExecutionSupervisor::new(engine));
+                self.install_supervisor(session_id.clone(), Arc::clone(&supervisor))
+                    .await;
+                supervisor
+            }
+        };
+        let ingress = GoalIngressContext::trusted(
+            driver.session_key().clone(),
+            driver.agent_alias().to_owned(),
+            format!("zerocode:{session_id}"),
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: driver.tui_id.clone(),
+            },
+        )?;
+        let response = supervisor
+            .submit(settings, ingress, driver, command)
+            .await?;
+        if matches!(
+            response,
+            GoalResponse::Paused(_)
+                | GoalResponse::AlreadyPaused(_)
+                | GoalResponse::Cancelled(_)
+                | GoalResponse::AlreadyCancelled(_)
+                | GoalResponse::Terminal(_)
+        ) {
+            self.remove_supervisor(&session_id).await;
+        }
+        Ok(response)
+    }
     /// Return the command lease for one raw RPC session identifier.
     pub async fn command_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.command_locks.lock().await;
