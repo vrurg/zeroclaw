@@ -2142,6 +2142,44 @@ impl Chat {
                         }
                     }
                 }
+                Ok(notif) if notif.method == "session/goal_update" => {
+                    let Some(session_id) = notif.params.get("session_id").and_then(|v| v.as_str())
+                    else {
+                        continue;
+                    };
+                    let Some(state) = self.state_for_session_mut(session_id) else {
+                        continue;
+                    };
+                    match notif.params.get("type").and_then(|v| v.as_str()) {
+                        Some("verified_candidate") => {
+                            if let Some(candidate) =
+                                notif.params.get("candidate").and_then(|v| v.as_str())
+                            {
+                                state
+                                    .entries
+                                    .push(ChatEntry::AgentMessage(Arc::<str>::from(candidate)));
+                                state.mark_dirty_append();
+                            }
+                        }
+                        Some("completed") => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                    "zc-goal-completed",
+                                ))));
+                            state.mark_dirty_append();
+                        }
+                        Some("paused_for_blocker") => {
+                            state
+                                .entries
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                    "zc-goal-paused",
+                                ))));
+                            state.mark_dirty_append();
+                        }
+                        _ => {}
+                    }
+                }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     self.begin_notification_resync();
                     continue;
