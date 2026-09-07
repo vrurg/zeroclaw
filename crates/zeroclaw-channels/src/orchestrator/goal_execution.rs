@@ -26,10 +26,12 @@ use zeroclaw_runtime::{
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
-    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn, find_channel_for_message,
-    get_or_create_provider, get_route_selection, model_provider_entry_for_ref,
-    outbound_content_format_for_channel, runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection,
+    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
+    build_channel_system_prompt_for_message_with_signal,
+    callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
+    get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
+    runtime_defaults_from_config, runtime_defaults_snapshot,
+    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
 };
 
@@ -311,6 +313,64 @@ impl MatrixGoalExecutionLease {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn initial_working_history(
+        &self,
+        provider: &dyn zeroclaw_providers::ModelProvider,
+        route: &ChannelRouteSelection,
+        canonical_history: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        let excluded_tools: &[String] =
+            if self.context.autonomy_level == zeroclaw_config::autonomy::AutonomyLevel::Full {
+                &[]
+            } else {
+                self.context.non_cli_excluded_tools.as_ref()
+            };
+        let native_tool_specs_present =
+            zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+                provider,
+                route.model.as_str(),
+                self.context.tools_registry.as_ref(),
+                excluded_tools,
+                self.context.activated_tools.as_ref(),
+            )
+            .unwrap_or(false);
+        let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
+            native_tool_specs_present,
+            self.context.agent_cfg.resolved.strict_tool_parsing,
+            self.context.system_prompt.as_str(),
+        );
+        let base_system_prompt = system_prompt_for_channel_turn(
+            self.context.as_ref(),
+            self.context.system_prompt.as_str(),
+            true,
+            callable_protocol_exposed,
+            excluded_tools,
+        );
+        let target_channel =
+            find_channel_for_message(&self.context.channels_by_name, &self.message);
+        let system_prompt = build_channel_system_prompt_for_message_with_signal(
+            &base_system_prompt,
+            &self.message,
+            target_channel,
+            native_tool_specs_present,
+        );
+        let mut history = vec![ChatMessage::system(system_prompt)];
+        history.extend(canonical_history);
+        history
+    }
+}
+
+fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
+    let turn_kind = match turn.kind {
+        GoalParentTurnKind::Start => "start",
+        GoalParentTurnKind::Resume => "resume",
+        GoalParentTurnKind::Continue => "continue",
+    };
+    ChatMessage::system(format!(
+        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
+        turn.objective
+    ))
 }
 
 #[async_trait]
@@ -338,16 +398,20 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let mut history = turn.working_history;
-        let turn_kind = match turn.kind {
-            GoalParentTurnKind::Start => "start",
-            GoalParentTurnKind::Resume => "resume",
-            GoalParentTurnKind::Continue => "continue",
+        let directive = goal_parent_directive(&turn);
+        let mut history = match turn.kind {
+            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
+                let mut history =
+                    self.initial_working_history(provider.as_ref(), &route, turn.working_history);
+                history.insert(1, directive);
+                history
+            }
+            GoalParentTurnKind::Continue => {
+                let mut history = turn.working_history;
+                history.push(directive);
+                history
+            }
         };
-        history.push(ChatMessage::system(format!(
-            "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-            turn.objective
-        )));
         let turn_id = uuid::Uuid::new_v4().to_string();
         let loop_knobs = LoopKnobs::default();
         let tool_loop = run_tool_call_loop(ToolLoop {
@@ -484,5 +548,32 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             ))
             .await
             .context("deliver Matrix Goal lifecycle notice")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_parent_directive_keeps_lifecycle_phase_out_of_user_control() {
+        for (kind, expected) in [
+            (GoalParentTurnKind::Start, "start"),
+            (GoalParentTurnKind::Resume, "resume"),
+            (GoalParentTurnKind::Continue, "continue"),
+        ] {
+            let directive = goal_parent_directive(&GoalParentTurn {
+                kind,
+                objective: "the trusted success criterion".to_owned(),
+                working_history: Vec::new(),
+            });
+            assert_eq!(directive.role, "system");
+            assert!(directive.content.contains("the trusted success criterion"));
+            assert!(
+                directive
+                    .content
+                    .contains(&format!("Turn kind: {expected}"))
+            );
+        }
     }
 }
