@@ -25,6 +25,7 @@ use crate::{
         GoalIngressPrincipal, GoalOperationScope, GoalParentTurn, GoalParentTurnKind,
         GoalParentTurnResult, GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver,
         GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+        dispose_unowned_session_goal,
     },
     rpc::context::RpcContext,
 };
@@ -348,6 +349,10 @@ impl RpcGoalRuntime {
                 .dispose_session(&GoalSessionKey::zero_code(session_id)?.durable_id())
                 .await?;
             self.remove_supervisor(session_id).await;
+        } else if let Some(control_plane) = control_plane() {
+            let registry = control_plane.goal_store()?;
+            let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
+            let _ = dispose_unowned_session_goal(registry.as_ref(), &durable_session_id).await?;
         }
         Ok(())
     }
@@ -375,15 +380,9 @@ impl RpcGoalRuntime {
             control_plane.boot_id.clone(),
         )?;
         let session_id = driver.raw_session_id().to_owned();
-        let current = registry
-            .current_goal_for_session(&driver.session_key().durable_id())
-            .await?;
-        let supervisor = match (self.supervisor(&session_id).await, current) {
-            (Some(supervisor), _) => supervisor,
-            (None, Some(task)) if !task.status.is_terminal() => {
-                bail!("Goal session has durable work without a local supervisor")
-            }
-            (None, _) => {
+        let supervisor = match self.supervisor(&session_id).await {
+            Some(supervisor) => supervisor,
+            None => {
                 let runtime = GoalRuntime::new(Arc::clone(&registry));
                 let tracker = CostTracker::get_or_init_global_required(
                     config.cost.clone(),
