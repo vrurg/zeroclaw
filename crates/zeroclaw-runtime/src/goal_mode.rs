@@ -344,6 +344,17 @@ pub struct GoalParentTurn {
     pub working_history: Vec<ChatMessage>,
 }
 
+/// Process-local result of one Goal parent turn.
+///
+/// The transcript is returned to the controller rather than persisted in
+/// canonical session history. It survives verifier `Continue` within this
+/// process only; pause and restart deliberately discard it.
+#[derive(Debug, Clone)]
+pub struct GoalParentTurnResult {
+    pub candidate: String,
+    pub working_history: Vec<ChatMessage>,
+}
+
 /// Trusted, isolated input for the mandatory Goal verifier.
 #[derive(Debug, Clone)]
 pub struct GoalVerifierTurn {
@@ -361,7 +372,7 @@ pub trait GoalSessionExecutionLease: Send {
         &mut self,
         operation: &GoalOperationScope,
         turn: GoalParentTurn,
-    ) -> Result<String>;
+    ) -> Result<GoalParentTurnResult>;
     async fn run_verifier(
         &mut self,
         operation: &GoalOperationScope,
