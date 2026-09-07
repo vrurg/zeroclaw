@@ -4502,6 +4502,11 @@ impl RpcDispatcher {
         self.ctx
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -4640,6 +4645,11 @@ impl RpcDispatcher {
             .sessions
             .signal_session_kill_for_generation(sid, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        self.ctx
+            .goal_runtime
+            .dispose_session(sid)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -7070,6 +7080,11 @@ impl RpcDispatcher {
             .sessions
             .signal_session_removal_for_generation(&req.session_id, requested_generation);
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
