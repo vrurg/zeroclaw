@@ -5443,6 +5443,11 @@ impl RpcDispatcher {
             )
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -5588,6 +5593,11 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        self.ctx
+            .goal_runtime
+            .dispose_session(sid)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
@@ -8712,6 +8722,11 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| self.stale_session_incarnation_error())?;
         self.ctx.sessions.notify_test_removal_signal_attempted();
+        self.ctx
+            .goal_runtime
+            .dispose_session(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
         let _guard = self
             .ctx
             .sessions
