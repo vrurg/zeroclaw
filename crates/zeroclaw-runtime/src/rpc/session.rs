@@ -685,8 +685,10 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
+        let candidates: Vec<String> = self
+            .sessions
+            .lock()
+            .await
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
@@ -695,6 +697,30 @@ impl SessionStore {
                     && !in_flight.contains(key.as_str())
             })
             .map(|(key, _)| key.clone())
+            .collect();
+        let mut queue_busy = std::collections::HashSet::new();
+        for key in &candidates {
+            if self.session_queue.queue_depth(key).await > 0 {
+                queue_busy.insert(key.clone());
+            }
+        }
+        let mut sessions = self.sessions.lock().await;
+        let in_flight: std::collections::HashSet<String> = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let victims: Vec<String> = candidates
+            .into_iter()
+            .filter(|key| {
+                !queue_busy.contains(key)
+                    && !in_flight.contains(key)
+                    && sessions.get(key).is_some_and(|s| {
+                        s.owner_tui_id.as_deref() == Some(tui_id) && &s.chat_mode == chat_mode
+                    })
+            })
             .collect();
         let mut evicted = Vec::with_capacity(victims.len());
         for key in victims {
@@ -1281,6 +1307,32 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "eviction must not fire a mid-turn cancel token"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_same_mode_sibling_skips_session_queue_owner() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some(owner.to_string()))
+        };
+        store.insert("busy_chat".into(), mk("tui1")).await.unwrap();
+        store.insert("new_chat".into(), mk("tui1")).await.unwrap();
+        let _turn_guard = store.session_queue.acquire("busy_chat").await.unwrap();
+
+        let evicted = store
+            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .await;
+
+        assert!(
+            evicted.is_empty(),
+            "queue-owned session must not be evicted"
+        );
+        assert!(
+            store.get_agent("busy_chat").await.is_some(),
+            "session must remain until its actor releases the queue"
         );
     }
 
