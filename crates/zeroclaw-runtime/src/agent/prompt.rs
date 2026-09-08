@@ -135,6 +135,7 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     // turn input and must not be swallowed by export redaction.
     let mut redact_native_tool_results = false;
     let mut redact_text_protocol_result = false;
+    let mut redact_malformed_text_protocol_result = false;
 
     messages
         .iter()
@@ -143,9 +144,12 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 && session_prompt_tool_call_envelope_mentioned(&message.content);
             let is_native_result = message.role == "tool";
             let is_text_protocol_result = message.role == "user";
+            let has_text_protocol_result_prefix =
+                is_text_protocol_result && message.content.starts_with("[Tool results]");
             let redact = is_sensitive_call
                 || (redact_native_tool_results && is_native_result)
-                || (redact_text_protocol_result && is_text_protocol_result);
+                || (redact_text_protocol_result && is_text_protocol_result)
+                || (redact_malformed_text_protocol_result && has_text_protocol_result_prefix);
 
             if message.role == "assistant" {
                 // The runtime parser accepts both native JSON envelopes and
@@ -157,12 +161,18 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 let native_batch = session_prompt_native_tool_call_envelope(&message.content);
                 redact_native_tool_results = is_sensitive_call && native_batch;
                 // A malformed envelope is withheld itself, but it is never
-                // executed and therefore cannot have a following text-protocol
-                // result. Do not mistake the next ordinary user turn for one.
-                redact_text_protocol_result = is_sensitive_call
-                    && session_prompt_text_protocol_call_envelope(&message.content);
-            } else if is_text_protocol_result {
+                // executed and therefore cannot have a following arbitrary user
+                // turn. A reserved `[Tool results]` record remains private for
+                // legacy transport-escaped envelopes that may already be in
+                // retained history.
+                let accepted_text_call =
+                    !native_batch && session_prompt_accepted_tool_call_envelope(&message.content);
+                redact_text_protocol_result = accepted_text_call;
+                redact_malformed_text_protocol_result =
+                    is_sensitive_call && !native_batch && !accepted_text_call;
+            } else if message.role == "user" {
                 redact_text_protocol_result = false;
+                redact_malformed_text_protocol_result = false;
             }
 
             if redact {
@@ -263,16 +273,14 @@ fn session_prompt_native_tool_call_envelope(content: &str) -> bool {
         || escaped_json_tool_protocol(content).is_some_and(|decoded| classify(&decoded))
 }
 
-fn session_prompt_text_protocol_call_envelope(content: &str) -> bool {
-    let classify = |candidate: &str| {
-        matches!(
-            classify_tool_protocol_envelope(candidate),
-            Some(ToolProtocolEnvelopeKind::TaggedToolCall)
-        )
+fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
+    let accepted = |candidate: &str| {
+        parsed_tool_protocol_mentions_known_tool(candidate, session_prompt_tool_names())
+            || tool_protocol_envelope_mentions_known_tool(candidate, session_prompt_tool_names())
     };
 
-    classify(content)
-        || escaped_json_tool_protocol(content).is_some_and(|decoded| classify(&decoded))
+    accepted(content)
+        || escaped_json_tool_protocol(content).is_some_and(|decoded| accepted(&decoded))
 }
 
 /// Normalize a transport-escaped JSON fragment only when it becomes one
