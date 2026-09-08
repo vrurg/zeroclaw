@@ -1939,6 +1939,25 @@ mod tests {
     }
 
     #[test]
+    fn export_copy_redacts_alias_mapped_session_prompt_tool_calls() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{"tool_calls":[{{"id":"call_1","name":"tools.session_prompt_set","arguments":{{"content":"{marker}"}}}}]}}"#
+            )),
+            ChatMessage::tool(format!("saved: {marker}")),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+        assert!(
+            export
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "alias-mapped calls must use the same export boundary as their canonical name"
+        );
+    }
+
+    #[test]
     fn export_copy_redacts_call_id_only_responses_prompt_list_and_native_result() {
         let marker = "session-prompt-private-marker";
         let messages = vec![
