@@ -1113,7 +1113,9 @@ async fn process_chat_message(
     // must therefore leave no partially started WebSocket turn behind.
     let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
     let session_prompt_budget = if session_prompt_tools_allowed {
-        match agent.session_prompt_budget() {
+        match zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .sync_scope(true, || agent.session_prompt_budget())
+        {
             Ok(budget) => Some(budget),
             Err(error) => {
                 let _ = send_ws_turn_failure(sender, &error, None).await;

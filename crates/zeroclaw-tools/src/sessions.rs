@@ -1664,10 +1664,10 @@ mod tests {
             .set_session_prompt("first", "task", "keep current")
             .unwrap();
         let current = render_session_prompts(&backend.list_session_prompts("first").unwrap());
-        let host_prompt_bytes = 100;
+        let host_prompt_chars = 100;
         let budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
-            host_prompt_bytes,
-            host_prompt_bytes + current.len() + 2,
+            host_prompt_chars,
+            host_prompt_chars + current.chars().count() + 2,
         );
 
         let set = SessionPromptSetTool::new(test_security());

@@ -5559,6 +5559,74 @@ mod tests {
         }
 
         #[test]
+        fn session_prompt_budget_includes_tools_visible_to_a_chat_turn() {
+            let (provider, _) = capturing_provider(true);
+            let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+            let mut agent = test_agent_with_provider(
+                provider,
+                vec![
+                    Box::new(crate::tools::SessionPromptListTool::new(security.clone())),
+                    Box::new(crate::tools::SessionPromptSetTool::new(security.clone())),
+                    Box::new(crate::tools::SessionPromptDeleteTool::new(security)),
+                ],
+            );
+
+            let attachments = "## Session Prompts\n- id: \"task\"; content: \"keep this task\"\n";
+            let outside_native = agent
+                .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)
+                .expect("unscoped host prompt should render")
+                .chars()
+                .count();
+            let outside_xml = agent
+                .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
+                .expect("unscoped XML host prompt should render")
+                .chars()
+                .count();
+            let outside_chat_turn = outside_native.max(outside_xml);
+            let (inside_native, inside_xml) = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .sync_scope(true, || {
+                    Ok::<_, anyhow::Error>((
+                        agent
+                            .build_system_prompt_without_session_prompt_attachments(
+                                &NativeToolDispatcher,
+                            )?
+                            .chars()
+                            .count(),
+                        agent
+                            .build_system_prompt_without_session_prompt_attachments(
+                                &XmlToolDispatcher,
+                            )?
+                            .chars()
+                            .count(),
+                    ))
+                })
+                .expect("scoped host prompt should render");
+            let inside_chat_turn = inside_native.max(inside_xml);
+
+            assert!(
+                inside_chat_turn > outside_chat_turn,
+                "chat-session admission must reserve the session-prompt tool catalog advertised to its turn"
+            );
+
+            agent.config.resolved.max_system_prompt_chars =
+                outside_chat_turn + 2 + attachments.chars().count();
+            assert!(
+                agent
+                    .session_prompt_budget()
+                    .expect("unscoped prompt budget should render")
+                    .permits(attachments),
+                "the deliberately under-scoped preflight would admit this attachment"
+            );
+            assert!(
+                !zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .sync_scope(true, || agent.session_prompt_budget())
+                    .expect("scoped prompt budget should render")
+                    .permits(attachments),
+                "chat-session admission must reject an attachment that exceeds its scoped tool prompt"
+            );
+        }
+
+        #[test]
         fn acp_style_agent_does_not_advertise_session_prompt_tools() {
             let (provider, _) = capturing_provider(true);
             let memory_cfg = zeroclaw_config::schema::MemoryConfig {

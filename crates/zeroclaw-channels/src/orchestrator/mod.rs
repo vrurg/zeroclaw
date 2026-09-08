@@ -6702,7 +6702,7 @@ async fn process_channel_message_body(
     // every host-authored channel addition so they remain a complete trailing
     // section inside the final provider-bound budget.
     let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
-    if session_prompt_attachments.is_empty() {
+    if ctx.prompt_config.channels.session_prompts_enabled && session_prompt_attachments.is_empty() {
         // Channel-specific host context is assembled after the agent's initial
         // finalizer. With no mutable tail to reserve, this owner performs the
         // canonical final character-budget pass over its completed host prompt.
