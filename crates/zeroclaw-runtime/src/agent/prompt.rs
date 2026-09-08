@@ -156,7 +156,11 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 // than a substring so export copies follow execution semantics.
                 let native_batch = session_prompt_native_tool_call_envelope(&message.content);
                 redact_native_tool_results = is_sensitive_call && native_batch;
-                redact_text_protocol_result = is_sensitive_call && !native_batch;
+                // A malformed envelope is withheld itself, but it is never
+                // executed and therefore cannot have a following text-protocol
+                // result. Do not mistake the next ordinary user turn for one.
+                redact_text_protocol_result = is_sensitive_call
+                    && session_prompt_text_protocol_call_envelope(&message.content);
             } else if is_text_protocol_result {
                 redact_text_protocol_result = false;
             }
@@ -252,6 +256,18 @@ fn session_prompt_native_tool_call_envelope(content: &str) -> bool {
                     | ToolProtocolEnvelopeKind::FunctionCall
                     | ToolProtocolEnvelopeKind::ResponsesFunctionCall
             )
+        )
+    };
+
+    classify(content)
+        || escaped_json_tool_protocol(content).is_some_and(|decoded| classify(&decoded))
+}
+
+fn session_prompt_text_protocol_call_envelope(content: &str) -> bool {
+    let classify = |candidate: &str| {
+        matches!(
+            classify_tool_protocol_envelope(candidate),
+            Some(ToolProtocolEnvelopeKind::TaggedToolCall)
         )
     };
 
@@ -2010,6 +2026,26 @@ mod tests {
         assert!(
             session_prompt_tool_call_envelope_mentioned(&malformed_transport_escaped),
             "malformed transport-escaped session-prompt calls must retain redaction"
+        );
+    }
+
+    #[test]
+    fn export_copy_preserves_user_input_after_malformed_ordinary_tool_envelope() {
+        let malformed = r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"pwd"}}]"#;
+        let messages = vec![
+            ChatMessage::assistant(malformed),
+            ChatMessage::user("cancel that and summarize the log"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+
+        assert_eq!(
+            export[0].content, SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER,
+            "malformed tool envelopes remain withheld at export boundaries"
+        );
+        assert_eq!(
+            export[1].content, "cancel that and summarize the log",
+            "a malformed envelope was never executed, so its following user message is ordinary input"
         );
     }
 
