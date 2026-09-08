@@ -47,10 +47,9 @@ computed. In that case, ZeroClaw fails the affected turn before provider
 dispatch rather than dropping attachments or truncating host context.
 
 If that final check fails, the affected session cannot use its tools to repair
-the collection because the turn never starts. Remove the attachment with the
-session management API or reset the session; raising
-`max_system_prompt_chars` is an alternative when the host-prompt limit is
-intentionally too small.
+the collection because the turn never starts. Reset or delete the session,
+which atomically removes its attachments; raising `max_system_prompt_chars` is
+an alternative when the host-prompt limit is intentionally too small.
 
 Changes take effect on the next top-level turn. The runtime appends a dedicated
 `## Session Prompts` section to the host-built system prompt. Entries are JSON

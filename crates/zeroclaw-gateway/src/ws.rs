@@ -67,6 +67,21 @@ async fn scope_websocket_session_prompt_context<T>(
         .await
 }
 
+/// Derive WebSocket admission evidence under the same capability scope the
+/// primary turn later uses to advertise and execute session-prompt tools.
+fn websocket_session_prompt_budget<T, E>(
+    session_prompt_tools_allowed: bool,
+    derive: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    if session_prompt_tools_allowed {
+        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .sync_scope(true, derive)
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
     #[serde(rename = "type")]
@@ -1112,19 +1127,16 @@ async fn process_chat_message(
     // turn running or publishes its cancellation handle. A construction error
     // must therefore leave no partially started WebSocket turn behind.
     let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
-    let session_prompt_budget = if session_prompt_tools_allowed {
-        match zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
-            .sync_scope(true, || agent.session_prompt_budget())
-        {
-            Ok(budget) => Some(budget),
+    let session_prompt_budget =
+        match websocket_session_prompt_budget(session_prompt_tools_allowed, || {
+            agent.session_prompt_budget()
+        }) {
+            Ok(budget) => budget,
             Err(error) => {
                 let _ = send_ws_turn_failure(sender, &error, None).await;
                 return;
             }
-        }
-    } else {
-        None
-    };
+        };
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
@@ -1769,10 +1781,10 @@ mod tests {
                 .list_session_prompts("gw-budget")
                 .expect("initial prompt list"),
         );
-        let host_bytes = 100;
+        let host_prompt_chars = 100;
         let budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
-            host_bytes,
-            host_bytes + 2 + rendered.len(),
+            host_prompt_chars,
+            host_prompt_chars + 2 + rendered.chars().count(),
         );
 
         let result = scope_websocket_session_prompt_context(
@@ -1798,6 +1810,29 @@ mod tests {
             .expect("prompt list after rejection");
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].content, "keep current");
+    }
+
+    #[test]
+    fn websocket_budget_derivation_enables_session_prompt_tool_visibility() {
+        let budget = websocket_session_prompt_budget(true, || {
+            assert!(
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .try_with(|allowed| *allowed)
+                    .unwrap_or(false),
+                "WebSocket admission must render the same session-prompt tools as its turn"
+            );
+            Ok::<_, ()>(zeroclaw_infra::session_backend::SessionPromptBudget::new(
+                0, 0,
+            ))
+        })
+        .expect("scoped WebSocket budget derivation should succeed");
+        assert!(budget.is_some());
+
+        let disabled = websocket_session_prompt_budget(false, || -> Result<(), ()> {
+            panic!("disabled WebSocket session prompts must not derive a budget")
+        })
+        .expect("disabled WebSocket session prompts should skip budget derivation");
+        assert!(disabled.is_none());
     }
 
     #[test]
