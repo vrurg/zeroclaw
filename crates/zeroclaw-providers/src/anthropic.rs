@@ -548,6 +548,107 @@ struct NativeContentIn {
     name: Option<String>,
     #[serde(default)]
     input: Option<serde_json::Value>,
+    #[serde(default)]
+    server_name: Option<String>,
+    #[serde(default)]
+    tool_use_id: Option<String>,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    is_error: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum ProviderOwnedBlockPhase {
+    NativeResponse,
+    StreamStart,
+}
+
+struct ProviderOwnedBlockFields<'a> {
+    id: Option<&'a str>,
+    name: Option<&'a str>,
+    server_name: Option<&'a str>,
+    tool_use_id: Option<&'a str>,
+    input: Option<&'a serde_json::Value>,
+    content: Option<&'a serde_json::Value>,
+    is_error: Option<bool>,
+}
+
+impl NativeContentIn {
+    fn provider_owned_fields(&self) -> ProviderOwnedBlockFields<'_> {
+        ProviderOwnedBlockFields {
+            id: self.id.as_deref(),
+            name: self.name.as_deref(),
+            server_name: self.server_name.as_deref(),
+            tool_use_id: self.tool_use_id.as_deref(),
+            input: self.input.as_ref(),
+            content: self.content.as_ref(),
+            is_error: self.is_error,
+        }
+    }
+}
+
+fn provider_owned_fields_from_value(block: &serde_json::Value) -> ProviderOwnedBlockFields<'_> {
+    ProviderOwnedBlockFields {
+        id: block.get("id").and_then(serde_json::Value::as_str),
+        name: block.get("name").and_then(serde_json::Value::as_str),
+        server_name: block.get("server_name").and_then(serde_json::Value::as_str),
+        tool_use_id: block.get("tool_use_id").and_then(serde_json::Value::as_str),
+        input: block.get("input"),
+        content: block.get("content"),
+        is_error: block.get("is_error").and_then(serde_json::Value::as_bool),
+    }
+}
+
+fn non_empty(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+fn is_web_search_result_content(content: &serde_json::Value) -> bool {
+    content.is_array()
+        || content.as_object().is_some_and(|content| {
+            content.get("type").and_then(serde_json::Value::as_str)
+                == Some("web_search_tool_result_error")
+                && content
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|error_code| !error_code.is_empty())
+        })
+}
+
+fn is_valid_provider_owned_block(
+    kind: &str,
+    fields: ProviderOwnedBlockFields<'_>,
+    phase: ProviderOwnedBlockPhase,
+) -> bool {
+    let input_is_object = fields.input.is_some_and(serde_json::Value::is_object);
+    let input_is_required = matches!(phase, ProviderOwnedBlockPhase::NativeResponse);
+
+    match kind {
+        "server_tool_use" => {
+            non_empty(fields.id)
+                && non_empty(fields.name)
+                && (!input_is_required || input_is_object)
+        }
+        "web_search_tool_result" => {
+            non_empty(fields.tool_use_id)
+                && fields.content.is_some_and(is_web_search_result_content)
+        }
+        "mcp_tool_use" => {
+            non_empty(fields.id)
+                && non_empty(fields.name)
+                && non_empty(fields.server_name)
+                && (!input_is_required || input_is_object)
+        }
+        "mcp_tool_result" => {
+            non_empty(fields.tool_use_id)
+                && fields.is_error.is_some()
+                && fields
+                    .content
+                    .is_some_and(|content| content.is_string() || content.is_array())
+        }
+        _ => false,
+    }
 }
 
 /// Typed builder for [`AnthropicModelProvider`].
@@ -1971,6 +2072,7 @@ impl AnthropicModelProvider {
         let mut tool_calls = Vec::new();
         let mut has_unsupported_content_block = false;
         let mut has_malformed_client_tool = false;
+        let mut has_malformed_provider_tool = false;
 
         let usage = response.usage.map(|u| {
             let uncached = u.input_tokens.unwrap_or(0);
@@ -1990,8 +2092,8 @@ impl AnthropicModelProvider {
         });
 
         for block in response.content {
-            let kind = block.kind;
-            match kind.as_str() {
+            let kind = block.kind.as_str();
+            match kind {
                 "text" => {
                     if let Some(text) = block
                         .text
@@ -2045,7 +2147,15 @@ impl AnthropicModelProvider {
                 "server_tool_use"
                 | "web_search_tool_result"
                 | "mcp_tool_use"
-                | "mcp_tool_result" => {}
+                | "mcp_tool_result" => {
+                    if !is_valid_provider_owned_block(
+                        kind,
+                        block.provider_owned_fields(),
+                        ProviderOwnedBlockPhase::NativeResponse,
+                    ) {
+                        has_malformed_provider_tool = true;
+                    }
+                }
                 _ => {
                     // A successful HTTP envelope is not a successful model
                     // response if it contains a block this adapter cannot
@@ -2055,7 +2165,7 @@ impl AnthropicModelProvider {
                     has_unsupported_content_block = true;
                 }
             }
-            content_block_types.push(kind);
+            content_block_types.push(block.kind);
         }
 
         let reasoning_content = if thinking_parts.is_empty() {
@@ -2075,7 +2185,8 @@ impl AnthropicModelProvider {
             reasoning_content,
         };
 
-        if has_unsupported_content_block || has_malformed_client_tool {
+        if has_unsupported_content_block || has_malformed_client_tool || has_malformed_provider_tool
+        {
             let error = TerminalCompletionError::InvalidTerminalReason;
             ::zeroclaw_log::record!(
                 WARN,
@@ -2600,6 +2711,23 @@ impl AnthropicModelProvider {
                     // malformed framing look like a clean completion.
                     let content_block =
                         event.get("content_block").filter(|block| block.is_object());
+                    let provider_owned_block = content_block
+                        .and_then(|block| block.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| {
+                            matches!(
+                                kind,
+                                "server_tool_use"
+                                    | "web_search_tool_result"
+                                    | "mcp_tool_use"
+                                    | "mcp_tool_result"
+                            )
+                        });
+                    // A malformed provider-owned frame is still evidence that
+                    // Anthropic may have performed work. It must therefore
+                    // retain the no-replay boundary even though it cannot
+                    // enter lifecycle state.
+                    saw_server_tool_activity |= provider_owned_block;
                     let block_type = content_block
                         .and_then(|block| block.get("type"))
                         .and_then(serde_json::Value::as_str)
@@ -2633,6 +2761,16 @@ impl AnthropicModelProvider {
                                     .and_then(|block| block.get("data"))
                                     .and_then(serde_json::Value::as_str)
                                     .is_some_and(|data| !data.is_empty()),
+                                "server_tool_use"
+                                | "web_search_tool_result"
+                                | "mcp_tool_use"
+                                | "mcp_tool_result" => content_block.is_some_and(|block| {
+                                    is_valid_provider_owned_block(
+                                        kind,
+                                        provider_owned_fields_from_value(block),
+                                        ProviderOwnedBlockPhase::StreamStart,
+                                    )
+                                }),
                                 _ => true,
                             }
                         });
@@ -2662,15 +2800,6 @@ impl AnthropicModelProvider {
                             *content_block_type_counts
                                 .entry(block_type.to_string())
                                 .or_default() += 1;
-                        }
-                        if matches!(
-                            block_type,
-                            "server_tool_use"
-                                | "web_search_tool_result"
-                                | "mcp_tool_use"
-                                | "mcp_tool_result"
-                        ) {
-                            saw_server_tool_activity = true;
                         }
                         if started && thinking_block_active {
                             // Anthropic's streaming contract closes each
@@ -4696,6 +4825,60 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[tokio::test]
+    async fn streaming_rejects_malformed_provider_tool_start_after_visible_text() {
+        use std::io::Cursor;
+
+        let bytes = b"event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut text = String::new();
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::TextDelta(chunk)) => text.push_str(&chunk.delta),
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        assert_eq!(
+            text, "answer",
+            "the prior visible prefix remains observable"
+        );
+        assert!(
+            !saw_final,
+            "malformed provider-tool start must not emit Final"
+        );
+        let failure = failure.expect("malformed provider-tool start must fail");
+        assert_eq!(
+            failure.reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(failure.usage.and_then(|usage| usage.output_tokens), Some(5));
+    }
+
+    #[tokio::test]
     async fn streaming_fallback_block_is_rejected_even_with_terminal_reason() {
         use std::io::Cursor;
 
@@ -4985,7 +5168,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let bytes = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: message_delta\n\
@@ -5030,7 +5213,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
 event: message_delta\n\
@@ -5077,7 +5260,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "event: message_start\n\\\n\
 data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n\\\n\
 event: content_block_start\n\\\n\
-data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"server_tool_use\"}}}}\n\n\\\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}}}\n\n\\\n\
 {tail}"
         );
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.into_bytes()));
@@ -5198,7 +5381,7 @@ data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_d
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
 event: error\n\
 data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\"}}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes));
@@ -5229,10 +5412,19 @@ data: {\"type\":\"error\",\"error\":{\"message\":\"upstream failed\"}}\n\n";
     async fn streaming_provider_tool_input_deltas_are_not_client_tool_calls() {
         use std::io::Cursor;
 
-        for kind in ["server_tool_use", "mcp_tool_use"] {
+        for (kind, content_block) in [
+            (
+                "server_tool_use",
+                r#"{"type":"server_tool_use","id":"srv_1","name":"web_search"}"#,
+            ),
+            (
+                "mcp_tool_use",
+                r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example"}"#,
+            ),
+        ] {
             let bytes = format!(
                 "event: content_block_start\n\
-data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{kind}\"}}}}\n\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\
 event: content_block_delta\n\
 data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\n\
 event: content_block_stop\n\
@@ -5412,7 +5604,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let bytes = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10}}}\n\n\
 event: content_block_start\n\
-data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\"}}\n\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srv_1\",\"name\":\"web_search\"}}\n\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n\
 event: message_stop\n\
@@ -6137,10 +6329,19 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn malformed_provider_tool_delta_never_emits_final() {
         use std::io::Cursor;
 
-        for provider_tool in ["server_tool_use", "mcp_tool_use"] {
+        for (provider_tool, content_block) in [
+            (
+                "server_tool_use",
+                r#"{"type":"server_tool_use","id":"srv_1","name":"web_search"}"#,
+            ),
+            (
+                "mcp_tool_use",
+                r#"{"type":"mcp_tool_use","id":"mcp_1","name":"echo","server_name":"example"}"#,
+            ),
+        ] {
             let bytes = format!(
                 "event: content_block_start\n\
-data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"{provider_tool}\"}}}}\n\n\
+data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{content_block}}}\n\n\
 event: content_block_delta\n\
 data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{}}}}\n\n\
 event: content_block_stop\n\
@@ -8257,6 +8458,162 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             context.policy().recovery(),
             TerminalRecoveryDisposition::NoReplay
+        );
+    }
+
+    #[test]
+    fn provider_owned_block_schemas_require_documented_fields() {
+        let cases = [
+            (
+                "server_tool_use",
+                serde_json::json!({
+                    "type": "server_tool_use",
+                    "id": "srv_1",
+                    "name": "web_search",
+                    "input": {}
+                }),
+                serde_json::json!({
+                    "type": "server_tool_use",
+                    "id": "srv_1",
+                    "name": "web_search"
+                }),
+                serde_json::json!({
+                    "type": "server_tool_use",
+                    "id": "srv_1",
+                    "input": {}
+                }),
+            ),
+            (
+                "web_search_tool_result",
+                serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": []
+                }),
+                serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": []
+                }),
+                serde_json::json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1"
+                }),
+            ),
+            (
+                "mcp_tool_use",
+                serde_json::json!({
+                    "type": "mcp_tool_use",
+                    "id": "mcp_1",
+                    "name": "echo",
+                    "server_name": "example",
+                    "input": {}
+                }),
+                serde_json::json!({
+                    "type": "mcp_tool_use",
+                    "id": "mcp_1",
+                    "name": "echo",
+                    "server_name": "example"
+                }),
+                serde_json::json!({
+                    "type": "mcp_tool_use",
+                    "id": "mcp_1",
+                    "name": "echo",
+                    "input": {}
+                }),
+            ),
+            (
+                "mcp_tool_result",
+                serde_json::json!({
+                    "type": "mcp_tool_result",
+                    "tool_use_id": "mcp_1",
+                    "is_error": false,
+                    "content": "done"
+                }),
+                serde_json::json!({
+                    "type": "mcp_tool_result",
+                    "tool_use_id": "mcp_1",
+                    "is_error": false,
+                    "content": []
+                }),
+                serde_json::json!({
+                    "type": "mcp_tool_result",
+                    "tool_use_id": "mcp_1",
+                    "content": []
+                }),
+            ),
+        ];
+
+        for (kind, native_block, stream_start_block, malformed_block) in cases {
+            let native: NativeContentIn =
+                serde_json::from_value(native_block).expect("native fixture must deserialize");
+            let malformed_native: NativeContentIn = serde_json::from_value(malformed_block.clone())
+                .expect("malformed fixture must deserialize");
+
+            assert!(
+                is_valid_provider_owned_block(
+                    kind,
+                    native.provider_owned_fields(),
+                    ProviderOwnedBlockPhase::NativeResponse,
+                ),
+                "{kind} must accept its documented native shape"
+            );
+            assert!(
+                is_valid_provider_owned_block(
+                    kind,
+                    provider_owned_fields_from_value(&stream_start_block),
+                    ProviderOwnedBlockPhase::StreamStart,
+                ),
+                "{kind} must accept its documented SSE start shape"
+            );
+            assert!(
+                !is_valid_provider_owned_block(
+                    kind,
+                    malformed_native.provider_owned_fields(),
+                    ProviderOwnedBlockPhase::NativeResponse,
+                ),
+                "{kind} missing a required native field must fail closed"
+            );
+            assert!(
+                !is_valid_provider_owned_block(
+                    kind,
+                    provider_owned_fields_from_value(&malformed_block),
+                    ProviderOwnedBlockPhase::StreamStart,
+                ),
+                "{kind} missing a required SSE-start field must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn native_response_rejects_malformed_provider_tool_beside_valid_text() {
+        let response: NativeChatResponse = serde_json::from_value(serde_json::json!({
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "text", "text": "answer"},
+                {"type": "server_tool_use", "id": "srv_1", "name": "web_search"}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }))
+        .expect("fixture must deserialize");
+
+        let error = AnthropicModelProvider::parse_native_response(response)
+            .expect_err("malformed provider-owned blocks must fail closed");
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("malformed provider block must preserve a typed terminal failure");
+
+        assert_eq!(
+            context.failure().reason,
+            TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            context
+                .failure()
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(5),
+            "provider-reported usage must survive malformed framing"
         );
     }
 
