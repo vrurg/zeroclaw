@@ -6702,8 +6702,10 @@ async fn process_channel_message_body(
     // every host-authored channel addition so they remain a complete trailing
     // section inside the final provider-bound budget.
     let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
-    let session_prompt_budget =
-        zeroclaw_infra::session_backend::SessionPromptBudget::new(system_prompt.len(), max);
+    let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
+        system_prompt.chars().count(),
+        max,
+    );
     if append_session_prompts_to_channel_system_prompt(
         &mut system_prompt,
         &session_prompt_attachments,

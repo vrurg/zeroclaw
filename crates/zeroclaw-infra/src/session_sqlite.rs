@@ -1734,7 +1734,7 @@ mod tests {
             content: content.to_string(),
             updated_at: String::new(),
         }]);
-        let budget = SessionPromptBudget::new(0, one_prompt.len() + 2);
+        let budget = SessionPromptBudget::new(0, one_prompt.chars().count() + 2);
         let start = Arc::new(Barrier::new(3));
 
         std::thread::scope(|scope| {

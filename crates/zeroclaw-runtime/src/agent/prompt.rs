@@ -101,8 +101,6 @@ pub struct InteractionContext {
 }
 
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
-pub(crate) const SYSTEM_PROMPT_TRUNCATION_MARKER: &str =
-    "\n\n[System prompt truncated to fit context budget]\n";
 const SESSION_PROMPTS_EXPORT_MARKER: &str = "\n\n[Persistent session prompts omitted from export]";
 const SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER: &str =
     "[Session-prompt tool exchange omitted from export]";
@@ -296,54 +294,25 @@ pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
 }
 
-/// Truncate a host-authored system prompt to a finite character budget.
-///
-/// The timestamp orientation is runtime-critical and is retained with the
-/// truncation marker, matching the legacy system-prompt construction path.
-pub(crate) fn truncate_system_prompt_to_budget(prompt: &mut String, max_chars: usize) {
-    if max_chars == 0 || prompt.len() <= max_chars {
-        return;
-    }
-
-    let reserved = TIMESTAMP_ORIENTATION.len() + SYSTEM_PROMPT_TRUNCATION_MARKER.len();
-    if max_chars >= reserved {
-        let mut end = max_chars - reserved;
-        while end > 0 && !prompt.is_char_boundary(end) {
-            end -= 1;
-        }
-        prompt.truncate(end);
-        prompt.push_str(SYSTEM_PROMPT_TRUNCATION_MARKER);
-        append_timestamp_orientation(prompt);
-    } else {
-        let mut end = max_chars.min(TIMESTAMP_ORIENTATION.len());
-        while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
-            end -= 1;
-        }
-        prompt.clear();
-        prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
-    }
-}
-
 /// Reserve a finite system-prompt budget for mandatory session attachments.
 ///
 /// Attachments are durable session context, so callers must never silently
-/// omit them. A finite budget may truncate a prompt without attachments, but
-/// an attachment-bearing turn must retain the complete host prompt: dropping
-/// its tail could remove safety or runtime policy while retaining mutable
-/// session context.
+/// omit them. An attachment-bearing turn must retain the complete host prompt:
+/// dropping its tail could remove safety or runtime policy while retaining
+/// mutable session context. This function does not impose a second budget on
+/// host context when there is no attachment tail.
 pub fn append_required_session_prompt_attachments(
     prompt: &mut String,
     attachments: &str,
     max_chars: usize,
 ) -> Result<()> {
     if attachments.is_empty() {
-        truncate_system_prompt_to_budget(prompt, max_chars);
         return Ok(());
     }
 
-    let attachment_len = attachments.len().saturating_add(2);
-    let total_len = prompt.len().saturating_add(attachment_len);
-    if max_chars > 0 && total_len > max_chars {
+    let attachment_chars = attachments.chars().count().saturating_add(2);
+    let total_chars = prompt.chars().count().saturating_add(attachment_chars);
+    if max_chars > 0 && total_chars > max_chars {
         anyhow::bail!(
             "Persistent session prompts and required host context exceed max_system_prompt_chars ({max_chars}); refusing to dispatch without them"
         );
@@ -800,7 +769,7 @@ mod tests {
         let error = append_required_session_prompt_attachments(
             &mut prompt,
             attachments,
-            original.len() + attachments.len() + 1,
+            original.chars().count() + attachments.chars().count() + 1,
         )
         .expect_err("one-byte overflow must fail instead of truncating host policy");
 
@@ -815,7 +784,7 @@ mod tests {
     fn attachments_append_after_the_complete_host_prompt_when_they_fit() {
         let mut prompt = "## Safety\n\nmandatory policy".to_string();
         let attachments = "## Session Prompts\n\n[task] persistent instruction";
-        let budget = prompt.len() + 2 + attachments.len();
+        let budget = prompt.chars().count() + 2 + attachments.chars().count();
 
         append_required_session_prompt_attachments(&mut prompt, attachments, budget).unwrap();
 
@@ -823,6 +792,31 @@ mod tests {
             prompt,
             format!("## Safety\n\nmandatory policy\n\n{attachments}")
         );
+    }
+
+    #[test]
+    fn attachments_use_the_configured_character_budget() {
+        let mut prompt = "## Safety\n\nЗберегти правила".to_string();
+        let attachments = "## Session Prompts\n\n[task] 继续当前任务";
+        let budget = prompt.chars().count() + 2 + attachments.chars().count();
+
+        append_required_session_prompt_attachments(&mut prompt, attachments, budget)
+            .expect("a complete multibyte prompt must fit its character budget");
+
+        assert_eq!(prompt.chars().count(), budget);
+        assert_eq!(
+            prompt,
+            "## Safety\n\nЗберегти правила\n\n## Session Prompts\n\n[task] 继续当前任务"
+        );
+    }
+
+    #[test]
+    fn empty_attachments_do_not_reapply_the_host_prompt_budget() {
+        let mut prompt = "界界界".to_string();
+
+        append_required_session_prompt_attachments(&mut prompt, "", 1).unwrap();
+
+        assert_eq!(prompt, "界界界");
     }
 
     zeroclaw_api::mock_tool_attribution!(TestTool);

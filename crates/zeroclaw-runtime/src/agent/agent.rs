@@ -2110,7 +2110,7 @@ impl Agent {
     }
 
     /// Build the complete host-authored prompt before the mutable session
-    /// attachment tail is appended. Primary-turn owners use its byte length
+    /// attachment tail is appended. Primary-turn owners use its character count
     /// for best-effort mutation admission; final assembly still validates the
     /// actual prompt before dispatch.
     fn build_system_prompt_without_session_prompt_attachments(
@@ -2176,14 +2176,16 @@ impl Agent {
         // rebuilding the turn context. Admission must reserve the largest host
         // variant; measuring only the currently selected dispatcher can accept
         // an attachment that makes the alternate prompt fail before dispatch.
-        let native_host_prompt_len = self
+        let native_host_prompt_chars = self
             .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)?
-            .len();
-        let xml_host_prompt_len = self
+            .chars()
+            .count();
+        let xml_host_prompt_chars = self
             .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)?
-            .len();
+            .chars()
+            .count();
         Ok(zeroclaw_infra::session_backend::SessionPromptBudget::new(
-            native_host_prompt_len.max(xml_host_prompt_len),
+            native_host_prompt_chars.max(xml_host_prompt_chars),
             self.config.resolved.max_system_prompt_chars,
         ))
     }
@@ -5476,24 +5478,24 @@ mod tests {
         fn session_prompt_attachments_are_host_appended_and_refreshable() {
             let (provider, _) = capturing_provider(true);
             let mut agent = test_agent_with_provider(provider, Vec::new());
-            let host_prompt_len = agent.system_prompt_for_test().unwrap().len();
+            let host_prompt_chars = agent.system_prompt_for_test().unwrap().chars().count();
             let first_attachment =
                 "## Session Prompts\n- id: \"task\"; content: \"first\"\n".to_string();
             agent.config.resolved.max_system_prompt_chars =
-                host_prompt_len + 2 + first_attachment.len();
+                host_prompt_chars + 2 + first_attachment.chars().count();
             agent.set_session_prompt_attachments(first_attachment.clone());
             let fitted_prompt = agent
                 .system_prompt_for_test()
                 .expect("a finite budget must retain required host policy and persistent prompts");
             assert!(
-                fitted_prompt.len() <= agent.config.resolved.max_system_prompt_chars,
+                fitted_prompt.chars().count() <= agent.config.resolved.max_system_prompt_chars,
                 "prompt must respect max_system_prompt_chars"
             );
             assert!(fitted_prompt.contains("content: \"first\""));
             assert!(fitted_prompt.contains(TIMESTAMP_ORIENTATION));
 
             agent.config.resolved.max_system_prompt_chars =
-                host_prompt_len + 1 + first_attachment.len();
+                host_prompt_chars + 1 + first_attachment.chars().count();
             agent.set_session_prompt_attachments(first_attachment);
             let error = agent
                 .system_prompt_for_test()
@@ -5525,20 +5527,23 @@ mod tests {
             let (provider, _) = capturing_provider(true);
             let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
             let attachments = "## Session Prompts\n- id: \"task\"; content: \"keep this task\"\n";
-            let native_host_len = agent
+            let native_host_chars = agent
                 .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)
                 .expect("native host prompt should render")
-                .len();
-            let xml_host_len = agent
+                .chars()
+                .count();
+            let xml_host_chars = agent
                 .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
                 .expect("XML host prompt should render")
-                .len();
+                .chars()
+                .count();
             assert!(
-                xml_host_len > native_host_len,
+                xml_host_chars > native_host_chars,
                 "the test must exercise the XML tool catalog expansion"
             );
 
-            agent.config.resolved.max_system_prompt_chars = xml_host_len + 2 + attachments.len();
+            agent.config.resolved.max_system_prompt_chars =
+                xml_host_chars + 2 + attachments.chars().count();
             let budget = agent
                 .session_prompt_budget()
                 .expect("budget should account for every dispatch protocol");

@@ -24,14 +24,14 @@ tokio::task_local! {
 /// still change the host prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionPromptBudget {
-    host_prompt_bytes: usize,
+    host_prompt_chars: usize,
     max_system_prompt_chars: usize,
 }
 
 impl SessionPromptBudget {
-    pub fn new(host_prompt_bytes: usize, max_system_prompt_chars: usize) -> Self {
+    pub fn new(host_prompt_chars: usize, max_system_prompt_chars: usize) -> Self {
         Self {
-            host_prompt_bytes,
+            host_prompt_chars,
             max_system_prompt_chars,
         }
     }
@@ -41,11 +41,11 @@ impl SessionPromptBudget {
     pub fn permits(&self, rendered_attachments: &str) -> bool {
         self.max_system_prompt_chars == 0
             || self
-                .host_prompt_bytes
+                .host_prompt_chars
                 .saturating_add(if rendered_attachments.is_empty() {
                     0
                 } else {
-                    rendered_attachments.len().saturating_add(2)
+                    rendered_attachments.chars().count().saturating_add(2)
                 })
                 <= self.max_system_prompt_chars
     }
@@ -406,5 +406,11 @@ mod tests {
     #[test]
     fn unlimited_session_prompt_budget_permits_any_rendered_tail() {
         assert!(SessionPromptBudget::new(usize::MAX, 0).permits("tail"));
+    }
+
+    #[test]
+    fn session_prompt_budget_uses_characters_not_bytes() {
+        let budget = SessionPromptBudget::new("Зберегти".chars().count(), 13);
+        assert!(budget.permits("继续"));
     }
 }
