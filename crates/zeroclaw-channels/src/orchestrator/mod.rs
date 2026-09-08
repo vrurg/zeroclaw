@@ -6702,6 +6702,13 @@ async fn process_channel_message_body(
     // every host-authored channel addition so they remain a complete trailing
     // section inside the final provider-bound budget.
     let max = ctx.agent_cfg.resolved.max_system_prompt_chars;
+    if session_prompt_attachments.is_empty() {
+        // Channel-specific host context is assembled after the agent's initial
+        // finalizer. With no mutable tail to reserve, this owner performs the
+        // canonical final character-budget pass over its completed host prompt.
+        system_prompt =
+            zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(system_prompt, max);
+    }
     let session_prompt_budget = zeroclaw_infra::session_backend::SessionPromptBudget::new(
         system_prompt.chars().count(),
         max,
@@ -36055,25 +36062,33 @@ Done."#;
         let peer_map = "Current-channel peer map for agent \"main\"";
         let thinking_prefix = "Think step by step.";
         let mut prompt = format!("{thinking_prefix}\n\n{host_context}\n\n{peer_map}");
-        let max = prompt.len() + "\n\n".len() + attachments.len();
+        let max = prompt.chars().count() + 2 + attachments.chars().count();
 
         append_session_prompts_to_channel_system_prompt(&mut prompt, attachments, max)
             .expect("a fitting attachment must reserve the completed host prompt budget");
 
-        assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
+        assert!(
+            prompt.chars().count() <= max,
+            "channel prompt exceeded finite budget"
+        );
         assert!(prompt.contains("content: \"persisted\""));
         assert!(prompt.ends_with(attachments));
     }
 
     #[test]
-    fn channel_session_prompt_empty_collection_caps_completed_host_prompt() {
+    fn channel_session_prompt_empty_collection_finalizes_completed_host_prompt() {
         let mut prompt = "host context ".repeat(64);
-        let max = prompt.len() / 2;
+        let max = prompt.chars().count() / 2;
+
+        prompt = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(prompt, max);
 
         append_session_prompts_to_channel_system_prompt(&mut prompt, "", max)
-            .expect("an empty attachment collection must still cap host context");
+            .expect("an empty attachment collection must not alter finalized host context");
 
-        assert!(prompt.len() <= max, "channel prompt exceeded finite budget");
+        assert!(
+            prompt.chars().count() <= max,
+            "channel prompt exceeded finite budget"
+        );
         assert!(!prompt.contains("## Session Prompts"));
     }
 
