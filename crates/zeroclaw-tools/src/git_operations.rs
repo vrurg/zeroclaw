@@ -1862,11 +1862,16 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.success, "worktree list failed: {listed:?}");
+        let worktrees: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        let linked_worktree_path = clean_verbatim_path(&linked_worktree.canonicalize().unwrap())
+            .to_string_lossy()
+            .into_owned();
         assert!(
-            listed
-                .output
-                .to_string()
-                .contains(&clean_verbatim_path(&linked_worktree).display().to_string()),
+            worktrees["worktrees"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .any(|entry| entry["path"] == linked_worktree_path)),
             "worktree list must include the authorized linked worktree: {listed:?}"
         );
 
@@ -2042,12 +2047,17 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.success, "read-only worktree list failed: {listed:?}");
+        let worktrees: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+        let read_only_worktree_path =
+            clean_verbatim_path(&read_only_root.path().canonicalize().unwrap())
+                .to_string_lossy()
+                .into_owned();
         assert!(
-            listed.output.to_string().contains(
-                &clean_verbatim_path(&read_only_root.path().canonicalize().unwrap())
-                    .display()
-                    .to_string()
-            ),
+            worktrees["worktrees"]
+                .as_array()
+                .is_some_and(|entries| entries
+                    .iter()
+                    .any(|entry| entry["path"] == read_only_worktree_path)),
             "the readable worktree must be listed: {listed:?}"
         );
     }
