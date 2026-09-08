@@ -1790,13 +1790,25 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        let expected_generation = self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let expected_queue_generation = self
+            .ctx
+            .sessions
+            .session_queue
+            .generation(&req.session_id)
+            .await;
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
         // complete. Removal then happens under the same incarnation fence.
         let _lifecycle_cancellation = self
             .ctx
             .sessions
-            .signal_session_removal(&req.session_id)
+            .signal_session_removal_at_generation(&req.session_id, expected_generation)
             .await;
         let _guard = self
             .ctx
@@ -1805,6 +1817,20 @@ impl RpcDispatcher {
             .acquire(&req.session_id)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if self.ctx.sessions.get_generation(&req.session_id).await != Some(expected_generation)
+            || self
+                .ctx
+                .sessions
+                .session_queue
+                .generation(&req.session_id)
+                .await
+                != expected_queue_generation
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session was replaced while close was pending",
+            ));
+        }
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1841,7 +1867,12 @@ impl RpcDispatcher {
             // promptly.
             drop(agent);
         }
-        if !self.ctx.sessions.remove(&req.session_id).await {
+        if !self
+            .ctx
+            .sessions
+            .remove_at_generation(&req.session_id, expected_generation)
+            .await
+        {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         self.ctx
@@ -1878,11 +1909,22 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+        let expected_generation = self
+            .ctx
+            .sessions
+            .get_generation(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let expected_queue_generation = self.ctx.sessions.session_queue.generation(sid).await;
 
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
-        let _lifecycle_cancellation = self.ctx.sessions.signal_session_kill(sid).await;
+        let _lifecycle_cancellation = self
+            .ctx
+            .sessions
+            .signal_session_kill_at_generation(sid, expected_generation)
+            .await;
         let _guard = self
             .ctx
             .sessions
@@ -1890,6 +1932,14 @@ impl RpcDispatcher {
             .acquire(sid)
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if self.ctx.sessions.get_generation(sid).await != Some(expected_generation)
+            || self.ctx.sessions.session_queue.generation(sid).await != expected_queue_generation
+        {
+            return Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "Session was replaced while kill was pending",
+            ));
+        }
         let chat_mode = self
             .ctx
             .sessions
@@ -1947,7 +1997,11 @@ impl RpcDispatcher {
             }
         }
 
-        let killed = self.ctx.sessions.kill_session(sid).await;
+        let killed = self
+            .ctx
+            .sessions
+            .kill_session_at_generation(sid, expected_generation)
+            .await;
         if killed {
             self.ctx.sessions.session_queue.invalidate(sid).await;
             if let Some(ref hooks) = self.ctx.hooks {
@@ -3251,7 +3305,15 @@ impl RpcDispatcher {
                 .channel_handles()
                 .unregister_channel("rpc");
         }
-        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        let existed = match expected_generation {
+            Some(generation) => {
+                self.ctx
+                    .sessions
+                    .remove_at_generation(&req.session_id, generation)
+                    .await
+            }
+            None => false,
+        };
         // A successful durable delete or live-session removal is the lifecycle
         // commit point. Only then invalidate holders from this incarnation.
         if deleted_durable_chat || existed {
@@ -10565,7 +10627,12 @@ mod tests {
             .await
             .expect("chat session/new should succeed");
         let token = tokio_util::sync::CancellationToken::new();
-        sessions.register_cancel_token(sid, token.clone());
+        let session_generation = sessions.get_generation(sid).await.unwrap();
+        let _registration = sessions.register_cancel_token_guard_at_session_generation(
+            sid,
+            session_generation,
+            token.clone(),
+        );
 
         dispatcher
             .handle_session_delete(&json!({"session_id": sid}))
@@ -14670,6 +14737,93 @@ mod tests {
             assert!(
                 provider_started_rx.try_recv().is_err(),
                 "{removal:?} must cancel before provider execution begins"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_lifecycle_requests_do_not_remove_same_id_successor() {
+        #[derive(Clone, Copy, Debug)]
+        enum Lifecycle {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for lifecycle in [Lifecycle::Close, Lifecycle::Kill, Lifecycle::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let chat_backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 2, 60,
+            ));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let sid = format!("stale-{lifecycle:?}").to_ascii_lowercase();
+            install_state_test_session(&sessions, &chat_backend, &sid, FailingProvider).await;
+            let predecessor_generation = sessions.get_generation(&sid).await.unwrap();
+            let ctx = RpcContext::for_persistence_tests(
+                zeroclaw_config::schema::Config::default(),
+                Arc::clone(&sessions),
+                Some(chat_backend.clone()
+                    as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let dispatcher = Arc::new(RpcDispatcher::new(
+                ctx,
+                tx,
+                "test-peer-stale-lifecycle".into(),
+            ));
+
+            // Hold the lifecycle request after it captures the predecessor.
+            // A direct store replacement models another authority completing a
+            // same-ID replacement before this request obtains finalization.
+            let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
+            let lifecycle_dispatcher = Arc::clone(&dispatcher);
+            let lifecycle_sid = sid.clone();
+            let lifecycle_task = zeroclaw_spawn::spawn!(async move {
+                match lifecycle {
+                    Lifecycle::Close => {
+                        lifecycle_dispatcher
+                            .handle_session_close(&json!({"session_id": lifecycle_sid}))
+                            .await
+                    }
+                    Lifecycle::Kill => {
+                        lifecycle_dispatcher
+                            .handle_session_kill(&json!({"session_id": lifecycle_sid}))
+                            .await
+                    }
+                    Lifecycle::Delete => {
+                        lifecycle_dispatcher
+                            .handle_session_delete(&json!({"session_id": lifecycle_sid}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("lifecycle request must wait behind the held admission");
+
+            assert!(sessions.remove(&sid).await, "test must remove predecessor");
+            install_state_test_session(&sessions, &chat_backend, &sid, FailingProvider).await;
+            let successor_generation = sessions.get_generation(&sid).await.unwrap();
+            assert_ne!(predecessor_generation, successor_generation);
+            drop(admission_guard);
+
+            let error = lifecycle_task
+                .await
+                .expect("lifecycle task must not panic")
+                .expect_err("stale lifecycle request must reject its successor");
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+            assert_eq!(
+                sessions.get_generation(&sid).await,
+                Some(successor_generation),
+                "{lifecycle:?} must leave the same-ID successor live"
             );
         }
     }
