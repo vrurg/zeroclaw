@@ -13,18 +13,21 @@ pub enum MaybeSet<T> {
     Null,
 }
 
-/// Adjusts a path on Windows to strip the UNC verbatim prefix `\\?\` if present.
-/// On Windows, `cmd.exe` and some legacy tools do not support paths starting with `\\?\`
+/// Adjusts a path on Windows to strip the verbatim prefix `\\?\` if present.
+/// On Windows, Git and some legacy tools do not support paths starting with `\\?\`
 /// as the current directory or within arguments.
+/// Non-Unicode paths remain unchanged so callers can reject them explicitly.
 pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", test))]
     {
-        let path_str = path.to_string_lossy();
-        if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
-            // Check if it's a local drive path (e.g. \\?\C:\...) by checking if the 6th char is ':'
-            if path_str.chars().nth(5) == Some(':') {
-                return std::path::PathBuf::from(stripped);
-            }
+        let Some(path_str) = path.to_str() else {
+            return path.to_path_buf();
+        };
+        if let Some(rest) = path_str.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = path_str.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
         }
     }
     path.to_path_buf()
@@ -54,15 +57,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clean_verbatim_path_strips_unc_prefix_on_windows() {
-        // Simulate a Windows verbatim UNC path
+    fn clean_verbatim_path_strips_verbatim_drive_prefix() {
         let verbatim_path = std::path::Path::new(r"\\?\C:\Users\me\repo");
         let cleaned = clean_verbatim_path(verbatim_path);
-        // On Windows, the prefix should be stripped; on other platforms, unchanged
-        #[cfg(target_os = "windows")]
         assert_eq!(cleaned.to_string_lossy(), r"C:\Users\me\repo");
-        #[cfg(not(target_os = "windows"))]
-        assert_eq!(cleaned.to_string_lossy(), r"\\?\C:\Users\me\repo");
     }
 
     #[test]
@@ -80,12 +78,24 @@ mod tests {
     }
 
     #[test]
-    fn clean_verbatim_path_does_not_strip_unc_driveless_path() {
-        // UNC path without drive letter (e.g. \\?\UNC\server\share) should not be stripped
+    fn clean_verbatim_path_converts_verbatim_unc_path() {
         let unc_server_path = std::path::Path::new(r"\\?\UNC\server\share");
         let cleaned = clean_verbatim_path(unc_server_path);
-        // Should remain unchanged since there's no drive letter at position 5
-        assert_eq!(cleaned.to_string_lossy(), r"\\?\UNC\server\share");
+        assert_eq!(cleaned.to_string_lossy(), r"\\server\share");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_verbatim_path_preserves_non_unicode_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"\\\\?\\C:\\Users\\me\\re\xffpo".to_vec(),
+        ));
+        let cleaned = clean_verbatim_path(&path);
+
+        assert_eq!(cleaned.as_os_str().as_bytes(), path.as_os_str().as_bytes());
+        assert!(cleaned.to_str().is_none());
     }
 
     #[test]

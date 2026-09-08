@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use serde_json::json;
-#[cfg(any(windows, test))]
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
+
+use crate::util_helpers::clean_verbatim_path;
 
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
@@ -558,6 +558,7 @@ impl GitOperationsTool {
     fn git_discovery_ceiling_path(root: &Path) -> anyhow::Result<PathBuf> {
         #[cfg(windows)]
         {
+            let root = clean_verbatim_path(root);
             let Some(root) = root.to_str() else {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -567,9 +568,7 @@ impl GitOperationsTool {
                 );
                 anyhow::bail!("Git discovery ceiling cannot represent non-Unicode authorized root");
             };
-            Ok(PathBuf::from(
-                Self::strip_windows_verbatim_prefix(root).into_owned(),
-            ))
+            Ok(PathBuf::from(root))
         }
         #[cfg(not(windows))]
         {
@@ -577,17 +576,8 @@ impl GitOperationsTool {
         }
     }
 
-    /// Convert Windows `canonicalize` output back to the spelling Git uses for
-    /// discovery. A verbatim `\\?\` path cannot match Git's plain cwd path.
-    #[cfg(any(windows, test))]
-    fn strip_windows_verbatim_prefix(path: &str) -> Cow<'_, str> {
-        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            Cow::Owned(format!(r"\\{rest}"))
-        } else if let Some(rest) = path.strip_prefix(r"\\?\") {
-            Cow::Borrowed(rest)
-        } else {
-            Cow::Borrowed(path)
-        }
+    fn git_worktree_path(path: &Path) -> PathBuf {
+        clean_verbatim_path(path)
     }
 
     async fn git_status(
@@ -1099,15 +1089,19 @@ impl GitOperationsTool {
         }
     }
 
-    fn worktree_list_entry_is_authorized(&self, raw_path: &str) -> bool {
+    fn authorized_worktree_list_path(&self, raw_path: &str) -> Option<PathBuf> {
         let Ok(path) = self.resolve_working_dir(Some(raw_path), false) else {
-            return false;
+            return None;
         };
         let roots = self.security.approved_read_roots(&path);
-        matches!(
+        if matches!(
             self.has_repository_within_authorized_roots(&path, &roots, false),
             RepositoryAuthorization::Authorized(_)
-        )
+        ) {
+            Some(clean_verbatim_path(&path))
+        } else {
+            None
+        }
     }
 
     fn parse_worktree_list(&self, output: &str, active_worktree: &Path) -> serde_json::Value {
@@ -1118,10 +1112,11 @@ impl GitOperationsTool {
         let mut is_detached = false;
         for line in output.lines().map(str::trim) {
             if line.is_empty() {
-                if !current_path.is_empty() && self.worktree_list_entry_is_authorized(&current_path)
+                if !current_path.is_empty()
+                    && let Some(authorized_path) = self.authorized_worktree_list_path(&current_path)
                 {
                     worktrees.push((
-                        std::mem::take(&mut current_path),
+                        authorized_path.to_string_lossy().into_owned(),
                         std::mem::take(&mut current_branch),
                         std::mem::take(&mut current_head),
                         is_detached,
@@ -1141,9 +1136,20 @@ impl GitOperationsTool {
                 is_detached = true;
             }
         }
-        if !current_path.is_empty() && self.worktree_list_entry_is_authorized(&current_path) {
-            worktrees.push((current_path, current_branch, current_head, is_detached));
+        if !current_path.is_empty()
+            && let Some(authorized_path) = self.authorized_worktree_list_path(&current_path)
+        {
+            worktrees.push((
+                authorized_path.to_string_lossy().into_owned(),
+                current_branch,
+                current_head,
+                is_detached,
+            ));
         }
+        let active_worktree = active_worktree
+            .canonicalize()
+            .unwrap_or_else(|_| active_worktree.to_path_buf());
+        let active_worktree = clean_verbatim_path(&active_worktree);
         let active_index = worktrees
             .iter()
             .enumerate()
@@ -1200,14 +1206,15 @@ impl GitOperationsTool {
                     })?;
                 self.sanitize_git_args(raw_path)?;
                 let worktree_path = self.ensure_worktree_add_target_allowed(raw_path)?;
-                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                let git_worktree_path = Self::git_worktree_path(&worktree_path);
+                let git_worktree_path = git_worktree_path.to_str().ok_or_else(|| {
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
                 let branch = args
                     .get("branch")
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
-                let mut git_args = vec!["worktree", "add", "--", worktree_path];
+                let mut git_args = vec!["worktree", "add", "--", git_worktree_path];
                 if !branch.is_empty() {
                     self.sanitize_git_args(branch)?;
                     git_args.push(branch);
@@ -1215,7 +1222,7 @@ impl GitOperationsTool {
                 self.run_git_command(&git_args, working_dir).await?;
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree added at: {worktree_path}").into(),
+                    output: format!("Worktree added at: {git_worktree_path}").into(),
                     error: None,
                 })
             }
@@ -1228,14 +1235,15 @@ impl GitOperationsTool {
                     })?;
                 self.sanitize_git_args(raw_path)?;
                 let worktree_path = self.ensure_worktree_remove_target_allowed(raw_path)?;
-                let worktree_path = worktree_path.to_str().ok_or_else(|| {
+                let git_worktree_path = Self::git_worktree_path(&worktree_path);
+                let git_worktree_path = git_worktree_path.to_str().ok_or_else(|| {
                     anyhow::Error::msg("Worktree path must be valid UTF-8 for git execution")
                 })?;
-                self.run_git_command(&["worktree", "remove", worktree_path], working_dir)
+                self.run_git_command(&["worktree", "remove", git_worktree_path], working_dir)
                     .await?;
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Worktree removed: {worktree_path}").into(),
+                    output: format!("Worktree removed: {git_worktree_path}").into(),
                     error: None,
                 })
             }
@@ -1858,7 +1866,7 @@ mod tests {
             listed
                 .output
                 .to_string()
-                .contains(&linked_worktree.display().to_string()),
+                .contains(&clean_verbatim_path(&linked_worktree).display().to_string()),
             "worktree list must include the authorized linked worktree: {listed:?}"
         );
 
@@ -1967,33 +1975,49 @@ mod tests {
 
         let tool = test_tool_with_allowed_root(workspace.path(), allowed_root.path().to_path_buf());
         let porcelain = format!(
-            "worktree {}\nHEAD workspace-head\nbranch refs/heads/master\n\nworktree {}\nHEAD sibling-head\ndetached\n\nworktree {}\nHEAD authorized-head\nbranch refs/heads/authorized-worktree-branch\n",
+            "worktree {}\nHEAD workspace-head\nbranch refs/heads/master\n\nworktree {}\nHEAD sibling-head\ndetached\n\nworktree {}\nHEAD authorized-head\nbranch refs/heads/authorized-worktree-branch\n\n",
             workspace.path().display(),
             sibling.display(),
             authorized.display(),
         );
         let listed = tool.parse_worktree_list(&porcelain, workspace.path());
         let worktrees = listed["worktrees"].as_array().unwrap();
+        let workspace_path = clean_verbatim_path(&workspace.path().canonicalize().unwrap());
+        let sibling_path = clean_verbatim_path(&sibling.canonicalize().unwrap());
+        let authorized_path = clean_verbatim_path(&authorized.canonicalize().unwrap());
+        assert_eq!(
+            worktrees.len(),
+            2,
+            "only authorized worktrees must be listed: {listed}"
+        );
+        assert_eq!(
+            worktrees
+                .iter()
+                .filter(|entry| entry["active"] == true)
+                .count(),
+            1,
+            "exactly one listed worktree must be active: {listed}"
+        );
         assert!(
             worktrees
                 .iter()
-                .any(|entry| entry["path"] == workspace.path().to_string_lossy().as_ref()),
+                .any(|entry| entry["path"] == workspace_path.to_string_lossy().as_ref()),
             "the authorized worktree must remain visible: {listed}"
         );
         let workspace_entry = worktrees
             .iter()
-            .find(|entry| entry["path"] == workspace.path().to_string_lossy().as_ref())
+            .find(|entry| entry["path"] == workspace_path.to_string_lossy().as_ref())
             .expect("the workspace worktree must remain visible");
         assert_eq!(workspace_entry["active"], true);
         assert!(
             !worktrees
                 .iter()
-                .any(|entry| entry["path"] == sibling.to_string_lossy().as_ref()),
+                .any(|entry| entry["path"] == sibling_path.to_string_lossy().as_ref()),
             "an unauthorized sibling worktree path must not be disclosed: {listed}"
         );
         let authorized_entry = worktrees
             .iter()
-            .find(|entry| entry["path"] == authorized.to_string_lossy().as_ref())
+            .find(|entry| entry["path"] == authorized_path.to_string_lossy().as_ref())
             .expect("the separately authorized worktree must remain visible");
         assert_eq!(authorized_entry["branch"], "authorized-worktree-branch");
         assert_eq!(authorized_entry["head"], "authorized-head");
@@ -2019,10 +2043,11 @@ mod tests {
             .unwrap();
         assert!(listed.success, "read-only worktree list failed: {listed:?}");
         assert!(
-            listed
-                .output
-                .to_string()
-                .contains(&read_only_root.path().display().to_string()),
+            listed.output.to_string().contains(
+                &clean_verbatim_path(&read_only_root.path().canonicalize().unwrap())
+                    .display()
+                    .to_string()
+            ),
             "the readable worktree must be listed: {listed:?}"
         );
     }
@@ -2625,18 +2650,30 @@ mod tests {
     }
 
     #[test]
-    fn git_ceiling_strips_windows_verbatim_prefixes() {
+    fn git_ceiling_cleans_windows_verbatim_prefixes() {
         assert_eq!(
-            GitOperationsTool::strip_windows_verbatim_prefix(r"\\?\C:\Users\me\repo"),
-            r"C:\Users\me\repo"
+            clean_verbatim_path(Path::new(r"\\?\C:\Users\me\repo")),
+            PathBuf::from(r"C:\Users\me\repo")
         );
         assert_eq!(
-            GitOperationsTool::strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo"),
-            r"\\server\share\repo"
+            clean_verbatim_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
         );
         assert_eq!(
-            GitOperationsTool::strip_windows_verbatim_prefix("/workspace/repo"),
-            "/workspace/repo"
+            clean_verbatim_path(Path::new("/workspace/repo")),
+            PathBuf::from("/workspace/repo")
+        );
+    }
+
+    #[test]
+    fn git_worktree_path_cleans_windows_verbatim_prefixes() {
+        assert_eq!(
+            GitOperationsTool::git_worktree_path(Path::new(r"\\?\C:\Users\me\repo")),
+            PathBuf::from(r"C:\Users\me\repo")
+        );
+        assert_eq!(
+            GitOperationsTool::git_worktree_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
         );
     }
 
