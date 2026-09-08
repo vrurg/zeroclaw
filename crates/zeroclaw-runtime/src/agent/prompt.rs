@@ -13,7 +13,8 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::{
     ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
     looks_like_malformed_json_tool_invocation, looks_like_malformed_tool_protocol_envelope,
-    parsed_tool_protocol_mentions_known_tool, tool_protocol_envelope_mentions_known_tool,
+    parse_tool_calls, parsed_tool_protocol_mentions_known_tool,
+    tool_protocol_envelope_mentions_known_tool,
 };
 
 /// Closed identifier supplied by a trusted interaction client. The identifier
@@ -227,7 +228,7 @@ pub(crate) fn session_prompt_tool_call_envelope_mentioned(content: &str) -> bool
     // redaction must track that accepted-call identity rather than a subset of
     // wrapper spellings, or a newly supported parser format can leak opaque
     // attachment content before approval.
-    parsed_tool_protocol_mentions_known_tool(content, session_prompt_tool_names())
+    session_prompt_accepted_tool_call_envelope(content)
         || tool_protocol_envelope_mentions_known_tool(content, session_prompt_tool_names())
         || escaped_json_tool_protocol(content).is_some_and(|decoded| {
             parsed_tool_protocol_mentions_known_tool(&decoded, session_prompt_tool_names())
@@ -274,8 +275,15 @@ fn session_prompt_native_tool_call_envelope(content: &str) -> bool {
 }
 
 fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
+    let accepted_by_runtime = |candidate: &str| {
+        parse_tool_calls(candidate)
+            .1
+            .iter()
+            .any(|call| session_prompt_tool_names().contains(&call.name.to_ascii_lowercase()))
+    };
     let accepted = |candidate: &str| {
-        parsed_tool_protocol_mentions_known_tool(candidate, session_prompt_tool_names())
+        accepted_by_runtime(candidate)
+            || parsed_tool_protocol_mentions_known_tool(candidate, session_prompt_tool_names())
             || tool_protocol_envelope_mentions_known_tool(candidate, session_prompt_tool_names())
     };
 
@@ -1905,20 +1913,28 @@ mod tests {
     }
 
     #[test]
-    fn export_copy_preserves_business_json_named_like_a_session_prompt_tool() {
+    fn export_copy_redacts_name_only_json_that_the_runtime_executes_as_a_session_prompt_tool() {
         let business_json =
             r#"{"name":"session_prompt_set","description":"Document this identifier for users"}"#;
         let messages = vec![
             ChatMessage::assistant(business_json),
+            ChatMessage::user("[Tool results]\nprivate result"),
             ChatMessage::user("ordinary next-turn input"),
         ];
 
         let export = redact_session_prompt_tool_exchanges_for_export(&messages);
-        assert_eq!(export[0].content, business_json);
-        assert_eq!(export[1].content, "ordinary next-turn input");
+        assert_eq!(
+            export[0].content, SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER,
+            "the runtime accepts a name-only JSON object as a tool call"
+        );
+        assert_eq!(
+            export[1].content,
+            SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
+        );
+        assert_eq!(export[2].content, "ordinary next-turn input");
         assert_eq!(
             redact_session_prompt_text_protocol_for_export(business_json),
-            business_json
+            SESSION_PROMPT_TOOL_EXCHANGE_EXPORT_MARKER
         );
     }
 
