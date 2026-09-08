@@ -121,6 +121,16 @@ pub struct SessionStore {
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
+    /// Lifecycle requests that observed a live session incarnation after its
+    /// prompt was admitted but before that prompt registered a token. The
+    /// pending request is consumed only by that exact incarnation's token
+    /// registration, so a same-ID successor cannot inherit cancellation.
+    pending_cancellations: std::sync::Mutex<HashMap<String, (u64, CancelCause)>>,
+    /// A prompt that has acquired the per-session queue and passed its
+    /// incarnation check, but has not registered a cancellation token yet.
+    /// This is the only state that may receive a pending lifecycle signal;
+    /// queued prompts have not been admitted and must remain unaffected.
+    pre_registration_admissions: std::sync::Mutex<HashMap<String, u64>>,
     max_sessions: usize,
     pub session_queue: Arc<SessionActorQueue>,
     /// Monotonic counter incremented on every `insert` that installs or
@@ -133,11 +143,11 @@ pub struct SessionStore {
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
-    /// Test-only pause immediately after a prompt registers its cancellation
-    /// token. Removal-race tests use this to issue close/kill/delete while the
-    /// prompt owns admission but before any fallible setup or provider work.
+    /// Test-only pause after a prompt acquires admission and validates its
+    /// incarnation, but before its cancellation token is registered. This is
+    /// the lifecycle signal boundary a removal must not miss.
     #[cfg(test)]
-    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    test_prompt_pre_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -150,6 +160,53 @@ pub(crate) struct CancelTokenRegistration<'a> {
     store: &'a SessionStore,
     session_id: &'a str,
     generation: Option<u64>,
+}
+
+/// Clears an unconsumed generation-bound lifecycle cancellation when its
+/// handler exits without completing removal. A failed delete must leave the
+/// live session usable rather than cancelling its next prompt.
+pub(crate) struct LifecycleCancellation<'a> {
+    store: &'a SessionStore,
+    session_id: String,
+    session_generation: u64,
+}
+
+/// Marks the narrow admitted-before-token window for one prompt. Dropping the
+/// marker on every setup path prevents later lifecycle requests from treating
+/// an idle or queued session as a pending turn.
+pub(crate) struct PreRegistrationAdmission<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    session_generation: u64,
+}
+
+impl Drop for PreRegistrationAdmission<'_> {
+    fn drop(&mut self) {
+        let mut admissions = self
+            .store
+            .pre_registration_admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if admissions.get(self.session_id) == Some(&self.session_generation) {
+            admissions.remove(self.session_id);
+        }
+    }
+}
+
+impl Drop for LifecycleCancellation<'_> {
+    fn drop(&mut self) {
+        let mut pending = self
+            .store
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(&self.session_id)
+            .is_some_and(|(generation, _)| *generation == self.session_generation)
+        {
+            pending.remove(&self.session_id);
+        }
+    }
 }
 
 impl CancelTokenRegistration<'_> {
@@ -181,13 +238,15 @@ impl SessionStore {
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
+            pending_cancellations: std::sync::Mutex::new(HashMap::new()),
+            pre_registration_admissions: std::sync::Mutex::new(HashMap::new()),
             max_sessions,
             session_queue,
             session_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
-            test_prompt_registration_pause: std::sync::Mutex::new(None),
+            test_prompt_pre_registration_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -677,22 +736,72 @@ impl SessionStore {
         generation
     }
 
-    pub(crate) fn register_cancel_token_guard<'a>(
+    /// Register an admitted prompt's token and immediately consume a pending
+    /// lifecycle cancellation for the same durable session incarnation.
+    ///
+    /// `cancel_tokens` is held while checking `pending_cancellations`, which
+    /// closes the signal-versus-registration window: lifecycle handlers take
+    /// the same lock order when they either cancel a token or record a pending
+    /// request.
+    pub(crate) fn register_cancel_token_guard_at_session_generation<'a>(
         &'a self,
         id: &'a str,
+        session_generation: u64,
         token: tokio_util::sync::CancellationToken,
     ) -> CancelTokenRegistration<'a> {
+        let registration_generation = self
+            .cancel_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        let token_for_cancel = token.clone();
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, stale)) = tokens.insert(id.to_string(), (registration_generation, token)) {
+            stale.cancel();
+        }
+        let pending = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        drop(tokens);
+
+        if let Some((pending_generation, cause)) = pending
+            && pending_generation == session_generation
+        {
+            self.record_cancel_cause(id, cause);
+            token_for_cancel.cancel();
+        }
+
         CancelTokenRegistration {
             store: self,
             session_id: id,
-            generation: Some(self.register_cancel_token(id, token)),
+            generation: Some(registration_generation),
+        }
+    }
+
+    /// Start the narrow admission interval in which a lifecycle request must
+    /// latch instead of looking only for a registered token. The caller holds
+    /// the per-session queue permit and has already validated this generation.
+    pub(crate) fn begin_pre_registration_admission<'a>(
+        &'a self,
+        id: &'a str,
+        session_generation: u64,
+    ) -> PreRegistrationAdmission<'a> {
+        self.pre_registration_admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), session_generation);
+        PreRegistrationAdmission {
+            store: self,
+            session_id: id,
+            session_generation,
         }
     }
 
     #[cfg(test)]
-    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
+    pub(crate) async fn wait_test_prompt_pre_registration_pause(&self) {
         let (entered, release) = {
-            let guard = self.test_prompt_registration_pause.lock().unwrap();
+            let guard = self.test_prompt_pre_registration_pause.lock().unwrap();
             match &*guard {
                 Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
                 None => return,
@@ -704,13 +813,13 @@ impl SessionStore {
 
     #[cfg(not(test))]
     #[inline(always)]
-    pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
+    pub(crate) async fn wait_test_prompt_pre_registration_pause(&self) {}
 
     #[cfg(test)]
-    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
+    pub(crate) fn set_test_prompt_pre_registration_pause(&self) -> PromptRegistrationPause {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_registration_pause.lock().unwrap() =
+        *self.test_prompt_pre_registration_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
     }
@@ -735,17 +844,32 @@ impl SessionStore {
         self.signal_cancellation(id, CancelCause::ClientRpc)
     }
 
-    /// Signal an in-flight turn before a close/delete handler waits for the
-    /// session admission permit. The handler removes the session only after
-    /// the admitted prompt has finalized under its original incarnation.
-    pub fn signal_session_removal(&self, id: &str) -> bool {
-        self.signal_cancellation(id, CancelCause::SessionRemoved)
+    /// Signal a removal before its handler waits for admission. If a prompt is
+    /// in the explicit admitted-before-token interval, latch the signal to the
+    /// observed session generation instead of losing it.
+    pub(crate) async fn signal_session_removal(
+        &self,
+        id: &str,
+    ) -> Option<LifecycleCancellation<'_>> {
+        let generation = self.get_generation(id).await?;
+        self.signal_cancellation_at_session_generation(id, generation, CancelCause::SessionRemoved);
+        Some(LifecycleCancellation {
+            store: self,
+            session_id: id.to_string(),
+            session_generation: generation,
+        })
     }
 
     /// Signal an in-flight turn before an administrative kill waits for the
     /// session admission permit.
-    pub fn signal_session_kill(&self, id: &str) -> bool {
-        self.signal_cancellation(id, CancelCause::AdminKill)
+    pub(crate) async fn signal_session_kill(&self, id: &str) -> Option<LifecycleCancellation<'_>> {
+        let generation = self.get_generation(id).await?;
+        self.signal_cancellation_at_session_generation(id, generation, CancelCause::AdminKill);
+        Some(LifecycleCancellation {
+            store: self,
+            session_id: id.to_string(),
+            session_generation: generation,
+        })
     }
 
     fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
@@ -760,29 +884,68 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
-    /// Cancel an in-flight turn only if `id` still names the observed live
-    /// session incarnation. Lifecycle callers use this before waiting on the
-    /// per-session queue, so a queued delete cannot cancel a same-ID successor.
-    pub async fn cancel_session_at_generation(&self, id: &str, expected_generation: u64) -> bool {
-        let sessions = self.sessions.lock().await;
-        if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
+    fn signal_cancellation_at_session_generation(
+        &self,
+        id: &str,
+        session_generation: u64,
+        cause: CancelCause,
+    ) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, token)) = tokens.get(id) {
+            self.record_cancel_cause(id, cause);
+            token.cancel();
+            return true;
+        }
+        let admissions = self
+            .pre_registration_admissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if admissions.get(id) != Some(&session_generation) {
             return false;
         }
-        self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
+        self.pending_cancellations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(id)
-            .map(|(_, token)| {
-                token.cancel();
-                true
-            })
-            .unwrap_or(false)
+            .insert(id.to_string(), (session_generation, cause));
+        true
+    }
+
+    /// Signal removal only if `id` still names the observed live incarnation.
+    /// The returned guard clears an unconsumed pending signal on handler
+    /// failure, so a later prompt cannot inherit a failed deletion request.
+    pub(crate) async fn signal_session_removal_at_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<LifecycleCancellation<'_>> {
+        let sessions = self.sessions.lock().await;
+        if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
+            return None;
+        }
+        drop(sessions);
+        self.signal_cancellation_at_session_generation(
+            id,
+            expected_generation,
+            CancelCause::SessionRemoved,
+        );
+        Some(LifecycleCancellation {
+            store: self,
+            session_id: id.to_string(),
+            session_generation: expected_generation,
+        })
     }
 
     /// Returns true if a cancel token is registered — i.e. a turn is in flight.
     pub fn has_inflight_turn(&self, id: &str) -> bool {
         self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_lifecycle_cancellation(&self, id: &str) -> bool {
+        self.pending_cancellations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)

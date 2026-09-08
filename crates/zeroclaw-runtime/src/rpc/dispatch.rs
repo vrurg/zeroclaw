@@ -1793,7 +1793,11 @@ impl RpcDispatcher {
         // Cancellation must be signalled before waiting: the admitted prompt
         // owns this permit until its terminal state and transcript writes are
         // complete. Removal then happens under the same incarnation fence.
-        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _lifecycle_cancellation = self
+            .ctx
+            .sessions
+            .signal_session_removal(&req.session_id)
+            .await;
         let _guard = self
             .ctx
             .sessions
@@ -1878,7 +1882,7 @@ impl RpcDispatcher {
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
-        self.ctx.sessions.signal_session_kill(sid);
+        let _lifecycle_cancellation = self.ctx.sessions.signal_session_kill(sid).await;
         let _guard = self
             .ctx
             .sessions
@@ -2249,17 +2253,32 @@ impl RpcDispatcher {
             ));
         }
 
+        // Lifecycle removal can observe this admitted incarnation before its
+        // cancellation token exists. Pause here only in tests; production
+        // registration atomically consumes any generation-bound removal latch
+        // before fallible setup or provider work can begin.
         // Register cancellation only after this incarnation is admitted. The
-        // RAII guard removes exactly this registration on every exit path.
+        // pre-registration guard marks only this narrow interval for a
+        // lifecycle latch; it drops as soon as the token exists, while the
+        // token guard removes exactly its registration on every later exit.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_registration = self
-            .ctx
-            .sessions
-            .register_cancel_token_guard(sid, cancel.clone());
-        self.ctx
-            .sessions
-            .wait_test_prompt_registration_pause()
-            .await;
+        let cancel_registration = {
+            let _pre_registration_admission = self
+                .ctx
+                .sessions
+                .begin_pre_registration_admission(sid, session_generation);
+            self.ctx
+                .sessions
+                .wait_test_prompt_pre_registration_pause()
+                .await;
+            self.ctx
+                .sessions
+                .register_cancel_token_guard_at_session_generation(
+                    sid,
+                    session_generation,
+                    cancel.clone(),
+                )
+        };
 
         let chat_mode = self
             .ctx
@@ -3118,12 +3137,15 @@ impl RpcDispatcher {
         // Deletion must terminate an admitted turn before waiting for its
         // queue permit. Bind cancellation to the captured session generation
         // so it cannot target a same-ID successor created meanwhile.
-        if let Some(generation) = expected_generation {
-            self.ctx
-                .sessions
-                .cancel_session_at_generation(&req.session_id, generation)
-                .await;
-        }
+        let _lifecycle_cancellation = match expected_generation {
+            Some(generation) => {
+                self.ctx
+                    .sessions
+                    .signal_session_removal_at_generation(&req.session_id, generation)
+                    .await
+            }
+            None => None,
+        };
         self.handle_session_delete_at_generation(
             req,
             expected_generation,
@@ -10521,6 +10543,10 @@ mod tests {
             sessions.get_agent(sid).await.is_some(),
             "failed deletion must leave the live session usable"
         );
+        assert!(
+            !sessions.has_pending_lifecycle_cancellation(sid),
+            "a failed delete must not cancel a later prompt for the preserved session"
+        );
     }
 
     #[tokio::test]
@@ -14570,7 +14596,8 @@ mod tests {
             );
             let (tx, _rx) = tokio::sync::mpsc::channel(64);
             let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-pre-setup-removal".into());
-            let (prompt_admitted, release_prompt) = sessions.set_test_prompt_registration_pause();
+            let (prompt_admitted, release_prompt) =
+                sessions.set_test_prompt_pre_registration_pause();
 
             let prompt_handle = dispatcher.spawn_handle();
             let sid_for_prompt = sid.clone();
@@ -14587,8 +14614,11 @@ mod tests {
                 prompt_admitted.notified(),
             )
             .await
-            .expect("prompt must own admission with its cancel token registered");
-            assert!(sessions.has_inflight_turn(&sid));
+            .expect("prompt must own admission before registering its cancel token");
+            assert!(
+                !sessions.has_inflight_turn(&sid),
+                "the test must hold the exact pre-registration cancellation window"
+            );
 
             let removal_handle = dispatcher.spawn_handle();
             let sid_for_removal = sid.clone();
