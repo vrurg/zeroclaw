@@ -2457,27 +2457,7 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 /// Persistent-prompt mutation arguments are private provider context. Retained
 /// channel history must not turn them into a later transcript/API export.
 fn redact_sensitive_session_prompt_tool_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut omit_tool_batch = false;
-    messages
-        .into_iter()
-        .filter(|message| {
-            if message.role == "assistant"
-                && zeroclaw_api::SESSION_PROMPT_TOOL_NAMES
-                    .iter()
-                    .any(|name| message.content.contains(name))
-            {
-                omit_tool_batch = true;
-                return false;
-            }
-            if message.role == "assistant" {
-                omit_tool_batch = false;
-            }
-            if message.role == "tool" && omit_tool_batch {
-                return false;
-            }
-            true
-        })
-        .collect()
+    zeroclaw_runtime::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages)
 }
 
 fn rollback_orphan_user_turn(
@@ -35971,7 +35951,7 @@ Done."#;
     }
 
     #[test]
-    fn retained_tool_history_omits_session_prompt_mutations() {
+    fn retained_tool_history_redacts_session_prompt_mutations() {
         let messages = vec![
             ChatMessage::assistant(
                 r#"{"tool_calls":[{"name":"session_prompt_set","arguments":"private marker"}]}"#,
@@ -35982,7 +35962,7 @@ Done."#;
         ];
 
         let retained = redact_sensitive_session_prompt_tool_messages(messages);
-        assert_eq!(retained.len(), 2);
+        assert_eq!(retained.len(), 4);
         assert!(
             retained
                 .iter()
@@ -35996,15 +35976,38 @@ Done."#;
     }
 
     #[test]
-    fn retained_tool_history_omits_every_result_from_a_mixed_sensitive_batch() {
+    fn retained_tool_history_redacts_every_result_from_a_mixed_sensitive_batch() {
         let messages = vec![
             ChatMessage::assistant(
-                r#"{"tool_calls":[{"name":"shell"},{"name":"session_prompt_list"}]}"#,
+                r#"{"tool_calls":[{"name":"shell","arguments":{}},{"name":"session_prompt_list","arguments":{}}]}"#,
             ),
             ChatMessage::tool("shell result"),
             ChatMessage::tool("private marker from list"),
         ];
-        assert!(redact_sensitive_session_prompt_tool_messages(messages).is_empty());
+        let retained = redact_sensitive_session_prompt_tool_messages(messages);
+        assert_eq!(retained.len(), 3);
+        assert!(
+            retained
+                .iter()
+                .all(|message| !message.content.contains("private marker"))
+        );
+    }
+
+    #[test]
+    fn retained_tool_history_preserves_ordinary_tool_arguments_that_name_session_prompts() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"name":"shell","arguments":{"cmd":"echo session_prompt_set"}}]}"#,
+            ),
+            ChatMessage::tool("session prompt tool name echoed"),
+        ];
+
+        let retained = redact_sensitive_session_prompt_tool_messages(messages.clone());
+        assert_eq!(retained.len(), messages.len());
+        for (actual, expected) in retained.iter().zip(&messages) {
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.content, expected.content);
+        }
     }
 
     #[test]
