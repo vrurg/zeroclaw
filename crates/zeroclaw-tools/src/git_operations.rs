@@ -513,6 +513,11 @@ impl GitOperationsTool {
             } else {
                 objects.join(target)
             };
+            if std::fs::symlink_metadata(&target)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                anyhow::bail!("Git metadata symlink is not authorized");
+            }
             self.validate_metadata_tree(&target, write, visited, module_metadata, module_roots)?;
             self.validate_object_alternates_at(
                 &target,
@@ -858,7 +863,7 @@ impl GitOperationsTool {
         Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args(args)
-            .current_dir(working_dir)
+            .current_dir(Self::git_subprocess_current_dir(working_dir))
             .stdin(std::process::Stdio::null());
         self.configure_git_environment(command.as_std_mut(), working_dir, true)?;
         let output = command.output().await?;
@@ -893,7 +898,7 @@ impl GitOperationsTool {
         Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args(READ_GIT_CONFIG_OVERRIDES)
-            .current_dir(working_dir)
+            .current_dir(Self::git_subprocess_current_dir(working_dir))
             .stdin(std::process::Stdio::null());
         Self::disable_filter_drivers(command.as_std_mut(), &filter_drivers);
         command.args(args);
@@ -930,7 +935,7 @@ impl GitOperationsTool {
                 "--get-regexp",
                 r"^filter\..*\.(clean|smudge|process|required)$",
             ])
-            .current_dir(working_dir)
+            .current_dir(Self::git_subprocess_current_dir(working_dir))
             .stdin(std::process::Stdio::null());
         self.configure_git_environment(command.as_std_mut(), working_dir, false)?;
         let output = command.output().await?;
@@ -1126,6 +1131,10 @@ impl GitOperationsTool {
             .arg(clean_verbatim_path(git_dir))
             .arg("--work-tree")
             .arg(clean_verbatim_path(repository_root));
+    }
+
+    fn git_subprocess_current_dir(path: &Path) -> PathBuf {
+        clean_verbatim_path(path)
     }
 
     fn git_discovery_ceiling_path(root: &Path) -> anyhow::Result<PathBuf> {
@@ -2347,6 +2356,27 @@ mod tests {
 
         assert_eq!(args[1], r"C:\repository\.git");
         assert_eq!(args[3], r"C:\repository");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn git_operations_status_accepts_a_canonical_windows_working_directory() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let canonical = repository.path().canonicalize().unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonical paths must exercise the verbatim-prefix path"
+        );
+
+        let status = test_tool(repository.path())
+            .execute(json!({"operation": "status", "path": &canonical}))
+            .await
+            .unwrap();
+        assert!(
+            status.success,
+            "status must start Git from a cleaned canonical directory: {status:?}"
+        );
     }
 
     #[test]
@@ -3634,6 +3664,30 @@ mod tests {
         assert!(
             result.is_err(),
             "out-of-grant object alternates must be rejected: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_operations_rejects_in_grant_symlinked_object_alternate() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let alternate_objects = repository.path().join("alternate-objects");
+        std::fs::create_dir(&alternate_objects).unwrap();
+        let symlinked_alternate = repository.path().join("alternate-link");
+        std::os::unix::fs::symlink(&alternate_objects, &symlinked_alternate).unwrap();
+        std::fs::write(
+            repository.path().join(".git/objects/info/alternates"),
+            format!("{}\n", symlinked_alternate.display()),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "in-grant symlinked object alternates must be rejected: {result:?}"
         );
     }
 
