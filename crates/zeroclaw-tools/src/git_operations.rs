@@ -584,6 +584,11 @@ impl GitOperationsTool {
                 } else {
                     repository_root.join(path)
                 };
+                if std::fs::symlink_metadata(&path)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    anyhow::bail!("Git metadata symlink is not authorized");
+                }
                 if path.exists() {
                     self.validate_metadata_tree(
                         &path,
@@ -701,15 +706,19 @@ impl GitOperationsTool {
     }
 
     fn git_config_values(config: &Path, query: &[&str]) -> anyhow::Result<Vec<String>> {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        command
             .args(["config", "--file"])
             .arg(clean_verbatim_path(config))
             .arg("--no-includes")
             .arg("--null")
             .args(query)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()?;
+            .current_dir(Self::git_subprocess_current_dir(
+                config.parent().unwrap_or_else(|| Path::new(".")),
+            ))
+            .stdin(std::process::Stdio::null());
+        Self::configure_git_base_environment(&mut command);
+        let output = command.output()?;
         if !output.status.success() {
             if output.status.code() == Some(1) {
                 return Ok(Vec::new());
@@ -999,13 +1008,7 @@ impl GitOperationsTool {
         // Git accepts a broad and evolving set of environment overrides. Start
         // from an empty Git-specific environment and add back only the fixed,
         // non-interactive values this invocation needs below.
-        let inherited_non_git_env = std::env::vars_os()
-            .filter(|(name, _)| !Self::is_git_environment_variable(name))
-            .collect::<Vec<_>>();
-        command.env_clear().envs(inherited_non_git_env);
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_PAGER", "cat");
+        Self::configure_git_base_environment(command);
         if self.security.workspace_only {
             let authorized_roots = if requires_write_access {
                 self.security.approved_write_roots(working_dir)
@@ -1049,6 +1052,17 @@ impl GitOperationsTool {
             }
         }
         Ok(())
+    }
+
+    fn configure_git_base_environment(command: &mut std::process::Command) {
+        let inherited_non_git_env = std::env::vars_os()
+            .filter(|(name, _)| !Self::is_git_environment_variable(name))
+            .collect::<Vec<_>>();
+        command.env_clear().envs(inherited_non_git_env);
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_PAGER", "cat");
     }
 
     async fn validated_repository_root_async(
@@ -3345,6 +3359,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn git_subprocess_current_dir_cleans_windows_verbatim_prefixes() {
+        assert_eq!(
+            GitOperationsTool::git_subprocess_current_dir(Path::new(r"\\?\C:\Users\me\repo")),
+            PathBuf::from(r"C:\Users\me\repo")
+        );
+        assert_eq!(
+            GitOperationsTool::git_subprocess_current_dir(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn git_commands_reject_unrepresentable_discovery_ceilings() {
@@ -3855,6 +3881,34 @@ mod tests {
         test_tool(repository.path())
             .validate_metadata_closure(repository.path(), true)
             .expect("in-grant hooks must remain authorized for write commands");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_operations_rejects_in_grant_symlinked_write_hooks_path() {
+        use std::os::unix::fs::symlink;
+
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let hooks_target = repository.path().join("hooks-target");
+        std::fs::create_dir(&hooks_target).unwrap();
+        symlink(&hooks_target, repository.path().join("hooks")).unwrap();
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\thooksPath = ./hooks\n",
+                std::fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result =
+            test_tool(repository.path()).validate_metadata_closure(repository.path(), true);
+        assert!(
+            result.is_err(),
+            "symlinked hooks paths must be rejected even when their target is in-grant: {result:?}"
+        );
     }
 
     #[tokio::test]
