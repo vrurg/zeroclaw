@@ -718,6 +718,7 @@ impl GitOperationsTool {
             ))
             .stdin(std::process::Stdio::null());
         Self::configure_git_base_environment(&mut command);
+        command.env("GIT_CONFIG_NOSYSTEM", "1");
         let output = command.output()?;
         if !output.status.success() {
             if output.status.code() == Some(1) {
@@ -1060,7 +1061,6 @@ impl GitOperationsTool {
             .collect::<Vec<_>>();
         command.env_clear().envs(inherited_non_git_env);
         command
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat");
     }

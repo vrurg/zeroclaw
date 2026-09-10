@@ -26,7 +26,10 @@ pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
         if let Some(rest) = path_str.strip_prefix(r"\\?\UNC\") {
             return std::path::PathBuf::from(format!(r"\\{rest}"));
         }
-        if let Some(rest) = path_str.strip_prefix(r"\\?\") {
+        if let Some(rest) = path_str
+            .strip_prefix(r"\\?\")
+            .filter(|rest| rest.chars().nth(1) == Some(':'))
+        {
             return std::path::PathBuf::from(rest);
         }
     }
@@ -82,6 +85,13 @@ mod tests {
         let unc_server_path = std::path::Path::new(r"\\?\UNC\server\share");
         let cleaned = clean_verbatim_path(unc_server_path);
         assert_eq!(cleaned.to_string_lossy(), r"\\server\share");
+    }
+
+    #[test]
+    fn clean_verbatim_path_preserves_unsupported_verbatim_prefixes() {
+        let volume_path =
+            std::path::Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\repo");
+        assert_eq!(clean_verbatim_path(volume_path), volume_path);
     }
 
     #[cfg(unix)]
