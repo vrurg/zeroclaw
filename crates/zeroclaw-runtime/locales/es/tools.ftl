@@ -64,6 +64,7 @@ tool-file-read = Leer el contenido de un archivo con números de línea. Admite 
 tool-file-write = Escribir contenido en un archivo del espacio de trabajo
 tool-git-operations = Realizar operaciones Git estructuradas (status, diff, log, branch, commit, add, checkout, stash). Proporciona salida JSON analizada e integra con la política de seguridad para controles de autonomía.
 tool-git-operations-error-not-in-repo = No se encuentra en un repositorio Git en '{ $path }'. Elija una ruta dentro de un árbol de trabajo Git, pase 'path' para un subdirectorio del repositorio, o inicialice un repositorio antes de ejecutar git_operations.
+tool-git-operations-error-path-not-authorized = La ruta Git '{ $path }' no está autorizada para esta operación. Elija una ruta cubierta por la raíz permitida aplicable.
 tool-git-forge-error-requires-field = { $resource }.{ $action } requiere '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requiere 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' debe ser 'completed' o 'not_planned'.

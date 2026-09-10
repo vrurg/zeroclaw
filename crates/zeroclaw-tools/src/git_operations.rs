@@ -30,6 +30,11 @@ struct ModuleMetadata {
     objects: BTreeSet<PathBuf>,
 }
 
+struct ValidatedRepository {
+    root: PathBuf,
+    git_dir: PathBuf,
+}
+
 impl GitOperationsTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
@@ -235,7 +240,7 @@ impl GitOperationsTool {
         &self,
         repository_root: &Path,
         requires_write_access: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PathBuf> {
         let git = repository_root.join(".git");
         let metadata = std::fs::symlink_metadata(&git)?;
         if metadata.file_type().is_symlink() {
@@ -358,7 +363,7 @@ impl GitOperationsTool {
                 &module_roots,
             )?;
         }
-        Ok(())
+        Ok(git_dir)
     }
 
     fn validate_metadata_tree(
@@ -790,12 +795,18 @@ impl GitOperationsTool {
                             })),
                         "git_operations: cannot resolve path"
                     );
-                    anyhow::Error::msg(format!("Cannot resolve path '{}': {}", p, e))
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-git-operations-error-path-not-authorized",
+                        &[("path", p)],
+                    ))
                 })?;
                 if !self.security.is_resolved_path_readable(&resolved)
                     || (requires_write_access && !self.security.is_resolved_path_allowed(&resolved))
                 {
-                    anyhow::bail!("Path '{}' is not authorized for this Git operation", p);
+                    anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                        "tool-git-operations-error-path-not-authorized",
+                        &[("path", p)],
+                    ));
                 }
                 resolved
             }
@@ -804,9 +815,19 @@ impl GitOperationsTool {
                 .workspace_dir
                 .canonicalize()
                 .map_err(|error| {
-                    anyhow::Error::msg(format!(
-                        "Cannot resolve Git workspace '{}': {error}",
-                        self.security.workspace_dir.display()
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "path": self.security.workspace_dir,
+                                "error": format!("{error}"),
+                            })),
+                        "git_operations: cannot resolve workspace path"
+                    );
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-git-operations-error-path-not-authorized",
+                        &[("path", &self.security.workspace_dir.display().to_string())],
                     ))
                 })?,
         };
@@ -818,11 +839,11 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let repository_root = self
+        let repository = self
             .validated_repository_root_async(working_dir, true)
             .await?;
         let mut command = tokio::process::Command::new("git");
-        Self::bind_git_worktree(command.as_std_mut(), &repository_root);
+        Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args(args)
             .current_dir(working_dir)
@@ -848,14 +869,14 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let repository_root = self
+        let repository = self
             .validated_repository_root_async(working_dir, false)
             .await?;
         let filter_drivers = self
-            .configured_filter_drivers(working_dir, &repository_root)
+            .configured_filter_drivers(working_dir, &repository)
             .await?;
         let mut command = tokio::process::Command::new("git");
-        Self::bind_git_worktree(command.as_std_mut(), &repository_root);
+        Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args([
                 "-c",
@@ -864,6 +885,8 @@ impl GitOperationsTool {
                 "core.pager=cat",
                 "-c",
                 "log.showSignature=false",
+                "-c",
+                "log.mailmap=false",
             ])
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
@@ -889,10 +912,10 @@ impl GitOperationsTool {
     async fn configured_filter_drivers(
         &self,
         working_dir: &Path,
-        repository_root: &Path,
+        repository: &ValidatedRepository,
     ) -> anyhow::Result<Vec<String>> {
         let mut command = tokio::process::Command::new("git");
-        Self::bind_git_worktree(command.as_std_mut(), repository_root);
+        Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args([
                 "config",
@@ -1022,7 +1045,7 @@ impl GitOperationsTool {
         &self,
         working_dir: &Path,
         requires_write_access: bool,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<ValidatedRepository> {
         let tool = self.clone();
         let working_dir = working_dir.to_path_buf();
         let validation_working_dir = working_dir.clone();
@@ -1056,7 +1079,7 @@ impl GitOperationsTool {
         &self,
         working_dir: &Path,
         requires_write_access: bool,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<ValidatedRepository> {
         let authorized_roots = if requires_write_access {
             self.security.approved_write_roots(working_dir)
         } else {
@@ -1068,8 +1091,12 @@ impl GitOperationsTool {
             requires_write_access,
         ) {
             RepositoryAuthorization::Authorized(repository_root) => {
-                self.validate_metadata_closure(&repository_root, requires_write_access)?;
-                Ok(repository_root)
+                let git_dir =
+                    self.validate_metadata_closure(&repository_root, requires_write_access)?;
+                Ok(ValidatedRepository {
+                    root: repository_root,
+                    git_dir,
+                })
             }
             _ => anyhow::bail!(
                 "Git repository authorization changed before command execution for '{}'",
@@ -1084,8 +1111,16 @@ impl GitOperationsTool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
     }
 
-    fn bind_git_worktree(command: &mut std::process::Command, repository_root: &Path) {
-        command.arg("--work-tree").arg(repository_root);
+    fn bind_git_worktree(
+        command: &mut std::process::Command,
+        repository_root: &Path,
+        git_dir: &Path,
+    ) {
+        command
+            .arg("--git-dir")
+            .arg(git_dir)
+            .arg("--work-tree")
+            .arg(repository_root);
     }
 
     fn git_discovery_ceiling_path(root: &Path) -> anyhow::Result<PathBuf> {
@@ -1894,7 +1929,7 @@ impl Tool for GitOperationsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Invalid path: {e}")),
+                    error: Some(e.to_string()),
                 });
             }
         };
@@ -2265,12 +2300,15 @@ mod tests {
         let repository = PathBuf::from(std::ffi::OsString::from_vec(
             b"/tmp/repository-\xff".to_vec(),
         ));
+        let git_dir = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/git-dir-\xff".to_vec()));
         let mut command = std::process::Command::new("git");
-        GitOperationsTool::bind_git_worktree(&mut command, &repository);
+        GitOperationsTool::bind_git_worktree(&mut command, &repository, &git_dir);
         let args = command.get_args().collect::<Vec<_>>();
 
-        assert_eq!(args[0], "--work-tree");
-        assert_eq!(args[1].as_bytes(), repository.as_os_str().as_bytes());
+        assert_eq!(args[0], "--git-dir");
+        assert_eq!(args[1].as_bytes(), git_dir.as_os_str().as_bytes());
+        assert_eq!(args[2], "--work-tree");
+        assert_eq!(args[3].as_bytes(), repository.as_os_str().as_bytes());
     }
 
     #[test]
@@ -2856,7 +2894,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("not authorized for this Git operation"),
+            err_msg.contains("Git path '..' is not authorized"),
             "Expected traversal rejection, got: {err_msg}"
         );
     }
@@ -2945,6 +2983,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_operations_binds_the_validated_git_dir_over_a_nested_bare_layout() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let nested_bare = repository.path().join("nested-bare");
+        std::fs::create_dir_all(nested_bare.join("objects/info")).unwrap();
+        std::fs::create_dir_all(nested_bare.join("refs/heads")).unwrap();
+        std::fs::write(nested_bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status", "path": &nested_bare}))
+            .await
+            .expect("status dispatch must return a tool result");
+        assert!(
+            result.success,
+            "Git must remain bound to the validated parent repository: {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn git_operations_do_not_mutate_parent_repository_via_read_only_grant() {
         let workspace = TempDir::new().unwrap();
         let repository = TempDir::new().unwrap();
@@ -3010,7 +3067,7 @@ mod tests {
                 result
                     .error
                     .as_deref()
-                    .is_some_and(|error| error.contains("Invalid path")),
+                    .is_some_and(|error| error.contains("Git path")),
                 "{operation} must fail during authorization: {:?}",
                 result.error
             );
@@ -3032,7 +3089,7 @@ mod tests {
             write
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("Invalid path")),
+                .is_some_and(|error| error.contains("Git path")),
             "write must fail during authorization: {:?}",
             write.error
         );
@@ -3085,7 +3142,7 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("Invalid path")),
+                .is_some_and(|error| error.contains("Git path")),
             "add must fail during authorization: {:?}",
             result.error
         );
@@ -4055,6 +4112,51 @@ mod tests {
                 "read-only log commands must not execute repository gpg.program"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn git_read_only_log_does_not_read_repository_mailmap_file() {
+        let workspace = TempDir::new().unwrap();
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+
+        let mailmap = outside.path().join("mailmap");
+        std::fs::write(
+            &mailmap,
+            "Mapped Author <mapped@example.com> Test <test@test.com>\n",
+        )
+        .unwrap();
+        for args in [
+            ["config", "log.mailmap", "true"].as_slice(),
+            ["config", "mailmap.file", mailmap.to_str().unwrap()].as_slice(),
+        ] {
+            let config = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .status()
+                .unwrap();
+            assert!(
+                config.success(),
+                "test repository configuration must succeed"
+            );
+        }
+
+        let tool = test_tool_with_read_only_root(workspace.path(), repository.path().to_path_buf());
+        let result = tool
+            .execute(json!({"operation": "log", "path": repository.path()}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "log failed: {:?}", result.error);
+        assert!(
+            result.output.to_string().contains("Test"),
+            "log must preserve the commit's unmapped author: {result:?}"
+        );
+        assert!(
+            !result.output.to_string().contains("Mapped Author"),
+            "read-only log must not read repository mailmap.file: {result:?}"
+        );
     }
 
     #[cfg(unix)]

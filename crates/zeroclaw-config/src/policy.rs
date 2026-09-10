@@ -3102,7 +3102,7 @@ impl SecurityPolicy {
         // Preserve the unconditional null-device exception before attempting
         // filesystem resolution: Windows spellings such as `nul` are not
         // canonicalizable paths.
-        if is_null_device(resolved) {
+        if cfg!(windows) && is_null_device(resolved) {
             return true;
         }
         // Keep the target in the same filesystem namespace as every policy
@@ -3255,7 +3255,7 @@ impl SecurityPolicy {
         // Preserve the unconditional null-device exception before attempting
         // filesystem resolution: Windows spellings such as `nul` are not
         // canonicalizable paths.
-        if is_null_device(resolved) {
+        if cfg!(windows) && is_null_device(resolved) {
             return true;
         }
         // See `is_resolved_path_readable`: authorization compares the target,
@@ -3265,6 +3265,10 @@ impl SecurityPolicy {
             return false;
         };
         let resolved = resolved_path.as_path();
+
+        if is_null_device(resolved) {
+            return true;
+        }
 
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -6469,7 +6473,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolved_write_check_does_not_follow_symlinks_to_the_null_device() {
+    fn resolved_write_check_preserves_symlinks_to_the_null_device() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -6483,12 +6487,12 @@ mod tests {
 
         assert!(policy.is_resolved_path_readable(Path::new("/dev/null")));
         assert!(policy.is_resolved_path_allowed(Path::new("/dev/null")));
-        // Reads retain the longstanding resolved-target exception for POSIX
-        // devices; writes only exempt a literal null-device spelling.
+        // Both reads and writes retain the longstanding resolved-target
+        // exception for POSIX devices.
         assert!(policy.is_resolved_path_readable(&null_alias));
         assert!(
-            !policy.is_resolved_path_allowed(&null_alias),
-            "a symlink to the null device must remain subject to write authorization"
+            policy.is_resolved_path_allowed(&null_alias),
+            "a symlink to the null device must retain write authorization"
         );
     }
 

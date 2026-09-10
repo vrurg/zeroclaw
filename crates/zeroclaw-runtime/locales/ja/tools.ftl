@@ -64,6 +64,7 @@ tool-file-read = 行番号付きのファイルコンテンツを読み込み。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み
 tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
 tool-git-operations-error-not-in-repo = '{ $path }' はGitリポジトリ内にありません。Gitワークツリー内のパスを選択し、リポジトリのサブディレクトリに 'path' を渡すか、git_operationsを実行する前にリポジトリを初期化してください。
+tool-git-operations-error-path-not-authorized = Gitパス '{ $path }' はこの操作に対して許可されていません。適用可能な許可済みルートに含まれるパスを選択してください。
 tool-git-forge-error-requires-field = { $resource }.{ $action } には '{ $field }' が必要です。
 tool-git-forge-error-requires-number = { $resource }.{ $action } には 'number' が必要です。
 tool-git-forge-error-issue-close-reason = issue.close の 'reason' は 'completed' または 'not_planned' である必要があります。

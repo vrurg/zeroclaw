@@ -98,6 +98,7 @@ tool-git-operations = Perform structured Git operations (status, diff, log, bran
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
 tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
 tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
