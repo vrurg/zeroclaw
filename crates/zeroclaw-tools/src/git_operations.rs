@@ -4161,6 +4161,48 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn git_read_only_log_does_not_follow_repository_mailmap_symlink() {
+        let workspace = TempDir::new().unwrap();
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+
+        let mailmap = outside.path().join("mailmap");
+        std::fs::write(
+            &mailmap,
+            "Mapped Author <mapped@example.com> Test <test@test.com>\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&mailmap, repository.path().join(".mailmap")).unwrap();
+        let config = std::process::Command::new("git")
+            .args(["config", "log.mailmap", "true"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(
+            config.success(),
+            "test repository configuration must succeed"
+        );
+
+        let tool = test_tool_with_read_only_root(workspace.path(), repository.path().to_path_buf());
+        let result = tool
+            .execute(json!({"operation": "log", "path": repository.path()}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "log failed: {:?}", result.error);
+        assert!(
+            result.output.to_string().contains("Test"),
+            "log must preserve the commit's unmapped author: {result:?}"
+        );
+        assert!(
+            !result.output.to_string().contains("Mapped Author"),
+            "read-only log must not follow a repository .mailmap symlink: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn git_read_only_commands_do_not_run_repository_clean_filters() {
         let workspace = TempDir::new().unwrap();
         let read_only_root = TempDir::new().unwrap();
