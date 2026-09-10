@@ -2258,6 +2258,19 @@ mod tests {
     }
 
     #[test]
+    fn git_base_environment_preserves_system_config() {
+        let mut command = std::process::Command::new("git");
+        GitOperationsTool::configure_git_base_environment(&mut command);
+
+        assert!(
+            !command
+                .get_envs()
+                .any(|(name, _)| name == std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM")),
+            "ordinary Git commands must retain system configuration"
+        );
+    }
+
+    #[test]
     fn git_read_commands_disable_mailmap_with_raw_author_placeholders() {
         assert!(
             READ_GIT_CONFIG_OVERRIDES
