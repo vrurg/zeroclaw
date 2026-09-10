@@ -35,6 +35,18 @@ struct ValidatedRepository {
     git_dir: PathBuf,
 }
 
+const READ_GIT_CONFIG_OVERRIDES: &[&str] = &[
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "log.showSignature=false",
+    "-c",
+    "log.mailmap=false",
+];
+const GIT_LOG_FORMAT: &str = "--pretty=format:%H|%an|%ae|%ad|%s";
+
 impl GitOperationsTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
@@ -861,9 +873,11 @@ impl GitOperationsTool {
 
     /// Run a read-classified Git command without repository-configured command
     /// hooks. `status` can invoke `core.fsmonitor`; `log` and `stash list` can
-    /// invoke `gpg.program` for signature display; `diff` also disables its
-    /// external-diff, text-conversion, and nested submodule-diff paths at the
-    /// call site below.
+    /// invoke `gpg.program` for signature display; `log` disables unsupported
+    /// mailmap resolution. Together with the fixed raw author placeholders in
+    /// `git_log`, that prevents Git from reading `.mailmap` or `mailmap.file`.
+    /// `diff` also disables its external-diff, text-conversion, and nested
+    /// submodule-diff paths at the call site below.
     async fn run_git_read_command(
         &self,
         args: &[&str],
@@ -878,16 +892,7 @@ impl GitOperationsTool {
         let mut command = tokio::process::Command::new("git");
         Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.pager=cat",
-                "-c",
-                "log.showSignature=false",
-                "-c",
-                "log.mailmap=false",
-            ])
+            .args(READ_GIT_CONFIG_OVERRIDES)
             .current_dir(working_dir)
             .stdin(std::process::Stdio::null());
         Self::disable_filter_drivers(command.as_std_mut(), &filter_drivers);
@@ -1324,7 +1329,7 @@ impl GitOperationsTool {
                     "--no-optional-locks",
                     "log",
                     &format!("-{limit_str}"),
-                    "--pretty=format:%H|%an|%ae|%ad|%s",
+                    GIT_LOG_FORMAT,
                     "--date=iso",
                 ],
                 working_dir,
@@ -2226,6 +2231,26 @@ mod tests {
                 .get_envs()
                 .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == Some("0".as_ref())),
             "Git must remain non-interactive"
+        );
+    }
+
+    #[test]
+    fn git_read_commands_disable_mailmap_with_raw_author_placeholders() {
+        assert!(
+            READ_GIT_CONFIG_OVERRIDES
+                .windows(2)
+                .any(|args| args == ["-c", "log.mailmap=false"]),
+            "read commands must disable Git mailmap initialization"
+        );
+        assert!(
+            GIT_LOG_FORMAT.contains("%an") && GIT_LOG_FORMAT.contains("%ae"),
+            "git log must render raw author identity fields"
+        );
+        assert!(
+            !["%aN", "%aE", "%aL"]
+                .iter()
+                .any(|placeholder| GIT_LOG_FORMAT.contains(placeholder)),
+            "git log must not render mailmap-aware author identity fields"
         );
     }
 
@@ -4141,6 +4166,20 @@ mod tests {
                 "test repository configuration must succeed"
             );
         }
+        let mapped_author = std::process::Command::new("git")
+            .args(["log", "--use-mailmap", "-1", "--format=%aN"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            mapped_author.status.success(),
+            "test mailmap control must succeed"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&mapped_author.stdout).trim(),
+            "Mapped Author",
+            "test mailmap control must apply the configured mapping"
+        );
 
         let tool = test_tool_with_read_only_root(workspace.path(), repository.path().to_path_buf());
         let result = tool
@@ -4159,21 +4198,17 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn git_read_only_log_does_not_follow_repository_mailmap_symlink() {
+    async fn git_read_only_log_does_not_read_repository_mailmap() {
         let workspace = TempDir::new().unwrap();
         let repository = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
         bootstrap_repo(repository.path(), &[]).await;
 
-        let mailmap = outside.path().join("mailmap");
         std::fs::write(
-            &mailmap,
+            repository.path().join(".mailmap"),
             "Mapped Author <mapped@example.com> Test <test@test.com>\n",
         )
         .unwrap();
-        std::os::unix::fs::symlink(&mailmap, repository.path().join(".mailmap")).unwrap();
         let config = std::process::Command::new("git")
             .args(["config", "log.mailmap", "true"])
             .current_dir(repository.path())
@@ -4182,6 +4217,20 @@ mod tests {
         assert!(
             config.success(),
             "test repository configuration must succeed"
+        );
+        let mapped_author = std::process::Command::new("git")
+            .args(["log", "--use-mailmap", "-1", "--format=%aN"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            mapped_author.status.success(),
+            "test mailmap control must succeed"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&mapped_author.stdout).trim(),
+            "Mapped Author",
+            "test mailmap control must apply the repository mapping"
         );
 
         let tool = test_tool_with_read_only_root(workspace.path(), repository.path().to_path_buf());
@@ -4197,7 +4246,7 @@ mod tests {
         );
         assert!(
             !result.output.to_string().contains("Mapped Author"),
-            "read-only log must not follow a repository .mailmap symlink: {result:?}"
+            "read-only log must not read repository .mailmap: {result:?}"
         );
     }
 
