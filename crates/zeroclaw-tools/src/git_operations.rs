@@ -2105,6 +2105,20 @@ mod tests {
         }
     }
 
+    fn git_config_set_path(dir: &std::path::Path, key: &str, value: &std::path::Path) {
+        let output = std::process::Command::new("git")
+            .args(["config", key])
+            .arg(value)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "test setup must configure {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn test_tool_with_allowed_root(
         dir: &std::path::Path,
         allowed_root: std::path::PathBuf,
@@ -3504,23 +3518,19 @@ mod tests {
             bootstrap_repo(repository.path(), &[]).await;
             let external_file = outside.path().join("metadata");
             std::fs::write(&external_file, "*.secret\n").unwrap();
-            let config = repository.path().join(".git/config");
-            std::fs::write(
-                &config,
-                format!(
-                    "{}\n[core]\n\t{key} = {}\n",
-                    std::fs::read_to_string(&config).unwrap(),
-                    external_file.display()
-                ),
-            )
-            .unwrap();
+            git_config_set_path(repository.path(), &format!("core.{key}"), &external_file);
 
-            let result = test_tool(repository.path())
+            let error = test_tool(repository.path())
                 .execute(json!({"operation": "status"}))
-                .await;
+                .await
+                .expect_err(&format!(
+                    "out-of-grant core.{key} must be rejected before Git runs"
+                ));
             assert!(
-                result.is_err(),
-                "out-of-grant core.{key} must be rejected before Git runs: {result:?}"
+                error
+                    .chain()
+                    .any(|cause| cause.to_string() == "Git metadata config path is not authorized"),
+                "core.{key} must reach metadata authorization, not fail while parsing config: {error:?}"
             );
         }
     }
@@ -3532,18 +3542,14 @@ mod tests {
         let attributes = repository.path().join("metadata-attributes");
         let excludes = repository.path().join("metadata-excludes");
         std::fs::write(&attributes, "*.generated -text\n").unwrap();
-        std::fs::write(&excludes, "*.generated\n").unwrap();
-        let config = repository.path().join(".git/config");
         std::fs::write(
-            &config,
-            format!(
-                "{}\n[core]\n\tattributesFile = {}\n\texcludesFile = {}\n",
-                std::fs::read_to_string(&config).unwrap(),
-                attributes.display(),
-                excludes.display(),
-            ),
+            &excludes,
+            "metadata-attributes\nmetadata-excludes\nignored-by-config\n",
         )
         .unwrap();
+        std::fs::write(repository.path().join("ignored-by-config"), "ignored\n").unwrap();
+        git_config_set_path(repository.path(), "core.attributesFile", &attributes);
+        git_config_set_path(repository.path(), "core.excludesFile", &excludes);
 
         let result = test_tool(repository.path())
             .execute(json!({"operation": "status"}))
@@ -3552,6 +3558,12 @@ mod tests {
         assert!(
             result.success,
             "in-grant metadata configuration failed: {result:?}"
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output.to_string()).unwrap();
+        assert_eq!(
+            output["untracked"],
+            json!([]),
+            "Git must use the authorized absolute excludes path"
         );
     }
 
@@ -3817,22 +3829,16 @@ mod tests {
         let repository = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         bootstrap_repo(repository.path(), &[]).await;
-        let config = repository.path().join(".git/config");
-        std::fs::write(
-            &config,
-            format!(
-                "{}\n[core]\n\thooksPath = {}\n",
-                std::fs::read_to_string(&config).unwrap(),
-                outside.path().display()
-            ),
-        )
-        .unwrap();
+        git_config_set_path(repository.path(), "core.hooksPath", outside.path());
 
-        let result =
-            test_tool(repository.path()).validate_metadata_closure(repository.path(), true);
+        let error = test_tool(repository.path())
+            .validate_metadata_closure(repository.path(), true)
+            .expect_err("out-of-grant hooks must be rejected for write commands");
         assert!(
-            result.is_err(),
-            "out-of-grant hooks must be rejected for write commands: {result:?}"
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "Git metadata is not authorized"),
+            "out-of-grant hooks must reach metadata authorization, not fail while parsing config: {error:?}"
         );
     }
 
