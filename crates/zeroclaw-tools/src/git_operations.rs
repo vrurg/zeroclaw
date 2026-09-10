@@ -1123,9 +1123,9 @@ impl GitOperationsTool {
     ) {
         command
             .arg("--git-dir")
-            .arg(git_dir)
+            .arg(clean_verbatim_path(git_dir))
             .arg("--work-tree")
-            .arg(repository_root);
+            .arg(clean_verbatim_path(repository_root));
     }
 
     fn git_discovery_ceiling_path(root: &Path) -> anyhow::Result<PathBuf> {
@@ -2334,6 +2334,19 @@ mod tests {
         assert_eq!(args[1].as_bytes(), git_dir.as_os_str().as_bytes());
         assert_eq!(args[2], "--work-tree");
         assert_eq!(args[3].as_bytes(), repository.as_os_str().as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_worktree_arguments_clean_windows_verbatim_prefixes() {
+        let repository = PathBuf::from(r"\\?\C:\repository");
+        let git_dir = PathBuf::from(r"\\?\C:\repository\.git");
+        let mut command = std::process::Command::new("git");
+        GitOperationsTool::bind_git_worktree(&mut command, &repository, &git_dir);
+        let args = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(args[1], r"C:\repository\.git");
+        assert_eq!(args[3], r"C:\repository");
     }
 
     #[test]
