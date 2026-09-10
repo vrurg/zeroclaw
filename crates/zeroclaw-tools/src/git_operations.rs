@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -10,6 +11,7 @@ use crate::util_helpers::clean_verbatim_path;
 
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
+#[derive(Clone)]
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
 }
@@ -20,6 +22,12 @@ enum RepositoryAuthorization {
     NotFound,
     DiscoveryBoundaryReached,
     Denied,
+}
+
+#[derive(Default)]
+struct ModuleMetadata {
+    configs: BTreeSet<PathBuf>,
+    objects: BTreeSet<PathBuf>,
 }
 
 impl GitOperationsTool {
@@ -219,6 +227,485 @@ impl GitOperationsTool {
             && (!requires_write_access || self.security.is_resolved_path_allowed(path))
     }
 
+    /// Validate the complete, currently reachable repository metadata tree before
+    /// handing it to Git.  Validating only `.git`/`gitdir`/`commondir` leaves
+    /// Git free to follow a later internal symlink (for example `index` or
+    /// `objects`) outside the policy boundary.
+    fn validate_metadata_closure(
+        &self,
+        repository_root: &Path,
+        requires_write_access: bool,
+    ) -> anyhow::Result<()> {
+        let git = repository_root.join(".git");
+        let metadata = std::fs::symlink_metadata(&git)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("Git metadata symlink is not authorized");
+        }
+        let git_dir = if metadata.file_type().is_dir() {
+            git.canonicalize()?
+        } else {
+            let contents = std::fs::read_to_string(&git)?;
+            let value = contents
+                .strip_prefix("gitdir: ")
+                .ok_or_else(|| anyhow::Error::msg("Invalid Git metadata file"))?
+                .trim_end_matches(['\r', '\n']);
+            if value.is_empty() || value.contains(['\r', '\n']) {
+                anyhow::bail!("Invalid Git metadata file");
+            }
+            let target = Path::new(value);
+            let target = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                git.parent()
+                    .ok_or_else(|| anyhow::Error::msg("Invalid Git metadata path"))?
+                    .join(target)
+            };
+            if std::fs::symlink_metadata(&target)?.file_type().is_symlink() {
+                anyhow::bail!("Git metadata symlink is not authorized");
+            }
+            target.canonicalize()?
+        };
+        let common_file = git_dir.join("commondir");
+        let common_dir = if common_file.exists() {
+            if std::fs::symlink_metadata(&common_file)?
+                .file_type()
+                .is_symlink()
+            {
+                anyhow::bail!("Git metadata symlink is not authorized");
+            }
+            let value = std::fs::read_to_string(&common_file)?;
+            let value = value.trim_end_matches(['\r', '\n']);
+            if value.is_empty() || value.contains(['\r', '\n']) {
+                anyhow::bail!("Invalid Git commondir");
+            }
+            let target = Path::new(value);
+            let target = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                git_dir.join(target)
+            };
+            if std::fs::symlink_metadata(&target)?.file_type().is_symlink() {
+                anyhow::bail!("Git metadata symlink is not authorized");
+            }
+            target.canonicalize()?
+        } else {
+            git_dir.clone()
+        };
+        let mut visited = BTreeSet::new();
+        let mut alternate_visited = BTreeSet::new();
+        let mut module_metadata = ModuleMetadata::default();
+        let module_roots = [git_dir.join("modules"), common_dir.join("modules")];
+        self.validate_metadata_tree(
+            &git_dir,
+            requires_write_access,
+            &mut visited,
+            &mut module_metadata,
+            &module_roots,
+        )?;
+        self.validate_metadata_tree(
+            &common_dir,
+            requires_write_access,
+            &mut visited,
+            &mut module_metadata,
+            &module_roots,
+        )?;
+        self.validate_object_alternates(
+            &git_dir,
+            requires_write_access,
+            &mut visited,
+            &mut alternate_visited,
+            &mut module_metadata,
+            &module_roots,
+        )?;
+        self.validate_object_alternates(
+            &common_dir,
+            requires_write_access,
+            &mut visited,
+            &mut alternate_visited,
+            &mut module_metadata,
+            &module_roots,
+        )?;
+        self.validate_metadata_config(
+            &git_dir,
+            repository_root,
+            requires_write_access,
+            &mut visited,
+            &mut module_metadata,
+            &module_roots,
+        )?;
+        if common_dir != git_dir {
+            self.validate_metadata_config(
+                &common_dir,
+                repository_root,
+                requires_write_access,
+                &mut visited,
+                &mut module_metadata,
+                &module_roots,
+            )?;
+        }
+        let module_configs = module_metadata.configs.iter().cloned().collect::<Vec<_>>();
+        let module_objects = module_metadata.objects.iter().cloned().collect::<Vec<_>>();
+        for config in module_configs {
+            self.validate_module_metadata_config(&config, requires_write_access)?;
+        }
+        for objects in module_objects {
+            self.validate_object_alternates_at(
+                &objects,
+                requires_write_access,
+                &mut visited,
+                &mut alternate_visited,
+                &mut module_metadata,
+                &module_roots,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_metadata_tree(
+        &self,
+        root: &Path,
+        write: bool,
+        visited: &mut BTreeSet<PathBuf>,
+        module_metadata: &mut ModuleMetadata,
+        module_roots: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !visited.insert(root.clone()) {
+            return Ok(());
+        }
+        if !self.metadata_path_is_authorized(&root, write) {
+            anyhow::bail!("Git metadata is not authorized");
+        }
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let path = entry.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("Git metadata symlink is not authorized");
+            }
+            if !self.metadata_path_is_authorized(&path, write) {
+                anyhow::bail!("Git metadata is not authorized");
+            }
+            if module_roots.iter().any(|root| path.starts_with(root)) {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("config") | Some("config.worktree") => {
+                        module_metadata.configs.insert(path.clone());
+                    }
+                    Some("objects") if meta.file_type().is_dir() => {
+                        module_metadata.objects.insert(path.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if meta.file_type().is_dir() {
+                self.validate_metadata_tree(&path, write, visited, module_metadata, module_roots)?;
+            } else if !meta.file_type().is_file() {
+                // Git's fsmonitor daemon and lock-file lifecycle can leave
+                // sockets/FIFOs in metadata. They are not pathname edges that
+                // Git follows for these operations; symlinks above remain
+                // rejected before any command is launched.
+                continue;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_object_alternates(
+        &self,
+        root: &Path,
+        write: bool,
+        visited: &mut BTreeSet<PathBuf>,
+        alternate_visited: &mut BTreeSet<PathBuf>,
+        module_metadata: &mut ModuleMetadata,
+        module_roots: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let objects = root.join("objects");
+        self.validate_object_alternates_at(
+            &objects,
+            write,
+            visited,
+            alternate_visited,
+            module_metadata,
+            module_roots,
+        )
+    }
+
+    fn validate_object_alternates_at(
+        &self,
+        objects: &Path,
+        write: bool,
+        visited: &mut BTreeSet<PathBuf>,
+        alternate_visited: &mut BTreeSet<PathBuf>,
+        module_metadata: &mut ModuleMetadata,
+        module_roots: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        let objects = match objects.canonicalize() {
+            Ok(objects) => objects,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !alternate_visited.insert(objects.clone()) {
+            return Ok(());
+        }
+        let alternate_file = objects.join("info/alternates");
+        if objects.join("info/http-alternates").exists() {
+            anyhow::bail!("Remote Git alternates are not authorized");
+        }
+        if !alternate_file.exists() {
+            return Ok(());
+        }
+        if std::fs::symlink_metadata(&alternate_file)?
+            .file_type()
+            .is_symlink()
+        {
+            anyhow::bail!("Git metadata symlink is not authorized");
+        }
+        for line in std::fs::read_to_string(alternate_file)?.split('\n') {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.contains('\r') {
+                anyhow::bail!("Invalid Git object alternate");
+            }
+            // Git also accepts C-quoted alternate paths.  This validator does
+            // not interpret that grammar, so reject the form rather than
+            // validating its literal quote-prefixed spelling.
+            if line.starts_with('"') {
+                anyhow::bail!("Quoted Git object alternates are not authorized");
+            }
+            let target = Path::new(line);
+            let target = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                objects.join(target)
+            };
+            self.validate_metadata_tree(&target, write, visited, module_metadata, module_roots)?;
+            self.validate_object_alternates_at(
+                &target,
+                write,
+                visited,
+                alternate_visited,
+                module_metadata,
+                module_roots,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_metadata_config(
+        &self,
+        directory: &Path,
+        repository_root: &Path,
+        write: bool,
+        visited: &mut BTreeSet<PathBuf>,
+        module_metadata: &mut ModuleMetadata,
+        module_roots: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        for config in [directory.join("config"), directory.join("config.worktree")] {
+            if !config.exists() {
+                continue;
+            }
+            let keys = Self::git_config_values(&config, &["--name-only", "--list"])?;
+            if keys.iter().any(|key| {
+                key.eq_ignore_ascii_case("include.path")
+                    || (key.to_ascii_lowercase().starts_with("includeif.")
+                        && key.to_ascii_lowercase().ends_with(".path"))
+            }) {
+                anyhow::bail!("Repository config includes are not authorized");
+            }
+            let hooks_values = Self::git_config_values(&config, &["--get-all", "core.hooksPath"])?;
+            self.validate_configured_metadata_paths(&config, &keys, repository_root, write)?;
+            if write
+                && hooks_values.is_empty()
+                && keys
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case("core.hookspath"))
+            {
+                anyhow::bail!("Empty Git hooks path is not authorized");
+            }
+            for value in hooks_values {
+                if !write {
+                    continue;
+                }
+                // Git expands `~`, strips its `:(optional)` pathname prefix,
+                // and interpolates `%(prefix)/` before resolving hooksPath.
+                // Do not validate those raw spellings as in-worktree paths.
+                if value.starts_with('~') || value.starts_with(":(") || value.starts_with("%(") {
+                    anyhow::bail!("Interpolated Git hooks path is not authorized");
+                }
+                if Path::new(&value)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    anyhow::bail!("Git hooks path is not authorized");
+                }
+                let path = Path::new(&value);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    repository_root.join(path)
+                };
+                if path.exists() {
+                    self.validate_metadata_tree(
+                        &path,
+                        write,
+                        visited,
+                        module_metadata,
+                        module_roots,
+                    )?;
+                } else if !self.metadata_path_is_authorized(&path, false) {
+                    anyhow::bail!("Git hooks path is not authorized");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_configured_metadata_paths(
+        &self,
+        config: &Path,
+        keys: &[String],
+        repository_root: &Path,
+        write: bool,
+    ) -> anyhow::Result<()> {
+        for key in ["core.attributesFile", "core.excludesFile"] {
+            let values = Self::git_config_values(config, &["--get-all", key])?;
+            if values.is_empty()
+                && keys
+                    .iter()
+                    .any(|configured| configured.eq_ignore_ascii_case(key))
+            {
+                anyhow::bail!("Empty Git metadata config path is not authorized");
+            }
+            for value in values {
+                self.validate_configured_metadata_path(&value, Some(repository_root), write)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_configured_metadata_path(
+        &self,
+        value: &str,
+        relative_base: Option<&Path>,
+        write: bool,
+    ) -> anyhow::Result<()> {
+        // Git expands `~` and `%(prefix)` in pathname configuration values.
+        // The closure deliberately does not interpret those spellings; treating
+        // them as literal in-worktree paths would validate a different file.
+        if value.is_empty()
+            || value.starts_with('~')
+            || value.starts_with("%(")
+            || value.starts_with(":(")
+        {
+            anyhow::bail!("Interpolated Git metadata config path is not authorized");
+        }
+        let configured = Path::new(value);
+        if configured
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("Git metadata config path is not authorized");
+        }
+        let path = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            relative_base
+                .ok_or_else(|| {
+                    anyhow::Error::msg("Relative module metadata path is not authorized")
+                })?
+                .join(configured)
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                    anyhow::bail!("Git metadata config path is not authorized");
+                }
+                if !self.metadata_path_is_authorized(&path, write) {
+                    anyhow::bail!("Git metadata config path is not authorized");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !self.metadata_path_is_authorized(&path, false) {
+                    anyhow::bail!("Git metadata config path is not authorized");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn validate_module_metadata_config(&self, config: &Path, write: bool) -> anyhow::Result<()> {
+        let keys = Self::git_config_values(config, &["--name-only", "--list"])?;
+        if keys.iter().any(|key| {
+            key.eq_ignore_ascii_case("include.path")
+                || (key.to_ascii_lowercase().starts_with("includeif.")
+                    && key.to_ascii_lowercase().ends_with(".path"))
+        }) {
+            anyhow::bail!("Repository config includes are not authorized");
+        }
+        if write
+            && keys
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case("core.hookspath"))
+        {
+            // A module config is discovered from its Git directory, not its
+            // worktree, so a relative hooksPath cannot be resolved safely here.
+            anyhow::bail!("Module Git hooks path is not authorized");
+        }
+        for key in ["core.attributesFile", "core.excludesFile"] {
+            for value in Self::git_config_values(config, &["--get-all", key])? {
+                self.validate_configured_metadata_path(&value, None, write)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn git_config_values(config: &Path, query: &[&str]) -> anyhow::Result<Vec<String>> {
+        let output = std::process::Command::new("git")
+            .args(["config", "--file"])
+            .arg(config)
+            .arg("--no-includes")
+            .arg("--null")
+            .args(query)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        if !output.status.success() {
+            if output.status.code() == Some(1) {
+                return Ok(Vec::new());
+            }
+            anyhow::bail!("Cannot inspect Git metadata configuration");
+        }
+        output
+            .stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                std::str::from_utf8(value)
+                    .map(str::to_owned)
+                    .map_err(Into::into)
+            })
+            .collect()
+    }
+
     fn candidate_path(&self, raw_path: &str) -> anyhow::Result<PathBuf> {
         if raw_path.contains('\0') {
             anyhow::bail!("Path not allowed: contains null byte");
@@ -331,7 +818,9 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let repository_root = self.validated_repository_root(working_dir, true)?;
+        let repository_root = self
+            .validated_repository_root_async(working_dir, true)
+            .await?;
         let mut command = tokio::process::Command::new("git");
         Self::bind_git_worktree(command.as_std_mut(), &repository_root);
         command
@@ -359,8 +848,12 @@ impl GitOperationsTool {
         args: &[&str],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let repository_root = self.validated_repository_root(working_dir, false)?;
-        let filter_drivers = self.configured_filter_drivers(working_dir).await?;
+        let repository_root = self
+            .validated_repository_root_async(working_dir, false)
+            .await?;
+        let filter_drivers = self
+            .configured_filter_drivers(working_dir, &repository_root)
+            .await?;
         let mut command = tokio::process::Command::new("git");
         Self::bind_git_worktree(command.as_std_mut(), &repository_root);
         command
@@ -393,10 +886,13 @@ impl GitOperationsTool {
     /// content before it knows which configured driver applies. Reading config
     /// key names does not run a driver, so this preflight lets the real read
     /// command disable every configured clean, smudge, and process filter.
-    async fn configured_filter_drivers(&self, working_dir: &Path) -> anyhow::Result<Vec<String>> {
-        let repository_root = self.validated_repository_root(working_dir, false)?;
+    async fn configured_filter_drivers(
+        &self,
+        working_dir: &Path,
+        repository_root: &Path,
+    ) -> anyhow::Result<Vec<String>> {
         let mut command = tokio::process::Command::new("git");
-        Self::bind_git_worktree(command.as_std_mut(), &repository_root);
+        Self::bind_git_worktree(command.as_std_mut(), repository_root);
         command
             .args([
                 "config",
@@ -522,6 +1018,40 @@ impl GitOperationsTool {
         Ok(())
     }
 
+    async fn validated_repository_root_async(
+        &self,
+        working_dir: &Path,
+        requires_write_access: bool,
+    ) -> anyhow::Result<PathBuf> {
+        let tool = self.clone();
+        let working_dir = working_dir.to_path_buf();
+        let validation_working_dir = working_dir.clone();
+        let validation = tokio::task::spawn_blocking(move || {
+            tool.validated_repository_root(&validation_working_dir, requires_write_access)
+        })
+        .await
+        .map_err(|error| {
+            anyhow::Error::msg(format!("Git metadata validation task failed: {error}"))
+        })?;
+        validation.map_err(|error| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": working_dir,
+                        "requires_write_access": requires_write_access,
+                        "error_key": "tool-git-operations-error-repository-not-authorized",
+                    })),
+                "git_operations: repository metadata validation failed"
+            );
+            error.context(crate::i18n::get_required_tool_string_with_args(
+                "tool-git-operations-error-repository-not-authorized",
+                &[("path", &working_dir.display().to_string())],
+            ))
+        })
+    }
+
     fn validated_repository_root(
         &self,
         working_dir: &Path,
@@ -537,7 +1067,10 @@ impl GitOperationsTool {
             &authorized_roots,
             requires_write_access,
         ) {
-            RepositoryAuthorization::Authorized(repository_root) => Ok(repository_root),
+            RepositoryAuthorization::Authorized(repository_root) => {
+                self.validate_metadata_closure(&repository_root, requires_write_access)?;
+                Ok(repository_root)
+            }
             _ => anyhow::bail!(
                 "Git repository authorization changed before command execution for '{}'",
                 working_dir.display()
@@ -1110,7 +1643,7 @@ impl GitOperationsTool {
         let mut current_branch = String::new();
         let mut current_head = String::new();
         let mut is_detached = false;
-        for line in output.lines().map(str::trim) {
+        for line in output.lines() {
             if line.is_empty() {
                 if !current_path.is_empty()
                     && let Some(authorized_path) = self.authorized_worktree_list_path(&current_path)
@@ -2751,6 +3284,470 @@ mod tests {
                 "Git metadata outside the allowed root must be denied: {result:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_operations_rejects_internal_metadata_symlink_before_git_runs() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &["tracked.txt"]).await;
+        std::fs::write(repository.path().join("tracked.txt"), "changed").unwrap();
+        let outside_index = outside.path().join("index");
+        std::fs::write(&outside_index, "outside marker").unwrap();
+        std::fs::remove_file(repository.path().join(".git/index")).unwrap();
+        std::os::unix::fs::symlink(&outside_index, repository.path().join(".git/index")).unwrap();
+
+        let tool = test_tool(repository.path());
+        let result = tool.execute(json!({"operation": "status"})).await;
+        assert!(
+            result.is_err(),
+            "internal metadata symlink must be rejected: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside_index).unwrap(),
+            "outside marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_repository_config_includes() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[include]\n\tpath = /tmp/zeroclaw-test-include\n",
+                std::fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let tool = test_tool(repository.path());
+        let result = tool.execute(json!({"operation": "status"})).await;
+        assert!(
+            result.is_err(),
+            "repository config includes must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_out_of_grant_metadata_config_paths() {
+        for key in ["attributesFile", "excludesFile"] {
+            let repository = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            bootstrap_repo(repository.path(), &[]).await;
+            let external_file = outside.path().join("metadata");
+            std::fs::write(&external_file, "*.secret\n").unwrap();
+            let config = repository.path().join(".git/config");
+            std::fs::write(
+                &config,
+                format!(
+                    "{}\n[core]\n\t{key} = {}\n",
+                    std::fs::read_to_string(&config).unwrap(),
+                    external_file.display()
+                ),
+            )
+            .unwrap();
+
+            let result = test_tool(repository.path())
+                .execute(json!({"operation": "status"}))
+                .await;
+            assert!(
+                result.is_err(),
+                "out-of-grant core.{key} must be rejected before Git runs: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_operations_accepts_in_grant_metadata_config_paths() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let attributes = repository.path().join("metadata-attributes");
+        let excludes = repository.path().join("metadata-excludes");
+        std::fs::write(&attributes, "*.generated -text\n").unwrap();
+        std::fs::write(&excludes, "*.generated\n").unwrap();
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\tattributesFile = {}\n\texcludesFile = {}\n",
+                std::fs::read_to_string(&config).unwrap(),
+                attributes.display(),
+                excludes.display(),
+            ),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await
+            .expect("in-grant metadata configuration must dispatch");
+        assert!(
+            result.success,
+            "in-grant metadata configuration failed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_preserves_relative_metadata_config_paths() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let nested = repository.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(
+            repository.path().join("metadata-excludes"),
+            "ignored-from-config\n",
+        )
+        .unwrap();
+        let stage = std::process::Command::new("git")
+            .args(["add", "metadata-excludes"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(stage.success(), "test setup must stage the metadata source");
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", "metadata source"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(
+            commit.success(),
+            "test setup must commit the metadata source"
+        );
+        std::fs::write(nested.join("ignored-from-config"), "ignored\n").unwrap();
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\texcludesFile = metadata-excludes\n",
+                std::fs::read_to_string(&config).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status", "path": &nested}))
+            .await
+            .expect("relative metadata configuration must dispatch");
+        assert!(
+            result.success,
+            "relative metadata configuration failed: {result:?}"
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output.to_string()).unwrap();
+        assert_eq!(
+            output["untracked"],
+            json!([]),
+            "Git must use the authorized relative excludes path from the repository root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_operations_rejects_symlinked_metadata_config_paths() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let external_file = outside.path().join("attributes");
+        std::fs::write(&external_file, "*.secret\n").unwrap();
+        let configured_file = repository.path().join("metadata-attributes");
+        std::os::unix::fs::symlink(&external_file, &configured_file).unwrap();
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\tattributesFile = {}\n",
+                std::fs::read_to_string(&config).unwrap(),
+                configured_file.display(),
+            ),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "symlinked metadata configuration must be rejected before Git runs: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_module_config_includes() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let module_config = repository.path().join(".git/modules/sub/config");
+        std::fs::create_dir_all(module_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &module_config,
+            "[include]\n\tpath = /tmp/zeroclaw-test-include\n",
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "module config includes must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_module_write_hooks_path() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let module_config = repository.path().join(".git/modules/sub/config");
+        std::fs::create_dir_all(module_config.parent().unwrap()).unwrap();
+        std::fs::write(&module_config, "[core]\n\thooksPath = hooks\n").unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .expect("commit dispatch must return a tool result");
+        assert!(
+            !result.success,
+            "module hooks path must reject write command: {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Git repository metadata at")),
+            "metadata validation must use the localized tool error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_out_of_grant_object_alternates() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let outside_objects = outside.path().join("objects");
+        std::fs::create_dir(&outside_objects).unwrap();
+        std::fs::write(
+            repository.path().join(".git/objects/info/alternates"),
+            format!("{}\n", outside_objects.display()),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "out-of-grant object alternates must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_quoted_out_of_grant_object_alternates() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let outside_objects = outside.path().join("objects");
+        std::fs::create_dir(&outside_objects).unwrap();
+        std::fs::write(
+            repository.path().join(".git/objects/info/alternates"),
+            format!("\"{}\"\n", outside_objects.display()),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "quoted out-of-grant object alternates must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_cr_terminated_object_alternates() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        std::fs::write(
+            repository.path().join(".git/objects/info/alternates"),
+            "missing-alternate\r\n",
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "CR-terminated object alternates must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_module_object_alternates() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let module_alternates = repository
+            .path()
+            .join(".git/modules/sub/objects/info/alternates");
+        std::fs::create_dir_all(module_alternates.parent().unwrap()).unwrap();
+        let outside_objects = outside.path().join("objects");
+        std::fs::create_dir(&outside_objects).unwrap();
+        std::fs::write(
+            &module_alternates,
+            format!("{}\n", outside_objects.display()),
+        )
+        .unwrap();
+
+        let result = test_tool(repository.path())
+            .execute(json!({"operation": "status"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "module object alternates must be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_accepts_cyclic_in_grant_object_alternates() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        std::fs::write(
+            repository.path().join(".git/objects/info/alternates"),
+            "../objects\n",
+        )
+        .unwrap();
+
+        test_tool(repository.path())
+            .validate_metadata_closure(repository.path(), false)
+            .expect("a cyclic in-grant alternate must be bounded and remain authorized");
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_out_of_grant_write_hooks_path() {
+        let repository = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\thooksPath = {}\n",
+                std::fs::read_to_string(&config).unwrap(),
+                outside.path().display()
+            ),
+        )
+        .unwrap();
+
+        let result =
+            test_tool(repository.path()).validate_metadata_closure(repository.path(), true);
+        assert!(
+            result.is_err(),
+            "out-of-grant hooks must be rejected for write commands: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_operations_rejects_interpolated_write_hooks_paths() {
+        for hooks_path in [
+            "",
+            "~/zeroclaw-test-hooks",
+            ":(optional)/tmp/zeroclaw-test-hooks",
+            "%(prefix)/../../tmp/zeroclaw-test-hooks",
+            "../../../../tmp/zeroclaw-test-hooks",
+        ] {
+            let repository = TempDir::new().unwrap();
+            bootstrap_repo(repository.path(), &[]).await;
+            let config = repository.path().join(".git/config");
+            std::fs::write(
+                &config,
+                format!(
+                    "{}\n[core]\n\thooksPath = {hooks_path}\n",
+                    std::fs::read_to_string(&config).unwrap()
+                ),
+            )
+            .unwrap();
+
+            let result = test_tool(repository.path())
+                .execute(json!({"operation": "commit", "message": "test"}))
+                .await
+                .expect("commit dispatch must return a tool result");
+            assert!(
+                !result.success,
+                "interpolated hooks path must reject the write command: {result:?}"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Git repository metadata at")),
+                "metadata validation must use the localized tool error: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_operations_accepts_in_grant_write_hooks_path() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let hooks = repository.path().join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let config = repository.path().join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\thooksPath = ./hooks\n",
+                std::fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+
+        test_tool(repository.path())
+            .validate_metadata_closure(repository.path(), true)
+            .expect("in-grant hooks must remain authorized for write commands");
+    }
+
+    #[tokio::test]
+    async fn git_operations_accepts_hooks_path_below_incidental_modules_ancestor() {
+        let parent = TempDir::new().unwrap();
+        let repository = parent.path().join("modules/repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        bootstrap_repo(&repository, &[]).await;
+        std::fs::create_dir(repository.join("hooks")).unwrap();
+        let config = repository.join(".git/config");
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[core]\n\thooksPath = ./hooks\n",
+                std::fs::read_to_string(&config).unwrap()
+            ),
+        )
+        .unwrap();
+
+        test_tool(&repository)
+            .validate_metadata_closure(&repository, true)
+            .expect("an incidental modules ancestor must not change hooks validation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_worktree_list_preserves_trailing_path_whitespace() {
+        let repository = TempDir::new().unwrap();
+        git_init_no_sign(repository.path(), &[]);
+        let worktree = repository.path().join("worktree-with-space ");
+        std::fs::create_dir(&worktree).unwrap();
+        let tool = test_tool(repository.path());
+        let porcelain = format!(
+            "worktree {}\nHEAD deadbeef\nbranch refs/heads/main\n\n",
+            worktree.display()
+        );
+
+        let result = tool.parse_worktree_list(&porcelain, repository.path());
+        assert_eq!(
+            result["worktrees"][0]["path"],
+            worktree.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
     }
 
     #[tokio::test]
