@@ -698,7 +698,7 @@ impl GitOperationsTool {
     fn git_config_values(config: &Path, query: &[&str]) -> anyhow::Result<Vec<String>> {
         let output = std::process::Command::new("git")
             .args(["config", "--file"])
-            .arg(config)
+            .arg(clean_verbatim_path(config))
             .arg("--no-includes")
             .arg("--null")
             .args(query)
