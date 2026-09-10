@@ -16,8 +16,8 @@ pub enum MaybeSet<T> {
 /// Adjusts a Windows drive or UNC path to strip its verbatim prefix.
 /// On Windows, Git and some legacy tools do not support paths starting with `\\?\`
 /// as the current directory or within arguments.
-/// Non-Unicode and unsupported verbatim paths remain unchanged so callers can
-/// reject them explicitly.
+/// Non-Unicode paths remain unchanged so callers can reject them explicitly.
+/// Unsupported verbatim paths are passed through unchanged.
 pub fn clean_verbatim_path(path: &std::path::Path) -> std::path::PathBuf {
     #[cfg(any(target_os = "windows", test))]
     {
