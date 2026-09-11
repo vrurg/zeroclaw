@@ -24,8 +24,10 @@ model_provider = "openai.default"
 
 The verifier provider must resolve through the ordinary configured provider
 profiles. The owning agent and an authorized foreground child keep their normal
-provider selection. A cost-limited goal requires complete pricing for eligible
-routes; token-only and unlimited goals still require valid token usage.
+provider selection. A cost-limited goal requires complete configured pricing
+for eligible routes; token-only and unlimited goals still require valid token
+usage. A provider/model priced only by an ordinary reporting catalog is not
+enough to admit a cost-limited Goal operation.
 
 ## Commands
 
