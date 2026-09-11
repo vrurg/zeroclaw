@@ -79,6 +79,7 @@ the operating system:
 | `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
+| `session/goal` | client -> daemon | Submit a typed Goal Mode control command for an existing session |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
@@ -197,6 +198,15 @@ The dispatch layer lives in `crates/zeroclaw-runtime/src/rpc/`:
 | `local.rs` | `LocalTransport` + listener (Unix socket / Windows named pipe) |
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
+
+Long-running `session/prompt` and `session/goal` work belongs to the accepted
+connection generation. The dispatcher retains their task handles through
+connection teardown, and a ZeroCode Goal worker retains the generation's
+liveness token for its full lifetime. This prevents a replacement daemon
+generation from admitting work for the same durable session while old Goal
+work is still unwinding. An ordinary client disconnect still retains the
+session and its Goal; explicit session lifecycle operations remain responsible
+for Goal disposal.
 
 The `RpcTransport` trait is designed so that additional transports (vsock,
 custom IPC) slot in without touching the dispatch or session logic. The
