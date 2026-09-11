@@ -30,7 +30,7 @@ use zeroclaw_runtime::{
     cost::CostTracker,
     goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
 };
-use zeroclaw_goal::control::dispose_unowned_session_goal;
+use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
 
 use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
 use super::{
@@ -1052,11 +1052,14 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 live_config: Some(Arc::clone(&self.context.live_config)),
             }),
         });
-        let candidate = scope_session_key(Some(self.session_key.durable_id()), async {
-            let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                .scope(receipt_scope, tool_loop);
-            scope_thread_id(Some(self.message.id.clone()), tool_loop).await
-        })
+        let candidate = scope_goal_parent_turn(scope_session_key(
+            Some(self.session_key.durable_id()),
+            async {
+                let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                    .scope(receipt_scope, tool_loop);
+                scope_thread_id(Some(self.message.id.clone()), tool_loop).await
+            },
+        ))
         .await;
         let candidate = match candidate {
             Ok(candidate) => candidate,
