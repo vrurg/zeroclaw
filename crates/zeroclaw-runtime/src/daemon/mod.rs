@@ -308,17 +308,6 @@ async fn reconcile_goal_policy_with_registry(
     anyhow::bail!("Goal policy reconciliation did not converge")
 }
 
-impl PartialEq for DaemonExit {
-    fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Shutdown, Self::Shutdown) | (Self::Reload(_), Self::Reload(_))
-        )
-    }
-}
-
-impl Eq for DaemonExit {}
-
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
 #[cfg(test)]
@@ -4370,7 +4359,7 @@ mod tests {
         .expect("daemon should remain supervised after a post-readiness socket error")
         .expect("daemon run should succeed after supervised socket restart");
 
-        assert_eq!(exit, DaemonExit::Shutdown);
+        assert!(matches!(exit, DaemonExit::Shutdown));
         assert!(
             attempts.load(Ordering::SeqCst) >= 2,
             "socket supervisor should retry after a post-readiness AddrInUse"
@@ -4474,7 +4463,7 @@ mod tests {
             .expect("ephemeral daemon should shut down after last client disconnects")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Shutdown);
+        assert!(matches!(result, DaemonExit::Shutdown));
     }
 
     #[tokio::test]
@@ -4512,7 +4501,7 @@ mod tests {
             .expect("ephemeral daemon should shut down after second disconnect")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Shutdown);
+        assert!(matches!(result, DaemonExit::Shutdown));
     }
 
     // ── daemon gateway bind-mode detection (fail-fast) ────────────────

@@ -12,10 +12,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWrite
 use zeroclaw_config::schema::Config;
 
 use super::{GoalIngressContext, GoalIngressPrincipal, GoalSurface};
-use crate::control_plane::{
-    GoalPolicyRevocationTarget, GoalTransitionResult, TaskKind, TaskRecord, TaskStatus,
-    control_plane,
-};
+use crate::control_plane::{GoalPolicyRevocationTarget, TaskKind, TaskRecord, TaskStatus};
 
 /// Why prospective policy revokes an otherwise nonterminal Goal.
 ///
@@ -289,39 +286,6 @@ pub fn collect_common_goal_policy_revocation_targets(
             })
         })
         .collect()
-}
-
-/// Apply common V1 policy revocation before transport listeners start.
-///
-/// This deliberately lives in the runtime rather than a channel adapter: a
-/// daemon may expose ZeroCode without Matrix, and feature/agent/provider
-/// revocation must still make retained ZeroCode Goals non-resumable.
-pub async fn reconcile_common_goal_policy_at_startup(config: &Config) -> Result<()> {
-    let Some(control_plane) = control_plane() else {
-        return Ok(());
-    };
-    let registry = control_plane.goal_store()?;
-    // A natural terminal transition racing revocation must not preserve every
-    // other revoked Goal by rolling back the exact batch. Reclassify under the
-    // same prospective configuration and retry a bounded number of times.
-    let initial_count = registry.list_nonterminal_session_goals().await?.len();
-    for _ in 0..=initial_count {
-        let targets = collect_common_goal_policy_revocation_targets(
-            config,
-            registry.list_nonterminal_session_goals().await?,
-        )?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-        match registry
-            .cancel_goals_for_policy_revocation(&targets)
-            .await?
-        {
-            GoalTransitionResult::Applied => return Ok(()),
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => continue,
-        }
-    }
-    anyhow::bail!("Goal policy reconciliation did not converge")
 }
 
 #[cfg(test)]
