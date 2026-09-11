@@ -1874,6 +1874,60 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
+        let goal = self.registry.get_goal_task(scope.task_id()).await?;
+        if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
+            goal.pending_tool_batch_id
+                .as_deref()
+                .zip(goal.pending_tool_epoch)
+        }) {
+            match self
+                .registry
+                .fail_unpaired_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    admitted_epoch,
+                    batch_id,
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => return Ok(()),
+                GoalTransitionResult::Stale => {
+                    // A lifecycle owner may have terminalized and fenced this
+                    // exact Goal while its tool loop was unwinding. The dirty
+                    // marker still must not strand that terminal task: clear
+                    // only the exact admitted batch, never a successor.
+                    let current = self
+                        .registry
+                        .current_goal_for_session(scope.session_id())
+                        .await?;
+                    if let Some(current) = current
+                        && current.id == scope.task_id()
+                        && current.status.is_terminal()
+                    {
+                        return match self
+                            .registry
+                            .clear_terminal_tool_batch(
+                                scope.task_id(),
+                                scope.session_id(),
+                                admitted_epoch,
+                                batch_id,
+                            )
+                            .await?
+                        {
+                            GoalTransitionResult::Applied => Ok(()),
+                            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                                bail!("Goal terminal tool-pairing cleanup lost its execution fence")
+                            }
+                        };
+                    }
+                    bail!("Goal tool-pairing failure lost its execution fence")
+                }
+                GoalTransitionResult::Missing => {
+                    bail!("Goal tool-pairing failure lost its execution fence")
+                }
+            }
+        }
         match self
             .registry
             .finish_session_goal(
