@@ -31,11 +31,15 @@ use zeroclaw_commands::goal::{
 
 pub mod goal_child_fence;
 mod goal_execution;
+mod policy;
 
 pub use goal_child_fence::scope_goal_parent as scope_goal_parent_turn;
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
     GoalExecutionSubmission, GoalExecutionSupervisor, dispose_unowned_session_goal,
+};
+pub use policy::{
+    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
 };
 
 /// The only V1 surfaces permitted to admit a Goal command.
