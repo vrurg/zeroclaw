@@ -3049,9 +3049,12 @@ mod tests {
             expected_epoch: 3,
         };
 
-        let merged =
-            merge_surface_goal_policy_targets(&[task.clone()], vec![target.clone()], vec![target])
-                .expect("one snapshot target may be selected by both classifiers");
+        let merged = merge_surface_goal_policy_targets(
+            std::slice::from_ref(&task),
+            vec![target.clone()],
+            vec![target],
+        )
+        .expect("one snapshot target may be selected by both classifiers");
         assert_eq!(merged.len(), 1);
 
         let outside_snapshot = crate::control_plane::GoalPolicyRevocationTarget {
@@ -3071,7 +3074,7 @@ mod tests {
             cancellations: std::sync::Mutex::new(Vec::new()),
         });
         let preflight: Arc<GoalPolicyPreflight> = Arc::new(Box::new(|_, _| {
-            Box::pin(async { Err(anyhow::anyhow!("Matrix policy classification failed")) })
+            Box::pin(async { Err(anyhow::Error::msg("Matrix policy classification failed")) })
         }));
 
         assert!(
@@ -4208,7 +4211,7 @@ mod tests {
                         if let Some(tx) = first_attempt_tx.lock().await.take() {
                             let _ = tx.send(());
                         }
-                        Err(anyhow::anyhow!("prospective configuration is invalid"))
+                        Err(anyhow::Error::msg("prospective configuration is invalid"))
                     } else {
                         Ok(Config::default())
                     }

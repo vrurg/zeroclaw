@@ -371,7 +371,7 @@ mod tests {
         let admission = coordinator.admit().await;
         let cutover = std::sync::Arc::new(coordinator);
         let waiting_cutover = std::sync::Arc::clone(&cutover);
-        let cutover_ready = tokio::spawn(async move {
+        let cutover_ready = zeroclaw_spawn::spawn!(async move {
             let _cutover = waiting_cutover.cutover().await;
         });
 
