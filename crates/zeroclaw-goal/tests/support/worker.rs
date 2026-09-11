@@ -1717,6 +1717,70 @@ async fn foreground_blocked_failure_delivery_does_not_hold_lifecycle_finalizatio
 }
 
 #[tokio::test]
+async fn external_pause_withdraws_failure_output_without_waiting_for_foreground() {
+    let (driver, ingress, registry, supervisor) = running_worker().await;
+    driver.script.fail_parent.store(true, Ordering::SeqCst);
+    let session = ingress.session_key().durable_id();
+    // Register the ordinary holder behind the admitted parent before releasing
+    // that call. The external pause must not wait for this foreground owner.
+    let mut holder_wait = Box::pin(driver.ordinary.boundary.clone().lock_owned());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut holder_wait)
+            .await
+            .is_err()
+    );
+    let external_supervisor = Arc::clone(&supervisor);
+    let external_session = session.clone();
+    let external = zeroclaw_spawn::spawn!(async move {
+        external_supervisor
+            .pause_for_external_cancellation(&external_session)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if registry.0.lock().unwrap().task.as_ref().unwrap().status == TaskStatus::Paused {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("external pause must fence the admitted parent before its release");
+    driver.script.release.add_permits(1);
+    let holder = tokio::time::timeout(Duration::from_secs(1), holder_wait)
+        .await
+        .expect("ordinary holder must acquire the real foreground");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), external)
+            .await
+            .expect("external pause must withdraw rather than wait for output delivery")
+            .unwrap()
+            .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Applied
+    );
+    {
+        let state = registry.0.lock().unwrap();
+        assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Failed);
+        assert_eq!(state.terminal_reason.as_deref(), Some("executor_failed"));
+        assert!(state.pending_settlements.is_empty());
+    }
+    assert!(driver.script.events.lock().unwrap().is_empty());
+    assert_eq!(driver.script.notices.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.acquisitions.load(Ordering::SeqCst), 1);
+    assert!(supervisor.try_retire().await);
+    drop(holder);
+    assert_eq!(
+        supervisor
+            .pause_for_external_cancellation(&session)
+            .await
+            .unwrap(),
+        zeroclaw_goal::GoalTransitionResult::Missing
+    );
+    supervisor.dispose_session(&session).await.unwrap();
+    assert!(registry.0.lock().unwrap().task.is_none());
+}
+
+#[tokio::test]
 async fn disposal_withdraws_inflight_drainer_delivery_without_waiting_on_its_latch() {
     let (driver, ingress, registry, supervisor) = running_worker().await;
     driver.script.fail_parent.store(true, Ordering::SeqCst);
