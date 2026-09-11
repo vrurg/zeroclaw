@@ -383,19 +383,6 @@ fn verifier_attribution_from_attempts<'a>(
         })
         .last()
 }
-
-fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
-    let kind = match turn.kind {
-        GoalParentTurnKind::Start => "start",
-        GoalParentTurnKind::Resume => "resume",
-        GoalParentTurnKind::Continue => "continue",
-    };
-    ChatMessage::system(format!(
-        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {kind}",
-        turn.objective
-    ))
-}
-
 #[async_trait]
 impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     fn session_key(&self) -> &GoalSessionKey {
@@ -429,7 +416,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
-        let directive = goal_parent_directive(&turn);
+        let directive = zeroclaw_goal::control::goal_parent_directive(&turn);
         let source = match turn.kind {
             GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
                 IsolatedTranscriptSource::Canonical {
