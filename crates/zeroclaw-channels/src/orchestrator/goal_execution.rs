@@ -44,7 +44,7 @@ use zeroclaw_runtime::{
         RuntimeGoalOperationAccountingFactory,
     },
 };
-use zeroclaw_goal::control::dispose_unowned_session_goal;
+use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
 
 use super::foreground::{
     foreground_lock, goal_command_lock, goal_supervisor_slot, matrix_goal_reset_pending,
@@ -1434,7 +1434,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 (result, fallback, safeguard)
             },
         ));
-        let (candidate, fallback, safeguard) = super::scope_safeguard_fallback(scoped_turn).await;
+        let (candidate, fallback, safeguard) = scope_goal_parent_turn(super::scope_safeguard_fallback(scoped_turn)).await;
         enum AttemptFailure {
             Core(anyhow::Error),
             TimedOut,
