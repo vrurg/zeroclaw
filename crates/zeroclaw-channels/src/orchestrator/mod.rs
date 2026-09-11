@@ -8255,7 +8255,7 @@ fn render_goal_status(
         "goal-mode-accounting-incomplete"
     });
     let status = format!("{:?}", projection.status).to_lowercase();
-    channel_runtime_cli_string_with_args(
+    let status = channel_runtime_cli_string_with_args(
         key,
         &[
             ("status", status.as_str()),
@@ -8266,15 +8266,41 @@ fn render_goal_status(
             ("token_accounting", token_accounting.as_str()),
             ("cost_accounting", cost_accounting.as_str()),
         ],
-    )
+    );
+    let details = projection
+        .blockers
+        .iter()
+        .map(|blocker| blocker.message.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .collect::<Vec<_>>();
+    let detail = if details.is_empty() {
+        projection
+            .pause_description
+            .as_deref()
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        details.join("; ")
+    };
+    if detail.trim().is_empty() {
+        status
+    } else {
+        format!(
+            "{status} {}",
+            channel_runtime_cli_string_with_args(
+                "goal-mode-blocker-detail",
+                &[("detail", detail.as_str())],
+            )
+        )
+    }
 }
 
 #[cfg(test)]
 mod goal_response_render_tests {
     use super::*;
     use zeroclaw_runtime::{
-        control_plane::{GoalAccountingState, TaskStatus},
-        goal_mode::GoalStatusProjection,
+        control_plane::{GoalAccountingState, GoalBlockerKind, GoalPauseReason, TaskStatus},
+        goal_mode::{GoalBlockerProjection, GoalStatusProjection},
     };
 
     #[test]
@@ -8311,6 +8337,39 @@ mod goal_response_render_tests {
         ));
         assert!(rendered.contains("40 tokens"));
         assert!(rendered.contains("60 tokens"));
+        assert!(!rendered.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn paused_goal_status_renders_actionable_blocker_detail() {
+        let projection = GoalStatusProjection {
+            task_id: "must-not-appear".to_string(),
+            status: TaskStatus::Paused,
+            execution_epoch: 2,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: Some(GoalPauseReason::VerifierBlocked),
+            pause_description: Some("A decision is required.".to_string()),
+            blockers: vec![GoalBlockerProjection {
+                kind: GoalBlockerKind::HumanEscalation,
+                message: "Approve the deployment.".to_string(),
+            }],
+            resumable: true,
+            known_tokens: Some(40),
+            known_cost_usd: Some(0.5),
+            token_accounting_complete: true,
+            cost_accounting_complete: true,
+            remaining_tokens: None,
+            remaining_cost_usd: None,
+        };
+
+        let rendered = render_goal_response(&zeroclaw_runtime::goal_mode::GoalResponse::Status(
+            projection,
+        ));
+        assert!(rendered.contains("Approve the deployment."));
+        assert!(rendered.contains("/goal resume"));
+        assert!(rendered.contains("/goal cancel"));
         assert!(!rendered.contains("must-not-appear"));
     }
 }

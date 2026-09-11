@@ -133,7 +133,7 @@ fn goal_status_message(projection: &crate::wire::GoalStatusProjection, key: &str
     } else {
         "zc-goal-accounting-incomplete"
     });
-    crate::i18n::t_args(
+    let status = crate::i18n::t_args(
         key,
         &[
             ("status", projection.status.as_str()),
@@ -144,7 +144,66 @@ fn goal_status_message(projection: &crate::wire::GoalStatusProjection, key: &str
             ("token_accounting", token_accounting.as_str()),
             ("cost_accounting", cost_accounting.as_str()),
         ],
+    );
+    goal_blocker_detail(
+        status,
+        projection.pause_description.as_deref(),
+        projection
+            .blockers
+            .iter()
+            .map(|blocker| blocker.message.as_str()),
     )
+}
+
+/// Render an actionable verifier-blocker detail when the trusted daemon
+/// supplied one. The durable status projection remains the source of truth;
+/// this only makes its user-facing resolution path visible in ZeroCode.
+fn goal_blocker_detail<'a>(
+    message: String,
+    description: Option<&str>,
+    blockers: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let Some(detail) = goal_blocker_text(description, blockers) else {
+        return message;
+    };
+    format!(
+        "{} {}",
+        message,
+        crate::i18n::t_args("zc-goal-blocker-detail", &[("detail", detail.as_str())])
+    )
+}
+
+fn goal_blocker_notice<'a>(
+    description: Option<&str>,
+    blockers: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let Some(detail) = goal_blocker_text(description, blockers) else {
+        return crate::i18n::t("zc-goal-paused-blocked");
+    };
+    crate::i18n::t_args(
+        "zc-goal-paused-blocked-detail",
+        &[("detail", detail.as_str())],
+    )
+}
+
+fn goal_blocker_text<'a>(
+    description: Option<&str>,
+    blockers: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let blockers = blockers
+        .into_iter()
+        .filter(|message| !message.trim().is_empty())
+        .collect::<Vec<_>>();
+    let detail = if blockers.is_empty() {
+        description.unwrap_or_default().to_owned()
+    } else {
+        blockers.join("; ")
+    };
+    if detail.trim().is_empty() {
+        None
+    } else {
+        Some(detail)
+    }
 }
 
 /// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
@@ -160,6 +219,8 @@ enum GoalUpdate<'a> {
     },
     PausedForBlocker {
         session_id: &'a str,
+        description: Option<&'a str>,
+        blockers: Vec<&'a str>,
     },
 }
 
@@ -177,7 +238,25 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
             candidate: payload.get("candidate")?.as_str()?,
         }),
         "completed" => Some(GoalUpdate::Completed { session_id }),
-        "paused_for_blocker" => Some(GoalUpdate::PausedForBlocker { session_id }),
+        "paused_for_blocker" => {
+            let description = match payload.get("description") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_str()?),
+            };
+            let blockers = match payload.get("blockers") {
+                None => Vec::new(),
+                Some(value) => value
+                    .as_array()?
+                    .iter()
+                    .map(|blocker| blocker.get("message")?.as_str())
+                    .collect::<Option<Vec<_>>>()?,
+            };
+            Some(GoalUpdate::PausedForBlocker {
+                session_id,
+                description,
+                blockers,
+            })
+        }
         _ => None,
     }
 }
@@ -2147,7 +2226,7 @@ impl Chat {
                     let session_id = match &update {
                         GoalUpdate::VerifiedCandidate { session_id, .. }
                         | GoalUpdate::Completed { session_id }
-                        | GoalUpdate::PausedForBlocker { session_id } => session_id,
+                        | GoalUpdate::PausedForBlocker { session_id, .. } => session_id,
                     };
                     let Some(state) = self.state_for_session_mut(session_id) else {
                         continue;
@@ -2167,12 +2246,16 @@ impl Chat {
                                 ))));
                             state.mark_dirty_append();
                         }
-                        GoalUpdate::PausedForBlocker { .. } => {
+                        GoalUpdate::PausedForBlocker {
+                            description,
+                            blockers,
+                            ..
+                        } => {
                             state
                                 .entries
-                                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                    "zc-goal-paused-blocked",
-                                ))));
+                                .push(ChatEntry::SystemMessage(Arc::<str>::from(
+                                    goal_blocker_notice(description, blockers),
+                                )));
                             state.mark_dirty_append();
                         }
                     }
@@ -19612,6 +19695,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_blocker_update_renders_actionable_resolution_detail() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/goal_update".to_string(),
+                params: serde_json::json!({
+                    "paused_for_blocker": {
+                        "session_id": "sess-1",
+                        "description": "A human decision is required.",
+                        "blockers": [{
+                            "kind": "human",
+                            "message": "Approve the deployment."
+                        }]
+                    }
+                }),
+            })
+            .expect("Goal blocker notification must queue");
+
+        chat.drain_notifications();
+
+        let entries = active_state(&mut chat).entries();
+        assert!(matches!(
+            entries.last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.as_ref()
+                    == "Goal paused: Approve the deployment. Use /goal resume after resolving it, or /goal cancel to dismiss the current Goal."
+        ));
+    }
+
     #[test]
     fn goal_submission_requires_the_exact_leading_command_token() {
         assert!(is_goal_command_submission("/goal status"));
@@ -19639,6 +19756,8 @@ mod tests {
             cost_limit_usd: Some(2.0),
             accounting_state: "complete".to_string(),
             pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
             resumable: false,
             known_tokens: Some(40),
             known_cost_usd: Some(0.5),

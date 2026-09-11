@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GoalBlockerProjection {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GoalStatusProjection {
     pub task_id: String,
     pub status: String,
@@ -16,6 +22,8 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: String,
     pub pause_reason: Option<String>,
+    pub pause_description: Option<String>,
+    pub blockers: Vec<GoalBlockerProjection>,
     pub resumable: bool,
     pub known_tokens: Option<u64>,
     pub known_cost_usd: Option<f64>,
@@ -73,7 +81,12 @@ mod goal_wire_tests {
             "token_limit": 100,
             "cost_limit_usd": 2.5,
             "accounting_state": "complete",
-            "pause_reason": null,
+            "pause_reason": "verifier_blocked",
+            "pause_description": "A decision is required.",
+            "blockers": [{
+                "kind": "human_escalation",
+                "message": "Approve the deployment."
+            }],
             "resumable": false,
             "known_tokens": 40,
             "known_cost_usd": 1.25,
@@ -86,6 +99,13 @@ mod goal_wire_tests {
 
         assert_eq!(projection.known_tokens, Some(40));
         assert_eq!(projection.known_cost_usd, Some(1.25));
+        assert_eq!(
+            projection.pause_description.as_deref(),
+            Some("A decision is required.")
+        );
+        assert_eq!(projection.blockers.len(), 1);
+        assert_eq!(projection.blockers[0].kind, "human_escalation");
+        assert_eq!(projection.blockers[0].message, "Approve the deployment.");
         assert!(projection.token_accounting_complete);
         assert!(projection.cost_accounting_complete);
         assert_eq!(projection.remaining_tokens, Some(60));
