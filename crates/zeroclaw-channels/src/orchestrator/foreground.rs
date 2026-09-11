@@ -112,13 +112,12 @@ pub(crate) async fn drain_policy_revoked_goal(
     };
     if supervisor.owns_scope(scope).await {
         supervisor.drain_policy_revoked(scope).await?;
-        if !supervisor.owns_scope(scope).await {
-            if slot
+        if !supervisor.owns_scope(scope).await
+            && slot
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &supervisor))
-            {
-                *slot = None;
-            }
+        {
+            *slot = None;
         }
     }
     Ok(())
