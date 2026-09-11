@@ -1,4 +1,4 @@
-//! Dormant Goal Mode configuration. Runtime admission is introduced later.
+//! Opt-in Goal Mode configuration shared by runtime admission surfaces.
 
 use serde::{Deserialize, Serialize};
 use zeroclaw_macros::Configurable;
