@@ -1756,6 +1756,9 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: true,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
 
     coordinator.quiesce_for_restart().await.unwrap();
@@ -1780,6 +1783,49 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
             .is_none(),
         "a rejected admission must not create durable Goal state"
     );
+
+    coordinator.reopen_for_generation().await;
+    let resumed_driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "next-generation").unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        complete_verifier: true,
+        continue_once: false,
+        parent_histories: Arc::new(Mutex::new(Vec::new())),
+        parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
+    });
+    assert!(matches!(
+        supervisor
+            .submit(
+                host_settings(true),
+                ingress.clone(),
+                resumed_driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the next generation task".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalResponse::Started(_)
+    ));
+
+    let scope = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("reopened coordinator admits the next daemon generation");
+    supervisor
+        .drain(
+            &GoalExecutionScope::new(
+                scope.id,
+                ingress.session_key().durable_id(),
+                scope.execution_epoch,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
