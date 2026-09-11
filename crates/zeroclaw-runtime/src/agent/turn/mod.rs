@@ -2408,6 +2408,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let allow_parallel_execution =
             parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
+        // Persist the Goal-only pairing marker after preparation has proved
+        // there is real work to dispatch, but before any tool can begin an
+        // external effect. Ordinary tool batches receive `None` and retain
+        // their current parallel execution behavior.
+        let pending_goal_tool_batch =
+            crate::agent::goal_tool_pairing::admit_goal_tool_batch(executable_calls.len()).await?;
+
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
@@ -2599,6 +2606,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &tool_results,
             use_native_tools,
         );
+
+        if let Some(batch) = pending_goal_tool_batch {
+            batch.settle().await?;
+        }
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
