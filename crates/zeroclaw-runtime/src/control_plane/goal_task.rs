@@ -81,6 +81,16 @@ pub enum GoalTransitionResult {
     Missing,
 }
 
+/// Exact durable identity captured while preparing a prospective-policy
+/// cutover.  It prevents a policy decision made for one Goal epoch from
+/// cancelling a later replacement or resumed executor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPolicyTarget {
+    pub task_id: String,
+    pub session_id: String,
+    pub execution_epoch: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskGoal {
     /// Canonical task row: lifecycle, ownership, route, principal, timestamps.
@@ -333,6 +343,28 @@ pub trait GoalTaskRegistry: Send + Sync {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>>;
+
+    /// Enumerate all nonterminal session-bound Goals for prospective-policy
+    /// classification. The returned records are observations only; a caller
+    /// must pass their exact identities to [`Self::cancel_policy_targets`] to
+    /// commit a revocation.
+    async fn list_nonterminal_session_goals(&self) -> anyhow::Result<Vec<TaskRecord>> {
+        anyhow::bail!("goal registry does not support policy classification")
+    }
+
+    /// Atomically cancel an exact set of nonterminal Goals because the
+    /// successor runtime policy revokes their eligibility.
+    ///
+    /// Any stale or missing target rolls back the whole set. The durable
+    /// cancellation fence is committed before the corresponding process-local
+    /// workers may be interrupted or drained.
+    async fn cancel_policy_targets(
+        &self,
+        targets: &[GoalPolicyTarget],
+    ) -> anyhow::Result<GoalTransitionResult> {
+        let _ = targets;
+        anyhow::bail!("goal registry does not support policy revocation")
+    }
 
     /// Read the raw terminal reason for one exact session-bound Goal. Callers
     /// must sanitize it before presenting it outside the control plane.

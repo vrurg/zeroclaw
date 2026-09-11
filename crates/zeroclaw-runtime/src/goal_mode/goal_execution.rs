@@ -154,7 +154,7 @@ impl GoalExecutionRestartCoordinator {
     /// Once this returns, all Goal work admitted by the retiring daemon has
     /// either settled under a restart fence or has been classified fail-closed.
     pub async fn quiesce_for_restart(&self) -> Result<()> {
-        self.gate.close_admission().await;
+        self.begin_policy_cutover().await;
         let supervisors = {
             let mut registered = self.supervisors.lock().await;
             let supervisors = registered
@@ -185,6 +185,13 @@ impl GoalExecutionRestartCoordinator {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Close fresh Goal admission while a prospective runtime policy is being
+    /// classified and durably applied. A failed prospective cutover must call
+    /// [`Self::reopen_for_generation`] before retaining the current runtime.
+    pub async fn begin_policy_cutover(&self) {
+        self.gate.close_admission().await;
     }
 
     /// Reopen admission for the next daemon generation after the retiring
