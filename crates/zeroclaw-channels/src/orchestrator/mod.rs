@@ -6426,9 +6426,25 @@ async fn process_channel_message_body(
         return;
     }
 
+    // A policy reload may fence and drain a Goal worker. That worker uses the
+    // same Matrix foreground lease as this ordinary turn, so the reload must
+    // finish before acquiring the lease. Running it inside the lease can make
+    // the drain await a worker which is itself waiting for this turn to
+    // release the lease.
+    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "Failed to apply runtime config update"
+        );
+    }
+
     // Matrix ordinary turns and later Goal execution share this canonical
-    // conversation-key foreground domain. Acquire before any session mutation
-    // or observable work: a cancelled queued turn must not proceed unlocked.
+    // conversation-key foreground domain. Acquire before per-conversation
+    // session mutation or observable work: a cancelled queued turn must not
+    // proceed unlocked.
     let _matrix_foreground_lease = match acquire_matrix_foreground_lease(
         ctx.as_ref(),
         &msg,
@@ -6553,15 +6569,6 @@ async fn process_channel_message_body(
         }
     }
 
-    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-            "Failed to apply runtime config update"
-        );
-    }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         reconcile_early_ack(
             ctx.as_ref(),
