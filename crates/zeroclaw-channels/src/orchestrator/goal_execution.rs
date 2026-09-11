@@ -244,41 +244,6 @@ pub(super) async fn revoke_matrix_goals_for_policy(
     Ok(())
 }
 
-/// Apply the persisted Matrix policy before channel listeners start. Boot
-/// recovery has already classified interrupted pending operations, so there
-/// is no resident executor to drain on this path.
-/// Reconcile durable Matrix Goal bindings against a prospective configuration.
-///
-/// The daemon calls this before accepting a reload. No Matrix worker is
-/// interrupted here: the guarded cancellation commits first, and normal
-/// daemon teardown subsequently drains the owning channel runtime.
-pub(super) async fn reconcile_matrix_goal_policy(
-    config: &zeroclaw_config::schema::Config,
-) -> Result<()> {
-    let Some(control_plane) = control_plane() else {
-        return Ok(());
-    };
-    let registry = control_plane.goal_store()?;
-    let initial_count = registry.list_nonterminal_session_goals().await?.len();
-    for _ in 0..=initial_count {
-        let targets = collect_matrix_goal_policy_revocation_targets(
-            config,
-            registry.list_nonterminal_session_goals().await?,
-        )?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-        match registry
-            .cancel_goals_for_policy_revocation(&targets)
-            .await?
-        {
-            GoalTransitionResult::Applied => return Ok(()),
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => continue,
-        }
-    }
-    bail!("Matrix Goal policy reconciliation did not converge")
-}
-
 use super::foreground::{
     drain_policy_revoked_goal, foreground_lock, goal_command_lock, goal_supervisor_slot,
 };

@@ -143,7 +143,7 @@ use self::foreground::{
 };
 use self::goal_execution::{
     collect_matrix_goal_policy_revocation_targets, dispose_matrix_goal,
-    reconcile_matrix_goal_policy, revoke_matrix_goals_for_policy, submit_matrix_goal,
+    revoke_matrix_goals_for_policy, submit_matrix_goal,
 };
 
 /// Collect Matrix-bound Goal revocations from the daemon-owned snapshot.
@@ -12725,7 +12725,6 @@ pub async fn start_channels(
     let config: Config = config_arc.read().clone();
     let goal_policy_cutover: Arc<dyn zeroclaw_runtime::goal_mode::GoalPolicyGate> =
         goal_policy_cutover;
-    reconcile_matrix_goal_policy(&config).await?;
     let any_agent_provider_resolves = config
         .agents
         .iter()

@@ -271,6 +271,14 @@ async fn reconcile_goal_policy_for_runtime_config(
         return Ok(());
     };
     let registry = control_plane.goal_store()?;
+    reconcile_goal_policy_with_registry(config, registry, surface_preflight).await
+}
+
+async fn reconcile_goal_policy_with_registry(
+    config: &Config,
+    registry: Arc<dyn crate::control_plane::GoalTaskRegistry>,
+    surface_preflight: Option<&Arc<GoalPolicyPreflight>>,
+) -> Result<()> {
     let initial_count = registry.list_nonterminal_session_goals().await?.len();
 
     for _ in 0..=initial_count {
@@ -2766,10 +2774,224 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::{
+        GoalPolicyRevocationTarget, GoalTaskRegistry, GoalTransitionResult,
+    };
+    use async_trait::async_trait;
 
-    #[test]
-    fn surface_targets_must_come_from_the_snapshot_and_duplicates_collapse() {
-        let task = crate::control_plane::TaskRecord {
+    struct RecordingGoalRegistry {
+        tasks: Vec<crate::control_plane::TaskRecord>,
+        cancellations: std::sync::Mutex<Vec<Vec<GoalPolicyRevocationTarget>>>,
+    }
+
+    #[async_trait]
+    impl GoalTaskRegistry for RecordingGoalRegistry {
+        async fn list_nonterminal_session_goals(
+            &self,
+        ) -> anyhow::Result<Vec<crate::control_plane::TaskRecord>> {
+            Ok(self.tasks.clone())
+        }
+
+        async fn cancel_goals_for_policy_revocation(
+            &self,
+            targets: &[GoalPolicyRevocationTarget],
+        ) -> anyhow::Result<GoalTransitionResult> {
+            self.cancellations
+                .lock()
+                .expect("test registry cancellation lock")
+                .push(targets.to_vec());
+            Ok(GoalTransitionResult::Applied)
+        }
+
+        async fn latest_active_goal_for_agent(
+            &self,
+            _agent: &str,
+        ) -> anyhow::Result<Option<crate::control_plane::TaskRecord>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn latest_active_goal_for_context(
+            &self,
+            _agent: &str,
+            _originator_route: Option<&str>,
+            _principal_id: Option<&str>,
+        ) -> anyhow::Result<Option<crate::control_plane::TaskRecord>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn latest_active_goal_id_for_context(
+            &self,
+            _agent: &str,
+            _originator_route: Option<&str>,
+            _principal_id: Option<&str>,
+        ) -> anyhow::Result<Option<String>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn get_goal_task(
+            &self,
+            _task_id: &str,
+        ) -> anyhow::Result<Option<crate::control_plane::GoalTaskRecord>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn update_goal_limits(
+            &self,
+            _task_id: &str,
+            _token_limit: Option<u64>,
+            _cost_limit_usd: Option<f64>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn update_goal_pause(
+            &self,
+            _task_id: &str,
+            _pause: Option<crate::control_plane::GoalPauseState>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn set_continuation_context(
+            &self,
+            _task_id: &str,
+            _context: Option<crate::control_plane::TaskContinuationContext>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn get_continuation_context(
+            &self,
+            _task_id: &str,
+        ) -> anyhow::Result<Option<crate::control_plane::TaskContinuationContext>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn current_goal_for_session(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<crate::control_plane::TaskRecord>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn terminal_reason_for_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<String>> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn create_or_replace_session_goal(
+            &self,
+            _task: crate::control_plane::TaskRecord,
+            _goal: crate::control_plane::GoalTaskRecord,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn pause_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _pause: crate::control_plane::GoalPauseState,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn resume_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _owner_pid: u32,
+            _owner_boot_id: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn finish_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _status: crate::control_plane::TaskStatus,
+            _error: Option<String>,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn mark_session_goal_delivered(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn admit_pending_operation(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _pending_call_id: &str,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn settle_pending_operation(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _admitted_epoch: i64,
+            _pending_call_id: &str,
+            _accounting_state: crate::control_plane::GoalAccountingState,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn begin_goal_tool_phase(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn complete_goal_tool_phase(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn update_session_goal_limits(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _token_limit: Option<u64>,
+            _cost_limit_usd: Option<f64>,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+
+        async fn delete_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+        ) -> anyhow::Result<GoalTransitionResult> {
+            anyhow::bail!("unused by reload-policy test registry")
+        }
+    }
+
+    fn reload_goal() -> crate::control_plane::TaskRecord {
+        crate::control_plane::TaskRecord {
             id: "goal-1".to_owned(),
             kind: crate::control_plane::TaskKind::Goal,
             agent: "main".to_owned(),
@@ -2787,7 +3009,12 @@ mod tests {
             execution_epoch: 3,
             started_at: "2026-09-10T00:00:00Z".to_owned(),
             finished_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn surface_targets_must_come_from_the_snapshot_and_duplicates_collapse() {
+        let task = reload_goal();
         let target = crate::control_plane::GoalPolicyRevocationTarget {
             task_id: task.id.clone(),
             session_id: "matrix-session".to_owned(),
@@ -2807,6 +3034,62 @@ mod tests {
         assert!(
             merge_surface_goal_policy_targets(&[task], Vec::new(), vec![outside_snapshot]).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn failing_surface_preflight_cannot_commit_common_goal_revocations() {
+        let registry = Arc::new(RecordingGoalRegistry {
+            tasks: vec![reload_goal()],
+            cancellations: std::sync::Mutex::new(Vec::new()),
+        });
+        let preflight: Arc<GoalPolicyPreflight> = Arc::new(Box::new(|_, _| {
+            Box::pin(async { Err(anyhow::anyhow!("Matrix policy classification failed")) })
+        }));
+
+        assert!(
+            reconcile_goal_policy_with_registry(
+                &Config::default(),
+                registry.clone(),
+                Some(&preflight),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            registry
+                .cancellations
+                .lock()
+                .expect("test registry cancellation lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn common_and_surface_revocations_commit_once_as_one_deduplicated_batch() {
+        let task = reload_goal();
+        let target = GoalPolicyRevocationTarget {
+            task_id: task.id.clone(),
+            session_id: task.session_id.clone().expect("test goal session"),
+            expected_epoch: task.execution_epoch,
+        };
+        let registry = Arc::new(RecordingGoalRegistry {
+            tasks: vec![task],
+            cancellations: std::sync::Mutex::new(Vec::new()),
+        });
+        let preflight: Arc<GoalPolicyPreflight> = Arc::new(Box::new(move |_, _| {
+            let target = target.clone();
+            Box::pin(async move { Ok(vec![target]) })
+        }));
+
+        reconcile_goal_policy_with_registry(&Config::default(), registry.clone(), Some(&preflight))
+            .await
+            .expect("both classifiers should share one cancellation batch");
+        let cancellations = registry
+            .cancellations
+            .lock()
+            .expect("test registry cancellation lock");
+        assert_eq!(cancellations.len(), 1);
+        assert_eq!(cancellations[0].len(), 1);
     }
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
