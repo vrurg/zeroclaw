@@ -424,24 +424,6 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         panic!("unexpected operation settlement")
     }
 
-    async fn begin_goal_tool_phase(
-        &self,
-        _task_id: &str,
-        _session_id: &str,
-        _expected_epoch: i64,
-    ) -> anyhow::Result<GoalTransitionResult> {
-        panic!("unexpected tool-phase admission")
-    }
-
-    async fn complete_goal_tool_phase(
-        &self,
-        _task_id: &str,
-        _session_id: &str,
-        _admitted_epoch: i64,
-    ) -> anyhow::Result<GoalTransitionResult> {
-        panic!("unexpected tool-phase completion")
-    }
-
     async fn update_session_goal_limits(
         &self,
         _task_id: &str,
