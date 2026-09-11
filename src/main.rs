@@ -6585,7 +6585,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
-                    daemon::DaemonExit::Reload => {
+                    daemon::DaemonExit::Reload(successor_config) => {
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -6594,7 +6594,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
-                        current_config = Box::pin(Config::load_or_init()).await?;
+                        current_config = *successor_config;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
                             &current_config.observability,

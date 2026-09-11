@@ -2,11 +2,12 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::collections::HashSet;
 
 use crate::control_plane::authority::is_authoritative;
 use crate::control_plane::goal_task::{
-    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
+    GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalPolicyTarget,
+    GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -961,6 +962,84 @@ impl GoalTaskRegistry for SqliteTaskStore {
         .context("get current goal for session")
     }
 
+    async fn list_nonterminal_session_goals(&self) -> Result<Vec<TaskRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT * FROM tasks
+                  WHERE kind = 'goal' AND session_id IS NOT NULL AND TRIM(session_id) != ''
+                    AND status IN ('running', 'paused')
+                  ORDER BY rowid ASC",
+            )
+            .context("prepare nonterminal session goal policy query")?;
+        let rows = stmt
+            .query_map([], row_to_record)
+            .context("query nonterminal session goals for policy")?;
+        let mut goals = Vec::new();
+        for row in rows {
+            match row {
+                Ok(goal) => goals.push(goal),
+                Err(error) => log_unreadable_task_row(error),
+            }
+        }
+        Ok(goals)
+    }
+
+    async fn cancel_policy_targets(
+        &self,
+        targets: &[GoalPolicyTarget],
+    ) -> Result<GoalTransitionResult> {
+        if targets.is_empty() {
+            return Ok(GoalTransitionResult::Applied);
+        }
+
+        let mut unique = HashSet::with_capacity(targets.len());
+        for target in targets {
+            anyhow::ensure!(
+                !target.task_id.trim().is_empty()
+                    && !target.session_id.trim().is_empty()
+                    && target.execution_epoch > 0,
+                "policy cancellation target must have nonblank task/session identities and a positive epoch"
+            );
+            anyhow::ensure!(
+                unique.insert((
+                    target.task_id.as_str(),
+                    target.session_id.as_str(),
+                    target.execution_epoch,
+                )),
+                "policy cancellation target is duplicated"
+            );
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic goal policy revocation")?;
+        for target in targets {
+            let updated = tx.execute(
+                "UPDATE tasks
+                    SET status = 'cancelled', error = 'policy_revoked',
+                        finished_at = COALESCE(finished_at, ?4),
+                        execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                            THEN execution_epoch + 1 ELSE execution_epoch END
+                  WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                    AND status IN ('running', 'paused') AND execution_epoch = ?3",
+                params![
+                    &target.task_id,
+                    &target.session_id,
+                    target.execution_epoch,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )?;
+            if updated == 0 {
+                return transition_failure(&tx, &target.task_id, &target.session_id);
+            }
+        }
+        tx.commit()
+            .context("commit atomic goal policy revocation")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn terminal_reason_for_session_goal(
         &self,
         task_id: &str,
@@ -1879,6 +1958,94 @@ mod tests {
                     .unwrap()
                     .is_none(),
                 "durable Goal control state must not outlive its disposed session"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_revocation_is_atomic_and_epoch_guarded() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        for (task_id, session_id) in [
+            ("policy-goal-a", "policy-session-a"),
+            ("policy-goal-b", "policy-session-b"),
+        ] {
+            let mut task = rec(task_id, "main", 1, "boot-1");
+            task.kind = TaskKind::Goal;
+            task.session_id = Some(session_id.to_owned());
+            assert_eq!(
+                store
+                    .create_or_replace_session_goal(task, goal_record(task_id, "finish work"))
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+        }
+
+        let stale_targets = store
+            .list_nonterminal_session_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|task| GoalPolicyTarget {
+                task_id: task.id,
+                session_id: task.session_id.expect("session-bound Goal"),
+                execution_epoch: task.execution_epoch,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stale_targets.len(), 2);
+
+        assert_eq!(
+            store
+                .pause_session_goal(
+                    "policy-goal-b",
+                    "policy-session-b",
+                    1,
+                    GoalPauseState {
+                        reason: GoalPauseReason::OperatorPaused,
+                        description: None,
+                        blockers: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store.cancel_policy_targets(&stale_targets).await.unwrap(),
+            GoalTransitionResult::Stale,
+            "a stale target must roll back every earlier cancellation in the set"
+        );
+        assert_eq!(
+            store.get("policy-goal-a").await.unwrap().unwrap().status,
+            TaskStatus::Running,
+            "the earlier target must remain untouched after the atomic rollback"
+        );
+
+        let fresh_targets = store
+            .list_nonterminal_session_goals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|task| GoalPolicyTarget {
+                task_id: task.id,
+                session_id: task.session_id.expect("session-bound Goal"),
+                execution_epoch: task.execution_epoch,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store.cancel_policy_targets(&fresh_targets).await.unwrap(),
+            GoalTransitionResult::Applied
+        );
+        for task_id in ["policy-goal-a", "policy-goal-b"] {
+            let task = store.get(task_id).await.unwrap().unwrap();
+            assert_eq!(task.status, TaskStatus::Cancelled);
+            assert_eq!(
+                store
+                    .terminal_reason_for_session_goal(task_id, task.session_id.as_deref().unwrap(),)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("policy_revoked")
             );
         }
     }

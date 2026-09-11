@@ -26,10 +26,14 @@ use crate::control_plane::{
 };
 
 mod goal_execution;
+mod policy;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
     GoalExecutionSupervisor, dispose_unowned_session_goal,
+};
+pub use policy::{
+    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
 };
 
 /// Scope one adapter-owned parent turn as an isolated Goal turn.

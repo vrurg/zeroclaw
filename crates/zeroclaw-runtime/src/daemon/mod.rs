@@ -212,13 +212,41 @@ pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum DaemonExit {
     Shutdown,
-    Reload,
+    /// A fully loaded successor configuration whose Goal policy has already
+    /// been durably applied while the retiring runtime still owned workers.
+    Reload(Box<Config>),
 }
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
+
+/// Load the exact successor configuration and apply its Goal-policy cutover
+/// before the retiring runtime tears down its transports.
+///
+/// A failed load, classification, or durable cancellation reopens Goal
+/// admission and lets the current daemon continue unchanged. Once this
+/// succeeds, the caller must use this exact `Config` value for the successor
+/// generation rather than loading a second, potentially drifted file.
+async fn prepare_reload_config() -> Result<Config> {
+    let successor = Config::load_or_init().await?;
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Ok(successor);
+    };
+    let coordinator = control_plane.goal_execution_restart();
+    coordinator.begin_policy_cutover().await;
+    let result = async {
+        let registry = control_plane.goal_store()?;
+        crate::goal_mode::revoke_goals_under_policy(registry.as_ref(), &successor).await
+    }
+    .await;
+    if let Err(error) = result {
+        coordinator.reopen_for_generation().await;
+        return Err(error.context("apply prospective Goal policy"));
+    }
+    Ok(successor)
+}
 
 #[cfg(test)]
 static SCHEDULER_CLEAN_SHUTDOWN_OBSERVED: std::sync::atomic::AtomicBool =
@@ -308,7 +336,12 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        return Ok(DaemonExit::Reload);
+                        match prepare_reload_config().await {
+                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
+                            Err(error) => {
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
+                            }
+                        }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
@@ -343,7 +376,12 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        return Ok(DaemonExit::Reload);
+                        match prepare_reload_config().await {
+                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
+                            Err(error) => {
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
+                            }
+                        }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
@@ -1064,13 +1102,13 @@ pub async fn run(
             "daemon",
             match exit {
                 DaemonExit::Shutdown => "shutdown requested",
-                DaemonExit::Reload => "reload requested",
+                DaemonExit::Reload(_) => "reload requested",
             },
         ),
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
-    if matches!(exit_result, Ok(DaemonExit::Reload))
+    if matches!(exit_result, Ok(DaemonExit::Reload(_)))
         && let Some(control_plane) = crate::control_plane::control_plane()
         && let Err(error) = control_plane
             .goal_execution_restart()
@@ -1351,7 +1389,7 @@ fn settle_exit_against_drain(exit: Result<DaemonExit>, drain: RpcDrain) -> Resul
     let RpcDrain::Outstanding(outstanding) = drain else {
         return exit;
     };
-    if !matches!(exit, Ok(DaemonExit::Reload)) {
+    if !matches!(exit, Ok(DaemonExit::Reload(_))) {
         return exit;
     }
     ::zeroclaw_log::record!(
@@ -2716,19 +2754,34 @@ mod tests {
     /// it is admissible only on proof that the retiring generation is finished.
     #[test]
     fn reload_is_refused_when_rpc_work_is_still_unwinding() {
-        assert_eq!(
-            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Outstanding(1)).unwrap(),
-            DaemonExit::Shutdown,
+        assert!(
+            matches!(
+                settle_exit_against_drain(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    RpcDrain::Outstanding(1)
+                )
+                .unwrap(),
+                DaemonExit::Shutdown
+            ),
             "an undrained reload must shut the process down instead of handing over"
         );
-        assert_eq!(
-            settle_exit_against_drain(Ok(DaemonExit::Reload), RpcDrain::Complete).unwrap(),
-            DaemonExit::Reload,
+        assert!(
+            matches!(
+                settle_exit_against_drain(
+                    Ok(DaemonExit::Reload(Box::default())),
+                    RpcDrain::Complete
+                )
+                .unwrap(),
+                DaemonExit::Reload(_)
+            ),
             "a drained reload must still reload"
         );
-        assert_eq!(
-            settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1)).unwrap(),
-            DaemonExit::Shutdown,
+        assert!(
+            matches!(
+                settle_exit_against_drain(Ok(DaemonExit::Shutdown), RpcDrain::Outstanding(1))
+                    .unwrap(),
+                DaemonExit::Shutdown
+            ),
             "a shutdown is unaffected by the drain verdict"
         );
         assert!(
@@ -3801,7 +3854,7 @@ mod tests {
             .expect("wait_for_exit_signal should return after reload signal")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Reload);
+        assert!(matches!(result, DaemonExit::Reload(_)));
     }
 
     #[tokio::test]
@@ -3857,7 +3910,7 @@ mod tests {
         .expect("daemon must not deadlock after a gateway-triggered reload");
         let exit = exit.expect("daemon run should succeed");
 
-        assert_eq!(exit, DaemonExit::Reload);
+        assert!(matches!(exit, DaemonExit::Reload(_)));
         let (
             host,
             port,
@@ -4052,7 +4105,7 @@ mod tests {
         .expect("daemon should remain supervised after a post-readiness socket error")
         .expect("daemon run should succeed after supervised socket restart");
 
-        assert_eq!(exit, DaemonExit::Shutdown);
+        assert!(matches!(exit, DaemonExit::Shutdown));
         assert!(
             attempts.load(Ordering::SeqCst) >= 2,
             "socket supervisor should retry after a post-readiness AddrInUse"
@@ -4122,7 +4175,7 @@ mod tests {
         .expect("daemon run should succeed");
         let elapsed = started.elapsed();
 
-        assert_eq!(exit, DaemonExit::Reload);
+        assert!(matches!(exit, DaemonExit::Reload(_)));
         assert!(
             drained.load(Ordering::SeqCst),
             "reload must wait for the accepted RPC connection to drain before retiring \
@@ -4169,7 +4222,7 @@ mod tests {
         .await
         .expect("daemon should return after gateway-triggered reload")
         .expect("daemon run should succeed");
-        assert_eq!(exit, DaemonExit::Reload);
+        assert!(matches!(exit, DaemonExit::Reload(_)));
 
         assert!(
             scheduler_clean_shutdown_observed(),
@@ -4233,7 +4286,7 @@ mod tests {
             .expect("ephemeral daemon should shut down after last client disconnects")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Shutdown);
+        assert!(matches!(result, DaemonExit::Shutdown));
     }
 
     #[tokio::test]
@@ -4271,7 +4324,7 @@ mod tests {
             .expect("ephemeral daemon should shut down after second disconnect")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Shutdown);
+        assert!(matches!(result, DaemonExit::Shutdown));
     }
 
     // ── daemon gateway bind-mode detection (fail-fast) ────────────────
