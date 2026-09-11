@@ -1921,7 +1921,8 @@ impl Agent {
                 break result;
             }
         };
-        let response = Box::pin(isolated_turn).await?;
+        let response = crate::agent::goal_child_fence::scope_goal_parent(Box::pin(isolated_turn))
+            .await?;
 
         if let Some(preamble) = injected_memory_preamble.take() {
             preamble.strip_from_history(&mut working_history);
