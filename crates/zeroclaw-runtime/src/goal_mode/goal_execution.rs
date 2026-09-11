@@ -1154,6 +1154,60 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
+        let goal = self.registry.get_goal_task(scope.task_id()).await?;
+        if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
+            goal.pending_tool_batch_id
+                .as_deref()
+                .zip(goal.pending_tool_epoch)
+        }) {
+            match self
+                .registry
+                .fail_unpaired_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    admitted_epoch,
+                    batch_id,
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => return Ok(()),
+                GoalTransitionResult::Stale => {
+                    // A lifecycle owner may have terminalized and fenced this
+                    // exact Goal while its tool loop was unwinding. The dirty
+                    // marker still must not strand that terminal task: clear
+                    // only the exact admitted batch, never a successor.
+                    let current = self
+                        .registry
+                        .current_goal_for_session(scope.session_id())
+                        .await?;
+                    if let Some(current) = current
+                        && current.id == scope.task_id()
+                        && current.status.is_terminal()
+                    {
+                        return match self
+                            .registry
+                            .clear_terminal_tool_batch(
+                                scope.task_id(),
+                                scope.session_id(),
+                                admitted_epoch,
+                                batch_id,
+                            )
+                            .await?
+                        {
+                            GoalTransitionResult::Applied => Ok(()),
+                            GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                                bail!("Goal terminal tool-pairing cleanup lost its execution fence")
+                            }
+                        };
+                    }
+                    bail!("Goal tool-pairing failure lost its execution fence")
+                }
+                GoalTransitionResult::Missing => {
+                    bail!("Goal tool-pairing failure lost its execution fence")
+                }
+            }
+        }
         match self
             .registry
             .finish_session_goal(
@@ -1898,5 +1952,132 @@ mod tests {
                 .as_deref(),
             Some("pricing_unavailable")
         );
+    }
+
+    #[tokio::test]
+    async fn dispose_unowned_session_goal_clears_a_terminal_dirty_tool_batch() {
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task = TaskRecord {
+            id: "goal-dispose-dirty-tool".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test-boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix:test-room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@test:example.org".to_owned()),
+            session_id: Some("matrix_goal-dispose-dirty-tool".to_owned()),
+            execution_epoch: 1,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let session_id = task.session_id.clone().unwrap();
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    task,
+                    GoalTaskRecord {
+                        task_id: "goal-dispose-dirty-tool".to_owned(),
+                        objective: "finish the work".to_owned(),
+                        ..GoalTaskRecord::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .admit_pending_tool_batch(
+                    "goal-dispose-dirty-tool",
+                    &session_id,
+                    1,
+                    "interrupted-batch",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        assert_eq!(
+            dispose_unowned_session_goal(store.as_ref(), &session_id)
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert!(
+            store
+                .current_goal_for_session(&session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_tool_loop_failure_clears_its_terminal_batch() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "interrupted-batch",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        assert_eq!(
+            store
+                .finish_session_goal(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    TaskStatus::Cancelled,
+                    Some("policy_revoked".to_owned()),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            tracker,
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        engine
+            .fail(&scope, "parent_operation_failed")
+            .await
+            .unwrap();
+        let current = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Cancelled);
+        let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
+        assert!(goal.pending_tool_batch_id.is_none());
+        assert!(goal.pending_tool_epoch.is_none());
     }
 }

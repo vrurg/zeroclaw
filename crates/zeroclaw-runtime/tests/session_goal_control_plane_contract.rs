@@ -477,6 +477,78 @@ async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
     );
 }
 
+#[tokio::test]
+async fn terminal_tool_batch_cleanup_releases_the_session_for_replacement() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let task = session_goal_task("terminal-tool-pair", "terminal-tool-pair-session");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(task, session_goal_extension("terminal-tool-pair"))
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_tool_batch(
+                "terminal-tool-pair",
+                "terminal-tool-pair-session",
+                1,
+                "interrupted-batch",
+            )
+            .await
+            .expect("mark dispatched tool batch"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "terminal-tool-pair",
+                "terminal-tool-pair-session",
+                1,
+                TaskStatus::Cancelled,
+                Some("session_disposed".to_owned()),
+            )
+            .await
+            .expect("terminalize Goal before disposal"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("replacement-tool-pair", "terminal-tool-pair-session"),
+                session_goal_extension("replacement-tool-pair"),
+            )
+            .await
+            .expect("dirty terminal Goal blocks replacement"),
+        GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .clear_terminal_tool_batch(
+                "terminal-tool-pair",
+                "terminal-tool-pair-session",
+                1,
+                "interrupted-batch",
+            )
+            .await
+            .expect("clear exact terminal batch"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("replacement-tool-pair", "terminal-tool-pair-session"),
+                session_goal_extension("replacement-tool-pair"),
+            )
+            .await
+            .expect("terminal cleanup releases replacement"),
+        GoalTransitionResult::Applied
+    );
+}
+
 #[test]
 fn objective_is_immutable_even_to_raw_sql() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
