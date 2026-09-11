@@ -1241,16 +1241,11 @@ impl Agent {
         );
         let tool_protocol_prompts = self.tool_protocol_prompts()?;
         let turn_id = Self::new_turn_id();
-        let knobs = crate::agent::loop_::LoopKnobs {
-            dedup_enabled: false,
-            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
-            detect_protocol_without_tools: false,
-            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
-        };
-        let pacing = zeroclaw_config::schema::PacingConfig {
-            loop_detection_enabled: false,
-            ..zeroclaw_config::schema::PacingConfig::default()
-        };
+        // Goal turns retain ordinary tool-loop safeguards. The Goal scope
+        // controls lifecycle and serialization, not tool-call deduplication
+        // or loop detection.
+        let knobs = crate::agent::loop_::LoopKnobs::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
