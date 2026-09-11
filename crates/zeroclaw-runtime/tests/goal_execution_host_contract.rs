@@ -12,14 +12,16 @@ use tokio::{
 use zeroclaw_commands::goal::GoalCommand;
 use zeroclaw_config::cost::CostTracker;
 use zeroclaw_runtime::control_plane::{
-    GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
-    SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskRegistry, TaskStatus,
+    GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
+    GoalTransitionResult, SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskRegistry,
+    TaskStatus,
 };
 use zeroclaw_runtime::goal_mode::{
-    GoalController, GoalExecutionHost, GoalExecutionScope, GoalExecutionSupervisor,
-    GoalHostSettings, GoalIngressContext, GoalIngressPrincipal, GoalOperationScope, GoalParentTurn,
-    GoalResponse, GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
-    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
+    GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
+    GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionBinding,
+    GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease, GoalSurface,
+    GoalVerifierTurn,
 };
 
 struct RecordingDriver {
@@ -1236,7 +1238,7 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
     let pause_driver = driver.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(
                 pause_settings,
@@ -1267,6 +1269,142 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
             .expect("paused Goal remains current")
             .status,
         TaskStatus::Paused
+    );
+}
+
+#[tokio::test]
+async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let coordinator = GoalExecutionRestartCoordinator::new();
+    let supervisor = coordinator
+        .new_supervisor(Arc::new(
+            runtime
+                .execution_engine(tracker, "main", Arc::default())
+                .unwrap(),
+        ))
+        .await;
+
+    assert!(matches!(
+        supervisor
+            .submit(
+                settings,
+                ingress.clone(),
+                driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the task".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        GoalResponse::Started(_)
+    ));
+    parent_started.notified().await;
+
+    let restart_coordinator = Arc::new(coordinator);
+    let mut restart = {
+        let restart_coordinator = Arc::clone(&restart_coordinator);
+        zeroclaw_spawn::spawn!(async move { restart_coordinator.quiesce_for_restart().await })
+    };
+    assert!(
+        timeout(Duration::from_millis(20), &mut restart)
+            .await
+            .is_err(),
+        "restart pause must let the admitted operation settle before it returns"
+    );
+
+    release_parent.notify_one();
+    restart.await.unwrap().unwrap();
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("restart-paused Goal remains current");
+    let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Paused);
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
+    assert!(goal.pending_call_id.is_none());
+}
+
+#[tokio::test]
+async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let ingress = matrix_ingress();
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let coordinator = GoalExecutionRestartCoordinator::new();
+    let supervisor = coordinator
+        .new_supervisor(Arc::new(
+            runtime
+                .execution_engine(tracker, "main", Arc::default())
+                .unwrap(),
+        ))
+        .await;
+    let driver = Arc::new(ExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
+            .unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+        delivered: Arc::new(AtomicUsize::new(0)),
+        complete_verifier: true,
+    });
+
+    coordinator.quiesce_for_restart().await.unwrap();
+    let error = supervisor
+        .submit(
+            host_settings(true),
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .expect_err("restart quiescence must reject a new execution admission");
+    assert!(error.to_string().contains("quiescing"));
+    assert!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected admission must not create durable Goal state"
     );
 }
 
@@ -1337,7 +1475,9 @@ async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_de
     let dispose_supervisor = Arc::clone(&supervisor);
     let session_id = ingress.session_key().durable_id();
     let mut dispose =
-        tokio::spawn(async move { dispose_supervisor.dispose_session(&session_id).await });
+        zeroclaw_spawn::spawn!(
+            async move { dispose_supervisor.dispose_session(&session_id).await }
+        );
     assert!(
         timeout(Duration::from_millis(20), &mut dispose)
             .await
@@ -1424,7 +1564,7 @@ async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pendin
     let pause_supervisor = Arc::clone(&supervisor);
     let pause_settings = settings.clone();
     let pause_ingress = ingress.clone();
-    let mut pause = tokio::spawn(async move {
+    let mut pause = zeroclaw_spawn::spawn!(async move {
         pause_supervisor
             .submit(pause_settings, pause_ingress, driver, GoalCommand::Pause)
             .await
@@ -1493,7 +1633,7 @@ async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier()
         .execution_engine(tracker, "main", Arc::default())
         .unwrap();
 
-    let run = tokio::spawn(async move { engine.run(&settings, &request).await });
+    let run = zeroclaw_spawn::spawn!(async move { engine.run(&settings, &request).await });
     parent_started.notified().await;
 
     let pause = runtime

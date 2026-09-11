@@ -4020,6 +4020,9 @@ mod tests {
         ControlPlaneHandle {
             store,
             boot_id: "test-boot".into(),
+            goal_execution_restart: Arc::new(
+                crate::goal_mode::GoalExecutionRestartCoordinator::new(),
+            ),
         }
     }
 
