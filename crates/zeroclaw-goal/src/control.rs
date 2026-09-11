@@ -30,7 +30,10 @@ use zeroclaw_commands::goal::{
 
 mod goal_execution;
 
-pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor};
+pub use goal_execution::{
+    GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
+    GoalExecutionSupervisor,
+};
 
 /// The only V1 surfaces permitted to admit a Goal command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
