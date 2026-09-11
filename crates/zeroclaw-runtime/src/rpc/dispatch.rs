@@ -8028,6 +8028,18 @@ impl RpcDispatcher {
                 return Err(error);
             }
         };
+        if self
+            .ctx
+            .goal_runtime
+            .pause_for_external_cancellation(&req.session_id)
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?
+        {
+            return to_result(SessionCancelResult {
+                session_id: req.session_id,
+                cancelled: true,
+            });
+        }
         match self
             .ctx
             .sessions
