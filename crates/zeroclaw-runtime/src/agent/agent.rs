@@ -1849,7 +1849,7 @@ impl Agent {
                 served_route_sink: None,
                 sop_reassembly: None,
             });
-        let response = crate::agent::goal_child_fence::scope_goal_parent(
+        let response = crate::goal_mode::scope_goal_parent_turn(
             crate::agent::turn::scope_tool_protocol_prompts(
                 Arc::clone(&tool_protocol_prompts),
                 isolated_loop,
