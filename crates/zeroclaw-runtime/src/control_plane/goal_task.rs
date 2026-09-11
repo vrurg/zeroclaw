@@ -3,6 +3,6 @@
 
 pub use zeroclaw_goal::task::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
-    GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
-    TaskContinuationConversationScope, TaskGoal,
+    GoalPolicyTarget, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
+    TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
 };

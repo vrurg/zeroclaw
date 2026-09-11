@@ -33,6 +33,7 @@ mod deferred;
 pub mod goal_child_fence;
 mod goal_execution;
 mod parent_input;
+mod policy;
 
 pub use deferred::{GoalControlClass, GoalQueuedControl, GoalTurnBoundary, classify_goal_control};
 
@@ -45,6 +46,9 @@ pub use goal_execution::{
     dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
+pub use policy::{
+    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
+};
 
 /// Compose transient verifier feedback as untrusted user-role input.
 ///
