@@ -250,8 +250,9 @@ use super::foreground::{
 use super::{
     ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn,
     build_channel_system_prompt_for_message_with_signal,
-    callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
-    get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
+    callable_protocol_exposed_for_channel_turn, ensure_nonempty_channel_reply,
+    find_channel_for_message, get_or_create_provider, get_route_selection,
+    model_provider_entry_for_ref, outbound_content_format_for_channel,
     runtime_defaults_from_config, runtime_defaults_snapshot,
     sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
     turn_execution::resolved_channel_execution,
@@ -346,7 +347,6 @@ pub(super) async fn submit_matrix_goal(
         let _policy_cutover = Arc::clone(&context.goal_policy_cutover).cutover().await;
         super::maybe_apply_runtime_config_update_locked(context.as_ref()).await?;
     }
-    let _policy_admission = Arc::clone(&context.goal_policy_cutover).admit().await;
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let defaults = runtime_defaults_snapshot(context.as_ref());
@@ -401,9 +401,13 @@ pub(super) async fn submit_matrix_goal(
         *supervisor_slot = Some(Arc::clone(&supervisor));
         supervisor
     };
-    let response = supervisor
-        .submit(settings, ingress, driver, command)
-        .await?;
+    let admission = {
+        let _policy_admission = Arc::clone(&context.goal_policy_cutover).admit().await;
+        supervisor
+            .admit(settings.clone(), ingress, driver, command)
+            .await?
+    };
+    let response = supervisor.finalize_admission(settings, admission).await?;
     if matches!(
         response,
         zeroclaw_runtime::goal_mode::GoalResponse::Paused(_)
@@ -612,6 +616,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         };
         let turn_id = uuid::Uuid::new_v4().to_string();
         let loop_knobs = LoopKnobs::default();
+        let excluded_tools: &[String] =
+            if self.context.autonomy_level == zeroclaw_config::autonomy::AutonomyLevel::Full {
+                &[]
+            } else {
+                self.context.non_cli_excluded_tools.as_ref()
+            };
         let tool_loop = run_tool_call_loop(ToolLoop {
             exec: resolved_channel_execution(
                 self.context.as_ref(),
@@ -619,7 +629,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 &route,
                 self.context.observer.as_ref(),
                 &loop_knobs,
-                self.context.non_cli_excluded_tools.as_ref(),
+                excluded_tools,
                 defaults.defaults.temperature,
             ),
             history: &mut history,
@@ -678,7 +688,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         .await?;
         let messages = vec![
             ChatMessage::system(
-                "Return only strict JSON: {\\\"decision\\\":\\\"complete|continue|blocked\\\",\\\"reason\\\":\\\"...\\\",\\\"blockers\\\":[...]}.",
+                "Return only strict JSON: {\"decision\":\"complete|continue|blocked\",\"reason\":\"...\",\"blockers\":[...]}.",
             ),
             ChatMessage::user(format!(
                 "Objective:\n{}\n\nCandidate:\n{}",
@@ -709,11 +719,17 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     }
 
     async fn append_verified_candidate(&mut self, candidate: String) -> Result<()> {
-        let delivered = sanitize_channel_response_for_format_with_leak_detection(
+        let sanitized = sanitize_channel_response_for_format_with_leak_detection(
             &candidate,
             self.context.tools_registry.as_ref(),
             &self.context.prompt_config.security.leak_detection,
             outbound_content_format_for_channel(&self.message.channel),
+        );
+        let delivered = ensure_nonempty_channel_reply(
+            sanitized,
+            &candidate,
+            &self.message.channel,
+            &self.message.reply_target,
         );
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
@@ -757,6 +773,18 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
                 )
             }
         };
+        let message = sanitize_channel_response_for_format_with_leak_detection(
+            &message,
+            self.context.tools_registry.as_ref(),
+            &self.context.prompt_config.security.leak_detection,
+            outbound_content_format_for_channel(&self.message.channel),
+        );
+        let message = ensure_nonempty_channel_reply(
+            message,
+            "Goal lifecycle notice",
+            &self.message.channel,
+            &self.message.reply_target,
+        );
         let channel = find_channel_for_message(&self.context.channels_by_name, &self.message)
             .context("Matrix Goal channel is no longer available")?;
         channel

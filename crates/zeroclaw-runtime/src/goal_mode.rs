@@ -991,11 +991,11 @@ impl GoalController {
         let ingress = submission.ingress();
         let command = submission.command();
 
-        if matches!(command, GoalCommand::Help) {
-            return Ok(GoalResponse::Help);
-        }
         if !settings.enabled {
             return Ok(GoalResponse::Disabled);
+        }
+        if matches!(command, GoalCommand::Help) {
+            return Ok(GoalResponse::Help);
         }
 
         match command {

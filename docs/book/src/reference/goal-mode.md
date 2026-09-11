@@ -79,10 +79,9 @@ is required. Explicit control commands return their own typed acknowledgement.
 ## Foreground children and trust boundaries
 
 Foreground `delegate` and `spawn_subagent` calls retain their ordinary target
-authorization and inherit the goal identity, cancellation, deadline, and
-usage attribution. They run serially with parent and verifier work. Goal-owned
-background, detached, parallel, and recursive work is rejected before work is
-created.
+authorization and inherit the goal identity and usage attribution. They run
+serially with parent and verifier work. Goal-owned background, detached,
+parallel, and recursive work is rejected before work is created.
 
 Matrix uses its immutable authenticated sender identity captured before hooks;
 hooks may cancel processing but cannot rewrite Goal authority, session binding,

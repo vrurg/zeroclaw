@@ -91,6 +91,16 @@ struct GoalWorker {
     handle: JoinHandle<Result<GoalExecutionOutcome>>,
 }
 
+/// Controller result retained between the policy-admitted durable transition
+/// and the post-transition worker work.  The split is intentional: launching
+/// or gracefully draining an epoch may await an in-flight model operation and
+/// must never retain a daemon-wide policy-admission lease while it does so.
+pub struct GoalExecutionAdmission {
+    response: GoalResponse,
+    execution: Option<GoalExecutionRequest>,
+    previous: Option<GoalExecutionScope>,
+}
+
 impl GoalExecutionSupervisor {
     pub fn new(engine: Arc<GoalExecutionEngine>) -> Self {
         Self {
@@ -143,19 +153,21 @@ impl GoalExecutionSupervisor {
         Ok(())
     }
 
-    /// Submit one typed Goal command and retain any execution it starts.
+    /// Commit one typed Goal command while its caller holds the policy
+    /// admission lease.  Call [`Self::finalize_admission`] only after that
+    /// lease is dropped.
     ///
     /// This is the only runtime composition point that launches a Goal
     /// worker. The controller keeps durable lifecycle authority; the
     /// supervisor only retains the exact process-local handle needed to drain
     /// a fenced epoch before a later execution can replace it.
-    pub async fn submit(
+    pub async fn admit(
         &self,
         settings: GoalHostSettings,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
-    ) -> Result<GoalResponse> {
+    ) -> Result<GoalExecutionAdmission> {
         let mut previous = self.scope_for_session(&ingress).await?;
         // A completed epoch becomes terminal before its adapter appends and
         // delivers the verified candidate. A replacement must wait for that
@@ -181,6 +193,26 @@ impl GoalExecutionSupervisor {
             .await?
             .into_parts();
 
+        Ok(GoalExecutionAdmission {
+            response,
+            execution,
+            previous,
+        })
+    }
+
+    /// Launch or gracefully drain the exact controller result after policy
+    /// admission is complete.  This may wait for an admitted operation to
+    /// settle, so callers must not retain a global policy gate here.
+    pub async fn finalize_admission(
+        &self,
+        settings: GoalHostSettings,
+        admission: GoalExecutionAdmission,
+    ) -> Result<GoalResponse> {
+        let GoalExecutionAdmission {
+            response,
+            execution,
+            previous,
+        } = admission;
         if let Some(request) = execution {
             if let Some(scope) = previous.as_ref() {
                 self.drain_after_fence(scope).await?;
@@ -200,6 +232,24 @@ impl GoalExecutionSupervisor {
         }
 
         Ok(response)
+    }
+
+    /// Submit one typed Goal command and retain any execution it starts.
+    ///
+    /// Compatibility helper for contexts that do not share the daemon policy
+    /// coordinator. Production callers use [`Self::admit`] and
+    /// [`Self::finalize_admission`] around their short admission lease.
+    pub async fn submit(
+        &self,
+        settings: GoalHostSettings,
+        ingress: GoalIngressContext,
+        driver: Arc<dyn GoalSessionDriver>,
+        command: GoalCommand,
+    ) -> Result<GoalResponse> {
+        let admission = self
+            .admit(settings.clone(), ingress, driver, command)
+            .await?;
+        self.finalize_admission(settings, admission).await
     }
 
     /// Hard-dispose one trusted session's current Goal control state.

@@ -401,11 +401,6 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
-        // Retain the read lease from current-policy inspection through the
-        // guarded controller mutation and any supervisor registration. A
-        // future cutover therefore cannot interleave a stale ZeroCode command
-        // between those two boundaries.
-        let _admission = self.policy_cutover.admit().await;
         let config = context.config.read().clone();
         if !config.goal.enabled {
             return Ok(GoalResponse::Disabled);
@@ -462,9 +457,16 @@ impl RpcGoalRuntime {
                 supervisor
             }
         };
-        let response = supervisor
-            .submit(settings, ingress, driver, command)
-            .await?;
+        let admission = {
+            // Keep the shared read lease only through the guarded durable
+            // transition.  `finalize_admission` may drain an admitted model
+            // operation and therefore must not stall policy cutover.
+            let _policy_admission = self.policy_cutover.admit().await;
+            supervisor
+                .admit(settings.clone(), ingress, driver, command)
+                .await?
+        };
+        let response = supervisor.finalize_admission(settings, admission).await?;
         if matches!(
             response,
             GoalResponse::Paused(_)
