@@ -1749,6 +1749,37 @@ fn goal_child_refusal(reason: &str) -> ToolResult {
     }
 }
 
+fn nested_goal_child_scope() -> anyhow::Result<Option<crate::agent::cost::GoalChildExecutionScope>>
+{
+    crate::agent::cost::goal_child_execution_scope()
+        .map(|scope| {
+            scope.foreground_child().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal child depth overflow"
+                );
+                anyhow::Error::msg("Goal child depth overflow")
+            })
+        })
+        .transpose()
+}
+
+async fn scope_goal_child_execution<T>(
+    scope: Option<crate::agent::cost::GoalChildExecutionScope>,
+    operation: impl std::future::Future<Output = T>,
+) -> T {
+    match scope {
+        Some(scope) => {
+            crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+                .scope(Some(scope), operation)
+                .await
+        }
+        None => operation.await,
+    }
+}
+
 impl DelegateTool {
     /// Original synchronous delegation path (extracted for reuse).
     async fn execute_sync(
@@ -3366,6 +3397,7 @@ impl DelegateTool {
         temperature: Option<f64>,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        let goal_child_scope = nested_goal_child_scope()?;
         let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
             return Ok(ToolResult {
                 success: false,
@@ -3675,6 +3707,7 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        let execution = scope_goal_child_execution(goal_child_scope, execution);
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -3814,7 +3847,7 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, CoordinatorCheckingEchoTool, FakeMcpTool);
 
     fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
         TaskRecord {
@@ -4963,6 +4996,42 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn agentic_goal_delegate_enters_child_scope_before_its_tool_loop() {
+        let root_scope = crate::agent::cost::GoalChildExecutionScope {
+            task_id: "goal".into(),
+            session_id: "session".into(),
+            execution_epoch: 1,
+            child_depth: 0,
+        };
+
+        crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+            .scope(Some(root_scope), async {
+                let child_scope = nested_goal_child_scope()
+                    .expect("Goal delegate child scope must be representable")
+                    .expect("Goal delegate must inherit an execution scope");
+                assert_eq!(child_scope.child_depth, 1);
+
+                crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+                    .scope(Some(child_scope), async {
+                        let tool = DelegateTool::new(sample_agents(), None, test_security());
+                        let result = tool
+                            .execute(serde_json::json!({"agent": "researcher", "prompt": "x"}))
+                            .await
+                            .expect("recursive Goal delegate refusal is a tool result");
+                        assert!(!result.success);
+                        assert!(
+                            result
+                                .error
+                                .unwrap_or_default()
+                                .contains("recursive delegation")
+                        );
+                    })
+                    .await;
+            })
+            .await;
+    }
+
     async fn wait_for_terminal_background_result(
         tool: &DelegateTool,
         task_id: &str,
@@ -5104,7 +5173,69 @@ mod tests {
         }
     }
 
+    struct CoordinatorCheckingEchoTool {
+        saw_coordinator: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Tool for CoordinatorCheckingEchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Echoes the `value` argument after checking the Goal loop scope."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"}
+                },
+                "required": ["value"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let scoped = crate::agent::cost::GOAL_TOOL_PHASE_COORDINATOR
+                .try_with(|coordinator| coordinator.is_some())
+                .unwrap_or(false);
+            self.saw_coordinator
+                .store(scoped, std::sync::atomic::Ordering::SeqCst);
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            Ok(ToolResult {
+                success: true,
+                output: format!("echo:{value}").into(),
+                error: None,
+            })
+        }
+    }
+
     struct OneToolThenFinalModelProvider;
+
+    struct RecordingGoalToolPhaseFence {
+        begins: std::sync::atomic::AtomicUsize,
+        completes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::agent::cost::GoalToolPhaseFence for RecordingGoalToolPhaseFence {
+        async fn begin(&self) -> anyhow::Result<()> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn complete(&self) -> anyhow::Result<()> {
+            self.completes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl ModelProvider for OneToolThenFinalModelProvider {
@@ -6667,6 +6798,71 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("tool count matched: 1"));
+    }
+
+    #[tokio::test]
+    async fn goal_parent_phase_encloses_an_agentic_delegate_child_tool_loop() {
+        let config = agentic_agent_config();
+        let child_tool = Arc::new(CoordinatorCheckingEchoTool {
+            saw_coordinator: std::sync::atomic::AtomicBool::new(false),
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![child_tool.clone()])));
+        let fence = Arc::new(RecordingGoalToolPhaseFence {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            completes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let coordinator = Arc::new(crate::agent::cost::GoalToolPhaseCoordinator::new(
+            Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>,
+        ));
+        let root_scope = crate::agent::cost::GoalChildExecutionScope {
+            task_id: "goal".into(),
+            session_id: "session".into(),
+            execution_epoch: 1,
+            child_depth: 0,
+        };
+
+        crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
+            .scope(Some(root_scope), async {
+                crate::agent::cost::GOAL_TOOL_PHASE_COORDINATOR
+                    .scope(Some(coordinator), async {
+                        let parent = crate::agent::cost::begin_goal_tool_phase_if_scoped()
+                            .await
+                            .expect("parent phase admission must succeed")
+                            .expect("Goal scope must create a parent phase lease");
+                        let result = tool
+                            .execute_agentic(
+                                "agentic",
+                                &config,
+                                "test-provider",
+                                "test-model",
+                                &OneToolThenFinalModelProvider,
+                                "run",
+                                Some(0.2),
+                            )
+                            .await
+                            .expect("agentic delegate execution must complete");
+                        assert!(result.success, "{result:?}");
+                        assert!(result.output.contains("done"));
+                        assert!(
+                            child_tool
+                                .saw_coordinator
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                            "the child tool loop must retain the shared coordinator"
+                        );
+                        parent
+                            .complete()
+                            .await
+                            .expect("the parent must settle the shared durable phase");
+                    })
+                    .await;
+            })
+            .await;
+
+        assert_eq!(fence.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fence.completes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

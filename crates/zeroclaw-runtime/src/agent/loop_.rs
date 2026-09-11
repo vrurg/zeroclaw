@@ -6894,7 +6894,7 @@ mod tests {
                 model_switch_callback: None,
                 pacing: &pacing,
                 strict_tool_parsing: false,
-                parallel_tools: false,
+                parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
@@ -6919,9 +6919,11 @@ mod tests {
             agent_alias: None,
             turn_id: &turn_id,
         });
-        let result = crate::agent::cost::GOAL_TOOL_PHASE_FENCE
+        let result = crate::agent::cost::GOAL_TOOL_PHASE_COORDINATOR
             .scope(
-                Some(Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>),
+                Some(Arc::new(crate::agent::cost::GoalToolPhaseCoordinator::new(
+                    Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>,
+                ))),
                 operation,
             )
             .await
@@ -6932,8 +6934,8 @@ mod tests {
             "result should end with 'done', got: {result}"
         );
         assert!(
-            max_active.load(Ordering::SeqCst) >= 1,
-            "tools should execute successfully"
+            max_active.load(Ordering::SeqCst) >= 2,
+            "ordinary Goal tools must retain parallel execution"
         );
 
         let tool_results_message = history
@@ -7546,9 +7548,11 @@ mod tests {
             agent_alias: None,
             turn_id: &turn_id,
         });
-        let _ = crate::agent::cost::GOAL_TOOL_PHASE_FENCE
+        let _ = crate::agent::cost::GOAL_TOOL_PHASE_COORDINATOR
             .scope(
-                Some(Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>),
+                Some(Arc::new(crate::agent::cost::GoalToolPhaseCoordinator::new(
+                    Arc::clone(&fence) as Arc<dyn crate::agent::cost::GoalToolPhaseFence>,
+                ))),
                 operation,
             )
             .await;

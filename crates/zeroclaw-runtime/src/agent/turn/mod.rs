@@ -1400,8 +1400,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Err(ToolLoopCancelled.into());
         }
 
-        if let Some(fence) = goal_tool_phase {
-            fence.complete().await?;
+        if let Some(lease) = goal_tool_phase {
+            lease.complete().await?;
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);

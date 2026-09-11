@@ -25,10 +25,10 @@ use super::{
     GoalSessionDriver, GoalSessionExecutionLease, GoalVerifierTurn,
 };
 use crate::agent::cost::{
-    GOAL_CHILD_EXECUTION_SCOPE, GOAL_OPERATION_ACCOUNTING, GOAL_TOOL_PHASE_FENCE,
+    GOAL_CHILD_EXECUTION_SCOPE, GOAL_OPERATION_ACCOUNTING, GOAL_TOOL_PHASE_COORDINATOR,
     GoalChildExecutionScope, GoalOperationAccounting, GoalOperationRequest,
-    GoalOperationSettlement, GoalToolPhaseFence, GoalUsageEvent, ModelProviderPricing,
-    provider_pricing, resolve_rates_opt,
+    GoalOperationSettlement, GoalToolPhaseCoordinator, GoalToolPhaseFence, GoalUsageEvent,
+    ModelProviderPricing, provider_pricing, resolve_rates_opt,
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -688,6 +688,7 @@ impl GoalExecutionEngine {
             registry: Arc::clone(&self.registry),
             scope: scope.clone(),
         });
+        let tool_phase = Arc::new(GoalToolPhaseCoordinator::new(tool_phase));
         let mut lease = self.runtime.acquire_execution(settings, request).await?;
 
         GOAL_OPERATION_ACCOUNTING
@@ -700,7 +701,7 @@ impl GoalExecutionEngine {
                         execution_epoch: scope.execution_epoch(),
                         child_depth: 0,
                     }),
-                    GOAL_TOOL_PHASE_FENCE.scope(Some(tool_phase), async {
+                    GOAL_TOOL_PHASE_COORDINATOR.scope(Some(tool_phase), async {
                         self.run_scoped(
                             &scope,
                             &objective,

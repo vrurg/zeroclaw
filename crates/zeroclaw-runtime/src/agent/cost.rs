@@ -3,6 +3,7 @@ use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use tokio::sync::Notify;
 use zeroclaw_config::schema::Config;
 use zeroclaw_providers::pricing::ModelRates;
 
@@ -285,8 +286,212 @@ pub(crate) trait GoalToolPhaseFence: Send + Sync {
     async fn complete(&self) -> anyhow::Result<()>;
 }
 
+/// Shares one durable Goal tool phase between nested foreground agent loops.
+///
+/// The control plane deliberately stores only whether *some* tool side effect
+/// in the Goal tree is awaiting its matching transcript result.  A parent
+/// delegate or subagent call can therefore keep that durable phase open while
+/// the awaited child runs an ordinary tool loop.  Each loop receives its own
+/// short-lived lease, but only the first lease enters durable state and only
+/// the final settled lease clears it.  This keeps V1's synchronous children
+/// working without making future independently scheduled child loops depend on
+/// a task-local reentrancy trick.  A future supervisor can explicitly scope
+/// this shared coordinator into each spawned child task.
+pub(crate) struct GoalToolPhaseCoordinator {
+    fence: Arc<dyn GoalToolPhaseFence>,
+    state: Mutex<GoalToolPhaseState>,
+    changed: Notify,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalToolPhaseState {
+    Clean,
+    Beginning,
+    InFlight { leases: usize },
+    Completing,
+    Broken,
+}
+
+/// A loop-local claim on a shared durable Goal tool phase.
+///
+/// Dropping an unsettled lease marks the coordinator broken and intentionally
+/// leaves the durable phase in flight.  The enclosing Goal then fails closed
+/// instead of resuming after an unpaired tool side effect.
+pub(crate) struct GoalToolPhaseLease {
+    coordinator: Arc<GoalToolPhaseCoordinator>,
+    settled: bool,
+}
+
+/// Owns an in-progress durable begin until it either establishes a lease or
+/// fails closed.
+///
+/// Unlike a lease, this guard exists while `fence.begin()` is awaiting. That
+/// makes cancellation safe for a future supervisor that scopes the coordinator
+/// into independently scheduled child loops: a cancelled begin cannot strand
+/// waiters in `Beginning`.
+struct GoalToolPhaseBeginGuard {
+    coordinator: Arc<GoalToolPhaseCoordinator>,
+    settled: bool,
+}
+
+impl GoalToolPhaseCoordinator {
+    pub(crate) fn new(fence: Arc<dyn GoalToolPhaseFence>) -> Self {
+        Self {
+            fence,
+            state: Mutex::new(GoalToolPhaseState::Clean),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>) -> anyhow::Result<GoalToolPhaseLease> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let should_begin = {
+                let mut state = self.state.lock();
+                match *state {
+                    GoalToolPhaseState::Clean => {
+                        *state = GoalToolPhaseState::Beginning;
+                        true
+                    }
+                    GoalToolPhaseState::Beginning | GoalToolPhaseState::Completing => false,
+                    GoalToolPhaseState::InFlight { ref mut leases } => {
+                        *leases = leases.checked_add(1).ok_or_else(|| {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                "Goal tool phase lease count overflow"
+                            );
+                            anyhow::Error::msg("Goal tool phase lease count overflow")
+                        })?;
+                        return Ok(GoalToolPhaseLease {
+                            coordinator: Arc::clone(self),
+                            settled: false,
+                        });
+                    }
+                    GoalToolPhaseState::Broken => {
+                        anyhow::bail!("Goal tool phase is unresolved");
+                    }
+                }
+            };
+
+            if should_begin {
+                let mut begin_guard = GoalToolPhaseBeginGuard {
+                    coordinator: Arc::clone(self),
+                    settled: false,
+                };
+                let result = self.fence.begin().await;
+                let mut state = self.state.lock();
+                match result {
+                    Ok(()) => *state = GoalToolPhaseState::InFlight { leases: 1 },
+                    Err(_) => *state = GoalToolPhaseState::Broken,
+                }
+                self.changed.notify_waiters();
+                begin_guard.settled = true;
+                result?;
+                return Ok(GoalToolPhaseLease {
+                    coordinator: Arc::clone(self),
+                    settled: false,
+                });
+            }
+
+            notified.await;
+        }
+    }
+
+    async fn release(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let should_complete = {
+                let mut state = self.state.lock();
+                match *state {
+                    GoalToolPhaseState::InFlight { leases } => match leases {
+                        0 => anyhow::bail!("Goal tool phase has no active lease"),
+                        1 => {
+                            *state = GoalToolPhaseState::Completing;
+                            true
+                        }
+                        _ => {
+                            *state = GoalToolPhaseState::InFlight { leases: leases - 1 };
+                            return Ok(());
+                        }
+                    },
+                    GoalToolPhaseState::Beginning | GoalToolPhaseState::Completing => false,
+                    GoalToolPhaseState::Clean => {
+                        anyhow::bail!("Goal tool phase lease is already settled");
+                    }
+                    GoalToolPhaseState::Broken => {
+                        anyhow::bail!("Goal tool phase is unresolved");
+                    }
+                }
+            };
+
+            if should_complete {
+                let result = self.fence.complete().await;
+                let mut state = self.state.lock();
+                match result {
+                    Ok(()) => *state = GoalToolPhaseState::Clean,
+                    Err(_) => *state = GoalToolPhaseState::Broken,
+                }
+                self.changed.notify_waiters();
+                return result;
+            }
+
+            notified.await;
+        }
+    }
+
+    fn abandon(&self) {
+        let mut state = self.state.lock();
+        if !matches!(
+            *state,
+            GoalToolPhaseState::Clean | GoalToolPhaseState::Broken
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Goal tool phase lease was abandoned; leaving Goal fail-closed"
+            );
+            *state = GoalToolPhaseState::Broken;
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+impl GoalToolPhaseLease {
+    pub(crate) async fn complete(mut self) -> anyhow::Result<()> {
+        let result = self.coordinator.release().await;
+        self.settled = true;
+        result
+    }
+}
+
+impl Drop for GoalToolPhaseLease {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.coordinator.abandon();
+        }
+    }
+}
+
+impl Drop for GoalToolPhaseBeginGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.coordinator.abandon();
+        }
+    }
+}
+
 tokio::task_local! {
-    pub(crate) static GOAL_TOOL_PHASE_FENCE: Option<Arc<dyn GoalToolPhaseFence>>;
+    pub(crate) static GOAL_TOOL_PHASE_COORDINATOR: Option<Arc<GoalToolPhaseCoordinator>>;
 }
 
 /// Process-local ancestry for a foreground child of a Goal execution.
@@ -325,17 +530,23 @@ pub(crate) fn goal_child_execution_scope() -> Option<GoalChildExecutionScope> {
         .flatten()
 }
 
-/// Begins an exact Goal tool phase only inside a Goal-owned turn.  The caller
-/// must complete the returned fence only after the matching tool results have
-/// entered its transient working transcript.  Dropping it without completion
-/// intentionally leaves the durable phase in flight for fail-closed recovery.
-pub(crate) async fn begin_goal_tool_phase_if_scoped()
--> anyhow::Result<Option<Arc<dyn GoalToolPhaseFence>>> {
-    let Some(fence) = GOAL_TOOL_PHASE_FENCE.try_with(Clone::clone).ok().flatten() else {
+/// Acquires a loop-local lease on the exact Goal tool phase inside a Goal-owned
+/// turn. The caller must settle the returned lease only after its matching tool
+/// results have entered the transient working transcript. Nested foreground
+/// loops receive independent leases, while the coordinator completes the
+/// durable phase only after the final lease settles. Dropping a lease without
+/// settlement intentionally leaves the durable phase in flight for fail-closed
+/// recovery.
+pub(crate) async fn begin_goal_tool_phase_if_scoped() -> anyhow::Result<Option<GoalToolPhaseLease>>
+{
+    let Some(coordinator) = GOAL_TOOL_PHASE_COORDINATOR
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    else {
         return Ok(None);
     };
-    fence.begin().await?;
-    Ok(Some(fence))
+    coordinator.acquire().await.map(Some)
 }
 
 /// Admit an operation only when the enclosing execution is Goal-scoped.
@@ -1059,6 +1270,210 @@ mod tests {
     struct RecordingGoalOperationAccounting {
         requests: Mutex<Vec<GoalOperationRequest>>,
         settlements: Mutex<Vec<GoalOperationSettlement>>,
+    }
+
+    struct NonReentrantGoalToolPhaseFence {
+        begins: std::sync::atomic::AtomicUsize,
+        completes: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockingGoalToolPhaseFence {
+        begins: std::sync::atomic::AtomicUsize,
+        completes: std::sync::atomic::AtomicUsize,
+        began: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release_begin: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl GoalToolPhaseFence for NonReentrantGoalToolPhaseFence {
+        async fn begin(&self) -> anyhow::Result<()> {
+            let prior = self
+                .begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                prior == 0,
+                "a nested loop must reuse the outer durable Goal tool phase"
+            );
+            Ok(())
+        }
+
+        async fn complete(&self) -> anyhow::Result<()> {
+            self.completes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GoalToolPhaseFence for BlockingGoalToolPhaseFence {
+        async fn begin(&self) -> anyhow::Result<()> {
+            if let Some(tx) = self.began.lock().take() {
+                tx.send(())
+                    .map_err(|_| anyhow::Error::msg("Goal phase test receiver dropped"))?;
+            }
+            self.release_begin.notified().await;
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn complete(&self) -> anyhow::Result<()> {
+            self.completes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_goal_tool_loops_reuse_one_durable_phase() {
+        let fence = Arc::new(NonReentrantGoalToolPhaseFence {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            completes: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        GOAL_TOOL_PHASE_COORDINATOR
+            .scope(
+                Some(Arc::new(GoalToolPhaseCoordinator::new(
+                    Arc::clone(&fence) as Arc<dyn GoalToolPhaseFence>
+                ))),
+                async {
+                    let parent = begin_goal_tool_phase_if_scoped()
+                        .await
+                        .expect("parent tool loop must open the durable phase")
+                        .expect("Goal scope must return a parent phase lease");
+                    let child = begin_goal_tool_phase_if_scoped()
+                        .await
+                        .expect("foreground child tool loop must not re-admit the phase")
+                        .expect("Goal scope must return a child phase lease");
+
+                    child
+                        .complete()
+                        .await
+                        .expect("child lease must settle without completing the durable phase");
+                    parent
+                        .complete()
+                        .await
+                        .expect("outer lease must settle the durable phase");
+                },
+            )
+            .await;
+
+        assert_eq!(
+            fence.begins.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "nested loops must issue one durable begin"
+        );
+        assert_eq!(
+            fence.completes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the outermost settled lease may complete the durable phase"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_loop_leases_share_one_durable_begin() {
+        let (began_tx, began_rx) = tokio::sync::oneshot::channel();
+        let fence = Arc::new(BlockingGoalToolPhaseFence {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            completes: std::sync::atomic::AtomicUsize::new(0),
+            began: Mutex::new(Some(began_tx)),
+            release_begin: Notify::new(),
+        });
+        let coordinator = Arc::new(GoalToolPhaseCoordinator::new(
+            Arc::clone(&fence) as Arc<dyn GoalToolPhaseFence>
+        ));
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first = zeroclaw_spawn::spawn!(async move { first_coordinator.acquire().await });
+        began_rx
+            .await
+            .expect("first lease must begin durable state");
+
+        let second_coordinator = Arc::clone(&coordinator);
+        let second = zeroclaw_spawn::spawn!(async move { second_coordinator.acquire().await });
+        tokio::task::yield_now().await;
+        fence.release_begin.notify_one();
+
+        let parent = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+            .await
+            .expect("first lease must not stall")
+            .expect("first lease task must not panic")
+            .expect("first lease must acquire");
+        let child = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("second lease must not miss the durable begin notification")
+            .expect("second lease task must not panic")
+            .expect("second lease must acquire");
+
+        child.complete().await.expect("child lease must settle");
+        parent.complete().await.expect("parent lease must settle");
+        assert_eq!(fence.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fence.completes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_durable_begin_fails_closed_without_stranding_waiters() {
+        let (began_tx, began_rx) = tokio::sync::oneshot::channel();
+        let fence = Arc::new(BlockingGoalToolPhaseFence {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            completes: std::sync::atomic::AtomicUsize::new(0),
+            began: Mutex::new(Some(began_tx)),
+            release_begin: Notify::new(),
+        });
+        let coordinator = Arc::new(GoalToolPhaseCoordinator::new(
+            Arc::clone(&fence) as Arc<dyn GoalToolPhaseFence>
+        ));
+
+        let beginning_coordinator = Arc::clone(&coordinator);
+        let beginning =
+            zeroclaw_spawn::spawn!(async move { beginning_coordinator.acquire().await });
+        began_rx
+            .await
+            .expect("the durable begin must be in flight before cancellation");
+
+        beginning.abort();
+        let cancellation = match beginning.await {
+            Err(cancellation) => cancellation,
+            Ok(_) => panic!("the begin task must report cancellation"),
+        };
+        assert!(cancellation.is_cancelled());
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), coordinator.acquire())
+            .await
+            .expect("a cancelled begin must not strand future acquirers");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a cancelled begin must fail closed"),
+        };
+        assert!(error.to_string().contains("unresolved"));
+        assert_eq!(fence.begins.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(fence.completes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoned_loop_lease_keeps_the_durable_phase_fail_closed() {
+        let fence = Arc::new(NonReentrantGoalToolPhaseFence {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+            completes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let coordinator = Arc::new(GoalToolPhaseCoordinator::new(
+            Arc::clone(&fence) as Arc<dyn GoalToolPhaseFence>
+        ));
+
+        drop(
+            coordinator
+                .acquire()
+                .await
+                .expect("first lease must acquire"),
+        );
+        let error = coordinator
+            .acquire()
+            .await
+            .err()
+            .expect("an abandoned lease must reject later tool work");
+        assert!(error.to_string().contains("unresolved"));
+        assert_eq!(fence.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fence.completes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[async_trait::async_trait]
