@@ -1102,13 +1102,15 @@ impl GoalOperationAccountant {
         let tracker = Arc::clone(&self.tracker);
         let agent_alias = self.agent_alias.clone();
         let task_id = self.scope.task_id().to_owned();
+        let conversation_id = self.scope.session_id().to_owned();
         tokio::task::spawn_blocking(move || {
             for (event, usage) in events {
-                tracker.record_scoped_usage_with_owned_task_and_provider_attribution(
+                tracker.record_scoped_usage_with_owned_task_provider_and_conversation_attribution(
                     usage,
                     Some(&agent_alias),
                     Some(task_id.clone()),
                     event.provider_ref,
+                    conversation_id.clone(),
                 )?;
             }
             Ok::<(), anyhow::Error>(())
@@ -1583,6 +1585,18 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Complete);
+
+        let ledger = std::fs::read_to_string(_directory.path().join("state/costs.jsonl"))
+            .expect("Goal settlement must persist canonical ledger usage");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(&ledger).expect("Goal ledger row must be valid JSON");
+        assert_eq!(record.task_id.as_deref(), Some(scope.task_id()));
+        assert_eq!(record.provider_ref.as_deref(), Some("fallback"));
+        assert_eq!(
+            record.conversation_id.as_deref(),
+            Some(scope.session_id()),
+            "Goal usage must retain its owning session in the canonical ledger"
+        );
     }
 
     #[tokio::test]

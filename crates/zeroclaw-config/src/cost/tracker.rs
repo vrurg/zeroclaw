@@ -255,6 +255,42 @@ impl CostTracker {
         )
     }
 
+    /// Persist a task-scoped event with the actual provider route and owning
+    /// chat session, even when ordinary cost tracking is disabled.
+    ///
+    /// This is for runtime work whose durable task and session bindings are
+    /// both authoritative at settlement time. It keeps task, provider, and
+    /// conversation attribution together in the canonical JSONL record rather
+    /// than relying on a later join or a Goal-specific ledger.
+    pub fn record_scoped_usage_with_owned_task_provider_and_conversation_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: impl Into<String>,
+        conversation_id: impl Into<String>,
+    ) -> Result<()> {
+        let provider_ref = provider_ref.into();
+        anyhow::ensure!(
+            !provider_ref.trim().is_empty(),
+            "Task-scoped usage provider reference must be nonblank"
+        );
+        let conversation_id = conversation_id.into();
+        anyhow::ensure!(
+            !conversation_id.trim().is_empty(),
+            "Task-scoped usage conversation id must be nonblank"
+        );
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            Some(provider_ref),
+            Some(conversation_id),
+            false,
+            File::sync_all,
+        )
+    }
+
     fn record_usage_with_owned_task_attribution_inner(
         &self,
         usage: TokenUsage,
@@ -1725,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_task_usage_retains_the_actual_provider_route() {
+    fn scoped_task_usage_retains_actual_provider_and_conversation_attribution() {
         let tmp = TempDir::new().unwrap();
         let tracker = CostTracker::new(
             CostConfig {
@@ -1737,11 +1773,12 @@ mod tests {
         .unwrap();
 
         tracker
-            .record_scoped_usage_with_owned_task_and_provider_attribution(
+            .record_scoped_usage_with_owned_task_provider_and_conversation_attribution(
                 TokenUsage::new("served-model", 2, 1, 0, 0.0, 0.0, 0.0),
                 Some("agent-a"),
                 Some("goal-a".into()),
                 "openai.fallback",
+                "matrix_goal-session-a",
             )
             .unwrap();
 
@@ -1749,6 +1786,10 @@ mod tests {
         let record: CostRecord = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(record.task_id.as_deref(), Some("goal-a"));
         assert_eq!(record.provider_ref.as_deref(), Some("openai.fallback"));
+        assert_eq!(
+            record.conversation_id.as_deref(),
+            Some("matrix_goal-session-a")
+        );
     }
 
     #[test]
