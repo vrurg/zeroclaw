@@ -396,6 +396,7 @@ impl RpcGoalRuntime {
         }
         let control_plane = control_plane().context("Goal control plane is unavailable")?;
         let registry = control_plane.goal_store()?;
+        let restart_coordinator = control_plane.goal_execution_restart();
         let limits = config.goal.effective_limits().map_err(|error| {
             anyhow::Error::msg(format!("Goal configuration is invalid: {error:?}"))
         })?;
@@ -422,7 +423,7 @@ impl RpcGoalRuntime {
                     driver.agent_alias().to_owned(),
                     Arc::new(build_type_level_model_provider_pricing(&config)),
                 )?);
-                let supervisor = Arc::new(GoalExecutionSupervisor::new(engine));
+                let supervisor = restart_coordinator.new_supervisor(engine).await;
                 self.install_supervisor(session_id.clone(), Arc::clone(&supervisor))
                     .await;
                 supervisor
