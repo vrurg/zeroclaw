@@ -347,6 +347,9 @@ pub(super) async fn submit_matrix_goal(
         let _policy_cutover = Arc::clone(&context.goal_policy_cutover).cutover().await;
         super::maybe_apply_runtime_config_update_locked(context.as_ref()).await?;
     }
+    // Hold this only through the configuration snapshot and durable
+    // controller admission.  Finalization may drain an in-flight operation.
+    let policy_admission = Arc::clone(&context.goal_policy_cutover).admit().await;
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let defaults = runtime_defaults_snapshot(context.as_ref());
@@ -401,12 +404,10 @@ pub(super) async fn submit_matrix_goal(
         *supervisor_slot = Some(Arc::clone(&supervisor));
         supervisor
     };
-    let admission = {
-        let _policy_admission = Arc::clone(&context.goal_policy_cutover).admit().await;
-        supervisor
-            .admit(settings.clone(), ingress, driver, command)
-            .await?
-    };
+    let admission = supervisor
+        .admit(settings.clone(), ingress, driver, command)
+        .await?;
+    drop(policy_admission);
     let response = supervisor.finalize_admission(settings, admission).await?;
     if matches!(
         response,

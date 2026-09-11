@@ -401,6 +401,9 @@ impl RpcGoalRuntime {
         driver: Arc<ZeroCodeGoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
+        // Protect the policy snapshot and guarded controller transition, but
+        // release the daemon-wide gate before graceful worker draining.
+        let policy_admission = self.policy_cutover.admit().await;
         let config = context.config.read().clone();
         if !config.goal.enabled {
             return Ok(GoalResponse::Disabled);
@@ -457,15 +460,10 @@ impl RpcGoalRuntime {
                 supervisor
             }
         };
-        let admission = {
-            // Keep the shared read lease only through the guarded durable
-            // transition.  `finalize_admission` may drain an admitted model
-            // operation and therefore must not stall policy cutover.
-            let _policy_admission = self.policy_cutover.admit().await;
-            supervisor
-                .admit(settings.clone(), ingress, driver, command)
-                .await?
-        };
+        let admission = supervisor
+            .admit(settings.clone(), ingress, driver, command)
+            .await?;
+        drop(policy_admission);
         let response = supervisor.finalize_admission(settings, admission).await?;
         if matches!(
             response,
