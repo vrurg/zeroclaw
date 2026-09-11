@@ -922,7 +922,31 @@ impl RpcDispatcher {
                 self.prompt_tasks.push(task);
                 return;
             }
-            Method::SessionGoal => self.handle_session_goal(&req.params).await,
+            Method::SessionGoal => {
+                // Goal commands can fence and drain a live worker. Keep the
+                // connection read loop responsive and let teardown own the
+                // spawned command exactly as it owns ordinary prompts.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                self.prompt_tasks.retain(|task| !task.is_finished());
+                let task = zeroclaw_spawn::spawn!(async move {
+                    let result = handle.handle_session_goal(&params_clone).await;
+                    if !is_notif {
+                        match result {
+                            Ok(value) => handle.send_result(id_clone, value).await,
+                            Err(error) => {
+                                handle
+                                    .send_error(id_clone, error.code, &error.message)
+                                    .await;
+                            }
+                        }
+                    }
+                });
+                self.prompt_tasks.push(task);
+                return;
+            }
             Method::SessionConfigure => self.handle_session_configure(&req.params).await,
             Method::SessionCancel => self.handle_session_cancel(&req.params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
@@ -2873,6 +2897,7 @@ impl RpcDispatcher {
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
                 Arc::clone(&self.rpc),
+                self.connection_activity.clone(),
                 req.session_id.clone(),
                 tui_id,
             )

@@ -39,6 +39,9 @@ const GOAL_UPDATE_METHOD: &str = "session/goal_update";
 pub struct ZeroCodeGoalSessionDriver {
     context: Arc<RpcContext>,
     outbound: Arc<RpcOutbound>,
+    // Held by the worker-owned driver so the RPC generation cannot finish
+    // draining while a Goal it admitted is still unwinding.
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
     session_key: GoalSessionKey,
     agent_alias: String,
     session_generation: u64,
@@ -50,6 +53,7 @@ impl ZeroCodeGoalSessionDriver {
     pub async fn new(
         context: Arc<RpcContext>,
         outbound: Arc<RpcOutbound>,
+        connection_activity: Option<crate::rpc::ConnectionActivity>,
         session_id: String,
         tui_id: String,
     ) -> Result<Self> {
@@ -85,6 +89,7 @@ impl ZeroCodeGoalSessionDriver {
         Ok(Self {
             context,
             outbound,
+            connection_activity,
             session_key,
             agent_alias,
             session_generation,
@@ -175,6 +180,10 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
     }
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
+        // This is deliberately a liveness token rather than a cancellation
+        // signal. Ordinary EOF must retain the durable Goal, while reload must
+        // wait until the worker has released the driver.
+        let _connection_generation = self.connection_activity.as_ref();
         self.assert_ingress(ingress)?;
         self.revalidate_session().await?;
         let lock = self
