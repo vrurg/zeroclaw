@@ -1631,6 +1631,81 @@ async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
 }
 
 #[tokio::test]
+async fn supervisor_external_cancel_pauses_only_after_the_admitted_parent_settles() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::clone(&verifier_calls),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+    supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    parent_started.notified().await;
+
+    let session_id = ingress.session_key().durable_id();
+    let cancelling = Arc::clone(&supervisor);
+    let mut cancel = zeroclaw_spawn::spawn!(async move {
+        cancelling
+            .pause_for_external_cancellation(&session_id)
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(20), &mut cancel)
+            .await
+            .is_err(),
+        "external cancellation must let the admitted operation settle before returning"
+    );
+    release_parent.notify_one();
+    assert_eq!(
+        cancel.await.unwrap().unwrap(),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let goal = store.get_goal_task(&current.id).await.unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Paused);
+    assert_eq!(goal.pause_reason, Some(GoalPauseReason::OperatorPaused));
+    assert!(goal.pending_call_id.is_none());
+}
+
+#[tokio::test]
 async fn restart_coordinator_fences_every_host_before_waiting_for_any_one_host() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
