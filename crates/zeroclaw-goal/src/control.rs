@@ -32,6 +32,7 @@ use zeroclaw_commands::goal::{
 pub mod goal_child_fence;
 mod goal_execution;
 mod parent_input;
+mod policy;
 
 pub use goal_child_fence::scope_goal_parent as scope_goal_parent_turn;
 pub use goal_execution::{
@@ -39,6 +40,9 @@ pub use goal_execution::{
     GoalExecutionSubmission, GoalExecutionSupervisor, dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
+pub use policy::{
+    GoalPolicyDecision, GoalPolicyRevocation, classify_goal_policy, revoke_goals_under_policy,
+};
 
 /// Compose transient verifier feedback as untrusted user-role input.
 ///
