@@ -278,7 +278,7 @@ pub fn collect_common_goal_policy_revocation_targets(
             let session_id = task
                 .session_id
                 .filter(|session_id| !session_id.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Goal policy target lost its session binding"))?;
+                .ok_or_else(|| anyhow::Error::msg("Goal policy target lost its session binding"))?;
             Ok(GoalPolicyRevocationTarget {
                 task_id: task.id,
                 session_id,

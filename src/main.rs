@@ -6548,7 +6548,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
-                        current_config = next_config;
+                        current_config = *next_config;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
                             &current_config.observability,

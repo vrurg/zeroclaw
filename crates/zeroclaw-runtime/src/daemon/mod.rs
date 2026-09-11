@@ -205,7 +205,7 @@ pub enum DaemonExit {
     Shutdown,
     /// A fully validated prospective configuration whose Goal policy was
     /// durably reconciled before this daemon iteration began teardown.
-    Reload(Config),
+    Reload(Box<Config>),
 }
 
 /// Main owns configuration loading. The daemon receives this injected loader
@@ -419,7 +419,7 @@ async fn wait_for_exit_signal_with_preflight(
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         match reload_preflight().await {
-                            Ok(config) => return Ok(DaemonExit::Reload(config)),
+                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
                             Err(error) => {
                                 reload_tx.send_replace(false);
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Daemon reload rejected; retaining the active runtime");
@@ -460,7 +460,7 @@ async fn wait_for_exit_signal_with_preflight(
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
                         match reload_preflight().await {
-                            Ok(config) => return Ok(DaemonExit::Reload(config)),
+                            Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
                             Err(error) => {
                                 reload_tx.send_replace(false);
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Daemon reload rejected; retaining the active runtime");
