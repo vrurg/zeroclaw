@@ -39,9 +39,6 @@ pub struct GoalTaskRecord {
     /// Whether all Goal-attributed usage is known enough to admit another operation.
     #[serde(default)]
     pub accounting_state: GoalAccountingState,
-    /// Payload-free pairing fence around an in-flight Goal tool phase.
-    #[serde(default)]
-    pub tool_phase: GoalToolPhase,
 }
 
 impl Default for GoalTaskRecord {
@@ -57,7 +54,6 @@ impl Default for GoalTaskRecord {
             pending_call_id: None,
             pending_call_epoch: None,
             accounting_state: GoalAccountingState::Complete,
-            tool_phase: GoalToolPhase::Clean,
         }
     }
 }
@@ -70,14 +66,6 @@ pub enum GoalAccountingState {
     Missing,
     Invalid,
     OutcomeUnknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalToolPhase {
-    #[default]
-    Clean,
-    InFlight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,23 +398,6 @@ pub trait GoalTaskRegistry: Send + Sync {
         admitted_epoch: i64,
         pending_call_id: &str,
         accounting_state: GoalAccountingState,
-    ) -> anyhow::Result<GoalTransitionResult>;
-
-    /// Fence the process-local tool phase before polling a Goal-owned tool
-    /// batch. No transcript is persisted here.
-    async fn begin_goal_tool_phase(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        expected_epoch: i64,
-    ) -> anyhow::Result<GoalTransitionResult>;
-
-    /// Clear the tool phase for the exact current Goal epoch.
-    async fn complete_goal_tool_phase(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        expected_epoch: i64,
     ) -> anyhow::Result<GoalTransitionResult>;
 
     /// Atomically replace both effective limits for a running or paused Goal.
