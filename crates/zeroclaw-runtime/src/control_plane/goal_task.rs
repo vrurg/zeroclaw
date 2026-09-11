@@ -37,6 +37,13 @@ pub struct GoalTaskRecord {
     /// Epoch that admitted `pending_call_id`; always paired with the identifier.
     #[serde(default)]
     pub pending_call_epoch: Option<i64>,
+    /// Durable fence for an executable tool batch whose assistant tool-use
+    /// record has not yet been paired with every result in session history.
+    #[serde(default)]
+    pub pending_tool_batch_id: Option<String>,
+    /// Epoch that admitted `pending_tool_batch_id`; always paired with it.
+    #[serde(default)]
+    pub pending_tool_epoch: Option<i64>,
     /// Whether all Goal-attributed usage is known enough to admit another operation.
     #[serde(default)]
     pub accounting_state: GoalAccountingState,
@@ -54,6 +61,8 @@ impl Default for GoalTaskRecord {
             blockers: Vec::new(),
             pending_call_id: None,
             pending_call_epoch: None,
+            pending_tool_batch_id: None,
+            pending_tool_epoch: None,
             accounting_state: GoalAccountingState::Complete,
         }
     }
@@ -436,6 +445,59 @@ pub trait GoalTaskRegistry: Send + Sync {
         pending_call_id: &str,
         accounting_state: GoalAccountingState,
     ) -> anyhow::Result<GoalTransitionResult>;
+
+    /// Fence one executable tool batch for the exact running Goal epoch.
+    /// This is independent of the provider-operation fence: a tool batch has
+    /// no spend reservation, but it must be durably paired before resumption.
+    async fn admit_pending_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Clear the matching tool-batch fence after complete history pairing.
+    /// Settlement remains legal after a pause has fenced the Goal to a later
+    /// epoch, because it cannot admit a successor operation.
+    async fn settle_pending_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Atomically terminalize a running or paused Goal whose exact admitted
+    /// tool batch could not be paired. Clearing the marker separately would
+    /// create a resumable gap, so storage owns both mutations in one guard.
+    async fn fail_unpaired_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
+
+    /// Remove a matching marker from a terminal Goal. Terminal Goals cannot
+    /// resume, so this preserves replacement/disposal progress without
+    /// claiming that an interrupted batch paired cleanly.
+    async fn clear_terminal_tool_batch(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _admitted_epoch: i64,
+        _batch_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support durable tool pairing")
+    }
 
     /// Atomically replace both effective limits for a running or paused Goal.
     async fn update_session_goal_limits(

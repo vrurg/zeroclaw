@@ -34,6 +34,7 @@ use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
     GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
+use crate::agent::goal_tool_pairing::scope_goal_tool_pairing;
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
     GoalTaskRegistry, GoalTransitionResult, TaskStatus,
@@ -918,8 +919,11 @@ impl GoalExecutionEngine {
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
-                self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
-                    .await
+                scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
+                    self.run_scoped(&scope, &objective, initial_turn_kind, lease.as_mut())
+                        .await
+                })
+                .await
             })
             .await
     }

@@ -102,6 +102,15 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         .expect("read migrated task columns");
     assert!(columns.contains(&"session_id".to_string()));
     assert!(columns.contains(&"execution_epoch".to_string()));
+    let goal_columns: Vec<String> = verify
+        .prepare("PRAGMA table_info(goal_tasks)")
+        .expect("inspect migrated Goal columns")
+        .query_map([], |row| row.get(1))
+        .expect("query migrated Goal columns")
+        .collect::<Result<_, _>>()
+        .expect("read migrated Goal columns");
+    assert!(goal_columns.contains(&"pending_tool_batch_id".to_string()));
+    assert!(goal_columns.contains(&"pending_tool_epoch".to_string()));
     let terminal_table: String = verify
         .query_row(
             "SELECT name FROM sqlite_master
@@ -262,6 +271,209 @@ fn independent_connections_admit_exactly_one_current_goal_for_a_session() {
     assert_eq!(
         duplicate_error.sqlite_error_code(),
         Some(ErrorCode::ConstraintViolation)
+    );
+}
+
+#[tokio::test]
+async fn a_fenced_goal_tool_batch_can_settle_after_the_pause_epoch() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let task = session_goal_task("tool-batch", "tool-batch-session");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(task, session_goal_extension("tool-batch"))
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .admit_pending_tool_batch("tool-batch", "tool-batch-session", 1, "batch-one")
+            .await
+            .expect("admit exact tool batch"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .pause_session_goal(
+                "tool-batch",
+                "tool-batch-session",
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .expect("fence Goal before draining the tool batch"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .settle_pending_tool_batch("tool-batch", "tool-batch-session", 1, "batch-one")
+            .await
+            .expect("settle the admitted batch despite the later pause epoch"),
+        GoalTransitionResult::Applied
+    );
+    let goal = store
+        .get_goal_task("tool-batch")
+        .await
+        .expect("read goal extension")
+        .expect("Goal extension exists");
+    assert!(goal.pending_tool_batch_id.is_none());
+    assert!(goal.pending_tool_epoch.is_none());
+
+    let paused = store
+        .current_goal_for_session("tool-batch-session")
+        .await
+        .expect("read current Goal")
+        .expect("current Goal remains visible");
+    assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(paused.execution_epoch, 2);
+    assert_eq!(
+        store
+            .resume_session_goal(
+                "tool-batch",
+                "tool-batch-session",
+                paused.execution_epoch,
+                1,
+                "boot-b",
+            )
+            .await
+            .expect("resume only after a clean paired tool batch"),
+        GoalTransitionResult::Applied
+    );
+}
+
+#[tokio::test]
+async fn restart_fails_an_unpaired_goal_tool_batch_without_replaying_it() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let task = session_goal_task("interrupted-tools", "interrupted-tools-session");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(task, session_goal_extension("interrupted-tools"))
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_tool_batch(
+                "interrupted-tools",
+                "interrupted-tools-session",
+                1,
+                "interrupted-batch",
+            )
+            .await
+            .expect("mark dispatched tool batch"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .reconcile_goal_boot_state("boot-new")
+            .expect("reconcile interrupted Goal"),
+        1
+    );
+    let task = store
+        .current_goal_for_session("interrupted-tools-session")
+        .await
+        .expect("read current Goal")
+        .expect("failed Goal remains status-visible");
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .terminal_reason_for_session_goal("interrupted-tools", "interrupted-tools-session")
+            .await
+            .expect("read terminal Goal reason")
+            .as_deref(),
+        Some("goal_tool_pairing_incomplete")
+    );
+    let goal = store
+        .get_goal_task("interrupted-tools")
+        .await
+        .expect("read goal extension")
+        .expect("Goal extension remains available");
+    assert!(goal.pending_tool_batch_id.is_none());
+    assert!(goal.pending_tool_epoch.is_none());
+}
+
+#[tokio::test]
+async fn pausing_with_an_unpaired_tool_batch_is_not_resumable() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    let task = session_goal_task("unsafe-tool-pair", "unsafe-tool-pair-session");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(task, session_goal_extension("unsafe-tool-pair"))
+            .await
+            .expect("create current Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_tool_batch(
+                "unsafe-tool-pair",
+                "unsafe-tool-pair-session",
+                1,
+                "unpaired-batch",
+            )
+            .await
+            .expect("mark dispatched tool batch"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .pause_session_goal(
+                "unsafe-tool-pair",
+                "unsafe-tool-pair-session",
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .expect("fence Goal before classifying the batch"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .fail_unpaired_tool_batch(
+                "unsafe-tool-pair",
+                "unsafe-tool-pair-session",
+                2,
+                1,
+                "unpaired-batch",
+            )
+            .await
+            .expect("fail atomically instead of reopening the Goal"),
+        GoalTransitionResult::Applied
+    );
+    let terminal = store
+        .current_goal_for_session("unsafe-tool-pair-session")
+        .await
+        .expect("read current Goal")
+        .expect("terminal Goal remains visible");
+    assert_eq!(terminal.status, TaskStatus::Failed);
+    assert_eq!(terminal.execution_epoch, 3);
+    assert_eq!(
+        store
+            .resume_session_goal(
+                "unsafe-tool-pair",
+                "unsafe-tool-pair-session",
+                terminal.execution_epoch,
+                1,
+                "boot-b",
+            )
+            .await
+            .expect("terminal Goal produces typed stale response"),
+        GoalTransitionResult::Stale
     );
 }
 

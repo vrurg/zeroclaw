@@ -296,6 +296,41 @@ pub(super) fn converge_schema(conn: &Connection) -> Result<()> {
                  BEGIN SELECT RAISE(ABORT, 'goal accounting state is invalid'); END;",
     )
     .context("ensure session-bound Goal control guards")?;
+    for (column, sql) in [
+        (
+            "pending_tool_batch_id",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_tool_batch_id TEXT",
+        ),
+        (
+            "pending_tool_epoch",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_tool_epoch INTEGER",
+        ),
+    ] {
+        add_column_if_missing(conn, "goal_tasks", column, sql)?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_pending_tool_batch
+                 ON goal_tasks(pending_tool_batch_id)
+                 WHERE pending_tool_batch_id IS NOT NULL;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_pending_tool_pair_insert
+                 BEFORE INSERT ON goal_tasks FOR EACH ROW
+                 WHEN (NEW.pending_tool_batch_id IS NULL) != (NEW.pending_tool_epoch IS NULL)
+                      OR (NEW.pending_tool_batch_id IS NOT NULL
+                          AND (length(trim(NEW.pending_tool_batch_id)) = 0
+                               OR typeof(NEW.pending_tool_epoch) != 'integer'
+                               OR NEW.pending_tool_epoch < 1))
+                 BEGIN SELECT RAISE(ABORT, 'goal pending tool batch id and epoch must be paired and valid'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_pending_tool_pair_update
+                 BEFORE UPDATE OF pending_tool_batch_id, pending_tool_epoch ON goal_tasks FOR EACH ROW
+                 WHEN (NEW.pending_tool_batch_id IS NULL) != (NEW.pending_tool_epoch IS NULL)
+                      OR (NEW.pending_tool_batch_id IS NOT NULL
+                          AND (length(trim(NEW.pending_tool_batch_id)) = 0
+                               OR typeof(NEW.pending_tool_epoch) != 'integer'
+                               OR NEW.pending_tool_epoch < 1))
+                 BEGIN SELECT RAISE(ABORT, 'goal pending tool batch id and epoch must be paired and valid'); END;
+        ",
+    )
+    .context("ensure Goal tool-pairing guards")?;
     // New and provisional v8 databases both need the immutable-objective
     // guard. Existing provisional `success_criteria` columns remain ignored.
     conn.execute_batch(
@@ -474,12 +509,54 @@ impl SqliteTaskStore {
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
-                           AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
+                    AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
                                 OR accounting_state != 'complete')
                     )",
                 params![boot_id, &now],
             )
             .context("fail interrupted goal accounting")?;
+
+        let failed_tool_pairing = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'failed', error = 'goal_tool_pairing_incomplete',
+                        finished_at = COALESCE(finished_at, ?2),
+                        execution_epoch = CASE
+                            WHEN status IN ('running', 'paused')
+                                 AND execution_epoch < 9223372036854775807
+                            THEN execution_epoch + 1
+                            ELSE execution_epoch
+                        END
+                  WHERE kind = 'goal' AND session_id IS NOT NULL
+                    AND owner_boot_id != ?1
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
+                    AND status IN ('running', 'paused')
+                    AND EXISTS (
+                        SELECT 1 FROM goal_tasks
+                         WHERE task_id = tasks.id
+                           AND (pending_tool_batch_id IS NOT NULL
+                                OR pending_tool_epoch IS NOT NULL)
+                    )",
+                params![boot_id, &now],
+            )
+            .context("fail interrupted Goal with unpaired tool batch")?;
+
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pending_tool_batch_id = NULL, pending_tool_epoch = NULL
+              WHERE task_id IN (
+                    SELECT id FROM tasks
+                     WHERE kind = 'goal' AND session_id IS NOT NULL
+                       AND owner_boot_id != ?1
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
+              ) AND (pending_tool_batch_id IS NOT NULL OR pending_tool_epoch IS NOT NULL)",
+            params![boot_id],
+        )
+        .context("clear classified interrupted Goal tool batch")?;
 
         tx.execute(
             "UPDATE goal_tasks
@@ -493,6 +570,7 @@ impl SqliteTaskStore {
                                      AND owner_boot_id = tasks.owner_boot_id)
                        AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                    AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                     AND accounting_state = 'complete'",
             params![boot_id, daemon_restart],
         )
@@ -511,6 +589,7 @@ impl SqliteTaskStore {
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                           AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                            AND accounting_state = 'complete'
                     )",
                 params![boot_id],
@@ -531,6 +610,7 @@ impl SqliteTaskStore {
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                           AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                            AND accounting_state = 'complete'
                     )",
                 params![boot_id, &now],
@@ -538,8 +618,12 @@ impl SqliteTaskStore {
             .context("fail exhausted goal epoch")?;
         tx.commit().context("commit goal boot reconciliation")?;
         Ok(
-            (missing_extension + failed_accounting + cleared_terminal_pending + paused + exhausted)
-                as u64,
+            (missing_extension
+                + failed_accounting
+                + failed_tool_pairing
+                + cleared_terminal_pending
+                + paused
+                + exhausted) as u64,
         )
     }
 }
@@ -658,6 +742,8 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
         blockers: blockers_from_db(row.get("blockers_json")?)?,
         pending_call_id: row.get("pending_call_id")?,
         pending_call_epoch: row.get("pending_call_epoch")?,
+        pending_tool_batch_id: row.get("pending_tool_batch_id")?,
+        pending_tool_epoch: row.get("pending_tool_epoch")?,
         accounting_state: match row.get::<_, String>("accounting_state")?.as_str() {
             "complete" => GoalAccountingState::Complete,
             "missing" => GoalAccountingState::Missing,
@@ -692,8 +778,9 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
         "INSERT INTO goal_tasks
             (task_id, objective, effective_token_limit, effective_cost_limit_usd,
              pause_reason, pause_description, blockers_json,
-             pending_call_id, pending_call_epoch, accounting_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             pending_call_id, pending_call_epoch, pending_tool_batch_id,
+             pending_tool_epoch, accounting_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ",
         params![
             rec.task_id,
@@ -705,6 +792,8 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
             blockers_json,
             rec.pending_call_id,
             rec.pending_call_epoch,
+            rec.pending_tool_batch_id,
+            rec.pending_tool_epoch,
             accounting_state_to_db(rec.accounting_state),
         ],
     )
@@ -864,7 +953,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         conn.query_row(
             "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
                     pause_reason, pause_description, blockers_json,
-                    pending_call_id, pending_call_epoch, accounting_state
+                    pending_call_id, pending_call_epoch, pending_tool_batch_id,
+                    pending_tool_epoch, accounting_state
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
@@ -1072,6 +1162,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         }
         if goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
+            || goal.pending_tool_batch_id.is_some()
+            || goal.pending_tool_epoch.is_some()
             || goal.accounting_state != GoalAccountingState::Complete
         {
             anyhow::bail!("new session goals must not include pending or incomplete state");
@@ -1113,6 +1205,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             let settled = tx
                 .query_row(
                     "SELECT pending_call_id IS NULL AND pending_call_epoch IS NULL
+                           AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                        FROM goal_tasks WHERE task_id = ?1",
                     params![&current.id],
                     |row| row.get::<_, bool>(0),
@@ -1193,6 +1286,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id AND accounting_state = 'complete'
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                       AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
                 )",
             params![
                 task_id,
@@ -1311,6 +1405,143 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn admit_pending_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        batch_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        if batch_id.trim().is_empty() {
+            anyhow::bail!("goal pending tool batch id must be nonblank");
+        }
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE goal_tasks
+                SET pending_tool_batch_id = ?4, pending_tool_epoch = ?3
+              WHERE task_id = ?1
+                AND pending_tool_batch_id IS NULL AND pending_tool_epoch IS NULL
+                AND accounting_state = 'complete'
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status = 'running' AND execution_epoch = ?3
+                )",
+            params![task_id, session_id, expected_epoch, batch_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&conn, task_id, session_id);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn settle_pending_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE goal_tasks
+                SET pending_tool_batch_id = NULL, pending_tool_epoch = NULL
+              WHERE task_id = ?1
+                AND pending_tool_batch_id = ?4 AND pending_tool_epoch = ?3
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                )",
+            params![task_id, session_id, admitted_epoch, batch_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&conn, task_id, session_id);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn fail_unpaired_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic Goal tool-pairing failure")?;
+        let cleared = tx.execute(
+            "UPDATE goal_tasks
+                SET pending_tool_batch_id = NULL, pending_tool_epoch = NULL
+              WHERE task_id = ?1
+                AND pending_tool_batch_id = ?5 AND pending_tool_epoch = ?4
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status IN ('running', 'paused') AND execution_epoch = ?3
+                )",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                admitted_epoch,
+                batch_id
+            ],
+        )?;
+        if cleared == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        let failed = tx.execute(
+            "UPDATE tasks
+                SET status = 'failed', error = 'goal_tool_pairing_incomplete',
+                    finished_at = COALESCE(finished_at, ?4),
+                    execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                        THEN execution_epoch + 1 ELSE execution_epoch END
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status IN ('running', 'paused') AND execution_epoch = ?3",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        if failed == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.commit()
+            .context("commit atomic Goal tool-pairing failure")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
+    async fn clear_terminal_tool_batch(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        admitted_epoch: i64,
+        batch_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE goal_tasks
+                SET pending_tool_batch_id = NULL, pending_tool_epoch = NULL
+              WHERE task_id = ?1
+                AND pending_tool_batch_id = ?4 AND pending_tool_epoch = ?3
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
+                )",
+            params![task_id, session_id, admitted_epoch, batch_id],
+        )?;
+        if updated == 0 {
+            return transition_failure(&conn, task_id, session_id);
+        }
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn update_session_goal_limits(
         &self,
         task_id: &str,
@@ -1354,7 +1585,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 AND NOT EXISTS (
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
-                       AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
+                       AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
+                            OR pending_tool_batch_id IS NOT NULL OR pending_tool_epoch IS NOT NULL)
                 )",
             params![task_id, session_id, expected_epoch],
         )?;
