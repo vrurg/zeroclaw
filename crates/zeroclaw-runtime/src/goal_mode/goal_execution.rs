@@ -34,6 +34,7 @@ use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
     GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
+use crate::agent::goal_tool_pairing::scope_goal_tool_pairing;
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
     GoalTaskRegistry, GoalTransitionResult, TaskStatus,
@@ -722,6 +723,115 @@ impl GoalExecutionSupervisor {
         scope: &GoalExecutionScope,
     ) -> Result<Option<GoalResponse>> {
         let _ = self.drain(scope).await;
+        let Some((mut current, mut goal)) = self.fenced_goal_state(scope).await? else {
+            return Ok(None);
+        };
+        let mut classified = false;
+
+        if let Some((pending_id, admitted_epoch)) =
+            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
+        {
+            match self
+                .engine
+                .registry
+                .settle_pending_operation(
+                    &current.id,
+                    scope.session_id(),
+                    admitted_epoch,
+                    pending_id,
+                    GoalAccountingState::OutcomeUnknown,
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+            classified = true;
+            let Some(state) = self.fenced_goal_state(scope).await? else {
+                return Ok(None);
+            };
+            (current, goal) = state;
+            if current.status == TaskStatus::Paused {
+                match self
+                    .engine
+                    .registry
+                    .finish_session_goal(
+                        &current.id,
+                        scope.session_id(),
+                        current.execution_epoch,
+                        TaskStatus::Failed,
+                        Some("accounting_outcome_unknown".to_owned()),
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied => {}
+                    GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+                }
+                let Some(state) = self.fenced_goal_state(scope).await? else {
+                    return Ok(None);
+                };
+                (current, goal) = state;
+            }
+        }
+
+        if let Some((batch_id, admitted_epoch)) = goal
+            .pending_tool_batch_id
+            .as_deref()
+            .zip(goal.pending_tool_epoch)
+        {
+            let transition = if current.status.is_terminal() {
+                self.engine
+                    .registry
+                    .clear_terminal_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            } else {
+                self.engine
+                    .registry
+                    .fail_unpaired_tool_batch(
+                        &current.id,
+                        scope.session_id(),
+                        current.execution_epoch,
+                        admitted_epoch,
+                        batch_id,
+                    )
+                    .await?
+            };
+            match transition {
+                GoalTransitionResult::Applied => {}
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
+            }
+            classified = true;
+            let Some(state) = self.fenced_goal_state(scope).await? else {
+                return Ok(None);
+            };
+            (current, goal) = state;
+        }
+
+        if !classified {
+            return Ok(None);
+        }
+        let projection = super::GoalStatusProjection::from_parts(&current, &goal);
+        Ok(Some(match current.status {
+            TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
+            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
+            _ => GoalResponse::Stale,
+        }))
+    }
+
+    async fn fenced_goal_state(
+        &self,
+        scope: &GoalExecutionScope,
+    ) -> Result<
+        Option<(
+            crate::control_plane::TaskRecord,
+            crate::control_plane::GoalTaskRecord,
+        )>,
+    > {
         let Some(current) = self
             .engine
             .registry
@@ -739,74 +849,7 @@ impl GoalExecutionSupervisor {
             .get_goal_task(&current.id)
             .await?
             .context("Goal extension disappeared while classifying a fenced operation")?;
-        let Some((pending_id, admitted_epoch)) =
-            goal.pending_call_id.as_deref().zip(goal.pending_call_epoch)
-        else {
-            return Ok(None);
-        };
-        match self
-            .engine
-            .registry
-            .settle_pending_operation(
-                &current.id,
-                scope.session_id(),
-                admitted_epoch,
-                pending_id,
-                GoalAccountingState::OutcomeUnknown,
-            )
-            .await?
-        {
-            GoalTransitionResult::Applied => {}
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-        }
-        let Some(current) = self
-            .engine
-            .registry
-            .current_goal_for_session(scope.session_id())
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current.id != scope.task_id() {
-            return Ok(None);
-        }
-        if current.status == TaskStatus::Paused {
-            match self
-                .engine
-                .registry
-                .finish_session_goal(
-                    &current.id,
-                    scope.session_id(),
-                    current.execution_epoch,
-                    TaskStatus::Failed,
-                    Some("accounting_outcome_unknown".to_owned()),
-                )
-                .await?
-            {
-                GoalTransitionResult::Applied => {}
-                GoalTransitionResult::Stale | GoalTransitionResult::Missing => return Ok(None),
-            }
-        }
-        let Some(current) = self
-            .engine
-            .registry
-            .current_goal_for_session(scope.session_id())
-            .await?
-        else {
-            return Ok(None);
-        };
-        let goal = self
-            .engine
-            .registry
-            .get_goal_task(&current.id)
-            .await?
-            .context("Goal extension disappeared after fenced-operation classification")?;
-        let projection = super::GoalStatusProjection::from_parts(&current, &goal);
-        Ok(Some(match current.status {
-            TaskStatus::Cancelled => GoalResponse::Cancelled(projection),
-            _ if current.status.is_terminal() => GoalResponse::Terminal(projection),
-            _ => GoalResponse::Stale,
-        }))
+        Ok(Some((current, goal)))
     }
 }
 
@@ -872,6 +915,19 @@ pub async fn dispose_unowned_session_goal(
             result => return Ok(result),
         }
     }
+    if let Some((batch_id, admitted_epoch)) = goal
+        .pending_tool_batch_id
+        .as_deref()
+        .zip(goal.pending_tool_epoch)
+    {
+        match registry
+            .clear_terminal_tool_batch(&reloaded.id, session_id, admitted_epoch, batch_id)
+            .await?
+        {
+            GoalTransitionResult::Applied => {}
+            result => return Ok(result),
+        }
+    }
     registry
         .delete_session_goal(&reloaded.id, session_id, reloaded.execution_epoch)
         .await
@@ -928,12 +984,15 @@ impl GoalExecutionEngine {
 
         GOAL_OPERATION_ACCOUNTING
             .scope(Some(accountant), async {
-                self.run_scoped(
-                    &scope,
-                    &objective,
-                    request.initial_turn_kind(),
-                    lease.as_mut(),
-                )
+                scope_goal_tool_pairing(Arc::clone(&self.registry), scope.clone(), async {
+                    self.run_scoped(
+                        &scope,
+                        &objective,
+                        request.initial_turn_kind(),
+                        lease.as_mut(),
+                    )
+                    .await
+                })
                 .await
             })
             .await
@@ -1165,6 +1224,29 @@ impl GoalExecutionEngine {
     }
 
     async fn fail(&self, scope: &GoalExecutionScope, reason: &'static str) -> Result<()> {
+        let goal = self.registry.get_goal_task(scope.task_id()).await?;
+        if let Some((batch_id, admitted_epoch)) = goal.as_ref().and_then(|goal| {
+            goal.pending_tool_batch_id
+                .as_deref()
+                .zip(goal.pending_tool_epoch)
+        }) {
+            match self
+                .registry
+                .fail_unpaired_tool_batch(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    admitted_epoch,
+                    batch_id,
+                )
+                .await?
+            {
+                GoalTransitionResult::Applied => return Ok(()),
+                GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
+                    bail!("Goal tool-pairing failure lost its execution fence")
+                }
+            }
+        }
         match self
             .registry
             .finish_session_goal(
