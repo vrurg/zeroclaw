@@ -116,6 +116,7 @@ pub(super) async fn submit_matrix_goal(
     )?);
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
+    let restart_coordinator = control_plane.goal_execution_restart();
     let defaults = runtime_defaults_snapshot(context.as_ref());
     let configured_limits =
         defaults.config.goal.effective_limits().map_err(|error| {
@@ -158,9 +159,7 @@ pub(super) async fn submit_matrix_goal(
                     defaults.config.as_ref(),
                 )),
             )?);
-            let supervisor = Arc::new(zeroclaw_runtime::goal_mode::GoalExecutionSupervisor::new(
-                engine,
-            ));
+            let supervisor = restart_coordinator.new_supervisor(engine).await;
             *slot = Some(Arc::clone(&supervisor));
             supervisor
         }
