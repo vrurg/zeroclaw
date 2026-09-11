@@ -351,6 +351,28 @@ pub struct RpcGoalRuntime {
 }
 
 impl RpcGoalRuntime {
+    /// Apply the Goal lifecycle consequence of an externally cancelled RPC
+    /// session before the ordinary session cancellation token is signalled.
+    ///
+    /// A resident Goal owns the session queue while a model operation is in
+    /// flight.  Its durable pause and accounting settlement therefore finish
+    /// first; signalling the ordinary token beforehand would interrupt the
+    /// operation the Goal controller is required to account for.
+    pub async fn pause_for_external_cancellation(&self, session_id: &str) -> Result<bool> {
+        let Some(supervisor) = self.supervisor(session_id).await else {
+            return Ok(false);
+        };
+        let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
+        let result = supervisor
+            .pause_for_external_cancellation(&durable_session_id)
+            .await?;
+        if matches!(result, crate::control_plane::GoalTransitionResult::Applied) {
+            self.remove_supervisor(session_id).await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Fence and dispose the current Goal before its RPC session disappears.
     ///
     /// This must run before the caller waits on `SessionActorQueue`: an active

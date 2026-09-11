@@ -455,6 +455,44 @@ impl GoalExecutionSupervisor {
         Ok(())
     }
 
+    /// Fence and drain the resident Goal owned by an externally cancelled
+    /// session without interrupting an already-admitted model operation.
+    pub async fn pause_for_external_cancellation(
+        &self,
+        session_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let Some(scope) = self.scope_for_session_id(session_id).await? else {
+            return Ok(GoalTransitionResult::Missing);
+        };
+        let current = self
+            .engine
+            .registry
+            .current_goal_for_session(session_id)
+            .await?;
+        let transition = match current {
+            Some(current)
+                if current.id == scope.task_id() && current.status == TaskStatus::Running =>
+            {
+                self.engine
+                    .registry
+                    .pause_session_goal(
+                        &current.id,
+                        session_id,
+                        current.execution_epoch,
+                        GoalPauseState {
+                            reason: GoalPauseReason::OperatorPaused,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await?
+            }
+            Some(_) | None => GoalTransitionResult::Stale,
+        };
+        let _ = self.drain_lifecycle_fence(&scope).await?;
+        Ok(transition)
+    }
+
     /// Fence every resident epoch without waiting for any worker. The restart
     /// coordinator uses this first phase across all transport hosts.
     async fn fence_for_restart(&self) -> GoalRestartFence {
