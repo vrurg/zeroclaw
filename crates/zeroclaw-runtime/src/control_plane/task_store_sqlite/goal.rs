@@ -509,7 +509,7 @@ impl SqliteTaskStore {
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
-                    AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
+                           AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL
                                 OR accounting_state != 'complete')
                     )",
                 params![boot_id, &now],
