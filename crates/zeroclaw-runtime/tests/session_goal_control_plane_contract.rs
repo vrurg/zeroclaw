@@ -5,8 +5,7 @@ use std::sync::{Arc, Barrier};
 use rusqlite::{Connection, ErrorCode, params};
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
-    GoalToolPhase, GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry,
-    TaskStatus,
+    GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
 };
 
 fn insert_current_goal(
@@ -359,34 +358,6 @@ async fn guarded_transitions_fence_stale_epochs_and_terminal_replacement() {
     );
     assert_eq!(
         store
-            .begin_goal_tool_phase("goal-one", "session-one", 2)
-            .await
-            .expect("fence stale tool start"),
-        GoalTransitionResult::Stale
-    );
-    assert_eq!(
-        store
-            .begin_goal_tool_phase("goal-one", "session-one", 3)
-            .await
-            .expect("begin exact tool phase"),
-        GoalTransitionResult::Applied
-    );
-    assert_eq!(
-        store
-            .complete_goal_tool_phase("goal-one", "session-one", 2)
-            .await
-            .expect("fence stale tool completion"),
-        GoalTransitionResult::Stale
-    );
-    assert_eq!(
-        store
-            .complete_goal_tool_phase("goal-one", "session-one", 3)
-            .await
-            .expect("complete exact tool phase"),
-        GoalTransitionResult::Applied
-    );
-    assert_eq!(
-        store
             .update_session_goal_limits("goal-one", "session-one", 2, Some(11), None)
             .await
             .expect("fence stale limit update"),
@@ -491,7 +462,7 @@ async fn guarded_transitions_fence_stale_epochs_and_terminal_replacement() {
 }
 
 #[tokio::test]
-async fn pausing_an_in_flight_tool_phase_fails_closed_and_cannot_resume() {
+async fn pausing_a_goal_is_resumable_when_no_operation_is_pending() {
     let store = SqliteTaskStore::new_in_memory().expect("initialize store");
     assert_eq!(
         store
@@ -505,14 +476,6 @@ async fn pausing_an_in_flight_tool_phase_fails_closed_and_cannot_resume() {
     );
     assert_eq!(
         store
-            .begin_goal_tool_phase("tool-pause", "tool-pause-session", 1)
-            .await
-            .expect("begin tool phase"),
-        GoalTransitionResult::Applied
-    );
-
-    assert_eq!(
-        store
             .pause_session_goal(
                 "tool-pause",
                 "tool-pause-session",
@@ -524,38 +487,22 @@ async fn pausing_an_in_flight_tool_phase_fails_closed_and_cannot_resume() {
                 },
             )
             .await
-            .expect("pause Goal while a tool phase is in flight"),
+            .expect("pause Goal"),
         GoalTransitionResult::Applied
-    );
-    assert_eq!(
-        store
-            .complete_goal_tool_phase("tool-pause", "tool-pause-session", 1)
-            .await
-            .expect("stale tool completion is fenced"),
-        GoalTransitionResult::Stale
     );
     let task = store
         .current_goal_for_session("tool-pause-session")
         .await
         .expect("read fenced Goal")
         .expect("Goal remains auditable");
-    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.status, TaskStatus::Paused);
     assert_eq!(task.execution_epoch, 2);
-    assert_eq!(
-        store
-            .get_goal_task("tool-pause")
-            .await
-            .expect("read fenced Goal extension")
-            .expect("Goal extension remains auditable")
-            .tool_phase,
-        GoalToolPhase::InFlight
-    );
     assert_eq!(
         store
             .resume_session_goal("tool-pause", "tool-pause-session", 2, 2, "boot-new")
             .await
             .expect("resume paused Goal"),
-        GoalTransitionResult::Stale
+        GoalTransitionResult::Applied
     );
 }
 
@@ -764,13 +711,6 @@ async fn sqlite_guards_session_binding_pending_pairing_and_goal_state_domains() 
         ),
         "raw SQL must reject an unknown accounting state",
     );
-    assert_constraint(
-        connection.execute(
-            "UPDATE goal_tasks SET tool_phase = 'not-a-phase' WHERE task_id = 'goal-raw-two'",
-            [],
-        ),
-        "raw SQL must reject an unknown tool phase",
-    );
 }
 
 #[tokio::test]
@@ -881,23 +821,6 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
     assert_eq!(
         store
             .create_or_replace_session_goal(
-                session_goal_task("in-flight", "in-flight-session"),
-                session_goal_extension("in-flight"),
-            )
-            .await
-            .expect("create in-flight Goal"),
-        GoalTransitionResult::Applied
-    );
-    assert_eq!(
-        store
-            .begin_goal_tool_phase("in-flight", "in-flight-session", 1)
-            .await
-            .expect("record unpaired process-local tool phase"),
-        GoalTransitionResult::Applied
-    );
-    assert_eq!(
-        store
-            .create_or_replace_session_goal(
                 session_goal_task("pending", "pending-session"),
                 session_goal_extension("pending"),
             )
@@ -919,7 +842,7 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         reopened
             .reconcile_goal_boot_state("boot-new")
             .expect("reconcile previous boot"),
-        3
+        2
     );
     let clean = reopened
         .current_goal_for_session("clean-session")
@@ -930,42 +853,10 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
     assert_eq!(clean.execution_epoch, 2);
     assert_eq!(
         reopened
-            .get_goal_task("clean")
-            .await
-            .expect("read clean extension")
-            .expect("extension exists")
-            .tool_phase,
-        GoalToolPhase::Clean
-    );
-    assert_eq!(
-        reopened
             .resume_session_goal("clean", "clean-session", 2, 2, "boot-new")
             .await
             .expect("resume post-restart Goal"),
         GoalTransitionResult::Applied
-    );
-    let in_flight = reopened
-        .current_goal_for_session("in-flight-session")
-        .await
-        .expect("read in-flight Goal")
-        .expect("in-flight Goal exists");
-    assert_eq!(in_flight.status, TaskStatus::Failed);
-    assert_eq!(in_flight.execution_epoch, 2);
-    assert_eq!(
-        reopened
-            .resume_session_goal("in-flight", "in-flight-session", 2, 2, "boot-new")
-            .await
-            .expect("reject resume of interrupted tool phase"),
-        GoalTransitionResult::Stale
-    );
-    assert_eq!(
-        reopened
-            .get_goal_task("in-flight")
-            .await
-            .expect("read in-flight extension")
-            .expect("extension exists")
-            .tool_phase,
-        GoalToolPhase::InFlight
     );
     let pending = reopened
         .current_goal_for_session("pending-session")

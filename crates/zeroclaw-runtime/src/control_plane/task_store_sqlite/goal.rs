@@ -1,11 +1,11 @@
 //! SQLite-backed [`GoalTaskRegistry`] implementation.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::control_plane::goal_task::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
-    GoalTaskRegistry, GoalToolPhase, GoalTransitionResult, TaskContinuationContext,
+    GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
 };
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
@@ -209,10 +209,6 @@ pub(super) fn migrate_schema(
                 "accounting_state",
                 "ALTER TABLE goal_tasks ADD COLUMN accounting_state TEXT NOT NULL DEFAULT 'complete'",
             ),
-            (
-                "tool_phase",
-                "ALTER TABLE goal_tasks ADD COLUMN tool_phase TEXT NOT NULL DEFAULT 'clean'",
-            ),
         ] {
             add_column_if_missing(conn, "goal_tasks", column, sql)?;
         }
@@ -284,13 +280,11 @@ pub(super) fn migrate_schema(
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_state_values_insert
                  BEFORE INSERT ON goal_tasks FOR EACH ROW
                  WHEN NEW.accounting_state NOT IN ('complete', 'missing', 'invalid', 'outcome_unknown')
-                      OR NEW.tool_phase NOT IN ('clean', 'in_flight')
-                 BEGIN SELECT RAISE(ABORT, 'goal accounting state or tool phase is invalid'); END;
+                 BEGIN SELECT RAISE(ABORT, 'goal accounting state is invalid'); END;
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_state_values_update
-                 BEFORE UPDATE OF accounting_state, tool_phase ON goal_tasks FOR EACH ROW
+                 BEFORE UPDATE OF accounting_state ON goal_tasks FOR EACH ROW
                  WHEN NEW.accounting_state NOT IN ('complete', 'missing', 'invalid', 'outcome_unknown')
-                      OR NEW.tool_phase NOT IN ('clean', 'in_flight')
-                 BEGIN SELECT RAISE(ABORT, 'goal accounting state or tool phase is invalid'); END;",
+                 BEGIN SELECT RAISE(ABORT, 'goal accounting state is invalid'); END;",
         )
         .context("apply control-plane schema v8")?;
     }
@@ -309,8 +303,8 @@ pub(super) fn migrate_schema(
 
 impl SqliteTaskStore {
     /// Fence a Goal interrupted by a previous daemon without reconstructing its
-    /// process-local transcript. A pending operation or unpaired tool phase is
-    /// fail-closed; only a clean operation becomes resumable after restart.
+    /// process-local transcript. A pending operation is fail-closed; a settled
+    /// operation becomes resumable after restart.
     pub fn reconcile_goal_boot_state(&self, boot_id: &str) -> Result<u64> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -374,30 +368,6 @@ impl SqliteTaskStore {
             )
             .context("fail interrupted goal accounting")?;
 
-        let failed_tool_phase = tx
-            .execute(
-                "UPDATE tasks
-                    SET status = 'failed', error = 'tool_phase_incomplete',
-                        finished_at = COALESCE(finished_at, ?2),
-                        execution_epoch = CASE
-                            WHEN execution_epoch < 9223372036854775807
-                            THEN execution_epoch + 1
-                            ELSE execution_epoch
-                        END
-                  WHERE kind = 'goal' AND session_id IS NOT NULL
-                    AND owner_boot_id != ?1
-                    AND status IN ('running', 'paused')
-                    AND EXISTS (
-                        SELECT 1 FROM goal_tasks
-                         WHERE task_id = tasks.id
-                           AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                           AND accounting_state = 'complete'
-                           AND tool_phase = 'in_flight'
-                    )",
-                params![boot_id, &now],
-            )
-            .context("fail interrupted goal tool phase")?;
-
         tx.execute(
             "UPDATE goal_tasks
                 SET pending_call_id = NULL, pending_call_epoch = NULL
@@ -420,7 +390,7 @@ impl SqliteTaskStore {
                        AND status = 'running' AND owner_boot_id != ?1
                        AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                    AND accounting_state = 'complete' AND tool_phase = 'clean'",
+                    AND accounting_state = 'complete'",
             params![boot_id, daemon_restart],
         )
         .context("mark interrupted goal pause")?;
@@ -436,7 +406,6 @@ impl SqliteTaskStore {
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                            AND accounting_state = 'complete'
-                           AND tool_phase = 'clean'
                     )",
                 params![boot_id],
             )
@@ -454,13 +423,12 @@ impl SqliteTaskStore {
                          WHERE task_id = tasks.id
                            AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                            AND accounting_state = 'complete'
-                           AND tool_phase = 'clean'
                     )",
                 params![boot_id, &now],
             )
             .context("fail exhausted goal epoch")?;
         tx.commit().context("commit goal boot reconciliation")?;
-        Ok((missing_extension + failed_accounting + failed_tool_phase + paused + exhausted) as u64)
+        Ok((missing_extension + failed_accounting + paused + exhausted) as u64)
     }
 }
 
@@ -591,17 +559,6 @@ fn row_to_goal_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<GoalTaskRecord>
                 ));
             }
         },
-        tool_phase: match row.get::<_, String>("tool_phase")?.as_str() {
-            "clean" => GoalToolPhase::Clean,
-            "in_flight" => GoalToolPhase::InFlight,
-            value => {
-                return Err(rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    format!("invalid goal tool phase {value}").into(),
-                ));
-            }
-        },
     })
 }
 
@@ -614,13 +571,6 @@ fn accounting_state_to_db(state: GoalAccountingState) -> &'static str {
     }
 }
 
-fn tool_phase_to_db(phase: GoalToolPhase) -> &'static str {
-    match phase {
-        GoalToolPhase::Clean => "clean",
-        GoalToolPhase::InFlight => "in_flight",
-    }
-}
-
 fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()> {
     let pause_reason = rec.pause_reason.map(pause_reason_to_db).transpose()?;
     let blockers_json = blockers_to_db(&rec.blockers)?;
@@ -630,8 +580,8 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
         "INSERT INTO goal_tasks
             (task_id, objective, effective_token_limit, effective_cost_limit_usd,
              pause_reason, pause_description, blockers_json,
-             pending_call_id, pending_call_epoch, accounting_state, tool_phase)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             pending_call_id, pending_call_epoch, accounting_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(task_id) DO NOTHING",
         params![
             rec.task_id,
@@ -644,7 +594,6 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
             rec.pending_call_id,
             rec.pending_call_epoch,
             accounting_state_to_db(rec.accounting_state),
-            tool_phase_to_db(rec.tool_phase),
         ],
     )
     .context("insert goal task record")?;
@@ -803,7 +752,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         conn.query_row(
             "SELECT task_id, objective, effective_token_limit, effective_cost_limit_usd,
                     pause_reason, pause_description, blockers_json,
-                    pending_call_id, pending_call_epoch, accounting_state, tool_phase
+                    pending_call_id, pending_call_epoch, accounting_state
              FROM goal_tasks WHERE task_id = ?1",
             params![task_id],
             row_to_goal_task,
@@ -939,7 +888,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
         if goal.pending_call_id.is_some()
             || goal.pending_call_epoch.is_some()
             || goal.accounting_state != GoalAccountingState::Complete
-            || goal.tool_phase != GoalToolPhase::Clean
         {
             anyhow::bail!("new session goals must not include pending or incomplete state");
         }
@@ -997,57 +945,24 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let blockers = blockers_to_db(&pause.blockers)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().context("start guarded goal pause")?;
-        let tool_phase = tx
-            .query_row(
-                "SELECT tool_phase FROM goal_tasks WHERE task_id = ?1",
-                params![task_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(tool_phase) = tool_phase else {
-            return transition_failure(&tx, task_id, session_id);
-        };
-        let tool_phase_in_flight = match tool_phase.as_str() {
-            "clean" => false,
-            "in_flight" => true,
-            _ => bail!("invalid persisted Goal tool phase for task {task_id}"),
-        };
-        let (status, error, finished_at) = if tool_phase_in_flight {
-            (
-                "failed",
-                Some("tool_phase_incomplete"),
-                Some(chrono::Utc::now().to_rfc3339()),
-            )
-        } else {
-            ("paused", None, None)
-        };
         let updated = tx.execute(
             "UPDATE tasks
-                SET status = ?4, error = ?5, finished_at = ?6,
+                SET status = 'paused', error = NULL, finished_at = NULL,
                     execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                 AND status = 'running' AND execution_epoch = ?3
                 AND execution_epoch < 9223372036854775807",
-            params![
-                task_id,
-                session_id,
-                expected_epoch,
-                status,
-                error,
-                finished_at
-            ],
+            params![task_id, session_id, expected_epoch,],
         )?;
         if updated == 0 {
             return transition_failure(&tx, task_id, session_id);
         }
-        if !tool_phase_in_flight {
-            tx.execute(
-                "UPDATE goal_tasks
-                    SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
-                  WHERE task_id = ?4",
-                params![reason, pause.description, blockers, task_id],
-            )?;
-        }
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = ?1, pause_description = ?2, blockers_json = ?3
+              WHERE task_id = ?4",
+            params![reason, pause.description, blockers, task_id],
+        )?;
         tx.commit().context("commit guarded goal pause")?;
         Ok(GoalTransitionResult::Applied)
     }
@@ -1073,7 +988,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id AND accounting_state = 'complete'
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
-                       AND tool_phase = 'clean'
                 )",
             params![
                 task_id,
@@ -1185,52 +1099,6 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 pending_call_id,
                 accounting_state_to_db(accounting_state),
             ],
-        )?;
-        if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
-        }
-        Ok(GoalTransitionResult::Applied)
-    }
-
-    async fn begin_goal_tool_phase(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        expected_epoch: i64,
-    ) -> Result<GoalTransitionResult> {
-        let conn = self.conn.lock();
-        let updated = conn.execute(
-            "UPDATE goal_tasks SET tool_phase = 'in_flight'
-              WHERE task_id = ?1 AND tool_phase = 'clean'
-                AND EXISTS (
-                    SELECT 1 FROM tasks
-                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
-                       AND status = 'running' AND execution_epoch = ?3
-                )",
-            params![task_id, session_id, expected_epoch],
-        )?;
-        if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
-        }
-        Ok(GoalTransitionResult::Applied)
-    }
-
-    async fn complete_goal_tool_phase(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        expected_epoch: i64,
-    ) -> Result<GoalTransitionResult> {
-        let conn = self.conn.lock();
-        let updated = conn.execute(
-            "UPDATE goal_tasks SET tool_phase = 'clean'
-              WHERE task_id = ?1 AND tool_phase = 'in_flight'
-                AND EXISTS (
-                    SELECT 1 FROM tasks
-                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
-                       AND status = 'running' AND execution_epoch = ?3
-                )",
-            params![task_id, session_id, expected_epoch],
         )?;
         if updated == 0 {
             return transition_failure(&conn, task_id, session_id);
