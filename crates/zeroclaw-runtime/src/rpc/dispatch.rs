@@ -1681,11 +1681,7 @@ impl RpcDispatcher {
                 // execution lease and can be disposed through the durable
                 // no-worker path without interrupting work.
                 for (sid, _) in &evicted {
-                    self.ctx
-                        .goal_runtime
-                        .dispose_session(sid)
-                        .await
-                        .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+                    self.dispose_session_goal(sid).await?;
                 }
                 if let Some(ref hooks) = self.ctx.hooks {
                     for (sid, _) in &evicted {
@@ -1899,11 +1895,7 @@ impl RpcDispatcher {
         // owns this permit until its terminal state and transcript writes are
         // complete. Removal then happens under the same incarnation fence.
         self.ctx.sessions.signal_session_removal(&req.session_id);
-        self.ctx
-            .goal_runtime
-            .dispose_session(&req.session_id)
-            .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        self.dispose_session_goal(&req.session_id).await?;
         let _guard = self
             .ctx
             .sessions
@@ -1984,11 +1976,7 @@ impl RpcDispatcher {
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
         self.ctx.sessions.signal_session_kill(sid);
-        self.ctx
-            .goal_runtime
-            .dispose_session(sid)
-            .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        self.dispose_session_goal(sid).await?;
         let _guard = self
             .ctx
             .sessions
@@ -2734,6 +2722,16 @@ impl RpcDispatcher {
         to_result(SessionGoalResult { response })
     }
 
+    /// Keep the Goal supervisor's drain future off the caller's async frame.
+    /// Session creation, replacement, close, delete, and kill all preserve the
+    /// same durable-disposal ordering, while the small boxed boundary keeps
+    /// the pre-existing constrained-stack session/new path viable.
+    async fn dispose_session_goal(&self, session_id: &str) -> Result<(), JsonRpcError> {
+        Box::pin(self.ctx.goal_runtime.dispose_session(session_id))
+            .await
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))
+    }
+
     /// Emit the terminal `session/update` notification for a turn.
     /// The TUI uses this — not the JSON-RPC response — to flip
     /// `turn_in_flight` back to false.
@@ -3184,11 +3182,7 @@ impl RpcDispatcher {
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
         self.ctx.sessions.signal_session_removal(&req.session_id);
-        self.ctx
-            .goal_runtime
-            .dispose_session(&req.session_id)
-            .await
-            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+        self.dispose_session_goal(&req.session_id).await?;
         let _guard = self
             .ctx
             .sessions
