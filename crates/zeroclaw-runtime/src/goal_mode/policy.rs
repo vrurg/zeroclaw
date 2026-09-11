@@ -259,6 +259,38 @@ pub fn authorize_common_goal_ingress(
     classify_common_goal_policy(config, &task)
 }
 
+/// Collect exact targets revoked by the transport-neutral Goal policy.
+///
+/// The caller owns the durable snapshot and combines these targets with the
+/// closed set of surface-specific classifiers before invoking the single
+/// transactional cancellation. Keeping this function pure prevents a later
+/// surface classifier failure from partially applying a reload cutover.
+pub fn collect_common_goal_policy_revocation_targets(
+    config: &Config,
+    tasks: impl IntoIterator<Item = TaskRecord>,
+) -> Result<Vec<GoalPolicyRevocationTarget>> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                classify_common_goal_policy(config, task),
+                GoalPolicyDecision::Revoked(_)
+            )
+        })
+        .map(|task| {
+            let session_id = task
+                .session_id
+                .filter(|session_id| !session_id.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Goal policy target lost its session binding"))?;
+            Ok(GoalPolicyRevocationTarget {
+                task_id: task.id,
+                session_id,
+                expected_epoch: task.execution_epoch,
+            })
+        })
+        .collect()
+}
+
 /// Apply common V1 policy revocation before transport listeners start.
 ///
 /// This deliberately lives in the runtime rather than a channel adapter: a
@@ -274,30 +306,10 @@ pub async fn reconcile_common_goal_policy_at_startup(config: &Config) -> Result<
     // same prospective configuration and retry a bounded number of times.
     let initial_count = registry.list_nonterminal_session_goals().await?.len();
     for _ in 0..=initial_count {
-        let targets = registry
-            .list_nonterminal_session_goals()
-            .await?
-            .into_iter()
-            .filter(|task| {
-                matches!(
-                    classify_common_goal_policy(config, task),
-                    GoalPolicyDecision::Revoked(_)
-                )
-            })
-            .map(|task| {
-                let session_id = task
-                    .session_id
-                    .filter(|session_id| !session_id.trim().is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Goal policy target lost its session binding")
-                    })?;
-                Ok(GoalPolicyRevocationTarget {
-                    task_id: task.id,
-                    session_id,
-                    expected_epoch: task.execution_epoch,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let targets = collect_common_goal_policy_revocation_targets(
+            config,
+            registry.list_nonterminal_session_goals().await?,
+        )?;
         if targets.is_empty() {
             return Ok(());
         }
@@ -375,6 +387,18 @@ mod tests {
             authorize_common_goal_ingress(&Config::default(), &ingress),
             GoalPolicyDecision::Revoked(GoalPolicyRevocationReason::GoalDisabled)
         );
+    }
+
+    #[test]
+    fn common_collector_is_pure_and_returns_exact_durable_target() {
+        let task = running_goal();
+        let targets = collect_common_goal_policy_revocation_targets(&Config::default(), [task])
+            .expect("disabled Goal Mode must classify the target");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].task_id, "goal-policy-test");
+        assert_eq!(targets[0].session_id, "rpc_session");
+        assert_eq!(targets[0].expected_epoch, 1);
     }
 
     #[tokio::test]

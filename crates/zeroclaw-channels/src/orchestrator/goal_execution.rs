@@ -187,6 +187,25 @@ fn policy_revocation_target(task: TaskRecord) -> Result<GoalPolicyRevocationTarg
     })
 }
 
+/// Collect Matrix-specific revocation targets from a daemon-owned task
+/// snapshot. This is intentionally side-effect free so the runtime can join
+/// it with its common-policy targets and commit one all-or-nothing fence.
+pub(super) fn collect_matrix_goal_policy_revocation_targets(
+    config: &zeroclaw_config::schema::Config,
+    tasks: impl IntoIterator<Item = TaskRecord>,
+) -> Result<Vec<GoalPolicyRevocationTarget>> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            matches!(
+                classify_matrix_goal_policy(config, task),
+                MatrixGoalPolicyEligibility::Revoked(_)
+            )
+        })
+        .map(policy_revocation_target)
+        .collect()
+}
+
 pub(super) async fn revoke_matrix_goals_for_policy(
     context: &ChannelRuntimeContext,
     next_config: &zeroclaw_config::schema::Config,
@@ -228,37 +247,36 @@ pub(super) async fn revoke_matrix_goals_for_policy(
 /// Apply the persisted Matrix policy before channel listeners start. Boot
 /// recovery has already classified interrupted pending operations, so there
 /// is no resident executor to drain on this path.
-pub(super) async fn revoke_matrix_goals_at_startup(
+/// Reconcile durable Matrix Goal bindings against a prospective configuration.
+///
+/// The daemon calls this before accepting a reload. No Matrix worker is
+/// interrupted here: the guarded cancellation commits first, and normal
+/// daemon teardown subsequently drains the owning channel runtime.
+pub(super) async fn reconcile_matrix_goal_policy(
     config: &zeroclaw_config::schema::Config,
 ) -> Result<()> {
     let Some(control_plane) = control_plane() else {
         return Ok(());
     };
     let registry = control_plane.goal_store()?;
-    let targets = registry
-        .list_nonterminal_session_goals()
-        .await?
-        .into_iter()
-        .filter(|task| {
-            matches!(
-                classify_matrix_goal_policy(config, task),
-                MatrixGoalPolicyEligibility::Revoked(_)
-            )
-        })
-        .map(policy_revocation_target)
-        .collect::<Result<Vec<_>>>()?;
-    if targets.is_empty() {
-        return Ok(());
-    }
-    match registry
-        .cancel_goals_for_policy_revocation(&targets)
-        .await?
-    {
-        GoalTransitionResult::Applied => Ok(()),
-        GoalTransitionResult::Stale | GoalTransitionResult::Missing => {
-            bail!("Goal policy changed during startup reconciliation")
+    let initial_count = registry.list_nonterminal_session_goals().await?.len();
+    for _ in 0..=initial_count {
+        let targets = collect_matrix_goal_policy_revocation_targets(
+            config,
+            registry.list_nonterminal_session_goals().await?,
+        )?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+        match registry
+            .cancel_goals_for_policy_revocation(&targets)
+            .await?
+        {
+            GoalTransitionResult::Applied => return Ok(()),
+            GoalTransitionResult::Stale | GoalTransitionResult::Missing => continue,
         }
     }
+    bail!("Matrix Goal policy reconciliation did not converge")
 }
 
 use super::foreground::{
@@ -822,6 +840,38 @@ mod tests {
         assert_eq!(
             classify_matrix_goal_policy(&zeroclaw_config::schema::Config::default(), &task),
             MatrixGoalPolicyEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn matrix_collector_is_pure_and_ignores_non_matrix_goal() {
+        let task = TaskRecord {
+            id: "goal-zerocode".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: zeroclaw_runtime::control_plane::TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("zerocode:local".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("zc-session".to_owned()),
+            execution_epoch: 1,
+            started_at: "2026-09-07T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+
+        assert!(
+            collect_matrix_goal_policy_revocation_targets(
+                &zeroclaw_config::schema::Config::default(),
+                [task],
+            )
+            .expect("non-Matrix Goal must be ignored")
+            .is_empty()
         );
     }
 

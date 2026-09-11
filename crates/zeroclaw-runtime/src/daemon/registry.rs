@@ -9,10 +9,22 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
+use crate::control_plane::{GoalPolicyRevocationTarget, TaskRecord};
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub type GoalPolicyPreflightFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<GoalPolicyRevocationTarget>>> + Send>>;
+
+/// Collects surface-specific Goal revocations from a daemon-owned durable
+/// snapshot while the daemon-wide cutover lease is held.
+///
+/// The runtime owns common Goal policy; channel crates register only their
+/// closed, durable-binding classifiers here. The callback must not mutate
+/// storage: the daemon combines all targets and commits one exact transaction.
+pub type GoalPolicyPreflight =
+    Box<dyn Fn(Config, Vec<TaskRecord>) -> GoalPolicyPreflightFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct GatewayReloadControls {
@@ -78,6 +90,7 @@ pub struct DaemonRegistry {
     relay_start: Option<RpcStarter>,
     enroll_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
+    goal_policy_preflight: Option<GoalPolicyPreflight>,
     /// Shared SOP engine built by the daemon reload loop. Passed through to
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
@@ -163,6 +176,14 @@ impl DaemonRegistry {
         self
     }
 
+    /// Register the closed set of surface-specific Goal-policy checks used by
+    /// a daemon reload. The daemon retains the common policy and the shared
+    /// admission/cutover barrier.
+    pub fn register_goal_policy_preflight(&mut self, preflight: GoalPolicyPreflight) -> &mut Self {
+        self.goal_policy_preflight = Some(preflight);
+        self
+    }
+
     #[cfg(test)]
     fn has_mqtt_start(&self) -> bool {
         self.mqtt_start.is_some()
@@ -186,6 +207,10 @@ impl DaemonRegistry {
 
     pub(crate) fn take_mqtt_start(&mut self) -> Option<MqttStarter> {
         self.mqtt_start.take()
+    }
+
+    pub(crate) fn take_goal_policy_preflight(&mut self) -> Option<GoalPolicyPreflight> {
+        self.goal_policy_preflight.take()
     }
 
     /// Set the shared SOP engine for this daemon iteration.

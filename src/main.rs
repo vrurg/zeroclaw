@@ -6015,6 +6015,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         })
                     }
                 }));
+                registry.register_goal_policy_preflight(Box::new(|config, tasks| {
+                    Box::pin(async move {
+                        zeroclaw_channels::orchestrator::collect_goal_policy_revocation_targets(
+                            config, tasks,
+                        )
+                    })
+                }));
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
@@ -6514,13 +6521,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // RpcContext (RPC/TUI agent sessions) can share it.
                 registry.set_sop_engine(sop_engine, sop_audit);
 
-                let exit = Box::pin(daemon::run(
+                let reload_config: zeroclaw_runtime::daemon::ReloadConfigLoader =
+                    std::sync::Arc::new(|| Box::pin(Config::load_or_init()));
+                let exit = Box::pin(daemon::run_with_reload(
                     current_config.clone(),
                     host.clone(),
                     port,
                     registry,
                     ephemeral,
                     startup_feedback_enabled,
+                    reload_config,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -6529,7 +6539,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let exit = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
-                    daemon::DaemonExit::Reload => {
+                    daemon::DaemonExit::Reload(next_config) => {
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -6538,7 +6548,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
-                        current_config = Box::pin(Config::load_or_init()).await?;
+                        current_config = next_config;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
                             &current_config.observability,

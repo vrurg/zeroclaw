@@ -1,6 +1,10 @@
 use anyhow::{Context as _, Result};
 use chrono::Utc;
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
@@ -192,15 +196,120 @@ impl Drop for StartupReadinessAttempt {
 }
 
 mod registry;
-pub use registry::{DaemonRegistry, GatewayReloadControls};
+pub use registry::{DaemonRegistry, GatewayReloadControls, GoalPolicyPreflight};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum DaemonExit {
     Shutdown,
-    Reload,
+    /// A fully validated prospective configuration whose Goal policy was
+    /// durably reconciled before this daemon iteration began teardown.
+    Reload(Config),
 }
+
+/// Main owns configuration loading. The daemon receives this injected loader
+/// so a rejected prospective configuration can leave the current runtime
+/// intact instead of consulting process-global configuration during teardown.
+pub type ReloadConfigLoader = Arc<dyn Fn() -> ReloadConfigFuture + Send + Sync>;
+pub type ReloadConfigFuture = Pin<Box<dyn Future<Output = Result<Config>> + Send>>;
+
+type ReloadPreflight = Arc<dyn Fn() -> ReloadConfigFuture + Send + Sync>;
+
+fn merge_surface_goal_policy_targets(
+    snapshot: &[crate::control_plane::TaskRecord],
+    common_targets: Vec<crate::control_plane::GoalPolicyRevocationTarget>,
+    surface_targets: Vec<crate::control_plane::GoalPolicyRevocationTarget>,
+) -> Result<Vec<crate::control_plane::GoalPolicyRevocationTarget>> {
+    let snapshot_targets = snapshot
+        .iter()
+        .filter_map(|task| {
+            task.session_id
+                .as_deref()
+                .filter(|session_id| !session_id.trim().is_empty())
+                .map(|session_id| (task.id.as_str(), session_id, task.execution_epoch))
+        })
+        .collect::<HashSet<_>>();
+    for target in &surface_targets {
+        if !snapshot_targets.contains(&(
+            target.task_id.as_str(),
+            target.session_id.as_str(),
+            target.expected_epoch,
+        )) {
+            anyhow::bail!("surface Goal policy classifier returned a target outside the snapshot");
+        }
+    }
+
+    let mut targets = common_targets;
+    targets.extend(surface_targets);
+    targets.sort_by(|left, right| {
+        (&left.task_id, &left.session_id, left.expected_epoch).cmp(&(
+            &right.task_id,
+            &right.session_id,
+            right.expected_epoch,
+        ))
+    });
+    targets.dedup_by(|left, right| {
+        left.task_id == right.task_id
+            && left.session_id == right.session_id
+            && left.expected_epoch == right.expected_epoch
+    });
+    Ok(targets)
+}
+
+/// Reconcile every closed V1 Goal-policy classifier from one durable snapshot.
+///
+/// Classification is deliberately side-effect free. Only after every
+/// classifier succeeds do we issue the registry's all-or-nothing guarded
+/// cancellation, so an invalid Matrix binding cannot leave a common-policy
+/// cancellation committed while the current daemon keeps serving traffic.
+async fn reconcile_goal_policy_for_runtime_config(
+    config: &Config,
+    surface_preflight: Option<&Arc<GoalPolicyPreflight>>,
+) -> Result<()> {
+    let Some(control_plane) = crate::control_plane::control_plane() else {
+        return Ok(());
+    };
+    let registry = control_plane.goal_store()?;
+    let initial_count = registry.list_nonterminal_session_goals().await?.len();
+
+    for _ in 0..=initial_count {
+        let tasks = registry.list_nonterminal_session_goals().await?;
+        let common_targets =
+            crate::goal_mode::collect_common_goal_policy_revocation_targets(config, tasks.clone())?;
+        let surface_targets = if let Some(surface_preflight) = surface_preflight {
+            surface_preflight(config.clone(), tasks.clone()).await?
+        } else {
+            Vec::new()
+        };
+        let targets = merge_surface_goal_policy_targets(&tasks, common_targets, surface_targets)?;
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        match registry
+            .cancel_goals_for_policy_revocation(&targets)
+            .await?
+        {
+            crate::control_plane::GoalTransitionResult::Applied => return Ok(()),
+            crate::control_plane::GoalTransitionResult::Stale
+            | crate::control_plane::GoalTransitionResult::Missing => continue,
+        }
+    }
+
+    anyhow::bail!("Goal policy reconciliation did not converge")
+}
+
+impl PartialEq for DaemonExit {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Shutdown, Self::Shutdown) | (Self::Reload(_), Self::Reload(_))
+        )
+    }
+}
+
+impl Eq for DaemonExit {}
 
 const EPHEMERAL_GRACE_SECS: u64 = 1;
 
@@ -218,8 +327,28 @@ pub(crate) fn scheduler_clean_shutdown_observed() -> bool {
     SCHEDULER_CLEAN_SHUTDOWN_OBSERVED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(test)]
 async fn wait_for_exit_signal(
+    reload_rx: tokio::sync::watch::Receiver<bool>,
+    ephemeral: bool,
+    client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<DaemonExit> {
+    let (reload_tx, _) = tokio::sync::watch::channel(false);
+    let reload_preflight: ReloadPreflight = Arc::new(|| Box::pin(async { Ok(Config::default()) }));
+    wait_for_exit_signal_with_preflight(
+        reload_rx,
+        reload_tx,
+        reload_preflight,
+        ephemeral,
+        client_count,
+    )
+    .await
+}
+
+async fn wait_for_exit_signal_with_preflight(
     mut reload_rx: tokio::sync::watch::Receiver<bool>,
+    reload_tx: tokio::sync::watch::Sender<bool>,
+    reload_preflight: ReloadPreflight,
     ephemeral: bool,
     client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<DaemonExit> {
@@ -292,7 +421,13 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        return Ok(DaemonExit::Reload);
+                        match reload_preflight().await {
+                            Ok(config) => return Ok(DaemonExit::Reload(config)),
+                            Err(error) => {
+                                reload_tx.send_replace(false);
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Daemon reload rejected; retaining the active runtime");
+                            }
+                        }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
@@ -327,7 +462,13 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        return Ok(DaemonExit::Reload);
+                        match reload_preflight().await {
+                            Ok(config) => return Ok(DaemonExit::Reload(config)),
+                            Err(error) => {
+                                reload_tx.send_replace(false);
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Daemon reload rejected; retaining the active runtime");
+                            }
+                        }
                     }
                 }
                 _ = &mut ephemeral_shutdown => {
@@ -477,13 +618,36 @@ async fn classify_gateway_bind_outcome(
     }
 }
 
-pub async fn run(
+#[cfg(test)]
+async fn run(
+    config: Config,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    let reload_config: ReloadConfigLoader = Arc::new(|| Box::pin(async { Ok(Config::default()) }));
+    run_with_reload(
+        config,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+        reload_config,
+    )
+    .await
+}
+
+pub async fn run_with_reload(
     mut config: Config,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
     ephemeral: bool,
     startup_feedback_enabled: bool,
+    reload_config: ReloadConfigLoader,
 ) -> Result<DaemonExit> {
     config.gateway.host = host.clone();
     if port != 0 {
@@ -603,13 +767,33 @@ pub async fn run(
         );
         crate::health::mark_component_ok("control-plane");
     }
-    crate::goal_mode::reconcile_common_goal_policy_at_startup(&config).await?;
-
     // Goal policy validation and revocation must fence every exposed Goal
     // transport together. The coordinator belongs to this daemon iteration;
     // it is intentionally not a process-global singleton.
     let goal_policy_cutover =
         std::sync::Arc::new(crate::goal_mode::GoalPolicyCutoverCoordinator::new());
+    let goal_policy_preflight: Option<Arc<GoalPolicyPreflight>> =
+        registry.take_goal_policy_preflight().map(Arc::from);
+    reconcile_goal_policy_for_runtime_config(&config, goal_policy_preflight.as_ref()).await?;
+    let reload_preflight: ReloadPreflight = {
+        let reload_config = Arc::clone(&reload_config);
+        let goal_policy_cutover = Arc::clone(&goal_policy_cutover);
+        Arc::new(move || {
+            let reload_config = Arc::clone(&reload_config);
+            let goal_policy_cutover = Arc::clone(&goal_policy_cutover);
+            let goal_policy_preflight = goal_policy_preflight.clone();
+            Box::pin(async move {
+                let prospective = reload_config().await?;
+                let _cutover = goal_policy_cutover.cutover().await;
+                reconcile_goal_policy_for_runtime_config(
+                    &prospective,
+                    goal_policy_preflight.as_ref(),
+                )
+                .await?;
+                Ok(prospective)
+            })
+        })
+    };
 
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
@@ -1005,7 +1189,13 @@ pub async fn run(
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
-    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
+    let exit = wait_for_exit_signal_with_preflight(
+        reload_rx,
+        reload_tx,
+        reload_preflight,
+        ephemeral,
+        socket_client_count,
+    );
     tokio::pin!(exit);
 
     let startup_result = if socket_required {
@@ -1053,7 +1243,7 @@ pub async fn run(
             "daemon",
             match exit {
                 DaemonExit::Shutdown => "shutdown requested",
-                DaemonExit::Reload => "reload requested",
+                DaemonExit::Reload(_) => "reload requested",
             },
         ),
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
@@ -2576,6 +2766,48 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_targets_must_come_from_the_snapshot_and_duplicates_collapse() {
+        let task = crate::control_plane::TaskRecord {
+            id: "goal-1".to_owned(),
+            kind: crate::control_plane::TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: crate::control_plane::TaskStatus::Running,
+            owner_pid: 1,
+            owner_boot_id: "test".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix:default:!room:example.org".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.org".to_owned()),
+            session_id: Some("matrix-session".to_owned()),
+            execution_epoch: 3,
+            started_at: "2026-09-10T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let target = crate::control_plane::GoalPolicyRevocationTarget {
+            task_id: task.id.clone(),
+            session_id: "matrix-session".to_owned(),
+            expected_epoch: 3,
+        };
+
+        let merged =
+            merge_surface_goal_policy_targets(&[task.clone()], vec![target.clone()], vec![target])
+                .expect("one snapshot target may be selected by both classifiers");
+        assert_eq!(merged.len(), 1);
+
+        let outside_snapshot = crate::control_plane::GoalPolicyRevocationTarget {
+            task_id: "other-goal".to_owned(),
+            session_id: "matrix-session".to_owned(),
+            expected_epoch: 3,
+        };
+        assert!(
+            merge_surface_goal_policy_targets(&[task], Vec::new(), vec![outside_snapshot]).is_err()
+        );
+    }
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
 
@@ -3610,7 +3842,76 @@ mod tests {
             .expect("wait_for_exit_signal should return after reload signal")
             .expect("task should not panic")
             .expect("signal handler should not error");
-        assert_eq!(result, DaemonExit::Reload);
+        assert!(matches!(result, DaemonExit::Reload(_)));
+    }
+
+    #[tokio::test]
+    async fn rejected_reload_keeps_waiting_for_a_later_valid_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{Mutex, oneshot};
+        use tokio::time::{Duration, timeout};
+
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(false);
+        let (first_attempt_tx, first_attempt_rx) = oneshot::channel();
+        let first_attempt_tx = std::sync::Arc::new(Mutex::new(Some(first_attempt_tx)));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let preflight: ReloadPreflight = {
+            let first_attempt_tx = std::sync::Arc::clone(&first_attempt_tx);
+            let attempts = std::sync::Arc::clone(&attempts);
+            std::sync::Arc::new(move || {
+                let first_attempt_tx = std::sync::Arc::clone(&first_attempt_tx);
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt == 0 {
+                        if let Some(tx) = first_attempt_tx.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        Err(anyhow::anyhow!("prospective configuration is invalid"))
+                    } else {
+                        Ok(Config::default())
+                    }
+                })
+            })
+        };
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reset_rx = reload_tx.subscribe();
+        let reload_tx_for_wait = reload_tx.clone();
+        let handle = zeroclaw_spawn::spawn!(wait_for_exit_signal_with_preflight(
+            reload_rx,
+            reload_tx_for_wait,
+            preflight,
+            false,
+            count,
+        ));
+
+        reload_tx.send(true).expect("request first reload");
+        timeout(Duration::from_secs(2), first_attempt_rx)
+            .await
+            .expect("first reload should reach preflight")
+            .expect("preflight should signal the rejected reload");
+        timeout(Duration::from_secs(2), async {
+            while *reset_rx.borrow() {
+                reset_rx
+                    .changed()
+                    .await
+                    .expect("reload sender should stay available");
+            }
+        })
+        .await
+        .expect("rejected reload should clear its request");
+        assert!(
+            !*reload_tx.borrow(),
+            "a rejected reload must clear the request while the runtime remains active"
+        );
+
+        reload_tx.send(true).expect("request valid reload");
+        let exit = timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("later valid reload should finish the wait")
+            .expect("wait task should not panic")
+            .expect("reload wait should succeed");
+        assert!(matches!(exit, DaemonExit::Reload(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3666,7 +3967,7 @@ mod tests {
         .expect("daemon must not deadlock after a gateway-triggered reload");
         let exit = exit.expect("daemon run should succeed");
 
-        assert_eq!(exit, DaemonExit::Reload);
+        assert!(matches!(exit, DaemonExit::Reload(_)));
         let (
             host,
             port,
@@ -3826,7 +4127,7 @@ mod tests {
         .await
         .expect("daemon should return after gateway-triggered reload")
         .expect("daemon run should succeed");
-        assert_eq!(exit, DaemonExit::Reload);
+        assert!(matches!(exit, DaemonExit::Reload(_)));
 
         assert!(
             scheduler_clean_shutdown_observed(),

@@ -142,9 +142,19 @@ use self::foreground::{
     persist_lock, wait_for_foreground_lease,
 };
 use self::goal_execution::{
-    dispose_matrix_goal, revoke_matrix_goals_at_startup, revoke_matrix_goals_for_policy,
-    submit_matrix_goal,
+    collect_matrix_goal_policy_revocation_targets, dispose_matrix_goal,
+    reconcile_matrix_goal_policy, revoke_matrix_goals_for_policy, submit_matrix_goal,
 };
+
+/// Collect Matrix-bound Goal revocations from the daemon-owned snapshot.
+/// This is intentionally a closed V1 adapter: other channel policy must opt
+/// in at its own durable-binding boundary.
+pub fn collect_goal_policy_revocation_targets(
+    config: Config,
+    tasks: Vec<zeroclaw_runtime::control_plane::TaskRecord>,
+) -> Result<Vec<zeroclaw_runtime::control_plane::GoalPolicyRevocationTarget>> {
+    collect_matrix_goal_policy_revocation_targets(&config, tasks)
+}
 use self::turn_execution::resolved_channel_execution;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
@@ -8278,6 +8288,8 @@ mod goal_response_render_tests {
             cost_limit_usd: Some(2.0),
             accounting_state: GoalAccountingState::Complete,
             pause_reason: None,
+            pause_description: None,
+            blockers: Vec::new(),
             resumable: false,
             known_tokens: Some(40),
             known_cost_usd: Some(0.5),
@@ -12713,7 +12725,7 @@ pub async fn start_channels(
     let config: Config = config_arc.read().clone();
     let goal_policy_cutover: Arc<dyn zeroclaw_runtime::goal_mode::GoalPolicyGate> =
         goal_policy_cutover;
-    revoke_matrix_goals_at_startup(&config).await?;
+    reconcile_matrix_goal_policy(&config).await?;
     let any_agent_provider_resolves = config
         .agents
         .iter()
