@@ -1832,9 +1832,11 @@ impl Agent {
                 served_route_sink: None,
                 sop_reassembly: None,
             });
-        let response = crate::agent::turn::scope_tool_protocol_prompts(
-            Arc::clone(&tool_protocol_prompts),
-            isolated_loop,
+        let response = crate::agent::goal_child_fence::scope_goal_parent(
+            crate::agent::turn::scope_tool_protocol_prompts(
+                Arc::clone(&tool_protocol_prompts),
+                isolated_loop,
+            ),
         )
         .await?;
 
