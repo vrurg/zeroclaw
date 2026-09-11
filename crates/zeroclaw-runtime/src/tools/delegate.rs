@@ -1828,8 +1828,19 @@ impl Tool for DelegateTool {
             DelegateAction::Delegate => {}
         }
 
+        let goal_scoped = crate::agent::goal_child_fence::is_goal_scoped();
+
         // --- Parallel mode ---
         if let Some(parallel_agents) = args.get("parallel").and_then(|v| v.as_array()) {
+            if goal_scoped {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "Goal mode V1 does not admit parallel foreground delegation".into(),
+                    ),
+                });
+            }
             return self.execute_parallel(parallel_agents, &args).await;
         }
 
@@ -1888,11 +1899,31 @@ impl Tool for DelegateTool {
             .unwrap_or(false);
 
         if background {
+            if goal_scoped {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Goal mode V1 does not admit background delegation".into()),
+                });
+            }
             return self.execute_background(agent_name, prompt, &args).await;
         }
 
         // --- Synchronous delegation (original path) ---
-        self.execute_sync(agent_name, prompt, &args).await
+        let _goal_child_guard = match crate::agent::goal_child_fence::admit_goal_child().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        crate::agent::goal_child_fence::scope_goal_child(
+            self.execute_sync(agent_name, prompt, &args),
+        )
+        .await
     }
 }
 

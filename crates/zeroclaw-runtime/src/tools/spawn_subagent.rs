@@ -86,6 +86,17 @@ impl Tool for SpawnSubagentTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let _goal_child_guard = match crate::agent::goal_child_fence::admit_goal_child().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+
         // Depth-1 cap: a SubAgent may not spawn its own subagents.
         // The caller-side flag is set at registry construction time
         // from `AgentRunOverrides.is_subagent`, so the refusal fires
@@ -219,7 +230,7 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
-        let run_result = Box::pin(scope!(
+        let run_result = crate::agent::goal_child_fence::scope_goal_child(Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
@@ -237,7 +248,7 @@ impl Tool for SpawnSubagentTool {
                 zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
-        ))
+        )))
         .await;
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
