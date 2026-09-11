@@ -20,8 +20,8 @@ use zeroclaw_runtime::goal_mode::{
     GoalController, GoalExecutionHost, GoalExecutionRestartCoordinator, GoalExecutionScope,
     GoalExecutionSupervisor, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
     GoalOperationScope, GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalResponse,
-    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease,
-    GoalSessionKey, GoalSessionLease, GoalSurface, GoalVerifierTurn,
+    GoalRuntime, GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
+    GoalSessionLease, GoalSurface, GoalVerifierTurn,
 };
 
 struct RecordingDriver {
