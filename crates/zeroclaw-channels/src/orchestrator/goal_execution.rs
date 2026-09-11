@@ -5,6 +5,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
+use super::{
+    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn_durably,
+    build_channel_system_prompt_for_message_with_signal,
+    callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
+    get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
+    runtime_defaults_from_config, runtime_defaults_snapshot,
+    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
+    turn_execution::resolved_channel_execution,
+};
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use zeroclaw_api::{
@@ -12,7 +22,9 @@ use zeroclaw_api::{
     model_provider::{ChatMessage, ChatRequest},
 };
 use zeroclaw_commands::goal::GoalBudgetLimits;
-use zeroclaw_goal::control::{dispose_unowned_session_goal, scope_goal_parent_turn};
+use zeroclaw_goal::control::{
+    dispose_unowned_session_goal, goal_parent_directive, scope_goal_parent_turn,
+};
 use zeroclaw_goal::{
     GoalExecutionNotice, GoalExecutionScope, GoalExecutionSubmission, GoalExecutionSupervisor,
     GoalFailureReason, GoalHostSettings, GoalIngressContext, GoalIngressPrincipal,
@@ -30,17 +42,6 @@ use zeroclaw_runtime::{
     control_plane::control_plane,
     cost::CostTracker,
     goal_accounting::{ModelProviderGoalUsagePricer, RuntimeGoalOperationAccountingFactory},
-};
-
-use super::foreground::{foreground_lock, goal_command_lock, goal_supervisor_slot};
-use super::{
-    ChannelRouteSelection, ChannelRuntimeContext, append_sender_turn_durably,
-    build_channel_system_prompt_for_message_with_signal,
-    callable_protocol_exposed_for_channel_turn, find_channel_for_message, get_or_create_provider,
-    get_route_selection, model_provider_entry_for_ref, outbound_content_format_for_channel,
-    runtime_defaults_from_config, runtime_defaults_snapshot,
-    sanitize_channel_response_for_format_with_leak_detection, system_prompt_for_channel_turn,
-    turn_execution::resolved_channel_execution,
 };
 
 /// Immutable Matrix facts captured before mutable inbound hooks run.
@@ -813,19 +814,6 @@ fn goal_start_history(
     history.extend(canonical_history);
     history
 }
-
-fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
-    let turn_kind = match turn.kind {
-        GoalParentTurnKind::Start => "start",
-        GoalParentTurnKind::Resume => "resume",
-        GoalParentTurnKind::Continue => "continue",
-    };
-    ChatMessage::system(format!(
-        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-        turn.objective
-    ))
-}
-
 fn verifier_attribution_from_attempts<'a>(
     attempts: impl IntoIterator<Item = (bool, &'a str, &'a str)>,
 ) -> Option<GoalVerifierAttribution> {
@@ -1392,7 +1380,6 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .context("deliver Matrix Goal lifecycle notice")
     }
 }
-
 fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
     match reason {
         GoalFailureReason::AgentOperationFailed => "goal-mode-failure-agent-operation",
@@ -1408,7 +1395,6 @@ fn matrix_goal_failure_key(reason: GoalFailureReason) -> &'static str {
         GoalFailureReason::Other => "goal-mode-failure-other",
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
