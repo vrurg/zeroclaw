@@ -1002,6 +1002,24 @@ struct GoalOperationAccountant {
     admitted: Mutex<Option<AdmittedOperation>>,
 }
 
+/// Construct the controller-owned budget blocker. Its text crosses the status
+/// and notification boundary, so it belongs to the runtime Fluent catalogue;
+/// verifier-provided blocker text remains preserved separately as untrusted
+/// data.
+fn budget_exhaustion_pause_state() -> GoalPauseState {
+    GoalPauseState {
+        reason: GoalPauseReason::BudgetExhausted,
+        description: Some(crate::i18n::get_required_cli_string(
+            "goal-mode-budget-exhausted-description",
+        )),
+        blockers: vec![GoalBlocker {
+            kind: GoalBlockerKind::Budget,
+            message: crate::i18n::get_required_cli_string("goal-mode-budget-exhausted-blocker"),
+            payload: None,
+        }],
+    }
+}
+
 impl GoalOperationAccountant {
     fn new(
         registry: Arc<dyn GoalTaskRegistry>,
@@ -1053,15 +1071,7 @@ impl GoalOperationAccountant {
     }
 
     async fn pause_budget_exhausted(&self) -> Result<()> {
-        let pause = GoalPauseState {
-            reason: GoalPauseReason::BudgetExhausted,
-            description: Some("Goal usage has reached its effective budget".to_owned()),
-            blockers: vec![GoalBlocker {
-                kind: GoalBlockerKind::Budget,
-                message: "Increase the Goal budget, then resume explicitly.".to_owned(),
-                payload: None,
-            }],
-        };
+        let pause = budget_exhaustion_pause_state();
         match self
             .registry
             .pause_session_goal(
@@ -1601,6 +1611,26 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn budget_exhaustion_pause_uses_catalogue_owned_text() {
+        let pause = budget_exhaustion_pause_state();
+
+        assert_eq!(pause.reason, GoalPauseReason::BudgetExhausted);
+        assert_eq!(
+            pause.description.as_deref(),
+            Some(
+                crate::i18n::get_required_cli_string("goal-mode-budget-exhausted-description")
+                    .as_str()
+            )
+        );
+        assert_eq!(pause.blockers.len(), 1);
+        assert_eq!(pause.blockers[0].kind, GoalBlockerKind::Budget);
+        assert_eq!(
+            pause.blockers[0].message,
+            crate::i18n::get_required_cli_string("goal-mode-budget-exhausted-blocker")
+        );
     }
 
     #[tokio::test]
