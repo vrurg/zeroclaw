@@ -20,7 +20,7 @@ use zeroclaw_runtime::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal,
+        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, scope_goal_parent_turn,
     },
 };
 
@@ -467,9 +467,10 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             turn_id: &turn_id,
             sop_reassembly: None,
         });
-        let candidate = scope_session_key(Some(self.session_key.durable_id()), async {
-            scope_thread_id(Some(self.message.id.clone()), tool_loop).await
-        })
+        let candidate = scope_goal_parent_turn(scope_session_key(
+            Some(self.session_key.durable_id()),
+            async { scope_thread_id(Some(self.message.id.clone()), tool_loop).await },
+        ))
         .await?;
         let _ = operation;
         Ok(GoalParentTurnResult {
