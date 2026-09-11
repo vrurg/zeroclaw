@@ -6527,6 +6527,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_scope_rejects_background_and_parallel_before_child_creation() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+
+        crate::agent::goal_child_fence::scope_goal_parent(async {
+            let background = tool
+                .execute(json!({"agent": "missing", "prompt": "test", "background": true}))
+                .await
+                .unwrap();
+            assert!(!background.success);
+            assert!(
+                background
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("background delegation"))
+            );
+
+            let parallel = tool
+                .execute(json!({"parallel": [{"agent": "missing", "prompt": "test"}]}))
+                .await
+                .unwrap();
+            assert!(!parallel.success);
+            assert!(
+                parallel
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("parallel foreground delegation"))
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn blank_prompt_rejected() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         let result = tool
