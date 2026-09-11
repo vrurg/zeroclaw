@@ -440,6 +440,17 @@ impl RpcGoalRuntime {
             std::process::id(),
             control_plane.boot_id.clone(),
         )?;
+        let durable_session_id = driver.session_key().durable_id();
+        if registry
+            .current_goal_for_session(&durable_session_id)
+            .await?
+            .is_some_and(|task| task.status.is_terminal())
+        {
+            // A self-terminating Goal does not necessarily have a following
+            // control command to remove its supervisor. A successor must use
+            // a fresh engine so it observes current pricing and configuration.
+            self.remove_supervisor(&session_id).await;
+        }
         let supervisor = match self.supervisor(&session_id).await {
             Some(supervisor) => supervisor,
             None => {
