@@ -276,9 +276,15 @@ impl Tool for SpawnSubagentTool {
             )
         ));
         let run_result = if let Some(scope) = goal_child_scope {
-            let child_scope = scope
-                .foreground_child()
-                .ok_or_else(|| anyhow::anyhow!("Goal child depth overflow"))?;
+            let child_scope = scope.foreground_child().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Goal child depth overflow"
+                );
+                anyhow::Error::msg("Goal child depth overflow")
+            })?;
             crate::agent::cost::GOAL_CHILD_EXECUTION_SCOPE
                 .scope(Some(child_scope), run)
                 .await

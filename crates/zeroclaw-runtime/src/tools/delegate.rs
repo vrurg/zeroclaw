@@ -2042,9 +2042,21 @@ impl DelegateTool {
         ));
         let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), dispatch).await {
             Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "Agent '{agent_name}' timed out after {timeout_secs}s"
-            )),
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target_agent": agent_name,
+                            "timeout_secs": timeout_secs,
+                        })),
+                    "delegate provider call timed out"
+                );
+                Err(anyhow::Error::msg(format!(
+                    "Agent '{agent_name}' timed out after {timeout_secs}s"
+                )))
+            }
         };
 
         let accepted = result.as_ref().ok().filter(|response| {
