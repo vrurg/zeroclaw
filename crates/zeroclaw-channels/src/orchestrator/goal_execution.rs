@@ -21,7 +21,7 @@ use zeroclaw_runtime::{
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
         GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_directive,
-        scope_goal_parent_turn,
+        goal_verifier_messages, scope_goal_parent_turn,
     },
 };
 
@@ -491,15 +491,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             &defaults,
         )
         .await?;
-        let messages = vec![
-            ChatMessage::system(
-                "Return only strict JSON. Schema: {\\\"decision\\\":\\\"complete|continue|blocked\\\",\\\"reason\\\":\\\"nonempty bounded explanation\\\",\\\"blockers\\\":[{\\\"kind\\\":\\\"needs_user_input|human_escalation|external_dependency\\\",\\\"message\\\":\\\"nonempty bounded explanation\\\",\\\"payload\\\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Do not emit any other keys or blocker kinds.",
-            ),
-            ChatMessage::user(format!(
-                "Objective:\n{}\n\nCandidate:\n{}",
-                turn.objective, turn.candidate
-            )),
-        ];
+        let messages = goal_verifier_messages(&turn);
         let response = resolved_channel_execution(
             self.context.as_ref(),
             provider.as_ref(),

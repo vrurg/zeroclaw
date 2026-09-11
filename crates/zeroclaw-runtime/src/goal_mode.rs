@@ -476,6 +476,22 @@ impl fmt::Debug for GoalVerifierTurn {
     }
 }
 
+/// Build the mandatory Goal verifier request.
+///
+/// The verifier receives only the admitted objective and exact candidate. The
+/// system message carries the runtime-owned response protocol.
+pub fn goal_verifier_messages(turn: &GoalVerifierTurn) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(
+            "Return only strict JSON: {\"decision\":\"complete|continue|blocked\",\"reason\":\"...\",\"blockers\":[...]}.",
+        ),
+        ChatMessage::user(format!(
+            "Objective:\n{}\n\nCandidate:\n{}",
+            turn.objective, turn.candidate
+        )),
+    ]
+}
+
 /// A lifecycle result which occurs after the synchronous Goal command reply.
 ///
 /// The executor supplies semantics only. Each admitted surface renders the
@@ -1589,6 +1605,30 @@ mod tests {
         );
         assert!(untrusted_offset < directive.content.find(objective).unwrap());
         assert!(directive.content.ends_with("\n---"));
+    }
+
+    #[test]
+    fn goal_verifier_messages_carry_only_objective_and_candidate() {
+        let objective = "ship goal mode";
+        let candidate = "the implementation is ready";
+        let messages = goal_verifier_messages(&GoalVerifierTurn {
+            objective: objective.to_owned(),
+            candidate: candidate.to_owned(),
+        });
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(
+            messages[0]
+                .content
+                .contains("{\"decision\":\"complete|continue|blocked\"")
+        );
+        assert!(!messages[0].content.contains("\\\""));
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(
+            messages[1].content,
+            format!("Objective:\n{objective}\n\nCandidate:\n{candidate}")
+        );
     }
 
     #[test]

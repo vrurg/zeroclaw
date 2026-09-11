@@ -273,15 +273,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 config.goal.verifier.model.as_deref(),
             )?
         };
-        let messages = vec![
-            ChatMessage::system(
-                "Return only strict JSON: {\"decision\":\"complete|continue|blocked\",\"reason\":\"...\",\"blockers\":[...]}.",
-            ),
-            ChatMessage::user(format!(
-                "Objective:\n{}\n\nCandidate:\n{}",
-                turn.objective, turn.candidate
-            )),
-        ];
+        let messages = crate::goal_mode::goal_verifier_messages(&turn);
         let response = crate::agent::loop_::ResolvedModelAccess {
             model_provider: provider.as_ref(),
             provider_name: &provider_name,
