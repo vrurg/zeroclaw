@@ -21215,8 +21215,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn goal_updates_require_one_canonical_variant_for_the_target_session() {
+    #[tokio::test]
+    async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
         let (notif_tx, notif_rx) = broadcast::channel(4);
