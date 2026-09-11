@@ -8,7 +8,7 @@
 //! through the ordinary provider path behind those boundaries. Transport
 //! adapters remain later-stage work.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -29,6 +29,15 @@ pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor,
     dispose_unowned_session_goal,
 };
+
+/// Scope one adapter-owned parent turn as an isolated Goal turn.
+///
+/// This is the shared execution-host boundary for every V1 transport. It
+/// limits only admission of Goal-owned foreground children; it does not alter
+/// ordinary tool batching or create a process-wide tool lock.
+pub async fn scope_goal_parent_turn<F: Future>(future: F) -> F::Output {
+    crate::agent::goal_child_fence::scope_goal_parent(future).await
+}
 
 /// The only V1 surfaces permitted to admit a Goal command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1185,5 +1194,16 @@ mod tests {
     fn zerocode_key_must_keep_the_existing_canonical_session_form() {
         assert!(GoalSessionKey::zero_code("same session").is_err());
         assert!(GoalSessionKey::zero_code("same-session").is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_parent_turn_scope_marks_goal_owned_child_admission() {
+        scope_goal_parent_turn(async {
+            let _guard = crate::agent::goal_child_fence::admit_goal_child()
+                .await
+                .expect("Goal parent scope should allow a foreground child")
+                .expect("Goal parent scope should install a child fence");
+        })
+        .await;
     }
 }
