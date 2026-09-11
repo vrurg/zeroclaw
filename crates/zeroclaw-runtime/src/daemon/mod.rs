@@ -216,6 +216,33 @@ pub type ReloadConfigFuture = Pin<Box<dyn Future<Output = Result<Config>> + Send
 
 type ReloadPreflight = Arc<dyn Fn() -> ReloadConfigFuture + Send + Sync>;
 
+/// Keeps the daemon-wide Goal admission fence alive after a reload preflight
+/// has durably reconciled prospective policy, until the old runtime has
+/// drained every Goal worker.
+///
+/// This is process-local teardown coordination only. The control plane keeps
+/// durable Goal lifecycle authority.
+#[derive(Default)]
+struct ReloadGoalPolicyCutover {
+    lease: tokio::sync::Mutex<Option<crate::goal_mode::GoalPolicyCutoverLease>>,
+}
+
+impl ReloadGoalPolicyCutover {
+    async fn retain(&self, lease: crate::goal_mode::GoalPolicyCutoverLease) -> Result<()> {
+        let mut held = self.lease.lock().await;
+        anyhow::ensure!(
+            held.is_none(),
+            "reload Goal policy cutover lease was retained more than once"
+        );
+        *held = Some(lease);
+        Ok(())
+    }
+
+    async fn take(&self) -> Option<crate::goal_mode::GoalPolicyCutoverLease> {
+        self.lease.lock().await.take()
+    }
+}
+
 fn merge_surface_goal_policy_targets(
     snapshot: &[crate::control_plane::TaskRecord],
     common_targets: Vec<crate::control_plane::GoalPolicyRevocationTarget>,
@@ -772,21 +799,25 @@ pub async fn run_with_reload(
     let goal_policy_preflight: Option<Arc<GoalPolicyPreflight>> =
         registry.take_goal_policy_preflight().map(Arc::from);
     reconcile_goal_policy_for_runtime_config(&config, goal_policy_preflight.as_ref()).await?;
+    let retained_reload_cutover = Arc::new(ReloadGoalPolicyCutover::default());
     let reload_preflight: ReloadPreflight = {
         let reload_config = Arc::clone(&reload_config);
         let goal_policy_cutover = Arc::clone(&goal_policy_cutover);
+        let retained_reload_cutover = Arc::clone(&retained_reload_cutover);
         Arc::new(move || {
             let reload_config = Arc::clone(&reload_config);
             let goal_policy_cutover = Arc::clone(&goal_policy_cutover);
             let goal_policy_preflight = goal_policy_preflight.clone();
+            let retained_reload_cutover = Arc::clone(&retained_reload_cutover);
             Box::pin(async move {
                 let prospective = reload_config().await?;
-                let _cutover = goal_policy_cutover.cutover().await;
+                let cutover = goal_policy_cutover.cutover().await;
                 reconcile_goal_policy_for_runtime_config(
                     &prospective,
                     goal_policy_preflight.as_ref(),
                 )
                 .await?;
+                retained_reload_cutover.retain(cutover).await?;
                 Ok(prospective)
             })
         })
@@ -1245,6 +1276,14 @@ pub async fn run_with_reload(
         ),
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
+
+    let _retained_reload_cutover =
+        match &exit_result {
+            Ok(DaemonExit::Reload(_)) => Some(retained_reload_cutover.take().await.context(
+                "reload preflight completed without retaining the Goal admission fence",
+            )?),
+            Ok(DaemonExit::Shutdown) | Err(_) => None,
+        };
 
     if let Some(rpc_ctx) = &rpc_ctx {
         rpc_ctx
@@ -4115,6 +4154,37 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert!(matches!(result, DaemonExit::Reload(_)));
+    }
+
+    #[tokio::test]
+    async fn retained_reload_cutover_blocks_goal_admission_until_teardown() {
+        use tokio::time::{Duration, timeout};
+
+        let coordinator =
+            std::sync::Arc::new(crate::goal_mode::GoalPolicyCutoverCoordinator::new());
+        let retained = ReloadGoalPolicyCutover::default();
+        retained
+            .retain(coordinator.cutover().await)
+            .await
+            .expect("a fresh reload cutover slot accepts one lease");
+
+        let waiting_coordinator = std::sync::Arc::clone(&coordinator);
+        let mut waiting_admission = zeroclaw_spawn::spawn!(async move {
+            let _admission = waiting_coordinator.admit().await;
+        });
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut waiting_admission)
+                .await
+                .is_err(),
+            "a successful reload preflight must keep old-policy Goal admission closed until teardown"
+        );
+
+        drop(retained.take().await);
+        timeout(Duration::from_secs(1), waiting_admission)
+            .await
+            .expect("Goal admission should resume after teardown")
+            .expect("Goal admission task should not panic");
     }
 
     #[tokio::test]

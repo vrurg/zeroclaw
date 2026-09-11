@@ -31,6 +31,7 @@ pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor,
     dispose_unowned_session_goal,
 };
+pub(crate) use policy::GoalPolicyCutoverLease;
 pub use policy::{
     GoalPolicyCutoverCoordinator, GoalPolicyDecision, GoalPolicyGate, GoalPolicyRevocationReason,
     GoalSurfacePolicy, authorize_common_goal_ingress, classify_common_goal_policy,
