@@ -62,11 +62,26 @@ work but lets an already-admitted model operation settle its usage. Restart
 requires an explicit resume; it does not reconstruct a previous working
 transcript, so resumed work can repeat external side effects.
 
+`/goal cancel` retains the terminal Goal audit while its session exists. A
+session close, delete, kill, or genuine replacement instead fences and drains
+the Goal, then removes its Goal control state; already-recorded ledger usage
+remains queryable. A live policy revocation (for example, disabling Goal Mode
+or removing its Matrix surface) cancels affected Goals and they cannot be
+resumed if the policy is later restored. A same-session reconnect is not a
+replacement and does not change the Goal.
+
 Budgets are admission limits, not strict spend ceilings: one admitted logical
 operation can exceed a finite limit, but no subsequent operation is admitted.
 Usage and remaining budget are derived from the canonical ledger. Missing,
 invalid, unattributed, or uncertain usage fails the goal closed and prevents
 further calls; provider operations are never replayed to guess their outcome.
+If interruption leaves an admitted operation unsettled, the Goal is likewise
+failed as outcome-unknown rather than being resumed from an incomplete record.
+
+Goal Mode keeps the configured provider path intact. A single serialized Goal
+operation may use the ordinary Reliable retry, route, fallback, or stream
+recovery behavior; all usage surfaced by that operation is attributed to the
+Goal before it settles. This does not make budget limits strict spend ceilings.
 
 A verifier is mandatory. It receives only the success criterion and exact
 candidate, then returns `complete`, `continue`, or `blocked`. Only a verified
@@ -105,6 +120,14 @@ or the parsed command. ZeroCode uses the existing session-control permission
 semantics and connection-registered `tui_id`; it does not add a separate owner
 rule or claim that `tui_id` is a remote-user identity. Expose WSS only where
 its existing ability to create and control sessions is appropriate.
+
+## Rollout evidence
+
+Before enabling Goal Mode for regular use, compare a disabled configuration
+with the intended enabled configuration and record stripped binary size,
+startup-to-ready time, and steady-state idle RSS. This evidence determines
+whether runtime opt-in remains sufficient; Goal Mode does not add a
+compile-time feature switch merely to reduce footprint.
 
 See [ADR-008](../architecture/decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
 for the durable source-of-truth decision.
