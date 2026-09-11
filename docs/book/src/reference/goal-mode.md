@@ -74,6 +74,20 @@ complete candidate is added to session history and delivered. `blocked` pauses
 the goal with actionable blockers; malformed verifier output and provider or
 accounting failures fail the goal rather than becoming blockers.
 
+## Design context
+
+The verifier-loop pattern has prior art. [Ralph Loop Agent][ralph-loop] repeats
+work until its completion verifier accepts the result and feeds an unsuccessful
+verifier's reason into a later iteration. [OpenCode Goal Plugin][opencode-goal]
+similarly lets an operator declare success criteria and requires completion
+evidence before accepting a completion claim.
+
+Goal Mode deliberately does not inherit either project's control plane. Its
+runtime controller, rather than prompt text or a model claim, owns the durable
+task transition; its verifier is required and goal-attributed; and its budget,
+session-disposal, and trusted-ingress rules remain the contracts described
+above.
+
 Goal calls do not add progress chatter for ordinary execution. A verified
 completion is delivered, and a verifier-caused pause reports that resolution
 is required. Explicit control commands return their own typed acknowledgement.
@@ -94,3 +108,6 @@ its existing ability to create and control sessions is appropriate.
 
 See [ADR-008](../architecture/decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md)
 for the durable source-of-truth decision.
+
+[ralph-loop]: https://github.com/vercel-labs/ralph-loop-agent#verifycompletion
+[opencode-goal]: https://github.com/willytop8/OpenCode-goal-plugin#how-it-works
