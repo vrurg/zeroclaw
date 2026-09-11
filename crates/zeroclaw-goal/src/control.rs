@@ -30,7 +30,10 @@ use zeroclaw_commands::goal::{
 
 mod goal_execution;
 
-pub use goal_execution::{GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionSupervisor};
+pub use goal_execution::{
+    GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
+    GoalExecutionSupervisor,
+};
 
 /// Compose transient verifier feedback as untrusted user-role input.
 ///
