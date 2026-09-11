@@ -8070,19 +8070,19 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let (exit, transferred_ownership) = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
-                    daemon::DaemonExit::Reload => {
+                    daemon::DaemonExit::Reload(successor_config) => {
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             ),
-                            "🔄 Daemon reload — re-reading config from disk"
+                            "🔄 Daemon reload — adopting validated successor config"
                         );
                         // Continuous ownership: the previous generation drained
-                        // with the guard retained and returned it; the fresh
-                        // snapshot below is loaded while this process still owns
-                        // the config lifecycle.
+                        // with the guard retained and returned it. Adopt the
+                        // exact policy-validated successor snapshot without a
+                        // second disk read or an ownership gap.
                         daemon_ownership = Some((
                             expected_data_dir,
                             transferred_ownership.ok_or_else(|| {
@@ -8098,7 +8098,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 anyhow::Error::msg("daemon reload did not retain config ownership")
                             })?,
                         ));
-                        current_config = Box::pin(Config::load_or_init()).await?;
+                        current_config = *successor_config;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
                             &current_config.observability,
