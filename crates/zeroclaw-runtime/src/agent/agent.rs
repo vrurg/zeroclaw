@@ -7731,7 +7731,7 @@ mod tests {
         let outcome = agent
             .run_isolated_turn(
                 IsolatedTranscriptSource::Canonical { prefix },
-                ChatMessage::system("Goal success criterion (trusted runtime directive): finish"),
+                ChatMessage::system("goal turn directive"),
             )
             .await
             .expect("isolated Goal turn should succeed");

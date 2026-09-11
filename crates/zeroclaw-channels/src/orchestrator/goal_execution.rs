@@ -20,7 +20,8 @@ use zeroclaw_runtime::{
         GoalExecutionNotice, GoalExecutionScope, GoalIngressContext, GoalOperationScope,
         GoalParentTurn, GoalParentTurnKind, GoalParentTurnResult, GoalSessionBinding,
         GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey, GoalSessionLease,
-        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, scope_goal_parent_turn,
+        GoalSurface, GoalVerifierTurn, dispose_unowned_session_goal, goal_parent_directive,
+        scope_goal_parent_turn,
     },
 };
 
@@ -380,19 +381,6 @@ fn goal_start_history(
     history.extend(canonical_history);
     history
 }
-
-fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
-    let turn_kind = match turn.kind {
-        GoalParentTurnKind::Start => "start",
-        GoalParentTurnKind::Resume => "resume",
-        GoalParentTurnKind::Continue => "continue",
-    };
-    ChatMessage::system(format!(
-        "Goal success criterion (trusted runtime directive): {}\nTurn kind: {turn_kind}",
-        turn.objective
-    ))
-}
-
 #[async_trait]
 impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
     fn session_key(&self) -> &GoalSessionKey {
@@ -575,7 +563,6 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
             .context("deliver Matrix Goal lifecycle notice")
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
