@@ -66,7 +66,7 @@ pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
-pub use zeroclaw_tools::git_operations::GitOperationsTool;
+pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -648,6 +648,20 @@ struct RuntimeShellAssembly {
     sandbox: Arc<dyn Sandbox>,
 }
 
+/// Adapts the runtime's canonical per-agent sandbox to the Git tool without
+/// making the lower-level tools crate depend on the runtime crate.
+struct RuntimeGitCommandBoundary {
+    sandbox: Arc<dyn Sandbox>,
+}
+
+impl GitCommandBoundary for RuntimeGitCommandBoundary {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        self.sandbox
+            .wrap_command(command)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 /// Pair the canonical runtime kind with one shared sandbox instance for every
 /// runtime-backed executor assembled by the production tool registry.
 fn runtime_shell_assembly(
@@ -948,7 +962,12 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(security.clone())),
+        Arc::new(GitOperationsTool::new_with_command_boundary(
+            security.clone(),
+            Arc::new(RuntimeGitCommandBoundary {
+                sandbox: sandbox.clone(),
+            }),
+        )),
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -9,11 +10,47 @@ use zeroclaw_config::policy::SecurityPolicy;
 
 use crate::util_helpers::clean_verbatim_path;
 
+/// Runtime-owned boundary applied to write-classified Git subprocesses.
+///
+/// The tool crate owns Git operation classification and must not depend on a
+/// concrete runtime sandbox. The production registry injects the per-agent
+/// sandbox through this narrow command-wrapping contract instead.
+///
+/// The boundary receives a bare `git` command before the tool applies Git
+/// arguments, its working directory, or its environment. Boundaries that need
+/// to remove inherited environment variables must use individual
+/// [`std::process::Command::env_remove`] calls; a blanket `env_clear` is
+/// superseded by the tool's Git environment hardening. Git-specific variables
+/// set by a boundary are also discarded: the tool owns the Git environment.
+pub trait GitCommandBoundary: Send + Sync {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()>;
+}
+
+struct UnconfiguredGitCommandBoundary;
+
+impl GitCommandBoundary for UnconfiguredGitCommandBoundary {
+    fn wrap_command(&self, _command: &mut std::process::Command) -> anyhow::Result<()> {
+        anyhow::bail!("Git write commands require a configured execution boundary")
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DirectGitCommandBoundary;
+
+#[cfg(test)]
+impl GitCommandBoundary for DirectGitCommandBoundary {
+    fn wrap_command(&self, _command: &mut std::process::Command) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
 #[derive(Clone)]
 pub struct GitOperationsTool {
     security: Arc<SecurityPolicy>,
+    git_command_boundary: Arc<dyn GitCommandBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,8 +85,25 @@ const READ_GIT_CONFIG_OVERRIDES: &[&str] = &[
 const GIT_LOG_FORMAT: &str = "--pretty=format:%H|%an|%ae|%ad|%s";
 
 impl GitOperationsTool {
+    /// Construct the tool without a runtime execution boundary.
+    ///
+    /// Read-classified operations remain available. Write-classified operations
+    /// fail closed; production callers should use
+    /// [`Self::new_with_command_boundary`].
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self::new_with_command_boundary(security, Arc::new(UnconfiguredGitCommandBoundary))
+    }
+
+    /// Construct the tool with the runtime-owned execution boundary used for
+    /// write-classified Git subprocesses.
+    pub fn new_with_command_boundary(
+        security: Arc<SecurityPolicy>,
+        git_command_boundary: Arc<dyn GitCommandBoundary>,
+    ) -> Self {
+        Self {
+            security,
+            git_command_boundary,
+        }
     }
 
     /// Sanitize git arguments to prevent injection attacks
@@ -870,12 +924,26 @@ impl GitOperationsTool {
             .validated_repository_root_async(working_dir, true)
             .await?;
         let mut command = tokio::process::Command::new("git");
+        self.git_command_boundary
+            .wrap_command(command.as_std_mut())
+            .map_err(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                    "git_operations: write command boundary rejected Git subprocess"
+                );
+                error.context("Git write command sandbox failed")
+            })?;
+        let boundary_env = Self::non_git_command_env_snapshot(command.as_std());
         Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
         command
             .args(args)
             .current_dir(Self::git_subprocess_current_dir(working_dir))
             .stdin(std::process::Stdio::null());
         self.configure_git_environment(command.as_std_mut(), working_dir, true)?;
+        Self::restore_command_env(command.as_std_mut(), boundary_env);
         let output = command.output().await?;
 
         if !output.status.success() {
@@ -1063,6 +1131,41 @@ impl GitOperationsTool {
         command
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_PAGER", "cat");
+    }
+
+    /// Preserve sandbox-provided environment entries while retaining the Git
+    /// environment allowlist configured after command wrapping. A boundary
+    /// must not be able to restore a Git-specific override that this tool
+    /// deliberately strips before execution.
+    fn non_git_command_env_snapshot(
+        command: &std::process::Command,
+    ) -> Vec<(OsString, Option<OsString>)> {
+        command
+            .get_envs()
+            .filter(|(name, _)| !Self::is_git_environment_variable(name))
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect()
+    }
+
+    fn restore_command_env(
+        command: &mut std::process::Command,
+        environment: Vec<(OsString, Option<OsString>)>,
+    ) {
+        for (name, value) in environment {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+        }
     }
 
     async fn validated_repository_root_async(
@@ -2074,13 +2177,50 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::policy::SecurityPolicy;
 
+    #[cfg(unix)]
+    struct MarkerGitCommandBoundary {
+        marker: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl GitCommandBoundary for MarkerGitCommandBoundary {
+        fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+            let program = command.get_program().to_os_string();
+            let args = command
+                .get_args()
+                .map(std::ffi::OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            let mut replacement = std::process::Command::new(program);
+            replacement
+                .args(args)
+                .env("ZEROCLAW_GIT_BOUNDARY_MARKER", &self.marker)
+                .env("GIT_CONFIG_GLOBAL", "/must-not-survive-boundary");
+            *command = replacement;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    struct RejectingGitCommandBoundary;
+
+    #[cfg(unix)]
+    impl GitCommandBoundary for RejectingGitCommandBoundary {
+        fn wrap_command(&self, _command: &mut std::process::Command) -> anyhow::Result<()> {
+            anyhow::bail!("test boundary rejection")
+        }
+    }
+
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: dir.to_path_buf(),
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security)
+        test_tool_with_security(security)
+    }
+
+    fn test_tool_with_security(security: Arc<SecurityPolicy>) -> GitOperationsTool {
+        GitOperationsTool::new_with_command_boundary(security, Arc::new(DirectGitCommandBoundary))
     }
 
     /// Initialise a git repo for tests with commit/tag signing disabled and a
@@ -2136,7 +2276,7 @@ mod tests {
             allowed_roots,
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security)
+        test_tool_with_security(security)
     }
 
     fn test_tool_with_read_only_root(
@@ -2149,7 +2289,7 @@ mod tests {
             allowed_roots_read_only: vec![read_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security)
+        test_tool_with_security(security)
     }
 
     fn test_tool_with_allowed_and_read_only_roots(
@@ -2164,7 +2304,7 @@ mod tests {
             allowed_roots_read_only: vec![read_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security)
+        test_tool_with_security(security)
     }
 
     fn test_tool_with_write_only_root(
@@ -2177,7 +2317,7 @@ mod tests {
             allowed_roots_write_only: vec![write_only_root],
             ..SecurityPolicy::default()
         });
-        GitOperationsTool::new(security)
+        test_tool_with_security(security)
     }
 
     #[test]
@@ -2582,6 +2722,141 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_write_operations_run_repository_hooks_inside_the_injected_boundary() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let marker = repository.path().join("boundary-marker");
+        let hook = repository.path().join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_PAGER\" \"${GIT_CONFIG_GLOBAL-unset}\" \"$PWD\" > \"$ZEROCLAW_GIT_BOUNDARY_MARKER\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        let branch = "boundary-worktree";
+        let status = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test setup must create a worktree branch");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: repository.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new_with_command_boundary(
+            security,
+            Arc::new(MarkerGitCommandBoundary {
+                marker: marker.clone(),
+            }),
+        );
+        let worktree = repository.path().join("boundary-worktree");
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": branch,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "worktree add failed: {result:?}");
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("0|cat|unset|{}", canonical_worktree.display(),),
+            "a replacing boundary must preserve the Git environment, cwd, and its non-Git marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_write_operations_fail_closed_when_the_command_boundary_rejects_execution() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let branch = "rejected-boundary-worktree";
+        let status = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test setup must create a worktree branch");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: repository.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new_with_command_boundary(
+            security,
+            Arc::new(RejectingGitCommandBoundary),
+        );
+        let worktree = repository.path().join("rejected-boundary-worktree");
+        let error = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": branch,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("test boundary rejection"),
+            "the boundary rejection must remain actionable: {error:#}"
+        );
+        assert!(
+            !worktree.exists(),
+            "the rejected boundary must not create a worktree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_write_operations_require_an_injected_execution_boundary() {
+        let repository = TempDir::new().unwrap();
+        bootstrap_repo(repository.path(), &[]).await;
+        let branch = "unconfigured-boundary-worktree";
+        let status = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "test setup must create a worktree branch");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: repository.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security);
+        let worktree = repository.path().join("unconfigured-boundary-worktree");
+        let error = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "add",
+                "worktree_path": &worktree,
+                "branch": branch,
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("require a configured execution boundary"),
+            "an unconfigured constructor must fail closed: {error:#}"
+        );
+        assert!(
+            !worktree.exists(),
+            "an unconfigured constructor must not create a worktree"
+        );
+    }
+
     #[tokio::test]
     async fn git_operations_preserve_linked_worktree_lifecycle_across_authorized_roots() {
         let workspace = TempDir::new().unwrap();
@@ -2755,7 +3030,7 @@ mod tests {
             forbidden_paths: Vec::new(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         let status = tool.execute(json!({"operation": "status"})).await.unwrap();
         assert!(
@@ -2777,7 +3052,7 @@ mod tests {
             forbidden_paths: vec![repository.path().display().to_string()],
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         let status = tool.execute(json!({"operation": "status"})).await.unwrap();
         assert!(
@@ -2818,7 +3093,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         let result = tool
             .execute(json!({"operation": "commit", "message": "test"}))
@@ -2845,7 +3120,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         for args in [json!({"operation": "branch"})] {
             let result = tool.execute(args).await.unwrap();
@@ -2864,7 +3139,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
@@ -3412,7 +3687,7 @@ mod tests {
             workspace_only: true,
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
         let mut command = std::process::Command::new("git");
 
         let error = tool
@@ -5140,7 +5415,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         let result = tool
             .execute(json!({"operation": "add", "paths": "a.txt b.txt"}))
@@ -5169,7 +5444,7 @@ mod tests {
             forbidden_paths: Vec::new(),
             ..SecurityPolicy::default()
         });
-        let tool = GitOperationsTool::new(security);
+        let tool = test_tool_with_security(security);
 
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
 
