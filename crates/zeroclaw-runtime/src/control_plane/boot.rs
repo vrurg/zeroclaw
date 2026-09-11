@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::reaper;
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
+use crate::goal_mode::GoalExecutionRestartCoordinator;
 
 /// The live control-plane, shared (cheaply, via `Arc`/clone) across producers and
 /// the reaper.
@@ -17,6 +18,12 @@ use super::task_store_sqlite::SqliteTaskStore;
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
     pub boot_id: String,
+    /// Process-local Goal executor coordination for this daemon process.
+    ///
+    /// This retains weak executor owners only. It is deliberately separate
+    /// from the durable task store, which remains the sole authority for Goal
+    /// identity, lifecycle, and accounting.
+    pub(crate) goal_execution_restart: Arc<GoalExecutionRestartCoordinator>,
 }
 
 impl ControlPlaneHandle {
@@ -26,7 +33,13 @@ impl ControlPlaneHandle {
         Ok(Self {
             store: Arc::new(SqliteTaskStore::new(data_dir)?),
             boot_id: process_identity().to_string(),
+            goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
         })
+    }
+
+    /// Shared process-local coordinator for all transport-owned Goal workers.
+    pub fn goal_execution_restart(&self) -> Arc<GoalExecutionRestartCoordinator> {
+        Arc::clone(&self.goal_execution_restart)
     }
 }
 
@@ -72,7 +85,11 @@ impl ControlPlaneRecoveryOwner {
             );
         }
         Ok(Self {
-            handle: ControlPlaneHandle { store, boot_id },
+            handle: ControlPlaneHandle {
+                store,
+                boot_id,
+                goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
+            },
         })
     }
 

@@ -6,13 +6,19 @@
 //! logical model operation and the strict task-attributed ledger settlement
 //! which follows that operation.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -67,6 +73,123 @@ pub struct GoalExecutionEngine {
 pub struct GoalExecutionSupervisor {
     engine: Arc<GoalExecutionEngine>,
     workers: Mutex<HashMap<GoalWorkerKey, GoalWorker>>,
+    restart_gate: Option<Arc<GoalExecutionRestartGate>>,
+}
+
+/// Process-local coordinator for the Goal executors admitted by one daemon.
+///
+/// It retains only weak worker owners. Durable identity, lifecycle, and usage
+/// remain in the task control plane; this coordinator exists solely to fence
+/// fresh execution admission and drain already-admitted work before a daemon
+/// replacement tears down its transport hosts.
+pub struct GoalExecutionRestartCoordinator {
+    gate: Arc<GoalExecutionRestartGate>,
+    supervisors: Mutex<Vec<Weak<GoalExecutionSupervisor>>>,
+}
+
+impl Default for GoalExecutionRestartCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GoalExecutionRestartCoordinator {
+    pub fn new() -> Self {
+        Self {
+            gate: Arc::new(GoalExecutionRestartGate::new()),
+            supervisors: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create and retain a supervisor for one transport-owned Goal host.
+    ///
+    /// The weak registration is deliberately not a second session registry:
+    /// the supervisor's durable scope remains the sole identity authority.
+    pub async fn new_supervisor(
+        &self,
+        engine: Arc<GoalExecutionEngine>,
+    ) -> Arc<GoalExecutionSupervisor> {
+        let supervisor = Arc::new(GoalExecutionSupervisor::with_restart_gate(
+            engine,
+            Arc::clone(&self.gate),
+        ));
+        let mut supervisors = self.supervisors.lock().await;
+        supervisors.retain(|candidate| candidate.strong_count() > 0);
+        supervisors.push(Arc::downgrade(&supervisor));
+        supervisor
+    }
+
+    /// Close execution admission and pause/drain every registered Goal host.
+    ///
+    /// Once this returns, all Goal work admitted by the retiring daemon has
+    /// either settled under a restart fence or has been classified fail-closed.
+    pub async fn quiesce_for_restart(&self) -> Result<()> {
+        self.gate.close_admission().await;
+        let supervisors = {
+            let mut registered = self.supervisors.lock().await;
+            let supervisors = registered
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            registered.retain(|candidate| candidate.strong_count() > 0);
+            supervisors
+        };
+        for supervisor in supervisors {
+            supervisor.pause_for_restart().await?;
+        }
+        Ok(())
+    }
+
+    /// Reopen admission for the next daemon generation after the retiring
+    /// generation has fully quiesced.
+    pub async fn reopen_for_generation(&self) {
+        self.gate.reopen().await;
+    }
+}
+
+struct GoalExecutionRestartGate {
+    closed: AtomicBool,
+    barrier: Arc<RwLock<()>>,
+}
+
+impl GoalExecutionRestartGate {
+    fn new() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            barrier: Arc::new(RwLock::new(())),
+        }
+    }
+
+    async fn admit(&self, command: &GoalCommand) -> Result<Option<GoalExecutionAdmission>> {
+        if !matches!(command, GoalCommand::Start { .. } | GoalCommand::Resume) {
+            return Ok(None);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            bail!("Goal execution is quiescing for daemon restart");
+        }
+        let guard = Arc::clone(&self.barrier).read_owned().await;
+        if self.closed.load(Ordering::Acquire) {
+            drop(guard);
+            bail!("Goal execution is quiescing for daemon restart");
+        }
+        Ok(Some(GoalExecutionAdmission { _guard: guard }))
+    }
+
+    async fn close_admission(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Wait for a command that already passed the first check to finish its
+        // durable transition and supervisor launch before collecting hosts.
+        let _barrier = self.barrier.write().await;
+    }
+
+    async fn reopen(&self) {
+        let _barrier = self.barrier.write().await;
+        self.closed.store(false, Ordering::Release);
+    }
+}
+
+struct GoalExecutionAdmission {
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -94,6 +217,18 @@ impl GoalExecutionSupervisor {
         Self {
             engine,
             workers: Mutex::new(HashMap::new()),
+            restart_gate: None,
+        }
+    }
+
+    fn with_restart_gate(
+        engine: Arc<GoalExecutionEngine>,
+        restart_gate: Arc<GoalExecutionRestartGate>,
+    ) -> Self {
+        Self {
+            engine,
+            workers: Mutex::new(HashMap::new()),
+            restart_gate: Some(restart_gate),
         }
     }
 
@@ -154,6 +289,10 @@ impl GoalExecutionSupervisor {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalResponse> {
+        let _admission = match &self.restart_gate {
+            Some(gate) => gate.admit(&command).await?,
+            None => None,
+        };
         let previous = self.scope_for_session(&ingress).await?;
         let (response, execution) = self
             .engine
@@ -275,6 +414,70 @@ impl GoalExecutionSupervisor {
             .registry
             .delete_session_goal(&task_id, session_id, reloaded.execution_epoch)
             .await
+    }
+
+    /// Fence and drain every resident epoch for daemon restart.
+    ///
+    /// A restart is not an operator cancellation: it keeps a cleanly settled
+    /// Goal resumable with the durable `DaemonRestart` reason. The durable
+    /// fence is committed before waiting, so the admitted operation may settle
+    /// its own usage but cannot admit a successor. An operation that cannot
+    /// settle is classified fail-closed by [`Self::drain_lifecycle_fence`].
+    ///
+    /// This owns no transport policy. A process-level lifecycle coordinator
+    /// chooses which supervisors must be paused before it tears down their
+    /// transports.
+    pub async fn pause_for_restart(&self) -> Result<()> {
+        let scopes = {
+            let workers = self.workers.lock().await;
+            workers
+                .iter()
+                .map(|(key, worker)| {
+                    GoalExecutionScope::new(
+                        key.task_id.clone(),
+                        key.session_id.clone(),
+                        worker.execution_epoch,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        for scope in scopes {
+            if let Some(current) = self
+                .engine
+                .registry
+                .current_goal_for_session(scope.session_id())
+                .await?
+                && current.id == scope.task_id()
+                && current.status == TaskStatus::Running
+            {
+                match self
+                    .engine
+                    .registry
+                    .pause_session_goal(
+                        &current.id,
+                        scope.session_id(),
+                        current.execution_epoch,
+                        GoalPauseState {
+                            reason: GoalPauseReason::DaemonRestart,
+                            description: None,
+                            blockers: Vec::new(),
+                        },
+                    )
+                    .await?
+                {
+                    GoalTransitionResult::Applied
+                    | GoalTransitionResult::Stale
+                    | GoalTransitionResult::Missing => {}
+                }
+            }
+
+            // A stale or terminal task can still retain a finished worker.
+            // Consume it as well, so restart never leaves a process-local
+            // executor behind after the durable lifecycle has moved on.
+            let _ = self.drain_lifecycle_fence(&scope).await?;
+        }
+        Ok(())
     }
 
     /// Return whether the exact epoch still has a process-local owner.
