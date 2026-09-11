@@ -24421,6 +24421,22 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn matrix_runtime_reload_precedes_foreground_lease() {
+        let source = include_str!("mod.rs");
+        let reload = source
+            .find("if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await")
+            .expect("ordinary turn must refresh runtime config");
+        let foreground = source
+            .find("let _matrix_foreground_lease = match acquire_matrix_foreground_lease(")
+            .expect("ordinary Matrix turn must acquire its foreground lease");
+
+        assert!(
+            reload < foreground,
+            "runtime config reload must complete before an ordinary Matrix turn holds the foreground lease"
+        );
+    }
+
     #[tokio::test]
     async fn matrix_single_message_typing_refreshes_before_notice_expiry() {
         let channel_impl = Arc::new(ExpiringTypingChannel {
