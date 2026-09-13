@@ -116,7 +116,6 @@ async fn abandon_prepared_context(ctx: &TurnCtx<'_>, context: &ToolCallHookConte
 /// operation.
 pub(crate) async fn abandon_unexecuted_prepared_contexts(
     ctx: &TurnCtx<'_>,
-    _iteration: usize,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
     hook_contexts: &[Option<ToolCallHookContext>],
@@ -842,7 +841,7 @@ mod tests {
             "call-1",
         )];
 
-        abandon_unexecuted_prepared_contexts(&ctx, 0, &[0], &calls, &[None], &[]).await;
+        abandon_unexecuted_prepared_contexts(&ctx, &[0], &calls, &[None], &[]).await;
 
         assert!(
             events.lock().unwrap().is_empty(),
@@ -1381,7 +1380,6 @@ mod tests {
         ];
         super::abandon_unexecuted_prepared_contexts(
             &ctx,
-            0,
             &[0, 2],
             &executable_calls,
             &hook_contexts,
@@ -1419,7 +1417,6 @@ mod tests {
         ];
         super::abandon_unexecuted_prepared_contexts(
             &ctx,
-            3,
             &[0, 1],
             &executable_calls,
             &hook_contexts,

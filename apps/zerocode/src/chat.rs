@@ -6229,9 +6229,9 @@ fn render_copied_label(f: &mut Frame, label: &str, rect: Rect) {
     );
 }
 
-fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let pa = match state.pending_approval() {
-        Some(p) => p,
+        Some(p) => p.clone(),
         None => return,
     };
 
@@ -6308,11 +6308,18 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         .wrap(Wrap { trim: true })
         .line_count(body_area.width.max(1))
         .saturating_sub(body_area.height as usize) as u16;
+    // Rendering establishes the authoritative viewport bound for the current
+    // terminal geometry. Keep stored state in sync so one Up key immediately
+    // moves from the visible bottom after any number of Down/PageDown inputs.
+    let scroll_offset = pa.scroll_offset.min(max_scroll);
+    if let Some(approval) = state.pending_approval.as_mut() {
+        approval.scroll_offset = scroll_offset;
+    }
     f.render_widget(
         Paragraph::new(text)
             .style(fill)
             .wrap(Wrap { trim: true })
-            .scroll((pa.scroll_offset.min(max_scroll), 0)),
+            .scroll((scroll_offset, 0)),
         body_area,
     );
     f.render_widget(
@@ -17061,7 +17068,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render_approval_overlay(frame, &s, area);
+                render_approval_overlay(frame, &mut s, area);
             })
             .expect("draw approval overlay");
 
@@ -17118,7 +17125,7 @@ mod tests {
             let backend = TestBackend::new(area.width, area.height);
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
-                .draw(|frame| render_approval_overlay(frame, &s, area))
+                .draw(|frame| render_approval_overlay(frame, &mut s, area))
                 .expect("draw scrolled approval overlay");
 
             let rendered = terminal
@@ -17141,6 +17148,44 @@ mod tests {
                 "all approval actions must remain visible while details scroll at {width} columns"
             );
         }
+    }
+
+    #[test]
+    fn approval_scroll_clamps_to_the_rendered_viewport_before_the_next_keypress() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        let details = (0..80)
+            .map(|line| format!("exact detail line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "session_prompt_set".to_string(),
+            arguments_summary: details,
+            timeout_secs: 30,
+        });
+        s.scroll_pending_approval(200);
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_approval_overlay(frame, &mut s, area))
+            .expect("draw approval overlay");
+
+        let rendered_bottom = s.pending_approval().unwrap().scroll_offset;
+        assert!(
+            rendered_bottom < 200,
+            "rendering stores the viewport ceiling"
+        );
+        s.scroll_pending_approval(-1);
+        assert_eq!(
+            s.pending_approval().unwrap().scroll_offset,
+            rendered_bottom.saturating_sub(1),
+            "one Up key must move immediately from the visible bottom"
+        );
     }
 
     #[test]

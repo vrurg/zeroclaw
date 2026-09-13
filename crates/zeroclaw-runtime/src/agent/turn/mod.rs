@@ -1271,7 +1271,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // the turn aborts.
                 call_prep::abandon_unexecuted_prepared_contexts(
                     &ctx,
-                    iteration,
                     &executable_indices,
                     &executable_calls,
                     &hook_contexts,
@@ -1325,7 +1324,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // post-execution handling and gets exactly one abandonment.
             call_prep::abandon_unexecuted_prepared_contexts(
                 &ctx,
-                iteration,
                 &executable_indices,
                 &executable_calls,
                 &hook_contexts,
