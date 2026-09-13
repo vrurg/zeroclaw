@@ -449,7 +449,7 @@ impl GoalExecutionSupervisor {
     /// Goal resumable with the durable `DaemonRestart` reason. The durable
     /// fence is committed before waiting, so the admitted operation may settle
     /// its own usage but cannot admit a successor. An operation that cannot
-    /// settle is classified fail-closed by [`Self::drain_lifecycle_fence`].
+    /// settle is classified fail-closed by the lifecycle-fence drain.
     ///
     /// This owns no transport policy. A process-level lifecycle coordinator
     /// chooses which supervisors must be paused before it tears down their

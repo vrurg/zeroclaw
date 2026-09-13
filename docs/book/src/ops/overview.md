@@ -9,6 +9,7 @@ This section covers:
 - [Service & daemon](./service.md): keeping the process alive
 - [Logs & observability](./observability.md): reading what the agent did
 - [Cost tracking](./cost-tracking.md): token spend and per-model cost
+- [Goal Mode](./goal-mode.md): experimental bounded foreground work
 - [Troubleshooting](./troubleshooting.md): when things break
 - [Network deployment](./network-deployment.md): exposing the gateway, tunnels, reverse proxies
 
