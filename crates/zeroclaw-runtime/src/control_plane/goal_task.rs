@@ -443,6 +443,22 @@ pub trait GoalTaskRegistry: Send + Sync {
         accounting_state: GoalAccountingState,
     ) -> anyhow::Result<GoalTransitionResult>;
 
+    /// Atomically classify an unsettled operation as outcome-unknown, clear
+    /// its exact fence, and terminalize the Goal when it is still executable.
+    /// A concurrently terminalized exact Goal keeps its terminal lifecycle
+    /// state while the matching operation marker is cleared for replacement
+    /// and disposal progress.
+    async fn resolve_unsettled_operation(
+        &self,
+        _task_id: &str,
+        _session_id: &str,
+        _expected_epoch: i64,
+        _admitted_epoch: i64,
+        _pending_call_id: &str,
+    ) -> anyhow::Result<GoalTransitionResult> {
+        anyhow::bail!("goal registry does not support unsettled operation resolution")
+    }
+
     /// Fence one executable tool batch for the exact running Goal epoch.
     /// This is independent of the provider-operation fence: a tool batch has
     /// no spend reservation, but it must be durably paired before resumption.

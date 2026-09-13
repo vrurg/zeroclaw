@@ -1,6 +1,6 @@
 # Background work lifecycle
 
-ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode defines a related target contract that is not yet wired end to end.
+ZeroClaw has several ways to continue work after the inbound request that started it. Cron jobs, SOP runs, delegated tasks, and runtime-spawned subagents share some execution machinery, but they do not share one lifecycle or one durable store. Goal mode is an experimental related control plane with its own durable lifecycle and foreground executor.
 
 Use this page when a change adds scheduled or autonomous work, introduces a wait or approval state, changes cancellation or restart behavior, or connects child work to an owning task. The first design question is not "how does it run in the background?" but "which subsystem owns its lifecycle?"
 
@@ -63,6 +63,8 @@ originating alias for reads and mutations.
 ## Goal-mode target contract
 
 [ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) anchors Goal Mode in the task control plane, which owns its lifecycle, ownership, route, principal, parent relation, and recovery eligibility. V1 admits explicit Matrix and ZeroCode commands through a trusted runtime gate, binds at most one Goal to a session, and supervises foreground execution through guarded task transitions.
+
+Matrix uses one process-local foreground lease per canonical conversation key for both Goal execution and ordinary turns. This prevents a newly admitted Goal from racing an already-running turn during configuration reload or lifecycle cutover. Consequently, ordinary Matrix turns in the same conversation wait for the active foreground turn even when Goal Mode is disabled; other conversations and other channels remain independent.
 
 A child path may participate in Goal Mode only when it preserves the owning Goal relationship and reports terminal state and model usage back to it. V1 permits only foreground `delegate` and `spawn_subagent` work; background, detached, parallel, and recursive Goal-owned child work remain excluded.
 

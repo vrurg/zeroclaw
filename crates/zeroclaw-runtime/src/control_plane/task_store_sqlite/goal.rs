@@ -1274,6 +1274,63 @@ impl GoalTaskRegistry for SqliteTaskStore {
         Ok(GoalTransitionResult::Applied)
     }
 
+    async fn resolve_unsettled_operation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+        admitted_epoch: i64,
+        pending_call_id: &str,
+    ) -> Result<GoalTransitionResult> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("start atomic Goal unsettled-operation resolution")?;
+        let cleared = tx.execute(
+            "UPDATE goal_tasks
+                SET pending_call_id = NULL, pending_call_epoch = NULL,
+                    accounting_state = 'outcome_unknown'
+              WHERE task_id = ?1
+                AND pending_call_id = ?5 AND pending_call_epoch = ?4
+                AND EXISTS (
+                    SELECT 1 FROM tasks
+                     WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
+                       AND (
+                           status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
+                           OR (status IN ('running', 'paused') AND execution_epoch = ?3)
+                       )
+                )",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                admitted_epoch,
+                pending_call_id,
+            ],
+        )?;
+        if cleared == 0 {
+            return transition_failure(&tx, task_id, session_id);
+        }
+        tx.execute(
+            "UPDATE tasks
+                SET status = 'failed', error = 'accounting_outcome_unknown',
+                    finished_at = COALESCE(finished_at, ?4),
+                    execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
+                        THEN execution_epoch + 1 ELSE execution_epoch END
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status IN ('running', 'paused') AND execution_epoch = ?3",
+            params![
+                task_id,
+                session_id,
+                expected_epoch,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.commit()
+            .context("commit atomic Goal unsettled-operation resolution")?;
+        Ok(GoalTransitionResult::Applied)
+    }
+
     async fn admit_pending_tool_batch(
         &self,
         task_id: &str,
