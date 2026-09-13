@@ -2520,12 +2520,13 @@ mod tests {
             .await
             .unwrap();
 
+        let error = accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap_err();
         assert!(
-            accountant
-                .admit(GoalOperationRequest::new("primary", "model"))
-                .await
-                .is_err(),
-            "a settled overshoot must stop the next logical operation"
+            error.to_string().contains("Goal budget is exhausted"),
+            "a settled overshoot must stop the next logical operation at the budget guard"
         );
         let task = store
             .current_goal_for_session(scope.session_id())
@@ -2574,11 +2575,14 @@ mod tests {
             scope,
         );
 
+        let error = second
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap_err();
         assert!(
-            second
-                .admit(GoalOperationRequest::new("primary", "model"))
-                .await
-                .is_err(),
+            error
+                .to_string()
+                .contains("Goal already has a pending operation"),
             "the durable pending slot must reject a second executor before it can see stale totals"
         );
     }
@@ -2588,11 +2592,14 @@ mod tests {
         let (store, accountant, scope, _directory) =
             accountant_fixture_with_limits(None, Some(1.0)).await;
 
+        let error = accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap_err();
         assert!(
-            accountant
-                .admit(GoalOperationRequest::new("primary", "model"))
-                .await
-                .is_err(),
+            error
+                .to_string()
+                .contains("Goal cost budget lacks complete pricing for the configured route"),
             "a cost-limited Goal must not admit a route whose price is unavailable"
         );
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();

@@ -129,6 +129,12 @@ pub(super) async fn submit_matrix_goal(
         original,
         command_lease,
     )?);
+    // Help is a local grammar response. Keep it available when the daemon has
+    // no active Goal control plane or its prospective Goal configuration is
+    // invalid, matching ZeroCode's pre-configuration Help behavior.
+    if matches!(command, zeroclaw_commands::goal::GoalCommand::Help) {
+        return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Help);
+    }
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
