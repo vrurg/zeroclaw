@@ -550,17 +550,29 @@ mod tests {
 
     #[test]
     fn every_goal_pause_reason_remains_readable_from_persisted_control_state() {
-        for (reason, wire_name) in [
-            (GoalPauseReason::OperatorPaused, "operator_paused"),
-            (GoalPauseReason::NeedsUserInput, "needs_user_input"),
-            (GoalPauseReason::HumanEscalation, "human_escalation"),
-            (GoalPauseReason::ExternalDependency, "external_dependency"),
-            (GoalPauseReason::ProviderUnavailable, "provider_unavailable"),
-            (GoalPauseReason::VerifierBlocked, "verifier_blocked"),
-            (GoalPauseReason::BudgetExhausted, "budget_exhausted"),
-            (GoalPauseReason::BudgetUnavailable, "budget_unavailable"),
-            (GoalPauseReason::DaemonRestart, "daemon_restarted"),
-        ] {
+        let reasons = [
+            GoalPauseReason::OperatorPaused,
+            GoalPauseReason::NeedsUserInput,
+            GoalPauseReason::HumanEscalation,
+            GoalPauseReason::ExternalDependency,
+            GoalPauseReason::ProviderUnavailable,
+            GoalPauseReason::VerifierBlocked,
+            GoalPauseReason::BudgetExhausted,
+            GoalPauseReason::BudgetUnavailable,
+            GoalPauseReason::DaemonRestart,
+        ];
+        for reason in reasons {
+            let wire_name = match reason {
+                GoalPauseReason::OperatorPaused => "operator_paused",
+                GoalPauseReason::NeedsUserInput => "needs_user_input",
+                GoalPauseReason::HumanEscalation => "human_escalation",
+                GoalPauseReason::ExternalDependency => "external_dependency",
+                GoalPauseReason::ProviderUnavailable => "provider_unavailable",
+                GoalPauseReason::VerifierBlocked => "verifier_blocked",
+                GoalPauseReason::BudgetExhausted => "budget_exhausted",
+                GoalPauseReason::BudgetUnavailable => "budget_unavailable",
+                GoalPauseReason::DaemonRestart => "daemon_restarted",
+            };
             let serialized = serde_json::to_string(&reason).unwrap();
             assert_eq!(serialized, format!("\"{wire_name}\""));
             let parsed: GoalPauseReason =
