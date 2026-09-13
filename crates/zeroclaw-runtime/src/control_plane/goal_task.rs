@@ -179,6 +179,8 @@ impl TaskGoal {
 /// Typed policy input for why a goal is paused.
 /// A pause reason is goal-specific explanation layered on top of
 /// [`TaskStatus::Paused`]. It must not be used as a second lifecycle enum.
+/// Values remain deserializable as durable Goal audit data even where the V1
+/// controller no longer creates that particular pause path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPauseReason {
@@ -544,6 +546,25 @@ mod tests {
 
         let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed, GoalPauseReason::OperatorPaused);
+    }
+
+    #[test]
+    fn every_goal_pause_reason_remains_readable_from_persisted_control_state() {
+        for reason in [
+            GoalPauseReason::OperatorPaused,
+            GoalPauseReason::NeedsUserInput,
+            GoalPauseReason::HumanEscalation,
+            GoalPauseReason::ExternalDependency,
+            GoalPauseReason::ProviderUnavailable,
+            GoalPauseReason::VerifierBlocked,
+            GoalPauseReason::BudgetExhausted,
+            GoalPauseReason::BudgetUnavailable,
+            GoalPauseReason::DaemonRestart,
+        ] {
+            let serialized = serde_json::to_string(&reason).unwrap();
+            let parsed: GoalPauseReason = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed, reason);
+        }
     }
 
     #[test]

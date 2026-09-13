@@ -275,6 +275,9 @@ pub(crate) trait GoalOperationAccounting: Send + Sync {
 }
 
 tokio::task_local! {
+    // A foreground child inherits this task-local scope. Re-scoping it around
+    // the child would let Goal-attributed usage escape its parent's durable
+    // task and operation fence.
     pub(crate) static GOAL_OPERATION_ACCOUNTING: Option<Arc<dyn GoalOperationAccounting>>;
 }
 
