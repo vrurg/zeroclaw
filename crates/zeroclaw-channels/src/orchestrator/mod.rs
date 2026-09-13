@@ -17113,6 +17113,25 @@ temperature = 0.3
         })
     }
 
+    #[tokio::test]
+    async fn matrix_goal_help_is_available_without_a_control_plane() {
+        // `/goal help` is local grammar, so it must remain available on the
+        // default disabled configuration without constructing a Goal runtime.
+        let response = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-help".to_owned(),
+            channel_message("matrix", Some("primary")),
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            zeroclaw_runtime::goal_mode::GoalResponse::Help
+        ));
+    }
+
     #[cfg(feature = "channel-webhook")]
     async fn receive_webhook_test_message(
         alias: &str,
