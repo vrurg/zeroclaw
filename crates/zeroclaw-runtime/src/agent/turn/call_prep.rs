@@ -22,6 +22,10 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
+    /// Contexts created by a successful before-hook phase, in the same order
+    /// as `executable_calls`. Terminal hook routing must preserve this fact:
+    /// a hook may rewrite a non-sensitive tool into a session-prompt tool.
+    pub(crate) hook_contexts: Vec<Option<ToolCallHookContext>>,
     /// Per-call immutable snapshot for draft start/completion events.
     pub(crate) stream_calls: Vec<Option<StreamToolCall>>,
 }
@@ -112,24 +116,33 @@ async fn abandon_prepared_context(ctx: &TurnCtx<'_>, context: &ToolCallHookConte
 /// operation.
 pub(crate) async fn abandon_unexecuted_prepared_contexts(
     ctx: &TurnCtx<'_>,
-    iteration: usize,
+    _iteration: usize,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
+    hook_contexts: &[Option<ToolCallHookContext>],
     completed: &[usize],
 ) {
     let Some(hooks) = ctx.hooks else {
         return;
     };
-    for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
+    for ((call_idx, call), hook_context) in executable_indices
+        .iter()
+        .zip(executable_calls.iter())
+        .zip(hook_contexts.iter())
+    {
         // Only calls whose before hook ran have a lifecycle context to abandon.
-        // Session-prompt tools deliberately bypass hooks because their attached
-        // content is not hook-visible; do not synthesize an orphaned callback
-        // when a batch aborts before post-execution handling.
-        if completed.contains(call_idx) || is_sensitive_session_prompt_tool(&call.name) {
+        // Do not reconstruct that state from the final tool name: a hook can
+        // rewrite an ordinary call into a session-prompt tool after entering
+        // the lifecycle. Other hook policies for prompt attachments remain
+        // deliberately out of scope until a separate architecture decision.
+        if completed.contains(call_idx) {
             continue;
         }
-        let context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *call_idx);
-        hooks.fire_tool_call_abandoned(&context, &call.name).await;
+        if let Some(hook_context) = hook_context {
+            hooks
+                .fire_tool_call_abandoned(hook_context, &call.name)
+                .await;
+        }
     }
 }
 
@@ -149,6 +162,7 @@ pub(crate) async fn prepare_tool_calls(
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+    let mut executable_hook_contexts: Vec<Option<ToolCallHookContext>> = Vec::new();
     let mut executable_stream_calls = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
     // Contexts whose before phase ran and that are still awaiting a terminal
@@ -407,6 +421,7 @@ pub(crate) async fn prepare_tool_calls(
 
         executable_indices.push(idx);
         executable_stream_calls.push(stream_call);
+        executable_hook_contexts.push(hook_context.clone());
         // From here the context's terminal operation is execution's
         // responsibility: the after hook on completion, or abandonment if the
         // execution phase aborts before post-execution handling.
@@ -433,6 +448,7 @@ pub(crate) async fn prepare_tool_calls(
         ordered_results,
         executable_indices,
         executable_calls,
+        hook_contexts: executable_hook_contexts,
         stream_calls: executable_stream_calls,
     })
 }
@@ -560,6 +576,7 @@ mod tests {
             &ctx,
             &prepared.executable_indices,
             &prepared.executable_calls,
+            &prepared.hook_contexts,
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
@@ -652,6 +669,10 @@ mod tests {
         cancel_before_for: Vec<String>,
     }
 
+    struct RewriteToSessionPromptRecorder {
+        observations: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
     #[async_trait]
     impl crate::hooks::HookHandler for LifecycleRecorder {
         fn name(&self) -> &str {
@@ -698,6 +719,39 @@ mod tests {
                 tool,
                 context.invocation_id()
             ));
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for RewriteToSessionPromptRecorder {
+        fn name(&self) -> &str {
+            "rewrite-to-session-prompt"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            _name: String,
+            _args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            crate::hooks::HookResult::Continue((
+                "session_prompt_set".to_string(),
+                serde_json::json!({"id": "task", "content": "private attachment"}),
+            ))
+        }
+
+        async fn on_after_tool_call_with_context_and_args(
+            &self,
+            _context: &zeroclaw_api::hook::ToolCallHookContext,
+            tool: &str,
+            args: &serde_json::Value,
+            result: &crate::tools::ToolResult,
+            _duration: Duration,
+        ) {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(format!("tool={tool};args={args};result={}", result.output));
         }
     }
 
@@ -788,12 +842,80 @@ mod tests {
             "call-1",
         )];
 
-        abandon_unexecuted_prepared_contexts(&ctx, 0, &[0], &calls, &[]).await;
+        abandon_unexecuted_prepared_contexts(&ctx, 0, &[0], &calls, &[None], &[]).await;
 
         assert!(
             events.lock().unwrap().is_empty(),
             "a session-prompt call bypasses the before hook, so batch abandonment must not synthesize an orphaned callback"
         );
+    }
+
+    #[tokio::test]
+    async fn rewritten_session_prompt_gets_a_terminal_hook_without_its_payload() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RewriteToSessionPromptRecorder {
+            observations: Arc::clone(&observations),
+        }));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        // This test isolates terminal-hook pairing. Dedicated prompt approval
+        // is exercised by approval-gate tests and would deny before execution
+        // without an interactive manager.
+        ctx.session_prompt_approval_required = false;
+        let calls = [parsed_call(
+            "ordinary_tool",
+            serde_json::json!({}),
+            "call-1",
+        )];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("the rewritten call remains executable");
+
+        assert!(prepared.hook_contexts[0].is_some());
+        assert_eq!(prepared.executable_calls[0].name, "session_prompt_set");
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.hook_contexts,
+            &prepared.stream_calls,
+            vec![ToolExecutionOutcome {
+                output: "private result".to_string(),
+                output_data: None,
+                success: true,
+                error_reason: None,
+                duration: Duration::ZERO,
+                receipt: None,
+            }],
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.len(),
+            1,
+            "the entered hook must terminate once"
+        );
+        assert!(observations[0].contains("tool=session_prompt_set"));
+        assert!(observations[0].contains("session_prompt_payload"));
+        assert!(!observations[0].contains("private attachment"));
+        assert!(!observations[0].contains("private result"));
     }
 
     #[tokio::test]
@@ -840,6 +962,7 @@ mod tests {
             &ctx,
             &prepared.executable_indices,
             &prepared.executable_calls,
+            &prepared.hook_contexts,
             &prepared.stream_calls,
             vec![ToolExecutionOutcome {
                 output: "ok".to_string(),
@@ -1211,8 +1334,19 @@ mod tests {
             parsed_call("kept", serde_json::json!({"k": 1}), "call-1"),
             parsed_call("lost", serde_json::json!({"l": 1}), "call-3"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 0, &[0, 2], &executable_calls, &[2])
-            .await;
+        let hook_contexts = vec![
+            Some(crate::hooks::tool_call_hook_context("test-turn", 0, 0)),
+            Some(crate::hooks::tool_call_hook_context("test-turn", 0, 2)),
+        ];
+        super::abandon_unexecuted_prepared_contexts(
+            &ctx,
+            0,
+            &[0, 2],
+            &executable_calls,
+            &hook_contexts,
+            &[2],
+        )
+        .await;
 
         assert_eq!(
             *events.lock().unwrap(),
@@ -1238,7 +1372,19 @@ mod tests {
             parsed_call("first", serde_json::json!({"n": 1}), "call-1"),
             parsed_call("second", serde_json::json!({"n": 2}), "call-2"),
         ];
-        super::abandon_unexecuted_prepared_contexts(&ctx, 3, &[0, 1], &executable_calls, &[]).await;
+        let hook_contexts = vec![
+            Some(crate::hooks::tool_call_hook_context("test-turn", 3, 0)),
+            Some(crate::hooks::tool_call_hook_context("test-turn", 3, 1)),
+        ];
+        super::abandon_unexecuted_prepared_contexts(
+            &ctx,
+            3,
+            &[0, 1],
+            &executable_calls,
+            &hook_contexts,
+            &[],
+        )
+        .await;
 
         assert_eq!(
             *events.lock().unwrap(),

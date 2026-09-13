@@ -166,11 +166,18 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 // turn. A reserved `[Tool results]` record remains private for
                 // legacy transport-escaped envelopes that may already be in
                 // retained history.
-                let accepted_text_call =
-                    !native_batch && session_prompt_accepted_tool_call_envelope(&message.content);
-                redact_text_protocol_result = accepted_text_call;
-                redact_malformed_text_protocol_result =
-                    is_sensitive_call && !native_batch && !accepted_text_call;
+                // A JSON-shaped envelope is not itself proof that the turn
+                // used native tools. Text fallback accepts the same envelope
+                // and stores its result as the reserved `[Tool results]`
+                // user message. The result record, not the envelope shape, is
+                // the authoritative execution-mode evidence at this export
+                // boundary. Keep a pending redaction for any sensitive call;
+                // it applies only to that reserved immediate result record, so
+                // ordinary user input remains intact after native calls.
+                redact_text_protocol_result = is_sensitive_call;
+                redact_malformed_text_protocol_result = is_sensitive_call
+                    && !native_batch
+                    && !session_prompt_accepted_tool_call_envelope(&message.content);
             } else if message.role == "user" {
                 redact_text_protocol_result = false;
                 redact_malformed_text_protocol_result = false;
@@ -2016,6 +2023,33 @@ mod tests {
         assert!(
             !redact_session_prompt_text_protocol_for_export(&messages[0].content).contains(marker)
         );
+    }
+
+    #[test]
+    fn export_copy_redacts_json_tool_calls_envelope_when_text_mode_records_a_user_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{"tool_calls":[{{"name":"session_prompt_list","arguments":{{"marker":"{marker}"}}}}]}}"#
+            )),
+            ChatMessage::user(format!(
+                "[Tool results]\\n<tool_result name=\"session_prompt_list\">{marker}</tool_result>"
+            )),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        assert!(session_prompt_native_tool_call_envelope(
+            &messages[0].content
+        ));
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+
+        assert!(
+            export[..2]
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "the text-mode result must follow its reserved history form, not the JSON envelope"
+        );
+        assert_eq!(export[2].content, "ordinary next-turn input");
     }
 
     #[test]

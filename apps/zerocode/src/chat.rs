@@ -41,9 +41,10 @@ use crate::text_selection::{
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
-// Height of the approval popup anchored to the bottom of the content area.
-// Used both in render_approval_overlay and to pad diffs so they aren't covered.
-const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
+// The approval body scrolls while its decision footer stays visible. Reserve
+// its largest supported footprint in the transcript so the full binding never
+// obscures conversation content beneath the modal.
+const APPROVAL_OVERLAY_MAX_HEIGHT: u16 = 16;
 
 /// How often the cwd line re-polls the daemon for the current git branch.
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -3475,6 +3476,24 @@ impl Chat {
                     }
                 }
             }
+            Some(
+                ChatTabAction::BrowseUp | ChatTabAction::BrowseUpVim | ChatTabAction::ScrollUp,
+            ) if state.pending_approval().is_some() => {
+                state.scroll_pending_approval(-1);
+            }
+            Some(
+                ChatTabAction::BrowseDown
+                | ChatTabAction::BrowseDownVim
+                | ChatTabAction::ScrollDown,
+            ) if state.pending_approval().is_some() => {
+                state.scroll_pending_approval(1);
+            }
+            Some(ChatTabAction::PageUp) if state.pending_approval().is_some() => {
+                state.scroll_pending_approval(-5);
+            }
+            Some(ChatTabAction::PageDown) if state.pending_approval().is_some() => {
+                state.scroll_pending_approval(5);
+            }
             Some(ChatTabAction::ApprovalApprove) if state.pending_approval().is_some() => {
                 if let Some(pa) = state.take_pending_approval() {
                     let _ = self
@@ -6216,13 +6235,13 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         None => return,
     };
 
-    // Anchor to the bottom of the given area.
+    // Anchor to the bottom of the given area. The action footer remains visible
+    // while a long exact approval binding scrolls in the body above it.
+    let max_height = area.height.saturating_sub(2).max(3);
+    let overlay_height = APPROVAL_OVERLAY_MAX_HEIGHT.min(max_height).max(3);
     let vert = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(APPROVAL_OVERLAY_HEIGHT),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(overlay_height)])
         .split(area);
     let overlay_area = Layout::default()
         .direction(Direction::Horizontal)
@@ -6259,24 +6278,40 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         "zc-chat-approval-title",
         &[("tool", &pa.tool_name), ("secs", &secs)],
     );
-    let text = if summary.is_empty() {
-        format!("{title}\n\n  {keys}")
-    } else {
-        format!("{title}\n\n  {summary}\n\n  {keys}")
-    };
-
     let fill = theme::fill_style();
-    let p = Paragraph::new(text)
-        .style(fill)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Approval Required ", theme::warn_style()))
-                .border_style(theme::approval_border_style())
-                .style(fill),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, overlay_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(" Approval Required ", theme::warn_style()))
+        .border_style(theme::approval_border_style())
+        .style(fill);
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+    let body_and_footer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let text = if summary.is_empty() {
+        title
+    } else {
+        format!("{title}\n\n{summary}")
+    };
+    let body_area = body_and_footer[0];
+    let max_scroll = Paragraph::new(text.clone())
+        .wrap(Wrap { trim: true })
+        .line_count(body_area.width.max(1))
+        .saturating_sub(body_area.height as usize) as u16;
+    f.render_widget(
+        Paragraph::new(text)
+            .style(fill)
+            .wrap(Wrap { trim: true })
+            .scroll((pa.scroll_offset.min(max_scroll), 0)),
+        body_area,
+    );
+    let scroll_hint = crate::i18n::t("zc-chat-approval-scroll-hint");
+    f.render_widget(
+        Paragraph::new(format!("↑/↓ {scroll_hint} · {keys}")).style(fill),
+        body_and_footer[1],
+    );
 }
 
 fn render_elicitation_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -7032,6 +7067,9 @@ pub struct PendingApproval {
     pub tool_name: String,
     pub arguments_summary: String,
     pub timeout_secs: u64,
+    /// Ephemeral viewport offset for the approval details. It is client-local:
+    /// the daemon owns the approval request and never needs presentation state.
+    pub scroll_offset: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -8248,7 +8286,7 @@ impl ChatState {
             ]));
         }
         if self.pending_approval.is_some() {
-            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+            for _ in 0..APPROVAL_OVERLAY_MAX_HEIGHT {
                 lines.push(Line::default());
             }
         }
@@ -8623,6 +8661,18 @@ impl ChatState {
         self.pending_approval.take()
     }
 
+    fn scroll_pending_approval(&mut self, delta: i16) {
+        let Some(approval) = self.pending_approval.as_mut() else {
+            return;
+        };
+        approval.scroll_offset = if delta.is_negative() {
+            approval.scroll_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            approval.scroll_offset.saturating_add(delta as u16)
+        };
+        self.mark_dirty_full();
+    }
+
     pub fn pending_elicitation(&self) -> Option<&PendingElicitation> {
         self.pending_elicitation.as_ref()
     }
@@ -8772,6 +8822,7 @@ impl ChatState {
                     tool_name,
                     arguments_summary,
                     timeout_secs,
+                    scroll_offset: 0,
                 });
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::WaitingForApproval;
@@ -11375,6 +11426,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         }
     }
 
@@ -11408,7 +11460,7 @@ mod tests {
             slice.len()
         );
         assert!(
-            local_scroll < height + APPROVAL_OVERLAY_HEIGHT,
+            local_scroll < height + APPROVAL_OVERLAY_MAX_HEIGHT,
             "local scroll ({local_scroll}) must land inside the visible window"
         );
     }
@@ -11558,7 +11610,7 @@ mod tests {
             "overlay-only history renders the overlay verbatim"
         );
         assert_eq!(local_scroll, 0);
-        assert!(total_rows >= APPROVAL_OVERLAY_HEIGHT);
+        assert!(total_rows >= APPROVAL_OVERLAY_MAX_HEIGHT);
     }
 
     #[test]
@@ -12678,6 +12730,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
         prior.pending_elicitation = Some(PendingElicitation {
             request_id: serde_json::json!("elicitation-r"),
@@ -12832,6 +12885,7 @@ mod tests {
             tool_name: "shell".into(),
             arguments_summary: "ls".into(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
         assert_eq!(
             s.sidebar_status(),
@@ -13058,6 +13112,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
         active.pending_elicitation = Some(PendingElicitation {
             request_id: serde_json::json!("elicitation-lag"),
@@ -15377,6 +15432,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
         chat.phase = ChatPhase::Active(Box::new(active));
         let approve = tokio::spawn(async move {
@@ -17007,6 +17063,70 @@ mod tests {
             cell.style().bg,
             Some(expected_bg),
             "approval overlay interior must use the active ZeroCode theme background"
+        );
+    }
+
+    #[test]
+    fn approval_overlay_scroll_is_ephemeral_and_bounded_at_zero() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "session_prompt_set".to_string(),
+            arguments_summary: "content_escaped: a long exact binding".to_string(),
+            timeout_secs: 30,
+        });
+
+        s.scroll_pending_approval(5);
+        assert_eq!(s.pending_approval().unwrap().scroll_offset, 5);
+        s.scroll_pending_approval(-9);
+        assert_eq!(
+            s.pending_approval().unwrap().scroll_offset,
+            0,
+            "scrolling above the first exact detail must clamp to its start"
+        );
+    }
+
+    #[test]
+    fn approval_overlay_renders_scrolled_exact_details_with_fixed_actions() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        let details = (0..28)
+            .map(|line| format!("exact detail line {line}"))
+            .chain(std::iter::once("BOTTOM_DETAILS_VISIBLE".to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "session_prompt_set".to_string(),
+            arguments_summary: details,
+            timeout_secs: 30,
+        });
+        s.scroll_pending_approval(24);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_approval_overlay(frame, &s, area))
+            .expect("draw scrolled approval overlay");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("BOTTOM_DETAILS_VISIBLE"),
+            "the terminal viewport must expose the tail of a long exact binding"
+        );
+        assert!(
+            rendered.contains("Enter=Allow"),
+            "approval actions must remain visible while details scroll"
         );
     }
 
@@ -20370,6 +20490,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
 
         chat.handle_paste(" must not reach the composer");
@@ -20523,6 +20644,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "pwd".to_string(),
             timeout_secs: 30,
+            scroll_offset: 0,
         });
         assert!(!chat.claims_pane_navigation(&word_left));
 

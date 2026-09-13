@@ -6,6 +6,7 @@ use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
+use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
@@ -16,14 +17,16 @@ pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
     executable_calls: &[ParsedToolCall],
+    hook_contexts: &[Option<ToolCallHookContext>],
     stream_calls: &[Option<StreamToolCall>],
     executed_outcomes: Vec<ToolExecutionOutcome>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
 ) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+    for ((((idx, call), hook_context), stream_call), outcome) in executable_indices
         .iter()
         .zip(executable_calls.iter())
+        .zip(hook_contexts.iter())
         .zip(stream_calls.iter())
         .zip(executed_outcomes)
     {
@@ -58,21 +61,38 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         // ── Hook: after_tool_call (void) ─────────────────
-        if !sensitive_session_prompt && let Some(hooks) = ctx.hooks {
-            let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *idx);
-            let tool_result_obj = crate::tools::ToolResult {
-                success: outcome.success,
-                output: outcome.output.clone().into(),
-                error: None,
+        if let (Some(hook_context), Some(hooks)) = (hook_context, ctx.hooks) {
+            // A session-prompt call that began as such never has a hook
+            // context. If a before hook rewrote an ordinary call into one, its
+            // already-entered lifecycle must still terminate, but the attached
+            // body and result remain outside hook visibility. A richer prompt
+            // hook policy would be a separate architecture decision; this V1
+            // projection intentionally carries only the final tool identity
+            // and completion status.
+            let (hook_args, tool_result_obj) = if sensitive_session_prompt {
+                (
+                    serde_json::json!({"session_prompt_payload": "omitted"}),
+                    crate::tools::ToolResult {
+                        success: outcome.success,
+                        output: "[Session-prompt tool result omitted for hook privacy]".into(),
+                        error: None,
+                    },
+                )
+            } else {
+                (
+                    call.arguments.clone(),
+                    crate::tools::ToolResult {
+                        success: outcome.success,
+                        output: outcome.output.clone().into(),
+                        error: None,
+                    },
+                )
             };
-            // The prepared arguments travel with the completion call so
-            // argument-auditing hooks export what was actually dispatched and
-            // never need to retain arguments between the hook phases.
             hooks
                 .fire_after_tool_call_with_context_and_args(
-                    &hook_context,
+                    hook_context,
                     &call.name,
-                    &call.arguments,
+                    &hook_args,
                     &tool_result_obj,
                     outcome.duration,
                 )

@@ -1204,6 +1204,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            hook_contexts,
             stream_calls,
         } = prepare_tool_calls(
             &ctx,
@@ -1273,6 +1274,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     iteration,
                     &executable_indices,
                     &executable_calls,
+                    &hook_contexts,
                     &[],
                 )
                 .await;
@@ -1284,18 +1286,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_hook_contexts = Vec::new();
         let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
-            executable_indices
-                .iter()
-                .copied()
-                .zip(executable_calls.iter())
-                .zip(stream_calls),
-        ) {
+        for (slot, (((call_idx, call), stream_call), hook_context)) in
+            executed_slots.into_iter().zip(
+                executable_indices
+                    .iter()
+                    .copied()
+                    .zip(executable_calls.iter())
+                    .zip(stream_calls)
+                    .zip(hook_contexts.iter()),
+            )
+        {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_hook_contexts.push(hook_context.clone());
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
@@ -1305,6 +1312,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_hook_contexts,
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
@@ -1320,6 +1328,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 iteration,
                 &executable_indices,
                 &executable_calls,
+                &hook_contexts,
                 &executed_completed_indices,
             )
             .await;
