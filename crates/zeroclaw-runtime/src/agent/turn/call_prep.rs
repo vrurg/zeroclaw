@@ -121,7 +121,11 @@ pub(crate) async fn abandon_unexecuted_prepared_contexts(
         return;
     };
     for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
-        if completed.contains(call_idx) {
+        // Only calls whose before hook ran have a lifecycle context to abandon.
+        // Session-prompt tools deliberately bypass hooks because their attached
+        // content is not hook-visible; do not synthesize an orphaned callback
+        // when a batch aborts before post-execution handling.
+        if completed.contains(call_idx) || is_sensitive_session_prompt_tool(&call.name) {
             continue;
         }
         let context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *call_idx);
@@ -184,13 +188,9 @@ pub(crate) async fn prepare_tool_calls(
                     abandon_prepared_context(ctx, hook_context, &tool_name).await;
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
                     let cancelled = format!("Cancelled by hook: {reason}");
-                    if !incoming_sensitive_session_prompt {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Cancel
-                            )
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
@@ -201,9 +201,8 @@ pub(crate) async fn prepare_tool_calls(
                                 "result": cancelled,
                                 "trace_id": ctx.turn_id,
                             })),
-                            "tool_call_result"
-                        );
-                    }
+                        "tool_call_result"
+                    );
                     if let Some(tx) = ctx.on_delta {
                         let _ = tx
                             .send(StreamDelta::Status(format!(
@@ -224,7 +223,7 @@ pub(crate) async fn prepare_tool_calls(
                     // Streaming consumers still see the call and its
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
                     // as the direct execution path always emitted.
-                    if !incoming_sensitive_session_prompt && let Some(tx) = ctx.event_tx {
+                    if let Some(tx) = ctx.event_tx {
                         emit_tool_call_pair(tx, call, &outcome).await;
                     }
                     ordered_results[idx] =
@@ -440,7 +439,7 @@ pub(crate) async fn prepare_tool_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedToolCalls, prepare_tool_calls};
+    use super::{PreparedToolCalls, abandon_unexecuted_prepared_contexts, prepare_tool_calls};
     use crate::agent::tool_execution::ToolExecutionOutcome;
     use crate::agent::turn::context::TurnCtx;
     use crate::agent::turn::post_exec::record_executed_outcomes;
@@ -768,6 +767,32 @@ mod tests {
                 "abandoned:guarded:test-turn:0:0".to_string(),
             ],
             "the cancelled context gets exactly one abandonment and never an after hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_abandonment_skips_session_prompt_without_a_hook_context() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runner = crate::hooks::HookRunner::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        let calls = [parsed_call(
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": "synthetic attachment"}),
+            "call-1",
+        )];
+
+        abandon_unexecuted_prepared_contexts(&ctx, 0, &[0], &calls, &[]).await;
+
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a session-prompt call bypasses the before hook, so batch abandonment must not synthesize an orphaned callback"
         );
     }
 
