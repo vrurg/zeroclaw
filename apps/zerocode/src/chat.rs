@@ -17140,8 +17140,8 @@ mod tests {
                 "the terminal viewport must expose the tail of a long exact binding at {width} columns"
             );
             assert!(
-                rendered.contains("↑/↓ scroll"),
-                "the translated scroll affordance must remain visible at {width} columns"
+                rendered.contains("↑/↓ scroll · Enter=Allow"),
+                "the current translated scroll affordance must remain visible at {width} columns"
             );
             assert!(
                 rendered.contains("Enter=Allow") && rendered.contains("Ctrl+D=Reject"),
