@@ -16,6 +16,11 @@ enabled configuration must declare both defaults and a verifier provider. Zero
 is an explicit unlimited value; omitting either default is an error, not a
 hidden product default.
 
+> **Warning:** A reload is a policy cutover, not a way to temporarily park
+> active Goals. Reloading a configuration that disables Goal Mode, or removes
+> or disables a Goal's owning agent or bound Matrix channel, durably cancels
+> that nonterminal Goal. Re-enabling the setting later cannot resume it.
+
 ```toml
 [goal]
 enabled = true
@@ -46,9 +51,11 @@ default_cost_limit_usd = 0.0
 model_provider = "openai.default"
 ```
 
-When a Goal has a finite cost limit, each currently eligible provider/model
-route must be priced before the next operation is admitted. Token-only and
-unlimited Goals can run without pricing, but still require usable token usage.
+When a Goal has a finite cost limit, the requested provider/model route and all
+prior recorded Goal usage must be priced before the next operation is admitted.
+An unpriced route reached later by ordinary provider failover is recorded and
+causes the following admission to fail. Token-only and unlimited Goals can run
+without pricing, but still require usable token usage.
 
 ## Commands
 
@@ -59,7 +66,8 @@ Use these commands in an existing Matrix conversation or zerocode session:
 /goal start --unlimited -- SUCCESS CRITERION
 /goal status
 /goal budget
-/goal budget set [--tokens N] [--cost-usd D]
+/goal budget set --tokens N [--cost-usd D]
+/goal budget set --cost-usd D [--tokens N]
 /goal budget set --unlimited
 /goal pause
 /goal resume
@@ -76,7 +84,8 @@ With no `start` flags, Goal Mode copies both configured defaults. Supplying a
 finite flag replaces both defaults: an omitted dimension becomes unlimited.
 `budget set` follows the same replacement rule. `--unlimited` cannot be mixed
 with finite flags. Token limits must be positive integers and cost limits must
-be finite positive values.
+be finite positive values. Unlike `start`, `budget set` has no defaults-copying
+form: it requires a finite selector or `--unlimited`.
 
 `/goal help` is local grammar help and remains available while Goal Mode is
 disabled. Other commands report that the feature is disabled until the complete
@@ -101,11 +110,15 @@ terminal audit record while the session still exists. Closing, deleting,
 killing, or truly replacing a session fences and disposes its Goal control
 state; the canonical usage ledger remains intact.
 
-On daemon restart or reload, settled running Goals pause and require an
-explicit resume. Goal Mode does not transfer an in-progress executor. If an
-operation was still unsettled, the Goal fails closed as outcome-unknown and is
-never replayed. Resuming can therefore repeat externally visible side effects;
-use it only when that is acceptable.
+On daemon restart, settled running Goals pause and require an explicit resume.
+A reload first re-evaluates Goal policy. A reload that revokes a Goal, for
+example by disabling Goal Mode or removing or disabling its owning agent or
+bound Matrix channel, durably cancels that Goal; later re-enablement cannot
+resume it. A reload that retains authorization pauses settled running Goals in
+the same way as restart. Goal Mode does not transfer an in-progress executor.
+If an operation was still unsettled, the Goal fails closed as outcome-unknown
+and is never replayed. Resuming can therefore repeat externally visible side
+effects; use it only when that is acceptable.
 
 ## Budget and accounting
 
