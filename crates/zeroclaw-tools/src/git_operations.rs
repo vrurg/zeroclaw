@@ -771,6 +771,8 @@ impl GitOperationsTool {
                 config.parent().unwrap_or_else(|| Path::new(".")),
             ))
             .stdin(std::process::Stdio::null());
+        // `git config --file` parses only the named configuration file; it
+        // does not access the object database and cannot trigger transport.
         Self::configure_git_base_environment(&mut command);
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         let output = command.output()?;
@@ -960,7 +962,8 @@ impl GitOperationsTool {
     /// mailmap resolution. Together with the fixed raw author placeholders in
     /// `git_log`, that prevents Git from reading `.mailmap` or `mailmap.file`.
     /// `diff` also disables its external-diff, text-conversion, and nested
-    /// submodule-diff paths at the call site below.
+    /// submodule-diff paths at the call site below. Missing promisor objects
+    /// fail closed instead of triggering transport.
     async fn run_git_read_command(
         &self,
         args: &[&str],
@@ -1078,6 +1081,15 @@ impl GitOperationsTool {
         // from an empty Git-specific environment and add back only the fixed,
         // non-interactive values this invocation needs below.
         Self::configure_git_base_environment(command);
+        if !requires_write_access {
+            // `GIT_ALLOW_PROTOCOL` is supported by Git versions that support
+            // partial clones and rejects every transport before Git can invoke
+            // repository-configured SSH. Newer Git versions additionally avoid
+            // reaching the lazy-fetch path at all.
+            command
+                .env("GIT_ALLOW_PROTOCOL", "")
+                .env("GIT_NO_LAZY_FETCH", "1");
+        }
         if self.security.workspace_only {
             let authorized_roots = if requires_write_access {
                 self.security.approved_write_roots(working_dir)
@@ -2409,6 +2421,28 @@ mod tests {
                 .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == Some("0".as_ref())),
             "Git must remain non-interactive"
         );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_ALLOW_PROTOCOL" && value == Some("".as_ref())),
+            "read commands must prohibit all Git transports"
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_NO_LAZY_FETCH" && value == Some("1".as_ref())),
+            "read commands must disable implicit promisor-object fetches"
+        );
+
+        let mut write_command = std::process::Command::new("git");
+        tool.configure_git_environment(&mut write_command, &resolved_tmp, true)
+            .unwrap();
+        for name in ["GIT_ALLOW_PROTOCOL", "GIT_NO_LAZY_FETCH"] {
+            assert!(
+                !write_command.get_envs().any(|(key, _)| key == name),
+                "write commands must not inherit the read-only transport guard: {name}"
+            );
+        }
     }
 
     #[test]
@@ -4718,6 +4752,114 @@ mod tests {
                 "read-only Git commands must not execute repository clean filters"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_read_diff_does_not_lazy_fetch_missing_promisor_objects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TempDir::new().unwrap();
+        let read_only_root = TempDir::new().unwrap();
+        bootstrap_repo(read_only_root.path(), &["tracked.txt"]).await;
+
+        let blob = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD:tracked.txt"])
+            .current_dir(read_only_root.path())
+            .output()
+            .unwrap();
+        assert!(blob.status.success(), "test repository setup must succeed");
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        let blob = blob.trim();
+        let object_path = read_only_root
+            .path()
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(object_path.is_file(), "test blob must be a loose object");
+
+        let marker = workspace.path().join("promisor-transport-ran");
+        let ssh_command = workspace.path().join("marker-ssh-command");
+        std::fs::write(
+            &ssh_command,
+            format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh_command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for args in [
+            [
+                "remote",
+                "add",
+                "origin",
+                "ssh://example.invalid/repository",
+            ]
+            .as_slice(),
+            ["config", "remote.origin.promisor", "true"].as_slice(),
+            ["config", "extensions.partialClone", "origin"].as_slice(),
+            ["config", "core.sshCommand", ssh_command.to_str().unwrap()].as_slice(),
+            ["config", "protocol.allow", "always"].as_slice(),
+            ["config", "protocol.ssh.allow", "always"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(read_only_root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "test repository setup must succeed");
+        }
+        std::fs::remove_file(&object_path).unwrap();
+        std::fs::write(read_only_root.path().join("tracked.txt"), "changed").unwrap();
+
+        let mut unguarded_transport = std::process::Command::new("git");
+        GitOperationsTool::configure_git_base_environment(&mut unguarded_transport);
+        let unguarded_transport = unguarded_transport
+            .args(["diff"])
+            .current_dir(read_only_root.path())
+            .output()
+            .unwrap();
+        assert!(
+            !unguarded_transport.status.success(),
+            "the marker SSH command exits unsuccessfully"
+        );
+        assert!(
+            marker.exists(),
+            "the unguarded fixture must reach the promisor SSH command"
+        );
+        std::fs::remove_file(&marker).unwrap();
+
+        let mut transport_denied = std::process::Command::new("git");
+        GitOperationsTool::configure_git_base_environment(&mut transport_denied);
+        let transport_denied = transport_denied
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .args(["diff"])
+            .current_dir(read_only_root.path())
+            .output()
+            .unwrap();
+        assert!(
+            !transport_denied.status.success(),
+            "missing promisor object must not produce a diff"
+        );
+        assert!(
+            !marker.exists(),
+            "transport denial must prevent the promisor SSH command from running"
+        );
+
+        let tool =
+            test_tool_with_read_only_root(workspace.path(), read_only_root.path().to_path_buf());
+        let error = tool
+            .execute(json!({"operation": "diff", "path": read_only_root.path()}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains(blob),
+            "read diff must fail because the promised object is unavailable: {error:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "read-only diff must not launch promisor transport"
+        );
     }
 
     #[cfg(unix)]
