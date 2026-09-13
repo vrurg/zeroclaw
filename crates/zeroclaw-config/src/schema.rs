@@ -463,8 +463,7 @@ pub struct Config {
     #[group = "Operations"]
     pub cost: CostConfig,
 
-    /// Experimental Goal Mode admission inputs (`[goal]`). This stage only
-    /// stores and validates the configuration; runtime admission is deferred.
+    /// Experimental, default-closed Goal Mode admission inputs (`[goal]`).
     #[serde(default)]
     #[nested]
     #[group = "Agent"]

@@ -5,8 +5,8 @@
 //! session driver with the typed ingress it derived before mutable hooks or
 //! prompt handling. The host owns typed admission, the controller owns
 //! guarded durable lifecycle transitions, and the execution engine accounts
-//! through the ordinary provider path behind those boundaries. Transport
-//! adapters remain later-stage work.
+//! through the ordinary provider path behind those boundaries. Matrix and
+//! ZeroCode adapters supply the trusted drivers used by this module.
 
 use std::{future::Future, sync::Arc};
 
@@ -274,7 +274,7 @@ pub trait GoalSessionDriver: Send + Sync {
 
 /// Controller-owned facts carried for one fenced Goal execution epoch.
 ///
-/// The host validates the session binding only. The later executor performs
+/// The host validates the session binding only. The execution engine performs
 /// the durable task and epoch fence before it asks a driver for this lease.
 #[derive(Debug, Clone)]
 pub struct GoalExecutionScope {
@@ -438,7 +438,7 @@ pub enum GoalExecutionNotice {
 
 /// Surface-owned foreground execution bridge. It retains the live-session
 /// guard and one foreground slot for its lifetime, but has no lifecycle or
-/// ledger authority; the later executor owns both around these calls.
+/// ledger authority; the execution engine owns both around these calls.
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
@@ -572,7 +572,8 @@ impl GoalExecutionHost {
     /// Validate a typed command against the exact trusted driver supplied by
     /// the caller. It does not mutate lifecycle state or start model work;
     /// [`GoalController`] consumes the returned submission for durable
-    /// transitions, while execution and accounting remain later-stage work.
+    /// transitions. Later execution reuses the retained exact driver and
+    /// durable scope rather than resolving authority from route text.
     pub async fn submit(
         &self,
         ingress: GoalIngressContext,
@@ -950,7 +951,8 @@ impl GoalStatusProjection {
                 .collect(),
             resumable: task.status == TaskStatus::Paused
                 && goal.accounting_state == GoalAccountingState::Complete
-                && goal.pending_call_id.is_none(),
+                && goal.pending_call_id.is_none()
+                && goal.pending_tool_batch_id.is_none(),
         }
     }
 }
@@ -1393,6 +1395,40 @@ mod tests {
         assert_eq!(
             projection.blocker_messages,
             ["Which environment should receive the change?"]
+        );
+    }
+
+    #[test]
+    fn goal_status_projection_does_not_offer_resume_with_a_dirty_tool_batch() {
+        let task = TaskRecord {
+            id: "goal-dirty-pause".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            pending_tool_batch_id: Some("unpaired-batch".to_owned()),
+            pending_tool_epoch: Some(1),
+            ..GoalTaskRecord::default()
+        };
+
+        assert!(
+            !GoalStatusProjection::from_parts(&task, &goal).resumable,
+            "the status response must not advertise a transition storage rejects"
         );
     }
 

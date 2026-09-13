@@ -267,7 +267,7 @@ impl GoalOperationSettlement {
 ///
 /// It has no provider construction or retry controls. A Goal executor scopes
 /// an implementation around a normal turn; every model-call boundary then
-/// performs guarded admission and settles the immutable #10144 attempt report.
+/// performs guarded admission and settles the immutable attempt report.
 #[async_trait::async_trait]
 pub(crate) trait GoalOperationAccounting: Send + Sync {
     async fn admit(&self, request: GoalOperationRequest) -> anyhow::Result<()>;
@@ -359,7 +359,7 @@ fn goal_operation_settlement(
 
 /// Resolve the configured rate map for an immutable actual provider/model
 /// attribution. Goal execution consumes this same resolver when it persists
-/// #10144 attempt reports, so configured model aliases cannot drift between
+/// attempt reports, so configured model aliases cannot drift between
 /// ordinary and Goal-scoped accounting.
 pub(crate) fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
     let try_lookup = |key: &str| -> ModelRates {

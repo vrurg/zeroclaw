@@ -1,4 +1,4 @@
-//! Dormant Goal Mode configuration. Runtime admission is introduced later.
+//! Experimental, default-closed Goal Mode configuration.
 
 use serde::{Deserialize, Serialize};
 use zeroclaw_macros::Configurable;

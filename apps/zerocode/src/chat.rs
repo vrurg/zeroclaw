@@ -10073,6 +10073,14 @@ mod tests {
         assert!(goal_response_message(&response).contains("pause reason: none"));
     }
 
+    #[test]
+    fn no_current_goal_response_uses_the_user_facing_message() {
+        assert_eq!(
+            goal_response_message(&crate::wire::GoalResponse::NoCurrentGoal),
+            "No current goal."
+        );
+    }
+
     fn draw_todo_close(chat: &mut Chat) -> Rect {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();

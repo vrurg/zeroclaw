@@ -1031,7 +1031,7 @@ impl GoalExecutionEngine {
             // That call is allowed to settle its already-incurred usage, but
             // its result must never admit a new parent or verifier operation.
             self.exact_running_task(scope).await?;
-            let parent = match lease
+            let parent_result = lease
                 .run_parent_turn(
                     &operation,
                     GoalParentTurn {
@@ -1040,16 +1040,13 @@ impl GoalExecutionEngine {
                         working_history: std::mem::take(&mut working_history),
                     },
                 )
-                .await
-            {
-                Ok(parent) => {
-                    self.require_complete_accounting(scope).await?;
-                    if !parent.candidate.trim().is_empty() {
-                        parent
-                    } else {
-                        self.fail(scope, "candidate_empty").await?;
-                        bail!("Goal parent returned an empty candidate");
-                    }
+                .await;
+            self.require_complete_accounting(scope).await?;
+            let parent = match parent_result {
+                Ok(parent) if !parent.candidate.trim().is_empty() => parent,
+                Ok(_) => {
+                    self.fail(scope, "candidate_empty").await?;
+                    bail!("Goal parent returned an empty candidate");
                 }
                 Err(error) => {
                     self.fail(scope, "parent_operation_failed").await?;
@@ -1064,7 +1061,7 @@ impl GoalExecutionEngine {
             // a drained parent result cannot start a second model operation.
             self.exact_running_task(scope).await?;
 
-            let verifier = match lease
+            let verifier_result = lease
                 .run_verifier(
                     &operation,
                     GoalVerifierTurn {
@@ -1072,12 +1069,10 @@ impl GoalExecutionEngine {
                         candidate: candidate.clone(),
                     },
                 )
-                .await
-            {
-                Ok(response) => {
-                    self.require_complete_accounting(scope).await?;
-                    response
-                }
+                .await;
+            self.require_complete_accounting(scope).await?;
+            let verifier = match verifier_result {
+                Ok(response) => response,
                 Err(error) => {
                     self.fail(scope, "verifier_operation_failed").await?;
                     return Err(error).context("Goal verifier operation failed");
