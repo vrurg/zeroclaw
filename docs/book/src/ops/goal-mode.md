@@ -59,7 +59,8 @@ without pricing, but still require usable token usage.
 
 ## Commands
 
-Use these commands in an existing Matrix conversation or zerocode session:
+Use these commands in an existing Matrix conversation or a zerocode Chat
+session. Goal Mode is unavailable for zerocode ACP sessions:
 
 ```text
 /goal start [--tokens N] [--cost-usd D] -- SUCCESS CRITERION
@@ -78,7 +79,8 @@ Use these commands in an existing Matrix conversation or zerocode session:
 The `--` delimiter is required. The text after it is the declared success
 criterion, not an additional authority source or a task identifier. ZeroClaw
 injects that exact criterion into the Goal parent prompt and presents it to the
-verifier with the exact candidate response. It is not editable after start.
+verifier with the exact candidate response. It is not editable after start and
+is limited to 4096 characters.
 
 With no `start` flags, Goal Mode copies both configured defaults. Supplying a
 finite flag replaces both defaults: an omitted dimension becomes unlimited.
@@ -86,6 +88,8 @@ finite flag replaces both defaults: an omitted dimension becomes unlimited.
 with finite flags. Token limits must be positive integers and cost limits must
 be finite positive values. Unlike `start`, `budget set` has no defaults-copying
 form: it requires a finite selector or `--unlimited`.
+Flags use a separate value (`--tokens 1000`), not an equals form such as
+`--tokens=1000`.
 
 `/goal help` is local grammar help and remains available while Goal Mode is
 disabled. Other commands report that the feature is disabled until the complete
@@ -124,9 +128,11 @@ effects; use it only when that is acceptable.
 
 Budgets are admission limits, not hard spend ceilings. One already-admitted
 logical operation can cross a finite limit; no later operation is admitted once
-known usage reaches it. Status and budget output derive their totals and
-remaining values from the canonical JSONL cost ledger rather than a separate
-Goal counter.
+known usage reaches it. Status and budget output report effective limits,
+accounting state, resumability, and pause or blocker detail. The controller
+derives usage from the canonical JSONL cost ledger for admission decisions;
+use [Cost tracking](./cost-tracking.md) to inspect recorded spend rather than
+expecting consumed or remaining values in a Goal response.
 
 Each Goal-owned parent, verifier, or foreground-child operation is serialized.
 The normal provider path may retry, route, fail over, or recover a stream, but
@@ -137,8 +143,8 @@ operation settles.
 Missing, invalid, uncertain, or insufficiently attributed usage is not treated
 as zero. The Goal fails and admits no further Goal-owned model call. A finite
 cost limit also fails if pricing cannot be established. This conservative rule
-is intentional: the displayed known usage is only a lower bound after an
-accounting failure.
+is intentional: recorded known usage is only a lower bound after an accounting
+failure.
 
 ## Children, tools, and surfaces
 
