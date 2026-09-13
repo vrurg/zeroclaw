@@ -136,7 +136,6 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
     // turn input and must not be swallowed by export redaction.
     let mut redact_native_tool_results = false;
     let mut redact_text_protocol_result = false;
-    let mut redact_malformed_text_protocol_result = false;
 
     messages
         .iter()
@@ -149,8 +148,7 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 is_text_protocol_result && message.content.starts_with("[Tool results]");
             let redact = is_sensitive_call
                 || (redact_native_tool_results && is_native_result)
-                || (redact_text_protocol_result && is_text_protocol_result)
-                || (redact_malformed_text_protocol_result && has_text_protocol_result_prefix);
+                || (redact_text_protocol_result && has_text_protocol_result_prefix);
 
             if message.role == "assistant" {
                 // The runtime parser accepts both native JSON envelopes and
@@ -161,26 +159,17 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 // than a substring so export copies follow execution semantics.
                 let native_batch = session_prompt_native_tool_call_envelope(&message.content);
                 redact_native_tool_results = is_sensitive_call && native_batch;
-                // A malformed envelope is withheld itself, but it is never
-                // executed and therefore cannot have a following arbitrary user
-                // turn. A reserved `[Tool results]` record remains private for
-                // legacy transport-escaped envelopes that may already be in
-                // retained history.
                 // A JSON-shaped envelope is not itself proof that the turn
                 // used native tools. Text fallback accepts the same envelope
                 // and stores its result as the reserved `[Tool results]`
                 // user message. The result record, not the envelope shape, is
                 // the authoritative execution-mode evidence at this export
-                // boundary. Keep a pending redaction for any sensitive call;
-                // it applies only to that reserved immediate result record, so
-                // ordinary user input remains intact after native calls.
+                // boundary. The pending state is consumed only by that
+                // reserved immediate record, never an ordinary user turn
+                // following a native tool result.
                 redact_text_protocol_result = is_sensitive_call;
-                redact_malformed_text_protocol_result = is_sensitive_call
-                    && !native_batch
-                    && !session_prompt_accepted_tool_call_envelope(&message.content);
             } else if message.role == "user" {
                 redact_text_protocol_result = false;
-                redact_malformed_text_protocol_result = false;
             }
 
             if redact {

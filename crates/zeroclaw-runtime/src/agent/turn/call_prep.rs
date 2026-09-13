@@ -851,6 +851,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_session_prompt_call_never_enters_the_hook_lifecycle() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let mut runner = crate::hooks::HookRunner::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let mut ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        ctx.session_prompt_approval_required = false;
+        let calls = [parsed_call(
+            "session_prompt_set",
+            serde_json::json!({"id": "task", "content": "synthetic attachment"}),
+            "call-1",
+        )];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("session-prompt preparation completes");
+
+        assert!(prepared.hook_contexts[0].is_none());
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "direct session-prompt tools must not expose their lifecycle or payload to hooks"
+        );
+    }
+
+    #[tokio::test]
     async fn rewritten_session_prompt_gets_a_terminal_hook_without_its_payload() {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();

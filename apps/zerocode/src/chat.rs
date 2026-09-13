@@ -6264,6 +6264,8 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     } else {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}")
     };
+    let scroll_hint = crate::i18n::t("zc-chat-approval-scroll-hint");
+    let footer = format!("↑/↓ {scroll_hint} · {keys}");
 
     // For file_edit/file_write, strip the bulk content fields — the diff
     // preview in the conversation already shows old/new content.
@@ -6286,9 +6288,15 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         .style(fill);
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
+    // The footer is fixed, but it must still wrap on narrow terminals so every
+    // approval action remains visible rather than clipping the reject affordance.
+    let footer_height = Paragraph::new(footer.as_str())
+        .wrap(Wrap { trim: true })
+        .line_count(inner.width.max(1))
+        .clamp(1, overlay_height.saturating_sub(1) as usize) as u16;
     let body_and_footer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(inner);
     let text = if summary.is_empty() {
         title
@@ -6307,9 +6315,8 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
             .scroll((pa.scroll_offset.min(max_scroll), 0)),
         body_area,
     );
-    let scroll_hint = crate::i18n::t("zc-chat-approval-scroll-hint");
     f.render_widget(
-        Paragraph::new(format!("↑/↓ {scroll_hint} · {keys}")).style(fill),
+        Paragraph::new(footer).style(fill).wrap(Wrap { trim: true }),
         body_and_footer[1],
     );
 }
@@ -17106,28 +17113,34 @@ mod tests {
         });
         s.scroll_pending_approval(24);
 
-        let area = Rect::new(0, 0, 100, 30);
-        let backend = TestBackend::new(area.width, area.height);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        terminal
-            .draw(|frame| render_approval_overlay(frame, &s, area))
-            .expect("draw scrolled approval overlay");
+        for width in [60, 80, 100] {
+            let area = Rect::new(0, 0, width, 30);
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render_approval_overlay(frame, &s, area))
+                .expect("draw scrolled approval overlay");
 
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(
-            rendered.contains("BOTTOM_DETAILS_VISIBLE"),
-            "the terminal viewport must expose the tail of a long exact binding"
-        );
-        assert!(
-            rendered.contains("Enter=Allow"),
-            "approval actions must remain visible while details scroll"
-        );
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                rendered.contains("BOTTOM_DETAILS_VISIBLE"),
+                "the terminal viewport must expose the tail of a long exact binding at {width} columns"
+            );
+            assert!(
+                rendered.contains("↑/↓ scroll"),
+                "the translated scroll affordance must remain visible at {width} columns"
+            );
+            assert!(
+                rendered.contains("Enter=Allow") && rendered.contains("Ctrl+D=Reject"),
+                "all approval actions must remain visible while details scroll at {width} columns"
+            );
+        }
     }
 
     #[test]
