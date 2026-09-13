@@ -520,6 +520,7 @@ impl GoalOperationAccounting for GoalOperationAccountant {
                         input_tokens: Some(1),
                         output_tokens: Some(1),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     },
                 ))
         {
@@ -763,6 +764,7 @@ mod tests {
             input_tokens: Some(input),
             output_tokens: Some(output),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         }
     }
 
