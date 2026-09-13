@@ -2625,6 +2625,14 @@ impl RpcDispatcher {
             let prompts = match prompts {
                 Ok(prompts) => prompts,
                 Err(error) => {
+                    // The durable Chat row was marked running before prompt
+                    // loading so status surfaces see the whole turn. This
+                    // early failure bypasses `execute_turn`, whose terminal
+                    // handling normally clears that state; leave no stale
+                    // active turn behind after notifying the client.
+                    if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                        let _ = backend.set_session_state(&session_key, "error", None);
+                    }
                     self.emit_turn_complete(
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
@@ -13760,6 +13768,56 @@ mod tests {
 
     #[tokio::test]
     async fn session_prompt_attachment_load_failure_emits_turn_complete_failed() {
+        struct PromptLoadFailingBackend {
+            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend,
+        }
+
+        impl zeroclaw_infra::session_backend::SessionBackend for PromptLoadFailingBackend {
+            fn list_session_prompts(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Vec<zeroclaw_infra::session_prompts::SessionPrompt>> {
+                Err(std::io::Error::other("injected prompt-load failure"))
+            }
+
+            fn load(&self, session_key: &str) -> Vec<zeroclaw_api::model_provider::ChatMessage> {
+                self.inner.load(session_key)
+            }
+
+            fn append(
+                &self,
+                session_key: &str,
+                message: &zeroclaw_api::model_provider::ChatMessage,
+            ) -> std::io::Result<()> {
+                self.inner.append(session_key, message)
+            }
+
+            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                self.inner.remove_last(session_key)
+            }
+
+            fn list_sessions(&self) -> Vec<String> {
+                self.inner.list_sessions()
+            }
+
+            fn set_session_state(
+                &self,
+                session_key: &str,
+                state: &str,
+                turn_id: Option<&str>,
+            ) -> std::io::Result<()> {
+                self.inner.set_session_state(session_key, state, turn_id)
+            }
+
+            fn get_session_state(
+                &self,
+                session_key: &str,
+            ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionState>>
+            {
+                self.inner.get_session_state(session_key)
+            }
+        }
+
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = make_acp_test_config(&tmp);
         config.channels.session_prompts_enabled = true;
@@ -13768,10 +13826,13 @@ mod tests {
             4, 10, 60,
         ));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
-        // The JSONL backend deliberately does not implement prompt attachments,
-        // giving this test a deterministic load failure before provider work.
-        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
-            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        // Keep real SQLite state tracking while making attachment loading fail
+        // deterministically before provider work.
+        let backend = Arc::new(PromptLoadFailingBackend {
+            inner: zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        });
+        let backend_for_assertion = Arc::clone(&backend);
+        let backend: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> = backend;
         let ctx =
             RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -13783,6 +13844,13 @@ mod tests {
             }))
             .await
             .expect("session/new should succeed");
+        backend_for_assertion
+            .inner
+            .append(
+                "rpc_prompt-load-failure",
+                &zeroclaw_api::model_provider::ChatMessage::user("existing durable history"),
+            )
+            .expect("fixture must create the durable Chat row whose state is tracked");
 
         let result = dispatcher
             .handle_session_prompt(&json!({
@@ -13798,6 +13866,15 @@ mod tests {
         assert_eq!(notification["method"], notification::SESSION_UPDATE);
         assert_eq!(notification["params"]["session_id"], "prompt-load-failure");
         assert_eq!(notification["params"]["outcome"], "failed");
+        let state = backend_for_assertion
+            .get_session_state("rpc_prompt-load-failure")
+            .unwrap()
+            .expect("the durable Chat row should remain available");
+        assert_eq!(state.state, "error");
+        assert!(
+            state.turn_id.is_none(),
+            "a prompt-load failure must clear its durable running turn id"
+        );
     }
 
     #[tokio::test]
@@ -14872,6 +14949,171 @@ mod tests {
             .set_session_agent_alias(&session_key, "test-agent")
             .unwrap();
         session_key
+    }
+
+    /// A real dispatcher-path provider that records each composed request and
+    /// returns a scripted XML tool call followed by terminal responses.
+    struct PromptAttachmentRpcProvider {
+        requests: Arc<std::sync::Mutex<Vec<Vec<zeroclaw_api::model_provider::ChatMessage>>>>,
+        responses: std::sync::Mutex<Vec<zeroclaw_providers::ChatResponse>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PromptAttachmentRpcProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PromptAttachmentRpcProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "prompt-attachment-rpc-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_chat_session_prompt_mutation_is_persisted_and_injected_on_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = PromptAttachmentRpcProvider {
+            requests: Arc::clone(&requests),
+            responses: std::sync::Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some(
+                        r#"<tool_call>
+{"name":"session_prompt_set","arguments":{"id":"task","content":"persisted RPC marker"}}
+</tool_call>"#
+                            .into(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("first turn complete".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("second turn complete".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        };
+        let agent_config = zeroclaw_config::schema::Config {
+            session_prompt_approval: zeroclaw_config::schema::SessionPromptApproval::Disabled,
+            ..Default::default()
+        };
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(crate::tools::SessionPromptSetTool::new(Arc::new(
+                    zeroclaw_config::policy::SecurityPolicy::default(),
+                )))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::XmlToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
+                config: Some(Arc::new(agent_config)),
+            })
+            .build()
+            .expect("test agent should build");
+
+        let sid = "rpc-prompt-attachment-mutation";
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let session_key = format!("rpc_{sid}");
+        backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.session_prompts_enabled = true;
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc-prompt:pid=1".into());
+
+        dispatcher
+            .handle_session_prompt(&json!({"session_id": sid, "prompt": "first turn"}))
+            .await
+            .expect("the dispatcher must complete the mutation turn");
+        let prompts = backend.list_session_prompts(&session_key).unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].id, "task");
+        assert_eq!(prompts[0].content, "persisted RPC marker");
+
+        dispatcher
+            .handle_session_prompt(&json!({"session_id": sid, "prompt": "second turn"}))
+            .await
+            .expect("the dispatcher must complete the follow-up turn");
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "two calls for the tool turn, one for the follow-up"
+        );
+        assert!(
+            requests[2]
+                .iter()
+                .filter(|message| message.role == "system")
+                .any(|message| message.content.contains("persisted RPC marker")),
+            "the next top-level RPC Chat turn must inject the attachment into provider context"
+        );
     }
 
     #[tokio::test]
