@@ -114,6 +114,9 @@ terminal audit record while the session still exists. Closing, deleting,
 killing, or truly replacing a session fences and disposes its Goal control
 state; the canonical usage ledger remains intact.
 
+If the admitted operation cannot settle while pausing, Goal Mode fails it
+closed as outcome-unknown instead of leaving a resumable paused Goal.
+
 On daemon restart, settled running Goals pause and require an explicit resume.
 A reload first re-evaluates Goal policy. A reload that revokes a Goal, for
 example by disabling Goal Mode or removing or disabling its owning agent or
