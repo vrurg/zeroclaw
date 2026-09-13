@@ -458,7 +458,12 @@ jobs:
     name: Check (${{ matrix.name }})
     needs: [fmt]
     runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    # The Cranelift lane reaches its final cross-crate activation proof after
+    # roughly fifteen minutes on a cold GitHub-hosted runner. Twenty minutes
+    # can cancel that proof while it is still running; retain a bounded ceiling
+    # with enough room for the final test rather than reporting a false gate
+    # failure.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
