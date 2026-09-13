@@ -11,7 +11,6 @@ use std::{borrow::Cow, collections::HashSet, sync::LazyLock};
 use zeroclaw_config::schema::IdentityConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::{
-    ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
     looks_like_malformed_json_tool_invocation, looks_like_malformed_tool_protocol_envelope,
     parse_tool_calls, parsed_tool_protocol_mentions_known_tool,
     tool_protocol_envelope_mentions_known_tool,
@@ -130,10 +129,10 @@ pub(crate) fn redact_session_prompt_attachments_for_export(prompt: &str) -> Cow<
 pub fn redact_session_prompt_tool_exchanges_for_export(
     messages: &[ChatMessage],
 ) -> Vec<ChatMessage> {
-    // A native batch can produce several `tool` messages, while the XML text
-    // protocol uses one following `user` message for all results. Keep those
-    // states separate: a user message after native results is ordinary next-
-    // turn input and must not be swallowed by export redaction.
+    // Native execution produces one or more `tool` messages, while the XML
+    // text protocol uses one following `user` message for all results. Keep
+    // those states separate: a user message after native results is ordinary
+    // next-turn input and must not be swallowed by export redaction.
     let mut redact_native_tool_results = false;
     let mut redact_text_protocol_result = false;
 
@@ -151,22 +150,17 @@ pub fn redact_session_prompt_tool_exchanges_for_export(
                 || (redact_text_protocol_result && has_text_protocol_result_prefix);
 
             if message.role == "assistant" {
-                // The runtime parser accepts both native JSON envelopes and
-                // text-protocol calls. The latter includes the plural
-                // `<tool_calls>` XML wrapper, whose text happens to contain
-                // `tool_calls` but whose following result is a `user` message.
-                // Derive result sequencing from the parsed envelope kind rather
-                // than a substring so export copies follow execution semantics.
-                let native_batch = session_prompt_native_tool_call_envelope(&message.content);
-                redact_native_tool_results = is_sensitive_call && native_batch;
-                // A JSON-shaped envelope is not itself proof that the turn
-                // used native tools. Text fallback accepts the same envelope
-                // and stores its result as the reserved `[Tool results]`
-                // user message. The result record, not the envelope shape, is
-                // the authoritative execution-mode evidence at this export
-                // boundary. The pending state is consumed only by that
-                // reserved immediate record, never an ordinary user turn
-                // following a native tool result.
+                // The result record is the authoritative execution-mode
+                // evidence at this export boundary. A native-capable provider
+                // can fall back to tagged text calls yet still append `tool`
+                // records after the runtime assigns call IDs, so envelope
+                // shape is not a safe discriminator. Redact every immediately
+                // following native result until the next assistant record.
+                redact_native_tool_results = is_sensitive_call;
+                // Text fallback stores its result as the reserved `[Tool
+                // results]` user message. The pending state is consumed only
+                // by that immediate reserved record, never ordinary user input
+                // following native results.
                 redact_text_protocol_result = is_sensitive_call;
             } else if message.role == "user" {
                 redact_text_protocol_result = false;
@@ -251,23 +245,6 @@ fn session_prompt_tool_names() -> &'static HashSet<String> {
 
 fn contains_malformed_tool_call_tag_lower(lower: &str) -> bool {
     lower.contains("<tool_call") || lower.contains("<toolcall") || lower.contains("<tool-call")
-}
-
-fn session_prompt_native_tool_call_envelope(content: &str) -> bool {
-    let classify = |candidate: &str| {
-        matches!(
-            classify_tool_protocol_envelope(candidate),
-            Some(
-                ToolProtocolEnvelopeKind::ToolCalls
-                    | ToolProtocolEnvelopeKind::ToolCallsAlias
-                    | ToolProtocolEnvelopeKind::FunctionCall
-                    | ToolProtocolEnvelopeKind::ResponsesFunctionCall
-            )
-        )
-    };
-
-    classify(content)
-        || escaped_json_tool_protocol(content).is_some_and(|decoded| classify(&decoded))
 }
 
 fn session_prompt_accepted_tool_call_envelope(content: &str) -> bool {
@@ -1950,9 +1927,6 @@ mod tests {
         assert!(session_prompt_tool_call_envelope_mentioned(
             &messages[0].content
         ));
-        assert!(session_prompt_native_tool_call_envelope(
-            &messages[0].content
-        ));
         let export = redact_session_prompt_tool_exchanges_for_export(&messages);
         assert!(
             export
@@ -2027,9 +2001,6 @@ mod tests {
             ChatMessage::user("ordinary next-turn input"),
         ];
 
-        assert!(session_prompt_native_tool_call_envelope(
-            &messages[0].content
-        ));
         let export = redact_session_prompt_tool_exchanges_for_export(&messages);
 
         assert!(
@@ -2248,6 +2219,28 @@ mod tests {
             );
             assert_eq!(export[2].content, "ordinary next-turn input");
         }
+    }
+
+    #[test]
+    fn export_copy_redacts_tagged_session_prompt_call_with_native_tool_result() {
+        let marker = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"<tool_call>{{"name":"session_prompt_list","arguments":{{}}}}</tool_call>"#
+            )),
+            ChatMessage::tool(format!("prompt list: {marker}")),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let export = redact_session_prompt_tool_exchanges_for_export(&messages);
+
+        assert!(
+            export[..2]
+                .iter()
+                .all(|message| !message.content.contains(marker)),
+            "a tagged fallback call can still receive a native tool-result record"
+        );
+        assert_eq!(export[2].content, "ordinary next-turn input");
     }
 
     #[test]
