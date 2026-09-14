@@ -512,21 +512,19 @@ fn promote_settlement_record(
     Ok(changed == 1)
 }
 
-/// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
-/// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
-/// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
-pub(super) fn collect_skipping_bad_rows<I>(rows: I) -> Vec<TaskRecord>
-where
-    I: Iterator<Item = rusqlite::Result<TaskRecord>>,
-{
+/// Collect query rows, skipping and logging conversion failures while
+/// propagating operational SQLite step errors. One unrecognised/corrupt record
+/// (for example a forward-incompatible `kind` or `status`) must not starve the
+/// reaper, but a failed database operation must never become partial success.
+fn collect_skipping_bad_rows(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<TaskRecord>> {
     let mut out = Vec::new();
-    for r in rows {
-        match r {
+    while let Some(row) = rows.next()? {
+        match row_to_record(row) {
             Ok(rec) => out.push(rec),
             Err(e) => log_unreadable_task_row(e),
         }
     }
-    out
+    Ok(out)
 }
 
 fn log_unreadable_task_row(error: rusqlite::Error) {
@@ -929,10 +927,8 @@ impl TaskRegistry for SqliteTaskStore {
         let mut stmt = conn
             .prepare("SELECT * FROM tasks WHERE status = 'running'")
             .context("prepare list_running")?;
-        let rows = stmt
-            .query_map([], row_to_record)
-            .context("query list_running")?;
-        Ok(collect_skipping_bad_rows(rows))
+        let mut rows = stmt.query([]).context("query list_running")?;
+        collect_skipping_bad_rows(&mut rows).context("decode list_running rows")
     }
 
     async fn list_by_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
@@ -940,10 +936,8 @@ impl TaskRegistry for SqliteTaskStore {
         let mut stmt = conn
             .prepare("SELECT * FROM tasks WHERE agent = ?1 ORDER BY started_at DESC")
             .context("prepare list_by_agent")?;
-        let rows = stmt
-            .query_map(params![agent], row_to_record)
-            .context("query list_by_agent")?;
-        Ok(collect_skipping_bad_rows(rows))
+        let mut rows = stmt.query(params![agent]).context("query list_by_agent")?;
+        collect_skipping_bad_rows(&mut rows).context("decode list_by_agent rows")
     }
 
     async fn reconcile_lost(&self, id: &str, _now_boot_id: &str) -> Result<bool> {
