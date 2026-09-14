@@ -186,7 +186,7 @@ pub(super) async fn submit_matrix_goal(
         // Pause and cancellation drain the old worker before the supervisor
         // returns. Rebuilding on an explicit resume picks up live policy and
         // pricing instead of keeping a stale configuration snapshot.
-        *supervisor_slot.lock().await = None;
+        clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
     }
     Ok(response)
 }
@@ -204,7 +204,7 @@ pub(super) async fn dispose_matrix_goal(
     let slot = goal_supervisor_slot(&context.persist_locks, history_key);
     if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
         supervisor.dispose_session(history_key).await?;
-        *slot.lock().await = None;
+        clear_supervisor_slot_if_current(&slot, &supervisor).await;
         return Ok(());
     }
 
@@ -249,6 +249,29 @@ pub(super) async fn dispose_matrix_goal(
         .delete_session_goal(&reloaded.id, history_key, reloaded.execution_epoch)
         .await?;
     Ok(())
+}
+
+/// Clear a session's resident supervisor only if it is still the one that
+/// performed the lifecycle transition.
+///
+/// Goal commands serialize their durable transition under the driver's command
+/// lease, but that lease is released before the transport receives the typed
+/// response. A subsequent command can therefore install a fresh supervisor
+/// before this function reacquires the process-local slot. Clearing the slot
+/// unconditionally would then orphan the successor's join handle.
+async fn clear_supervisor_slot_if_current(
+    slot: &Arc<
+        tokio::sync::Mutex<Option<Arc<zeroclaw_runtime::goal_mode::GoalExecutionSupervisor>>>,
+    >,
+    supervisor: &Arc<zeroclaw_runtime::goal_mode::GoalExecutionSupervisor>,
+) {
+    let mut slot = slot.lock().await;
+    if slot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, supervisor))
+    {
+        *slot = None;
+    }
 }
 
 #[async_trait]
