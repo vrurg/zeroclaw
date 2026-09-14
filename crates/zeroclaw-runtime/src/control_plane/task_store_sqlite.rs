@@ -218,13 +218,21 @@ fn add_column_if_missing(
         .prepare(&format!("PRAGMA table_info({table})"))
         .with_context(|| format!("inspect {table} columns"))?;
     let mut rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
+        .query([])
         .with_context(|| format!("query {table} columns"))?;
-    let exists = rows.any(|name| matches!(name, Ok(name) if name == column));
-    if !exists {
-        conn.execute_batch(alter_sql)
-            .with_context(|| format!("add {table}.{column}"))?;
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("iterate {table} columns"))?
+    {
+        let name: String = row
+            .get(1)
+            .with_context(|| format!("decode {table} column name"))?;
+        if name == column {
+            return Ok(());
+        }
     }
+    conn.execute_batch(alter_sql)
+        .with_context(|| format!("add {table}.{column}"))?;
     Ok(())
 }
 
@@ -537,20 +545,21 @@ fn log_unreadable_task_row(error: rusqlite::Error) {
     );
 }
 
-/// Collect settlement intents while skipping a corrupt persisted row. Recovery
-/// metadata must not keep ordinary task reconciliation from running.
-fn collect_skipping_bad_settlement_intents<I>(rows: I) -> Vec<TerminalSettlementIntent>
-where
-    I: Iterator<Item = rusqlite::Result<TerminalSettlementIntent>>,
-{
+/// Collect settlement intents while skipping conversion failures and
+/// propagating operational SQLite step errors. Recovery metadata must not keep
+/// ordinary task reconciliation from running, but a failed query cannot become
+/// partial success.
+fn collect_skipping_bad_settlement_intents(
+    rows: &mut rusqlite::Rows<'_>,
+) -> rusqlite::Result<Vec<TerminalSettlementIntent>> {
     let mut out = Vec::new();
-    for row in rows {
-        match row {
+    while let Some(row) = rows.next()? {
+        match row_to_settlement_intent(row) {
             Ok(intent) => out.push(intent),
             Err(error) => log_unreadable_terminal_settlement_intent(error),
         }
     }
-    out
+    Ok(out)
 }
 
 fn log_unreadable_terminal_settlement_intent(error: rusqlite::Error) {
@@ -851,10 +860,11 @@ impl TaskRegistry for SqliteTaskStore {
                  ORDER BY task_id",
             )
             .context("prepare list terminal settlement intents")?;
-        let rows = stmt
-            .query_map([], row_to_settlement_intent)
+        let mut rows = stmt
+            .query([])
             .context("query terminal settlement intents")?;
-        Ok(collect_skipping_bad_settlement_intents(rows))
+        collect_skipping_bad_settlement_intents(&mut rows)
+            .context("decode terminal settlement intent rows")
     }
 
     async fn promote_terminal_settlement(
