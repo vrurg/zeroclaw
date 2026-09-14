@@ -72,7 +72,7 @@ pub struct GoalExecutionEngine {
 /// It deliberately knows neither transport routing nor provider policy.
 pub struct GoalExecutionSupervisor {
     engine: Arc<GoalExecutionEngine>,
-    workers: Mutex<HashMap<GoalWorkerKey, GoalWorker>>,
+    workers: Mutex<HashMap<String, Arc<Mutex<GoalWorker>>>>,
     restart_gate: Option<Arc<GoalExecutionRestartGate>>,
 }
 
@@ -192,22 +192,8 @@ struct GoalExecutionAdmission {
     _guard: OwnedRwLockReadGuard<()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GoalWorkerKey {
-    task_id: String,
-    session_id: String,
-}
-
-impl GoalWorkerKey {
-    fn from_scope(scope: &GoalExecutionScope) -> Self {
-        Self {
-            task_id: scope.task_id().to_owned(),
-            session_id: scope.session_id().to_owned(),
-        }
-    }
-}
-
 struct GoalWorker {
+    task_id: String,
     execution_epoch: i64,
     handle: JoinHandle<Result<GoalExecutionOutcome>>,
 }
@@ -244,10 +230,11 @@ impl GoalExecutionSupervisor {
         request: GoalExecutionRequest,
     ) -> Result<()> {
         let scope = request.scope().clone();
-        let key = GoalWorkerKey::from_scope(&scope);
+        let session_id = scope.session_id().to_owned();
+        let task_id = scope.task_id().to_owned();
         let mut workers = self.workers.lock().await;
         ensure!(
-            !workers.contains_key(&key),
+            !workers.contains_key(&session_id),
             "Goal execution already has a live worker for this session"
         );
 
@@ -267,11 +254,12 @@ impl GoalExecutionSupervisor {
             result
         });
         workers.insert(
-            key,
-            GoalWorker {
+            session_id,
+            Arc::new(Mutex::new(GoalWorker {
+                task_id,
                 execution_epoch,
                 handle,
-            },
+            })),
         );
         Ok(())
     }
@@ -432,17 +420,18 @@ impl GoalExecutionSupervisor {
             let workers = self.workers.lock().await;
             workers
                 .iter()
-                .map(|(key, worker)| {
-                    GoalExecutionScope::new(
-                        key.task_id.clone(),
-                        key.session_id.clone(),
-                        worker.execution_epoch,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
+                .map(|(session_id, worker)| (session_id.clone(), Arc::clone(worker)))
+                .collect::<Vec<_>>()
         };
 
-        for scope in scopes {
+        for (session_id, worker) in scopes {
+            let worker = worker.lock().await;
+            let scope = GoalExecutionScope::new(
+                worker.task_id.clone(),
+                session_id,
+                worker.execution_epoch,
+            )?;
+            drop(worker);
             if let Some(current) = self
                 .engine
                 .registry
@@ -486,35 +475,40 @@ impl GoalExecutionSupervisor {
     /// consumes its result. The durable task status—not this handle map—is the
     /// source of truth for whether the Goal is currently running.
     pub async fn owns_scope(&self, scope: &GoalExecutionScope) -> bool {
-        let key = GoalWorkerKey::from_scope(scope);
-        let workers = self.workers.lock().await;
-        workers
-            .get(&key)
-            .is_some_and(|worker| worker.execution_epoch == scope.execution_epoch())
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(scope.session_id()).cloned()
+        };
+        let Some(worker) = worker else {
+            return false;
+        };
+        let worker = worker.lock().await;
+        worker.task_id == scope.task_id() && worker.execution_epoch == scope.execution_epoch()
     }
 
     /// Await the exact fenced epoch without interrupting its in-flight model
     /// operation. A pause path uses this after durable fencing so the admitted
     /// operation can settle its usage but cannot admit another operation.
     pub async fn drain(&self, scope: &GoalExecutionScope) -> Result<GoalExecutionOutcome> {
-        let key = GoalWorkerKey::from_scope(scope);
         let worker = {
-            let mut workers = self.workers.lock().await;
-            let Some(worker) = workers.get(&key) else {
+            let workers = self.workers.lock().await;
+            let Some(worker) = workers.get(scope.session_id()) else {
                 bail!("Goal execution has no worker for this session");
             };
-            ensure!(
-                worker.execution_epoch == scope.execution_epoch(),
-                "Goal execution worker epoch is stale"
-            );
-            workers
-                .remove(&key)
-                .context("Goal execution worker disappeared while draining")?
+            Arc::clone(worker)
         };
-        worker
-            .handle
+        let mut worker = worker.lock().await;
+        ensure!(
+            worker.task_id == scope.task_id() && worker.execution_epoch == scope.execution_epoch(),
+            "Goal execution worker epoch is stale"
+        );
+        let outcome = (&mut worker.handle)
             .await
-            .context("Goal execution worker join failed")?
+            .context("Goal execution worker join failed")?;
+        drop(worker);
+        let mut workers = self.workers.lock().await;
+        workers.remove(scope.session_id());
+        Ok(outcome?)
     }
 
     async fn scope_for_session(
@@ -526,24 +520,20 @@ impl GoalExecutionSupervisor {
     }
 
     async fn scope_for_session_id(&self, session_id: &str) -> Result<Option<GoalExecutionScope>> {
-        let workers = self.workers.lock().await;
-        let mut matching = workers
-            .iter()
-            .filter(|(key, _)| key.session_id == session_id);
-        let first = matching.next();
-        ensure!(
-            matching.next().is_none(),
-            "Goal execution has more than one worker for one session"
-        );
-        first
-            .map(|(key, worker)| {
-                GoalExecutionScope::new(
-                    key.task_id.clone(),
-                    key.session_id.clone(),
-                    worker.execution_epoch,
-                )
-            })
-            .transpose()
+        let worker = {
+            let workers = self.workers.lock().await;
+            workers.get(session_id).cloned()
+        };
+        let Some(worker) = worker else {
+            return Ok(None);
+        };
+        let worker = worker.lock().await;
+        GoalExecutionScope::new(
+            worker.task_id.clone(),
+            session_id.to_owned(),
+            worker.execution_epoch,
+        )
+        .map(Some)
     }
 
     /// Consume an epoch after its durable lifecycle has fenced it.

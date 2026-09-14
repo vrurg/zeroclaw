@@ -1069,8 +1069,7 @@ async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
@@ -1128,8 +1127,7 @@ async fn execution_supervisor_terminalizes_an_unexpected_worker_failure() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(FailingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
     });
     let request = runtime
         .submit(
@@ -1194,8 +1192,7 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -1282,8 +1279,7 @@ async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -1377,8 +1373,7 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
         ))
         .await;
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: true,
@@ -1418,8 +1413,7 @@ async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_de
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -1510,8 +1504,7 @@ async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pendin
     let parent_started = Arc::new(Notify::new());
     let release_parent = Arc::new(Notify::new());
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::new(AtomicUsize::new(0)),
@@ -1597,8 +1590,7 @@ async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier()
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
