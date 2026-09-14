@@ -1,6 +1,7 @@
 //! File-backed contract coverage for session-bound Goal control-plane state.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
+use std::time::Duration;
 
 use rusqlite::{Connection, ErrorCode, params};
 use zeroclaw_runtime::control_plane::task_registry::TerminalSettlementIntent;
@@ -110,6 +111,36 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         )
         .expect("retain terminal settlement table");
     assert_eq!(terminal_table, "terminal_settlement_intents");
+}
+
+#[test]
+fn current_schema_open_does_not_wait_for_an_unrelated_writer() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let database = directory.path().join("control_plane.db");
+    SqliteTaskStore::new(directory.path()).expect("initialize current control-plane schema");
+
+    let writer = Connection::open(&database).expect("open competing writer");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold competing write reservation");
+
+    let path = directory.path().to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    let opener = std::thread::spawn(move || sender.send(SqliteTaskStore::new(&path).map(|_| ())));
+
+    let result = receiver.recv_timeout(Duration::from_millis(250));
+    writer
+        .execute_batch("ROLLBACK")
+        .expect("release competing write reservation");
+    opener
+        .join()
+        .expect("join current-schema opener")
+        .expect("send current-schema open result");
+
+    assert!(
+        matches!(result, Ok(Ok(()))),
+        "opening a current schema must not acquire a migration write lock: {result:?}"
+    );
 }
 
 #[test]
@@ -1372,5 +1403,47 @@ async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
             .expect("replace terminal corrupt Goal"),
         GoalTransitionResult::Applied,
         "a missing extension cannot block terminal replacement"
+    );
+}
+
+#[tokio::test]
+async fn boot_recovery_skips_an_unreadable_goal_without_starving_other_recovery() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize store");
+    let database = directory.path().join("control_plane.db");
+    drop(store);
+
+    let fixture = Connection::open(&database).expect("open fixture database");
+    fixture
+        .execute_batch(
+            "INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
+             ) VALUES ('unreadable', 'goal', 'main', 'running', 'not-a-pid', 'boot-old',
+                       'session-unreadable', 1, 'now');
+             INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
+             ) VALUES ('recoverable', 'goal', 'main', 'running', 999999, 'boot-old',
+                       'session-recoverable', 1, 'now');",
+        )
+        .expect("write unreadable and recoverable Goal fixtures");
+    drop(fixture);
+
+    let reopened = SqliteTaskStore::new(directory.path()).expect("reopen store");
+    assert_eq!(
+        reopened
+            .reconcile_goal_boot_state("boot-new")
+            .expect("reconcile recoverable Goal despite unreadable sibling"),
+        1
+    );
+    assert_eq!(
+        reopened
+            .get("recoverable")
+            .await
+            .expect("read recovered Goal")
+            .expect("recoverable Goal exists")
+            .status,
+        TaskStatus::Failed
     );
 }
