@@ -1126,6 +1126,95 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
 }
 
 #[tokio::test]
+async fn boot_recovery_settles_terminal_goal_operation_before_replacement() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize store");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("cancelled-pending", "terminal-pending-session"),
+                session_goal_extension("cancelled-pending"),
+            )
+            .await
+            .expect("create Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                "cancelled-pending",
+                "terminal-pending-session",
+                1,
+                "operation-cancelled-pending",
+            )
+            .await
+            .expect("admit pending operation"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "cancelled-pending",
+                "terminal-pending-session",
+                1,
+                TaskStatus::Cancelled,
+                None,
+            )
+            .await
+            .expect("cancel Goal while operation settles"),
+        GoalTransitionResult::Applied
+    );
+    drop(store);
+
+    let reopened = SqliteTaskStore::new(directory.path()).expect("reopen store");
+    assert_eq!(
+        reopened
+            .reconcile_goal_boot_state("boot-new")
+            .expect("classify interrupted terminal operation"),
+        1
+    );
+    let cancelled = reopened
+        .current_goal_for_session("terminal-pending-session")
+        .await
+        .expect("read cancelled Goal")
+        .expect("cancelled Goal remains auditable");
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert_eq!(cancelled.execution_epoch, 2);
+    let extension = reopened
+        .get_goal_task("cancelled-pending")
+        .await
+        .expect("read Goal extension")
+        .expect("Goal extension remains readable");
+    assert_eq!(
+        extension.accounting_state,
+        GoalAccountingState::OutcomeUnknown
+    );
+    assert!(extension.pending_call_id.is_none());
+    assert!(extension.pending_call_epoch.is_none());
+
+    assert_eq!(
+        reopened
+            .create_or_replace_session_goal(
+                session_goal_task("replacement", "terminal-pending-session"),
+                session_goal_extension("replacement"),
+            )
+            .await
+            .expect("replace settled terminal Goal"),
+        GoalTransitionResult::Applied,
+        "terminal Goal control state must not wedge its session after recovery"
+    );
+    assert_eq!(
+        reopened
+            .current_goal_for_session("terminal-pending-session")
+            .await
+            .expect("read replacement Goal")
+            .expect("replacement Goal exists")
+            .id,
+        "replacement"
+    );
+}
+
+#[tokio::test]
 async fn boot_recovery_does_not_fence_a_live_foreign_goal_owner() {
     let store = SqliteTaskStore::new_in_memory().expect("initialize store");
     let mut task = session_goal_task("live-owner", "live-owner-session");
