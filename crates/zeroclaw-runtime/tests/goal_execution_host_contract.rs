@@ -778,6 +778,10 @@ fn host_settings_reject_invalid_semantic_default_limits() {
             cost_limit_usd: None,
         },
         zeroclaw_commands::goal::GoalBudgetLimits {
+            token_limit: Some(i64::MAX as u64 + 1),
+            cost_limit_usd: None,
+        },
+        zeroclaw_commands::goal::GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: Some(-1.0),
         },
