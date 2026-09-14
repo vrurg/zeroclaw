@@ -1319,6 +1319,56 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .unwrap(),
         GoalResponse::NoCurrentGoal
     ));
+    let colliding_start = host
+        .submit(
+            colliding_ingress.clone(),
+            recording_driver(&colliding_ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish a different task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &colliding_start)
+            .await
+            .unwrap(),
+        GoalResponse::NoCurrentGoal
+    ));
+}
+
+#[tokio::test]
+async fn typed_start_objective_is_rejected_before_durable_write() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let ingress = matrix_ingress();
+    let submission = GoalExecutionHost::new()
+        .submit(
+            ingress.clone(),
+            recording_driver(&ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "x".repeat(zeroclaw_commands::goal::MAX_GOAL_OBJECTIVE_CHARS + 1),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        controller
+            .submit(&host_settings(true), &submission)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .current_goal_for_session(&ingress.session_key().durable_id())
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
