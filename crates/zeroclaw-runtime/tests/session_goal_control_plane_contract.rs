@@ -91,7 +91,7 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         verify
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        10
+        11
     );
     let columns: Vec<String> = verify
         .prepare("PRAGMA table_info(tasks)")
@@ -307,6 +307,7 @@ async fn migration_normalizes_a_session_bound_goal_epoch_before_operation_admiss
         .expect("open provisional migration fixture")
         .execute_batch(
             "DROP TRIGGER trg_goal_tasks_require_epoch_update;
+             DROP TRIGGER trg_goal_tasks_epoch_monotonic;
              UPDATE tasks SET execution_epoch = 0 WHERE id = 'provisional-epoch';
              PRAGMA user_version = 9;",
         )
@@ -956,6 +957,19 @@ async fn sqlite_guards_session_binding_pending_pairing_and_goal_state_domains() 
     );
     connection
         .execute(
+            "UPDATE tasks SET execution_epoch = 2 WHERE id = 'goal-raw-one'",
+            [],
+        )
+        .expect("raw SQL may advance a session Goal execution epoch");
+    assert_constraint(
+        connection.execute(
+            "UPDATE tasks SET execution_epoch = 1 WHERE id = 'goal-raw-one'",
+            [],
+        ),
+        "raw SQL must not rewind a session Goal execution epoch",
+    );
+    connection
+        .execute(
             "INSERT INTO tasks (
                  id, kind, agent, status, owner_pid, owner_boot_id, session_id,
                  execution_epoch, started_at
@@ -1039,7 +1053,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
     assert_eq!(
-        schema_version, 10,
+        schema_version, 11,
         "migration records the final control-plane schema"
     );
     let running: (String, Option<String>, Option<String>) = verify
