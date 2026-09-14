@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
@@ -155,61 +155,6 @@ struct PausingExecutionDriver {
     verifier_calls: Arc<AtomicUsize>,
 }
 
-struct AbortOnDroppedDrainLease {
-    parent_started: Arc<Notify>,
-    worker_dropped: Arc<AtomicBool>,
-}
-
-struct AbortOnDroppedDrainGuard(Arc<AtomicBool>);
-
-impl Drop for AbortOnDroppedDrainGuard {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl GoalSessionExecutionLease for AbortOnDroppedDrainLease {
-    fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
-        Ok(Vec::new())
-    }
-
-    async fn run_parent_turn(
-        &mut self,
-        _operation: &GoalOperationScope,
-        _turn: GoalParentTurn,
-    ) -> anyhow::Result<GoalParentTurnResult> {
-        let _worker_guard = AbortOnDroppedDrainGuard(Arc::clone(&self.worker_dropped));
-        self.parent_started.notify_one();
-        std::future::pending::<anyhow::Result<GoalParentTurnResult>>().await
-    }
-
-    async fn run_verifier(
-        &mut self,
-        _operation: &GoalOperationScope,
-        _turn: GoalVerifierTurn,
-    ) -> anyhow::Result<String> {
-        unreachable!("a parked parent turn never reaches the verifier")
-    }
-
-    async fn append_verified_candidate(&mut self, _candidate: String) -> anyhow::Result<()> {
-        unreachable!("a parked parent turn never delivers a candidate")
-    }
-
-    async fn publish_goal_notice(
-        &mut self,
-        _notice: zeroclaw_runtime::goal_mode::GoalExecutionNotice,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-struct AbortOnDroppedDrainDriver {
-    binding: GoalSessionBinding,
-    parent_started: Arc<Notify>,
-    worker_dropped: Arc<AtomicBool>,
-}
-
 struct FailingExecutionDriver {
     binding: GoalSessionBinding,
 }
@@ -260,32 +205,6 @@ impl GoalSessionDriver for PausingExecutionDriver {
             parent_started: Arc::clone(&self.parent_started),
             release_parent: Arc::clone(&self.release_parent),
             verifier_calls: Arc::clone(&self.verifier_calls),
-        }))
-    }
-}
-
-#[async_trait]
-impl GoalSessionDriver for AbortOnDroppedDrainDriver {
-    fn surface(&self) -> GoalSurface {
-        self.binding.surface()
-    }
-
-    fn session_key(&self) -> &GoalSessionKey {
-        self.binding.session_key()
-    }
-
-    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
-        Ok(GoalSessionLease::new(self.binding.clone(), ()))
-    }
-
-    async fn acquire_execution(
-        &self,
-        _ingress: &GoalIngressContext,
-        _scope: &GoalExecutionScope,
-    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
-        Ok(Box::new(AbortOnDroppedDrainLease {
-            parent_started: Arc::clone(&self.parent_started),
-            worker_dropped: Arc::clone(&self.worker_dropped),
         }))
     }
 }
@@ -722,8 +641,7 @@ fn host_settings(enabled: bool) -> GoalHostSettings {
 
 fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
     Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     })
@@ -733,11 +651,7 @@ fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
 async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(
-            GoalSessionKey::zero_code("wrong-session").unwrap(),
-            "fresh-connection",
-        )
-        .unwrap(),
+        binding: GoalSessionBinding::new(GoalSessionKey::zero_code("wrong-session").unwrap()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -774,8 +688,7 @@ async fn supplied_driver_surface_mismatch_is_rejected_before_binding() {
 async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
@@ -805,7 +718,7 @@ async fn execution_driver_key_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
     let other_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(other_key, "fresh-connection").unwrap(),
+        binding: GoalSessionBinding::new(other_key),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -853,7 +766,7 @@ async fn driver_returning_a_different_binding_is_rejected_after_binding() {
     let returned_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
     let driver = Arc::new(WrongBindingDriver {
         advertised: ingress.session_key().clone(),
-        returned_binding: GoalSessionBinding::new(returned_key, "fresh-connection").unwrap(),
+        returned_binding: GoalSessionBinding::new(returned_key),
         binds: AtomicUsize::new(0),
     });
 
@@ -871,8 +784,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: false,
@@ -950,8 +862,7 @@ async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
 async fn exact_driver_binding_and_typed_command_are_preserved() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -1014,8 +925,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     .unwrap();
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -1101,8 +1011,7 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
@@ -1186,8 +1095,7 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
     let parent_histories = Arc::new(Mutex::new(Vec::new()));
     let parent_turn_kinds = Arc::new(Mutex::new(Vec::new()));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
@@ -1266,8 +1174,7 @@ async fn execution_supervisor_retains_one_exact_epoch_until_it_drains() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
@@ -1328,8 +1235,7 @@ async fn execution_supervisor_terminalizes_an_unexpected_worker_failure() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(FailingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
     });
     let request = runtime
         .submit(
@@ -1394,8 +1300,7 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -1474,18 +1379,18 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
 }
 
 #[tokio::test]
-async fn supervisor_drain_aborted_mid_join_aborts_the_goal_worker() {
+async fn cancelled_drain_keeps_the_worker_owned_for_a_later_lifecycle_retry() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let parent_started = Arc::new(Notify::new());
-    let worker_dropped = Arc::new(AtomicBool::new(false));
-    let driver = Arc::new(AbortOnDroppedDrainDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+    let release_parent = Arc::new(Notify::new());
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
-        worker_dropped: Arc::clone(&worker_dropped),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
     });
     let directory = TempDir::new().unwrap();
     let tracker = Arc::new(
@@ -1506,7 +1411,7 @@ async fn supervisor_drain_aborted_mid_join_aborts_the_goal_worker() {
 
     supervisor
         .submit(
-            settings.clone(),
+            settings,
             ingress.clone(),
             driver,
             GoalCommand::Start {
@@ -1522,32 +1427,53 @@ async fn supervisor_drain_aborted_mid_join_aborts_the_goal_worker() {
         .current_goal_for_session(&ingress.session_key().durable_id())
         .await
         .unwrap()
-        .expect("started Goal is current");
+        .expect("started Goal remains current while the parent turn is active");
     let scope = GoalExecutionScope::new(
         current.id,
         ingress.session_key().durable_id(),
         current.execution_epoch,
     )
     .unwrap();
-    let drain_supervisor = Arc::clone(&supervisor);
-    let mut drain = zeroclaw_spawn::spawn!(async move { drain_supervisor.drain(&scope).await });
 
+    let interrupted_supervisor = Arc::clone(&supervisor);
+    let interrupted_scope = scope.clone();
+    let mut interrupted =
+        zeroclaw_spawn::spawn!(
+            async move { interrupted_supervisor.drain(&interrupted_scope).await }
+        );
     assert!(
-        timeout(Duration::from_millis(20), &mut drain)
+        timeout(Duration::from_millis(20), &mut interrupted)
             .await
             .is_err(),
-        "drain must wait for the admitted operation"
+        "the first drain must wait for the admitted operation"
     );
-    drain.abort();
-    let _ = drain.await;
+    interrupted.abort();
+    let _ = interrupted.await;
 
-    timeout(Duration::from_secs(1), async {
-        while !worker_dropped.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("dropping a drain must abort the still-owned Goal worker");
+    assert!(
+        supervisor.owns_scope(&scope).await,
+        "cancelling a lifecycle waiter must not drop the worker handle"
+    );
+
+    let retry_supervisor = Arc::clone(&supervisor);
+    let retry_scope = scope.clone();
+    let mut retry =
+        zeroclaw_spawn::spawn!(async move { retry_supervisor.drain(&retry_scope).await });
+    assert!(
+        timeout(Duration::from_millis(20), &mut retry)
+            .await
+            .is_err(),
+        "the retained worker must still wait for its admitted operation"
+    );
+    release_parent.notify_one();
+    assert!(
+        retry.await.unwrap().is_err(),
+        "the test driver refuses delivery after the worker has settled"
+    );
+    assert!(
+        !supervisor.owns_scope(&scope).await,
+        "only the successful drain consumes the retained worker handle"
+    );
 }
 
 #[tokio::test]
@@ -1634,8 +1560,7 @@ async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -1902,8 +1827,7 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
         ))
         .await;
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: true,
@@ -1990,8 +1914,7 @@ async fn supervisor_disposal_drains_and_classifies_a_pending_operation_before_de
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -2082,8 +2005,7 @@ async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pendin
     let parent_started = Arc::new(Notify::new());
     let release_parent = Arc::new(Notify::new());
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::new(AtomicUsize::new(0)),
@@ -2169,8 +2091,7 @@ async fn operator_pause_drains_the_admitted_parent_without_starting_a_verifier()
     let release_parent = Arc::new(Notify::new());
     let verifier_calls = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(PausingExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         parent_started: Arc::clone(&parent_started),
         release_parent: Arc::clone(&release_parent),
         verifier_calls: Arc::clone(&verifier_calls),
@@ -2232,8 +2153,7 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
@@ -2367,8 +2287,7 @@ async fn session_lease_blocks_reconnect_until_controller_returns() {
     .unwrap();
     let ingress = matrix_ingress();
     let driver = Arc::new(LeaseDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         available_for_reconnect: Arc::new(AtomicUsize::new(1)),
     });
 
@@ -2433,8 +2352,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     )
     .unwrap();
     let driver = Arc::new(LeaseDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         available_for_reconnect: reconnect_available,
     });
 
