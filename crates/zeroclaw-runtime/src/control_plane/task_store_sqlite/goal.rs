@@ -1341,7 +1341,8 @@ mod tests {
         let conn = store.conn.lock();
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_insert;
-             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;",
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_epoch_insert;",
         )
         .unwrap();
         insert_task_record(&conn, task).unwrap();
@@ -1355,7 +1356,8 @@ mod tests {
         let conn = store.conn.lock();
         conn.execute_batch(
             "DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_insert;
-             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;",
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_session_update;
+             DROP TRIGGER IF EXISTS trg_goal_tasks_require_epoch_insert;",
         )
         .unwrap();
         insert_task_record(&conn, task).unwrap();
