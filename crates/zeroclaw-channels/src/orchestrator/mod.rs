@@ -7223,7 +7223,7 @@ async fn process_channel_message_body(
         Some(Err(GoalCommandParseError::NotGoalCommand)) | None => None,
         Some(parsed_goal_command) => Some((
             runtime_conversation_history_key(ctx.as_ref(), &msg),
-            msg.clone(),
+            matrix_goal_message_snapshot(&msg),
             parsed_goal_command,
         )),
     };
@@ -9132,6 +9132,32 @@ async fn process_channel_message_body(
         let _ = channel
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
+    }
+}
+
+/// Retains the Matrix message facts a Goal driver needs after hooks run.
+///
+/// Goal commands bypass the media pipeline, so retaining inbound attachment
+/// bytes here would only duplicate potentially large payloads while the
+/// command waits for its foreground lease.
+fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
+    ChannelMessage {
+        id: message.id.clone(),
+        sender: message.sender.clone(),
+        reply_target: message.reply_target.clone(),
+        content: message.content.clone(),
+        channel: message.channel.clone(),
+        channel_alias: message.channel_alias.clone(),
+        timestamp: message.timestamp,
+        thread_ts: message.thread_ts.clone(),
+        interruption_scope_id: message.interruption_scope_id.clone(),
+        attachments: Vec::new(),
+        subject: message.subject.clone(),
+        internal_sop_event: message.internal_sop_event.clone(),
+        passive_context: message.passive_context,
+        explicitly_addressed: message.explicitly_addressed,
+        conversation_scope: message.conversation_scope,
+        references: message.references.clone(),
     }
 }
 
@@ -16574,6 +16600,39 @@ temperature = 0.3
             subject: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn goal_snapshot_omits_attachments_but_preserves_matrix_routing_metadata() {
+        let mut message = channel_message("matrix", Some("operator"));
+        message.content = "/goal status".to_owned();
+        message.thread_ts = Some("thread-root".to_owned());
+        message.interruption_scope_id = Some("thread-scope".to_owned());
+        message.subject = Some("subject".to_owned());
+        message.references = vec!["reference".to_owned()];
+        message.attachments = vec![zeroclaw_api::media::MediaAttachment {
+            file_name: "large.bin".to_owned(),
+            data: vec![7; 64 * 1024],
+            mime_type: Some("application/octet-stream".to_owned()),
+            marker: None,
+        }];
+
+        let snapshot = matrix_goal_message_snapshot(&message);
+
+        assert!(snapshot.attachments.is_empty());
+        assert_eq!(snapshot.id, message.id);
+        assert_eq!(snapshot.sender, message.sender);
+        assert_eq!(snapshot.reply_target, message.reply_target);
+        assert_eq!(snapshot.content, message.content);
+        assert_eq!(snapshot.channel, message.channel);
+        assert_eq!(snapshot.channel_alias, message.channel_alias);
+        assert_eq!(snapshot.thread_ts, message.thread_ts);
+        assert_eq!(
+            snapshot.interruption_scope_id,
+            message.interruption_scope_id
+        );
+        assert_eq!(snapshot.subject, message.subject);
+        assert_eq!(snapshot.references, message.references);
     }
 
     #[test]
