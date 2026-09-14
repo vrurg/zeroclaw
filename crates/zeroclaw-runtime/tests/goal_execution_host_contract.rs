@@ -1626,6 +1626,57 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .unwrap(),
         GoalResponse::NoCurrentGoal
     ));
+
+    let first_cancel = host
+        .submit(
+            &host_settings(true),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Cancel,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&settings, &first_cancel).await.unwrap(),
+        GoalResponse::Cancelled(_)
+    ));
+
+    let colliding_terminal_replacement = host
+        .submit(
+            &host_settings(true),
+            colliding_ingress.clone(),
+            recording_driver(&colliding_ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "replace another principal's terminal goal".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &colliding_terminal_replacement)
+            .await
+            .unwrap(),
+        GoalResponse::NoCurrentGoal
+    ));
+
+    let first_terminal_status = host
+        .submit(
+            &host_settings(true),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &first_terminal_status)
+            .await
+            .unwrap(),
+        GoalResponse::Terminal(_)
+    ));
 }
 
 #[tokio::test]
