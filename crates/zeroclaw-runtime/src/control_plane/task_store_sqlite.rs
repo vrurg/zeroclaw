@@ -14,7 +14,7 @@ use super::task_registry::{
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 11;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 12;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
