@@ -603,11 +603,15 @@ impl GoalHostSettings {
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
         validate_default_limits(default_limits)?;
+        let ConfigGoalBudgetLimits {
+            token_limit,
+            cost_limit_usd,
+        } = default_limits;
         Ok(Self {
             enabled,
             default_limits: GoalBudgetLimits {
-                token_limit: default_limits.token_limit,
-                cost_limit_usd: default_limits.cost_limit_usd,
+                token_limit,
+                cost_limit_usd,
             },
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
