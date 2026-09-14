@@ -6,15 +6,21 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use tokio_util::sync::CancellationToken;
 use zeroclaw_runtime::goal_mode::GoalExecutionSupervisor;
 
-#[derive(Clone)]
 pub(crate) struct ConversationLocks {
     persist: Arc<Mutex<()>>,
+    matrix_goal: OnceLock<MatrixGoalLocks>,
+}
+
+/// Locks required only after a Matrix conversation enters the Goal control
+/// path. Ordinary channel traffic retains the historical persistence lock
+/// without paying for three unused async mutex allocations per conversation.
+struct MatrixGoalLocks {
     goal_command: Arc<tokio::sync::Mutex<()>>,
     foreground: Arc<tokio::sync::Mutex<()>>,
     goal_supervisor: Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>>,
@@ -24,50 +30,61 @@ impl ConversationLocks {
     pub(crate) fn new() -> Self {
         Self {
             persist: Arc::new(Mutex::new(())),
+            matrix_goal: OnceLock::new(),
+        }
+    }
+
+    fn matrix_goal(&self) -> &MatrixGoalLocks {
+        self.matrix_goal.get_or_init(|| MatrixGoalLocks {
             goal_command: Arc::new(tokio::sync::Mutex::new(())),
             foreground: Arc::new(tokio::sync::Mutex::new(())),
             goal_supervisor: Arc::new(tokio::sync::Mutex::new(None)),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn has_matrix_goal_locks(&self) -> bool {
+        self.matrix_goal.get().is_some()
     }
 }
 
 fn locks_for_key(
-    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
-) -> ConversationLocks {
+) -> Arc<ConversationLocks> {
     let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
     locks
         .entry(key.to_owned())
-        .or_insert_with(ConversationLocks::new)
+        .or_insert_with(|| Arc::new(ConversationLocks::new()))
         .clone()
 }
 
 pub(crate) fn persist_lock(
-    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
 ) -> Arc<Mutex<()>> {
-    locks_for_key(locks, key).persist
+    Arc::clone(&locks_for_key(locks, key).persist)
 }
 
 pub(crate) fn foreground_lock(
-    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
-    locks_for_key(locks, key).foreground
+    Arc::clone(&locks_for_key(locks, key).matrix_goal().foreground)
 }
 
 pub(crate) fn goal_command_lock(
-    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
 ) -> Arc<tokio::sync::Mutex<()>> {
-    locks_for_key(locks, key).goal_command
+    Arc::clone(&locks_for_key(locks, key).matrix_goal().goal_command)
 }
 
 pub(crate) fn goal_supervisor_slot(
-    locks: &Arc<Mutex<HashMap<String, ConversationLocks>>>,
+    locks: &Arc<Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     key: &str,
 ) -> Arc<tokio::sync::Mutex<Option<Arc<GoalExecutionSupervisor>>>> {
-    locks_for_key(locks, key).goal_supervisor
+    Arc::clone(&locks_for_key(locks, key).matrix_goal().goal_supervisor)
 }
 
 pub(crate) async fn wait_for_foreground_lease(
@@ -110,6 +127,22 @@ mod tests {
             .await
             .expect("same conversation must proceed after release")
             .expect("foreground waiter must not panic");
+    }
+
+    #[test]
+    fn persistence_only_conversation_does_not_allocate_matrix_goal_locks() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let _persist = persist_lock(&locks, "channel:ordinary");
+        let entry = locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get("channel:ordinary")
+            .expect("persistence lookup creates the conversation entry")
+            .clone();
+        assert!(!entry.has_matrix_goal_locks());
+
+        let _foreground = foreground_lock(&locks, "channel:ordinary");
+        assert!(entry.has_matrix_goal_locks());
     }
 
     #[tokio::test]
