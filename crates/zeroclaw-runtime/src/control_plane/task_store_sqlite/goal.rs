@@ -14,16 +14,11 @@ use super::{
     row_to_record, status_to_db,
 };
 
-fn transition_failure(
-    conn: &Connection,
-    task_id: &str,
-    session_id: &str,
-) -> Result<GoalTransitionResult> {
+fn transition_failure(conn: &Connection, task_id: &str) -> Result<GoalTransitionResult> {
     let row = conn
         .query_row(
-            "SELECT COALESCE(kind = 'goal' AND session_id = ?2, 0)
-               FROM tasks WHERE id = ?1",
-            params![task_id, session_id],
+            "SELECT 1 FROM tasks WHERE id = ?1",
+            params![task_id],
             |row| row.get::<_, bool>(0),
         )
         .optional()
@@ -896,6 +891,16 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start create or replace session goal transaction")?;
+        let requested_id_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                params![&task.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("check proposed session goal task identity")?;
+        if requested_id_exists {
+            anyhow::bail!("new session goal task id already exists");
+        }
         let current = tx
             .query_row(
                 "SELECT * FROM tasks WHERE kind = 'goal' AND session_id = ?1",
@@ -955,7 +960,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, expected_epoch,],
         )?;
         if updated == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.execute(
             "UPDATE goal_tasks
@@ -998,7 +1003,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if updated == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.execute(
             "UPDATE goal_tasks
@@ -1040,7 +1045,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if updated == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.commit().context("commit guarded goal finish")?;
         Ok(GoalTransitionResult::Applied)
@@ -1070,7 +1075,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, expected_epoch, pending_call_id],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
@@ -1101,7 +1106,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
@@ -1128,7 +1133,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, expected_epoch, tokens, cost],
         )?;
         if updated == 0 {
-            return transition_failure(&conn, task_id, session_id);
+            return transition_failure(&conn, task_id);
         }
         Ok(GoalTransitionResult::Applied)
     }
@@ -1154,7 +1159,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             params![task_id, session_id, expected_epoch],
         )?;
         if deleted == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.commit().context("commit guarded goal deletion")?;
         Ok(GoalTransitionResult::Applied)
