@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{Mutex, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -164,8 +164,25 @@ impl GoalExecutionRestartCoordinator {
             registered.retain(|candidate| candidate.strong_count() > 0);
             supervisors
         };
+        let mut restart_fences = Vec::with_capacity(supervisors.len());
+        let mut failure = None;
         for supervisor in supervisors {
-            supervisor.pause_for_restart().await?;
+            let fence = supervisor.fence_for_restart().await;
+            if let Some(error) = fence.error {
+                failure.get_or_insert(error);
+            }
+            restart_fences.push((supervisor, fence.scopes));
+        }
+        // Every host is durably fenced before any one host is allowed to wait
+        // for an admitted operation. A slow worker must not leave another
+        // transport host Running during the same daemon cutover.
+        for (supervisor, scopes) in restart_fences {
+            if let Err(error) = supervisor.drain_restart_fence(scopes).await {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         Ok(())
     }
@@ -225,7 +242,18 @@ struct GoalExecutionAdmission {
 struct GoalWorker {
     task_id: String,
     execution_epoch: i64,
-    handle: JoinHandle<Result<GoalExecutionOutcome>>,
+    completion: watch::Receiver<Option<GoalWorkerCompletion>>,
+    // Retaining the join handle keeps the worker owned until a lifecycle
+    // drainer has observed its completion. Drainers wait on `completion` so
+    // multiple lifecycle paths can safely observe one terminal result.
+    _handle: JoinHandle<()>,
+}
+
+type GoalWorkerCompletion = std::result::Result<GoalExecutionOutcome, String>;
+
+struct GoalRestartFence {
+    scopes: Vec<GoalExecutionScope>,
+    error: Option<anyhow::Error>,
 }
 
 impl GoalExecutionSupervisor {
@@ -270,6 +298,7 @@ impl GoalExecutionSupervisor {
 
         let engine = Arc::clone(&self.engine);
         let execution_epoch = scope.execution_epoch();
+        let (completion_tx, completion) = watch::channel(None);
         let handle = zeroclaw_spawn::spawn!(async move {
             let result = engine.run(&settings, &request).await;
 
@@ -277,18 +306,24 @@ impl GoalExecutionSupervisor {
             // Acquisition and other unexpected failures can occur before that
             // path. Do not leave their exact durable epoch Running without an
             // owner: terminalize it while the scope still proves the fence.
-            if result.is_err() && engine.exact_running_task(&scope).await.is_ok() {
-                engine.fail(&scope, "executor_failed").await?;
-            }
-
-            result
+            let result = if result.is_err() && engine.exact_running_task(&scope).await.is_ok() {
+                match engine.fail(&scope, "executor_failed").await {
+                    Ok(()) => result,
+                    Err(error) => Err(error.context("failed to terminalize Goal executor failure")),
+                }
+            } else {
+                result
+            };
+            let completion = result.map_err(|error| format!("{error:#}"));
+            let _ = completion_tx.send(Some(completion));
         });
         workers.insert(
             session_id,
             Arc::new(Mutex::new(GoalWorker {
                 task_id,
                 execution_epoch,
-                handle,
+                completion,
+                _handle: handle,
             })),
         );
         Ok(())
@@ -452,6 +487,17 @@ impl GoalExecutionSupervisor {
     /// chooses which supervisors must be paused before it tears down their
     /// transports.
     pub async fn pause_for_restart(&self) -> Result<()> {
+        let fence = self.fence_for_restart().await;
+        self.drain_restart_fence(fence.scopes).await?;
+        if let Some(error) = fence.error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Fence every resident epoch without waiting for any worker. The restart
+    /// coordinator uses this first phase across all transport hosts.
+    async fn fence_for_restart(&self) -> GoalRestartFence {
         let workers = {
             let workers = self.workers.lock().await;
             workers
@@ -461,19 +507,35 @@ impl GoalExecutionSupervisor {
         };
 
         let mut scopes = Vec::with_capacity(workers.len());
+        let mut error = None;
         for (session_id, worker) in workers {
             let worker = worker.lock().await;
-            let scope = GoalExecutionScope::new(
+            let scope = match GoalExecutionScope::new(
                 worker.task_id.clone(),
                 session_id,
                 worker.execution_epoch,
-            )?;
+            ) {
+                Ok(scope) => scope,
+                Err(candidate) => {
+                    error.get_or_insert(candidate);
+                    continue;
+                }
+            };
             drop(worker);
-            if let Some(current) = self
+            let current = match self
                 .engine
                 .registry
                 .current_goal_for_session(scope.session_id())
-                .await?
+                .await
+            {
+                Ok(current) => current,
+                Err(candidate) => {
+                    error.get_or_insert(candidate);
+                    scopes.push(scope);
+                    continue;
+                }
+            };
+            if let Some(current) = current
                 && current.id == scope.task_id()
                 && current.status == TaskStatus::Running
             {
@@ -490,19 +552,24 @@ impl GoalExecutionSupervisor {
                             blockers: Vec::new(),
                         },
                     )
-                    .await?
+                    .await
                 {
-                    GoalTransitionResult::Applied
-                    | GoalTransitionResult::Stale
-                    | GoalTransitionResult::Missing => {}
+                    Ok(
+                        GoalTransitionResult::Applied
+                        | GoalTransitionResult::Stale
+                        | GoalTransitionResult::Missing,
+                    ) => {}
+                    Err(candidate) => {
+                        error.get_or_insert(candidate);
+                    }
                 }
             }
             scopes.push(scope);
         }
+        GoalRestartFence { scopes, error }
+    }
 
-        // Fence every resident epoch before waiting for any one worker. A
-        // long-running first operation must not leave later sessions Running
-        // and able to admit another operation during the restart cutover.
+    async fn drain_restart_fence(&self, scopes: Vec<GoalExecutionScope>) -> Result<()> {
         for scope in scopes {
             // A stale or terminal task can still retain a finished worker.
             // Consume it as well, so restart never leaves a process-local
@@ -540,18 +607,38 @@ impl GoalExecutionSupervisor {
             };
             Arc::clone(worker)
         };
-        let mut worker = worker.lock().await;
-        ensure!(
-            worker.task_id == scope.task_id() && worker.execution_epoch == scope.execution_epoch(),
-            "Goal execution worker epoch is stale"
-        );
-        let outcome = (&mut worker.handle)
-            .await
-            .context("Goal execution worker join failed")?;
-        drop(worker);
+        let mut completion = {
+            let worker_guard = worker.lock().await;
+            ensure!(
+                worker_guard.task_id == scope.task_id()
+                    && worker_guard.execution_epoch == scope.execution_epoch(),
+                "Goal execution worker epoch is stale"
+            );
+            worker_guard.completion.clone()
+        };
+        loop {
+            let outcome = { completion.borrow().clone() };
+            if let Some(outcome) = outcome {
+                self.remove_worker_if_exact(scope.session_id(), &worker)
+                    .await;
+                return outcome.map_err(anyhow::Error::msg);
+            }
+            if completion.changed().await.is_err() {
+                self.remove_worker_if_exact(scope.session_id(), &worker)
+                    .await;
+                bail!("Goal execution worker stopped without reporting its completion");
+            }
+        }
+    }
+
+    async fn remove_worker_if_exact(&self, session_id: &str, expected: &Arc<Mutex<GoalWorker>>) {
         let mut workers = self.workers.lock().await;
-        workers.remove(scope.session_id());
-        Ok(outcome?)
+        if workers
+            .get(session_id)
+            .is_some_and(|worker| Arc::ptr_eq(worker, expected))
+        {
+            workers.remove(session_id);
+        }
     }
 
     async fn scope_for_session(
