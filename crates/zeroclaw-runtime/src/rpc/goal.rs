@@ -1155,7 +1155,8 @@ impl RpcGoalRuntime {
             .pause_for_external_cancellation(&durable_session_id)
             .await?;
         if matches!(result, crate::control_plane::GoalTransitionResult::Applied) {
-            self.remove_supervisor(session_id).await;
+            self.retire_supervisor_if_idle(session_id, &supervisor)
+                .await;
             return Ok(true);
         }
         Ok(false)
