@@ -15,6 +15,7 @@ use chrono::Utc;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
+use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
 
 use crate::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
@@ -597,21 +598,24 @@ impl GoalHostSettings {
     /// unlimited default to `None` before constructing this value.
     pub fn new(
         enabled: bool,
-        default_limits: GoalBudgetLimits,
+        default_limits: ConfigGoalBudgetLimits,
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
         validate_default_limits(default_limits)?;
         Ok(Self {
             enabled,
-            default_limits,
+            default_limits: GoalBudgetLimits {
+                token_limit: default_limits.token_limit,
+                cost_limit_usd: default_limits.cost_limit_usd,
+            },
             owner_pid,
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
     }
 }
 
-fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
+fn validate_default_limits(limits: ConfigGoalBudgetLimits) -> Result<()> {
     if limits
         .token_limit
         .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
