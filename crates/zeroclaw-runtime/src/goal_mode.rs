@@ -13,7 +13,6 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::Utc;
-use parking_lot::Mutex;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
@@ -415,13 +414,9 @@ pub struct GoalSubmission {
     /// retain this object rather than resolving a new driver from route or
     /// session text after the durable lifecycle transition.
     driver: Arc<dyn GoalSessionDriver>,
-    /// Stable diagnostic binding retained after the one-shot lease is
-    /// consumed by the controller. It is not an authority proof by itself.
-    binding: GoalSessionBinding,
-    /// A host admission can drive exactly one controller transition. The
-    /// controller takes and holds this lease across durable I/O, then drops it
-    /// before returning so ordinary commands do not block session replacement.
-    lease: Mutex<Option<GoalSessionLease>>,
+    /// A host admission can drive exactly one controller transition because
+    /// this non-cloneable submission owns its surface-provided session lease.
+    lease: GoalSessionLease,
 }
 
 impl std::fmt::Debug for GoalSubmission {
@@ -432,8 +427,7 @@ impl std::fmt::Debug for GoalSubmission {
             .field("command", &self.command)
             .field("driver_surface", &self.driver.surface())
             .field("driver_session_key", self.driver.session_key())
-            .field("binding", &self.binding)
-            .field("lease_present", &self.lease.lock().is_some())
+            .field("binding", self.lease.binding())
             .finish()
     }
 }
@@ -448,14 +442,7 @@ impl GoalSubmission {
     }
 
     pub fn binding(&self) -> &GoalSessionBinding {
-        &self.binding
-    }
-
-    fn take_lease(&self) -> Result<GoalSessionLease> {
-        self.lease
-            .lock()
-            .take()
-            .ok_or_else(|| anyhow::Error::msg("Goal submission has already been applied"))
+        self.lease.binding()
     }
 
     /// Borrow the exact surface driver validated during admission.
@@ -502,8 +489,7 @@ impl GoalExecutionHost {
             ingress,
             command,
             driver,
-            binding: lease.binding().clone(),
-            lease: Mutex::new(Some(lease)),
+            lease,
         })
     }
 
@@ -538,6 +524,27 @@ impl GoalExecutionHost {
 pub struct GoalRuntimeSubmission {
     response: GoalResponse,
     execution: Option<GoalExecutionRequest>,
+    /// Retained through supervisor and transport lifecycle cleanup. This
+    /// prevents a second Goal command from observing the same session before
+    /// the first command has drained and retired its exact executor.
+    lease: GoalSessionLease,
+}
+
+/// A completed durable controller transition which still owns the exact
+/// surface lease acquired for that command.
+pub struct GoalControllerSubmission {
+    response: GoalResponse,
+    submission: GoalSubmission,
+}
+
+impl GoalControllerSubmission {
+    pub fn response(&self) -> &GoalResponse {
+        &self.response
+    }
+
+    pub fn into_parts(self) -> (GoalResponse, GoalSubmission) {
+        (self.response, self.submission)
+    }
 }
 
 impl GoalRuntimeSubmission {
@@ -546,27 +553,44 @@ impl GoalRuntimeSubmission {
     }
 
     pub fn into_parts(self) -> (GoalResponse, Option<GoalExecutionRequest>) {
-        (self.response, self.execution)
+        let Self {
+            response,
+            execution,
+            lease,
+        } = self;
+        drop(lease);
+        (response, execution)
     }
 }
 
 /// Exact controller-to-executor handoff for a newly running Goal epoch.
 pub struct GoalExecutionRequest {
-    submission: GoalSubmission,
+    ingress: GoalIngressContext,
+    driver: Arc<dyn GoalSessionDriver>,
     scope: GoalExecutionScope,
 }
 
 impl GoalExecutionRequest {
-    pub fn submission(&self) -> &GoalSubmission {
-        &self.submission
+    pub fn ingress(&self) -> &GoalIngressContext {
+        &self.ingress
+    }
+
+    pub fn driver(&self) -> &Arc<dyn GoalSessionDriver> {
+        &self.driver
     }
 
     pub fn scope(&self) -> &GoalExecutionScope {
         &self.scope
     }
 
-    pub fn into_parts(self) -> (GoalSubmission, GoalExecutionScope) {
-        (self.submission, self.scope)
+    pub fn into_parts(
+        self,
+    ) -> (
+        GoalIngressContext,
+        Arc<dyn GoalSessionDriver>,
+        GoalExecutionScope,
+    ) {
+        (self.ingress, self.driver, self.scope)
     }
 }
 
@@ -605,19 +629,41 @@ impl GoalRuntime {
         command: GoalCommand,
     ) -> Result<GoalRuntimeSubmission> {
         let submission = self.host.submit(ingress, driver, command).await?;
-        let (response, submission) = self
+        let GoalSubmission {
+            ingress,
+            command,
+            driver,
+            lease,
+        } = submission;
+        let controller_submission = self
             .controller
-            .submit_for_execution(settings, submission)
+            .submit(
+                settings,
+                GoalSubmission {
+                    ingress,
+                    command,
+                    driver,
+                    lease,
+                },
+            )
             .await?;
+        let (response, submission) = controller_submission.into_parts();
+        let GoalSubmission {
+            ingress,
+            driver,
+            lease,
+            ..
+        } = submission;
         let execution = match &response {
             GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
                 Some(GoalExecutionRequest {
                     scope: GoalExecutionScope::new(
                         projection.task_id.clone(),
-                        submission.ingress().session_key().durable_id(),
+                        ingress.session_key().durable_id(),
                         projection.execution_epoch,
                     )?,
-                    submission,
+                    ingress,
+                    driver,
                 })
             }
             _ => None,
@@ -625,6 +671,7 @@ impl GoalRuntime {
         Ok(GoalRuntimeSubmission {
             response,
             execution,
+            lease,
         })
     }
 
@@ -640,8 +687,8 @@ impl GoalRuntime {
         self.host
             .acquire_execution(
                 settings,
-                request.submission().ingress(),
-                Arc::clone(request.submission().driver()),
+                request.ingress(),
+                Arc::clone(request.driver()),
                 request.scope(),
             )
             .await
@@ -790,51 +837,33 @@ impl GoalController {
     pub async fn submit(
         &self,
         settings: &GoalHostSettings,
-        submission: &GoalSubmission,
-    ) -> Result<GoalResponse> {
-        // Keep the surface-owned lease through every guarded transition below.
-        // Dropping it any earlier would permit a reconnect to invalidate the
-        // binding between host admission and durable mutation.
-        let _lease = submission.take_lease()?;
+        submission: GoalSubmission,
+    ) -> Result<GoalControllerSubmission> {
         let ingress = submission.ingress();
         let command = submission.command();
-
-        if matches!(command, GoalCommand::Help) {
-            return Ok(GoalResponse::Help);
-        }
-        if !settings.enabled {
-            return Ok(GoalResponse::Disabled);
-        }
-
-        match command {
-            GoalCommand::Start { budget, objective } => {
-                self.start(settings, ingress, *budget, objective.clone())
-                    .await
+        let response = if matches!(command, GoalCommand::Help) {
+            GoalResponse::Help
+        } else if !settings.enabled {
+            GoalResponse::Disabled
+        } else {
+            match command {
+                GoalCommand::Start { budget, objective } => {
+                    self.start(settings, ingress, *budget, objective.clone())
+                        .await?
+                }
+                GoalCommand::Status => self.status(ingress, false).await?,
+                GoalCommand::Budget => self.status(ingress, true).await?,
+                GoalCommand::SetBudget(selection) => self.set_budget(ingress, *selection).await?,
+                GoalCommand::Pause => self.pause(ingress).await?,
+                GoalCommand::Resume => self.resume(settings, ingress).await?,
+                GoalCommand::Cancel => self.cancel(ingress).await?,
+                GoalCommand::Help => unreachable!("handled before controller dispatch"),
             }
-            GoalCommand::Status => self.status(ingress, false).await,
-            GoalCommand::Budget => self.status(ingress, true).await,
-            GoalCommand::SetBudget(selection) => self.set_budget(ingress, *selection).await,
-            GoalCommand::Pause => self.pause(ingress).await,
-            GoalCommand::Resume => self.resume(settings, ingress).await,
-            GoalCommand::Cancel => self.cancel(ingress).await,
-            GoalCommand::Help => unreachable!("handled before controller dispatch"),
-        }
-    }
-
-    /// Apply a guarded transition while retaining the exact host-validated
-    /// submission for the executor that must immediately follow it.
-    ///
-    /// This is the only controller handoff that preserves the exact
-    /// surface-owned driver; an executor must never re-resolve it from route
-    /// or session text after a durable lifecycle change. The one-shot session
-    /// lease has already protected and completed the lifecycle transition.
-    pub async fn submit_for_execution(
-        &self,
-        settings: &GoalHostSettings,
-        submission: GoalSubmission,
-    ) -> Result<(GoalResponse, GoalSubmission)> {
-        let response = self.submit(settings, &submission).await?;
-        Ok((response, submission))
+        };
+        Ok(GoalControllerSubmission {
+            response,
+            submission,
+        })
     }
 
     async fn start(

@@ -790,9 +790,10 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .await
         .unwrap();
     let (response, start) = controller
-        .submit_for_execution(&settings, start)
+        .submit(&settings, start)
         .await
-        .unwrap();
+        .unwrap()
+        .into_parts();
     let GoalResponse::Started(started) = response else {
         panic!("expected a started Goal");
     };
@@ -809,7 +810,13 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
         .await
         .unwrap();
-    let GoalResponse::Paused(paused) = controller.submit(&settings, &pause).await.unwrap() else {
+    let GoalResponse::Paused(paused) = controller
+        .submit(&settings, pause)
+        .await
+        .unwrap()
+        .into_parts()
+        .0
+    else {
         panic!("expected a paused Goal");
     };
     assert_eq!(paused.execution_epoch, 2);
@@ -818,7 +825,12 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .submit(ingress.clone(), driver.clone(), GoalCommand::Resume)
         .await
         .unwrap();
-    let GoalResponse::Resumed(resumed) = controller.submit(&settings, &resume).await.unwrap()
+    let GoalResponse::Resumed(resumed) = controller
+        .submit(&settings, resume)
+        .await
+        .unwrap()
+        .into_parts()
+        .0
     else {
         panic!("expected a resumed Goal");
     };
@@ -829,7 +841,12 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, &cancel).await.unwrap(),
+        controller
+            .submit(&settings, cancel)
+            .await
+            .unwrap()
+            .into_parts()
+            .0,
         GoalResponse::Cancelled(_)
     ));
 }
@@ -877,7 +894,7 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
     assert!(lease.canonical_history().unwrap().is_empty());
     assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
     assert!(Arc::ptr_eq(
-        execution.submission().driver(),
+        execution.driver(),
         &(driver as Arc<dyn GoalSessionDriver>)
     ));
 }
@@ -994,7 +1011,12 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, &start).await.unwrap(),
+        controller
+            .submit(&settings, start)
+            .await
+            .unwrap()
+            .into_parts()
+            .0,
         GoalResponse::Started(_)
     ));
 
@@ -1009,7 +1031,12 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, &status).await.unwrap(),
+        controller
+            .submit(&settings, status)
+            .await
+            .unwrap()
+            .into_parts()
+            .0,
         GoalResponse::Status(_)
     ));
 
@@ -1022,7 +1049,12 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, &cancel).await.unwrap(),
+        controller
+            .submit(&settings, cancel)
+            .await
+            .unwrap()
+            .into_parts()
+            .0,
         GoalResponse::Cancelled(_)
     ));
 
@@ -1038,7 +1070,12 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         .await
         .unwrap();
     assert!(matches!(
-        controller.submit(&settings, &replacement).await.unwrap(),
+        controller
+            .submit(&settings, replacement)
+            .await
+            .unwrap()
+            .into_parts()
+            .0,
         GoalResponse::Started(_)
     ));
 }
@@ -1072,18 +1109,18 @@ async fn session_lease_blocks_reconnect_until_controller_returns() {
         !driver.reconnect_is_allowed(),
         "the host must retain the driver's session lease"
     );
-    assert!(matches!(
-        controller.submit(&settings, &submission).await.unwrap(),
-        GoalResponse::Disabled
-    ));
+    let completed = controller.submit(&settings, submission).await.unwrap();
+    assert!(matches!(completed.response(), GoalResponse::Disabled));
     assert!(
-        driver.reconnect_is_allowed(),
-        "the lease may release only after the controller has finished"
+        !driver.reconnect_is_allowed(),
+        "the lease remains held until the host has completed lifecycle cleanup"
     );
+    drop(completed);
+    assert!(driver.reconnect_is_allowed());
 }
 
 #[tokio::test]
-async fn host_submission_cannot_apply_a_second_lifecycle_transition() {
+async fn host_submission_is_consumed_by_the_controller_transition() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = host_settings(false);
@@ -1095,10 +1132,13 @@ async fn host_submission_cannot_apply_a_second_lifecycle_transition() {
         .unwrap();
 
     assert!(matches!(
-        controller.submit(&settings, &submission).await.unwrap(),
+        controller
+            .submit(&settings, submission)
+            .await
+            .unwrap()
+            .response(),
         GoalResponse::Disabled
     ));
-    assert!(controller.submit(&settings, &submission).await.is_err());
 }
 
 #[tokio::test]
@@ -1130,12 +1170,15 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         .await
         .unwrap();
 
-    let GoalResponse::Paused(_) = controller.submit(&settings, &submission).await.unwrap() else {
+    let completed = controller.submit(&settings, submission).await.unwrap();
+    let GoalResponse::Paused(_) = completed.response() else {
         panic!("expected a paused Goal");
     };
     assert_eq!(registry.pause_observed.load(Ordering::SeqCst), 1);
     assert!(
-        driver.reconnect_is_allowed(),
-        "the lease may release after the guarded lifecycle mutation returns"
+        !driver.reconnect_is_allowed(),
+        "the lease must cover the host's post-transition cleanup"
     );
+    drop(completed);
+    assert!(driver.reconnect_is_allowed());
 }
