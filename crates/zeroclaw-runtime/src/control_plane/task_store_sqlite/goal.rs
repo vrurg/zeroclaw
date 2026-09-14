@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::control_plane::authority::is_authoritative;
 use crate::control_plane::goal_task::{
     GoalAccountingState, GoalBlocker, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, GoalTransitionResult, TaskContinuationContext,
@@ -309,6 +310,40 @@ impl SqliteTaskStore {
     /// operation becomes resumable after restart.
     pub fn reconcile_goal_boot_state(&self, boot_id: &str) -> Result<u64> {
         let mut conn = self.conn.lock();
+        let recoverable_goals = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT * FROM tasks
+                      WHERE kind = 'goal' AND session_id IS NOT NULL
+                        AND status IN ('running', 'paused') AND owner_boot_id != ?1",
+                )
+                .context("prepare interrupted goal ownership query")?;
+            let rows = statement
+                .query_map(params![boot_id], row_to_record)
+                .context("query interrupted goal ownership")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("decode interrupted goal ownership")?
+        };
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS goal_recovery_candidates (
+                 task_id TEXT PRIMARY KEY
+             );
+             DELETE FROM goal_recovery_candidates;",
+        )
+        .context("reset in-memory goal recovery candidates")?;
+        {
+            let mut insert = conn
+                .prepare("INSERT INTO goal_recovery_candidates (task_id) VALUES (?1)")
+                .context("prepare goal recovery candidate insert")?;
+            for goal in recoverable_goals
+                .iter()
+                .filter(|goal| is_authoritative(goal))
+            {
+                insert
+                    .execute(params![&goal.id])
+                    .context("record authoritative goal recovery candidate")?;
+            }
+        }
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start goal boot reconciliation")?;
@@ -327,6 +362,7 @@ impl SqliteTaskStore {
                         END
                   WHERE kind = 'goal' AND session_id IS NOT NULL
                     AND owner_boot_id != ?1
+                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
                     AND status IN ('running', 'paused')
                     AND NOT EXISTS (
                         SELECT 1 FROM goal_tasks WHERE task_id = tasks.id
@@ -341,6 +377,7 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND owner_boot_id != ?1
+                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
               ) AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
         )
@@ -366,6 +403,7 @@ impl SqliteTaskStore {
                         END
                   WHERE kind = 'goal' AND session_id IS NOT NULL
                     AND owner_boot_id != ?1
+                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
                     AND status IN ('running', 'paused')
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
@@ -384,6 +422,7 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND owner_boot_id != ?1
+                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
               ) AND accounting_state = 'outcome_unknown'
                 AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
@@ -397,6 +436,7 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND status = 'running' AND owner_boot_id != ?1
+                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
                        AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                     AND accounting_state = 'complete'",
@@ -410,6 +450,7 @@ impl SqliteTaskStore {
                     SET status = 'paused', execution_epoch = execution_epoch + 1
                   WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                     AND owner_boot_id != ?1 AND execution_epoch < 9223372036854775807
+                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
@@ -427,6 +468,7 @@ impl SqliteTaskStore {
                         finished_at = COALESCE(finished_at, ?2)
                   WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                     AND owner_boot_id != ?1 AND execution_epoch = 9223372036854775807
+                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
