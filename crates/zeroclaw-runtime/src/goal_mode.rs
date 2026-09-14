@@ -904,7 +904,9 @@ impl GoalController {
         let Some(task) = self.current(ingress, &session_id).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
-        let projection = self.project(&task).await?;
+        let Some(projection) = self.projection_for(ingress, &session_id, &task.id).await? else {
+            return Ok(GoalResponse::Stale);
+        };
         if task.status.is_terminal() {
             Ok(GoalResponse::Terminal(projection))
         } else if budget {
@@ -1098,7 +1100,21 @@ impl GoalController {
         if task.id != task_id {
             return Ok(None);
         }
-        self.project(&task).await.map(Some)
+        match self.registry.get_goal_task(&task.id).await? {
+            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(&task, &goal))),
+            None => {
+                // A terminal predecessor can be atomically replaced between
+                // the current-task read and extension read. Recheck only on
+                // that exceptional missing-extension path so a genuine
+                // corrupt current task remains an error.
+                let current = self.current(ingress, session_id).await?;
+                if current.as_ref().is_none_or(|current| current.id != task.id) {
+                    Ok(None)
+                } else {
+                    bail!("Goal task extension is missing")
+                }
+            }
+        }
     }
 
     async fn projection_response(
