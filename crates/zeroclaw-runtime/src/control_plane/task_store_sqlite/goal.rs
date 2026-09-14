@@ -231,6 +231,13 @@ pub(super) fn migrate_schema(
             params![chrono::Utc::now().to_rfc3339()],
         )
         .context("reconcile legacy goals without V1 identity or objective")?;
+        conn.execute(
+            "UPDATE tasks SET execution_epoch = 1
+             WHERE kind = 'goal' AND session_id IS NOT NULL
+               AND length(trim(session_id)) > 0 AND execution_epoch < 1",
+            [],
+        )
+        .context("normalize legacy session-bound goal execution epochs")?;
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_tasks_active_goal_context;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_current_session
@@ -342,7 +349,14 @@ impl SqliteTaskStore {
         let failed_accounting = tx
             .execute(
                 "UPDATE tasks
-                    SET status = 'failed', error = 'accounting_outcome_unknown',
+                    SET status = 'failed', error = CASE (
+                            SELECT accounting_state FROM goal_tasks
+                             WHERE task_id = tasks.id
+                        )
+                        WHEN 'missing' THEN 'accounting_missing_or_invalid'
+                        WHEN 'invalid' THEN 'accounting_missing_or_invalid'
+                        ELSE 'accounting_outcome_unknown'
+                    END,
                         finished_at = COALESCE(finished_at, ?2),
                         execution_epoch = CASE
                             WHEN status IN ('running', 'paused')
@@ -956,7 +970,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     execution_epoch = execution_epoch + 1
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
                 AND status = 'running' AND execution_epoch = ?3
-                AND execution_epoch < 9223372036854775807",
+                AND execution_epoch < 9223372036854775807
+                AND EXISTS (
+                    SELECT 1 FROM goal_tasks WHERE task_id = tasks.id
+                )",
             params![task_id, session_id, expected_epoch,],
         )?;
         if updated == 0 {

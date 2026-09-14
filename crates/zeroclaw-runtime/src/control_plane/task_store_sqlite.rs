@@ -891,6 +891,7 @@ impl TaskRegistry for SqliteTaskStore {
         intent: TerminalSettlementIntent,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, &intent.task_id, "terminal settlement intent")?;
         persist_settlement_intent_record(&mut conn, &intent)
     }
 
@@ -916,6 +917,11 @@ impl TaskRegistry for SqliteTaskStore {
         error: Option<String>,
     ) -> Result<bool> {
         let mut conn = self.conn.lock();
+        reject_session_bound_goal_mutation(
+            &conn,
+            &intent.task_id,
+            "terminal settlement promotion",
+        )?;
         promote_settlement_record(&mut conn, intent, resolved_status, output, error)
     }
 
@@ -924,6 +930,7 @@ impl TaskRegistry for SqliteTaskStore {
         intent: &TerminalSettlementIntent,
     ) -> Result<bool> {
         let conn = self.conn.lock();
+        reject_session_bound_goal_mutation(&conn, &intent.task_id, "terminal settlement discard")?;
         Ok(delete_settlement_intent_record(&conn, intent)? == 1)
     }
 
