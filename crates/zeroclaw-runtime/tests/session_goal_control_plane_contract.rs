@@ -3,6 +3,7 @@
 use std::sync::{Arc, Barrier};
 
 use rusqlite::{Connection, ErrorCode, params};
+use zeroclaw_runtime::control_plane::task_registry::TerminalSettlementIntent;
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
     GoalTransitionResult, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
@@ -251,6 +252,54 @@ async fn provisional_v8_success_criteria_is_ignored() {
         goal.expect("Goal control state remains readable").objective,
         "produce a verified result",
         "the old column is ignored rather than becoming a second model field"
+    );
+}
+
+#[tokio::test]
+async fn migration_normalizes_a_session_bound_goal_epoch_before_operation_admission() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("provisional-epoch", "provisional-epoch-session"),
+                session_goal_extension("provisional-epoch"),
+            )
+            .await
+            .expect("create session Goal"),
+        GoalTransitionResult::Applied
+    );
+    let database = directory.path().join("control_plane.db");
+    Connection::open(&database)
+        .expect("open provisional migration fixture")
+        .execute_batch(
+            "UPDATE tasks SET execution_epoch = 0 WHERE id = 'provisional-epoch';
+             PRAGMA user_version = 9;",
+        )
+        .expect("write provisional epoch-zero fixture");
+    drop(store);
+
+    let migrated = SqliteTaskStore::new(directory.path()).expect("migrate provisional fixture");
+    assert_eq!(
+        migrated
+            .current_goal_for_session("provisional-epoch-session")
+            .await
+            .expect("read migrated Goal")
+            .expect("Goal remains current")
+            .execution_epoch,
+        1
+    );
+    assert_eq!(
+        migrated
+            .admit_pending_operation(
+                "provisional-epoch",
+                "provisional-epoch-session",
+                1,
+                "provisional-epoch-operation",
+            )
+            .await
+            .expect("admit operation at normalized epoch"),
+        GoalTransitionResult::Applied
     );
 }
 
@@ -576,8 +625,58 @@ async fn pausing_a_goal_is_resumable_when_no_operation_is_pending() {
 }
 
 #[tokio::test]
+async fn pause_rejects_a_goal_missing_its_control_extension() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("missing-extension", "missing-extension-session"),
+                session_goal_extension("missing-extension"),
+            )
+            .await
+            .expect("create session Goal"),
+        GoalTransitionResult::Applied
+    );
+    Connection::open(directory.path().join("control_plane.db"))
+        .expect("open independent corruption connection")
+        .execute(
+            "DELETE FROM goal_tasks WHERE task_id = 'missing-extension'",
+            [],
+        )
+        .expect("remove corrupt control extension");
+
+    assert_eq!(
+        store
+            .pause_session_goal(
+                "missing-extension",
+                "missing-extension-session",
+                1,
+                GoalPauseState {
+                    reason: GoalPauseReason::OperatorPaused,
+                    description: None,
+                    blockers: Vec::new(),
+                },
+            )
+            .await
+            .expect("classify corrupt Goal pause"),
+        GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("missing-extension-session")
+            .await
+            .expect("read corrupt Goal")
+            .expect("Goal remains auditable")
+            .status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn different_sessions_do_not_share_goal_admission_or_disposal_state() {
-    let store = SqliteTaskStore::new_in_memory().expect("initialize store");
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize control-plane schema");
     for (task_id, session_id) in [
         ("goal-left", "session-left"),
         ("goal-right", "session-right"),
@@ -613,6 +712,18 @@ async fn different_sessions_do_not_share_goal_admission_or_disposal_state() {
             .await
             .expect("read deleted session")
             .is_none()
+    );
+    let removed_control_rows: i64 = Connection::open(directory.path().join("control_plane.db"))
+        .expect("open independent verification connection")
+        .query_row(
+            "SELECT COUNT(*) FROM goal_tasks WHERE task_id = 'goal-left'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query disposed Goal control rows");
+    assert_eq!(
+        removed_control_rows, 0,
+        "disposal cascades Goal control-state removal"
     );
     assert_eq!(
         store
@@ -667,6 +778,21 @@ async fn generic_lifecycle_mutators_cannot_bypass_session_bound_goal_fencing() {
     let error = store
         .delete_by_agent("main")
         .expect_err("generic agent deletion must reject a session Goal");
+    assert!(format!("{error:#}").contains("session-bound Goal"));
+
+    let error = store
+        .persist_terminal_settlement_intent(TerminalSettlementIntent {
+            task_id: "goal-generic-fence".into(),
+            owner_pid: 1,
+            owner_boot_id: "boot-a".into(),
+            desired_status: TaskStatus::Completed,
+            artifact_path: "/tmp/goal.json".into(),
+            artifact_ref: Some("artifact:goal.json".into()),
+            artifact_sha256: "00".repeat(32),
+            terminal_error: None,
+        })
+        .await
+        .expect_err("generic settlement intent must reject a session Goal");
     assert!(format!("{error:#}").contains("session-bound Goal"));
 }
 
@@ -899,9 +1025,39 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
     );
     assert_eq!(
         store
+            .create_or_replace_session_goal(
+                session_goal_task("missing", "missing-session"),
+                session_goal_extension("missing"),
+            )
+            .await
+            .expect("create missing-usage Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
             .admit_pending_operation("pending", "pending-session", 1, "operation-pending")
             .await
             .expect("admit pending operation"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_operation("missing", "missing-session", 1, "operation-missing")
+            .await
+            .expect("admit missing-usage operation"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .settle_pending_operation(
+                "missing",
+                "missing-session",
+                1,
+                "operation-missing",
+                GoalAccountingState::Missing,
+            )
+            .await
+            .expect("record missing usage"),
         GoalTransitionResult::Applied
     );
     drop(store);
@@ -911,7 +1067,7 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         reopened
             .reconcile_goal_boot_state("boot-new")
             .expect("reconcile previous boot"),
-        2
+        3
     );
     let clean = reopened
         .current_goal_for_session("clean-session")
@@ -943,6 +1099,14 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
         GoalAccountingState::OutcomeUnknown
     );
     assert!(pending_extension.pending_call_id.is_none());
+    assert_eq!(
+        reopened
+            .terminal_reason_for_session_goal("missing", "missing-session")
+            .await
+            .expect("read missing-usage terminal reason")
+            .as_deref(),
+        Some("accounting_missing_or_invalid")
+    );
 }
 
 #[tokio::test]
