@@ -811,6 +811,46 @@ async fn generic_lifecycle_mutators_cannot_bypass_session_bound_goal_fencing() {
         .await
         .expect_err("generic settlement intent must reject a session Goal");
     assert!(format!("{error:#}").contains("session-bound Goal"));
+
+    let settlement = TerminalSettlementIntent {
+        task_id: "goal-generic-fence".into(),
+        owner_pid: 1,
+        owner_boot_id: "boot-a".into(),
+        desired_status: TaskStatus::Completed,
+        artifact_path: "/tmp/goal.json".into(),
+        artifact_ref: Some("artifact:goal.json".into()),
+        artifact_sha256: "00".repeat(32),
+        terminal_error: None,
+    };
+    for result in [
+        TaskRegistry::transition_terminal(
+            &store,
+            "goal-generic-fence",
+            TaskStatus::Completed,
+            None,
+            None,
+        )
+        .await,
+        TaskRegistry::transition_terminal_if_owner(
+            &store,
+            "goal-generic-fence",
+            1,
+            "boot-a",
+            TaskStatus::Completed,
+            None,
+            None,
+        )
+        .await,
+        store
+            .promote_terminal_settlement(&settlement, TaskStatus::Completed, None, None)
+            .await,
+        store.discard_terminal_settlement_intent(&settlement).await,
+        TaskRegistry::reconcile_timed_out(&store, "goal-generic-fence", 1, "boot-a", "heartbeat-a")
+            .await,
+    ] {
+        let error = result.expect_err("generic lifecycle mutation must reject a session Goal");
+        assert!(format!("{error:#}").contains("session-bound Goal"));
+    }
 }
 
 #[tokio::test]
