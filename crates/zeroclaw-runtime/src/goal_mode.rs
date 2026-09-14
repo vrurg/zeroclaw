@@ -291,11 +291,20 @@ pub trait GoalSessionDriver: Send + Sync {
 ///
 /// The host validates the session binding only. The later executor performs
 /// the durable task and epoch fence before it asks a driver for this lease.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GoalExecutionScope {
     task_id: String,
     session_id: String,
     execution_epoch: i64,
+}
+
+impl fmt::Debug for GoalExecutionScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalExecutionScope")
+            .field("execution_epoch", &self.execution_epoch)
+            .finish()
+    }
 }
 
 impl GoalExecutionScope {
@@ -333,17 +342,32 @@ impl GoalExecutionScope {
 }
 
 /// Trusted input for a parent Goal turn.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GoalParentTurn {
     pub objective: String,
     pub working_history: Vec<ChatMessage>,
 }
 
+impl fmt::Debug for GoalParentTurn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalParentTurn")
+            .field("working_history_len", &self.working_history.len())
+            .finish()
+    }
+}
+
 /// Trusted, isolated input for the mandatory Goal verifier.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GoalVerifierTurn {
     pub objective: String,
     pub candidate: String,
+}
+
+impl fmt::Debug for GoalVerifierTurn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("GoalVerifierTurn").finish()
+    }
 }
 
 /// Surface-owned foreground execution bridge. It retains the live-session
@@ -734,18 +758,18 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(&session_id, &task_id, GoalResponse::Started)
+                self.projection_response(ingress, &task_id, GoalResponse::Started)
                     .await
             }
-            GoalTransitionResult::Stale => self.start_stale_response(&session_id).await,
+            GoalTransitionResult::Stale => self.start_stale_response(ingress).await,
             GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
         }
     }
 
     /// A failed start CAS has more than one durable cause. Reload before
     /// presenting it: only a currently non-terminal Goal is actually active.
-    async fn start_stale_response(&self, session_id: &str) -> Result<GoalResponse> {
-        let Some(task) = self.current(session_id).await? else {
+    async fn start_stale_response(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::Stale);
         };
         if !task.status.is_terminal() {
@@ -755,8 +779,7 @@ impl GoalController {
     }
 
     async fn status(&self, ingress: &GoalIngressContext, budget: bool) -> Result<GoalResponse> {
-        let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(&session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         let projection = self.project(&task).await?;
@@ -775,7 +798,7 @@ impl GoalController {
         selection: GoalBudgetSelection,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(&session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status.is_terminal() {
@@ -794,7 +817,7 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(&session_id, &task.id, GoalResponse::BudgetUpdated)
+                self.projection_response(ingress, &task.id, GoalResponse::BudgetUpdated)
                     .await
             }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
@@ -803,7 +826,7 @@ impl GoalController {
 
     async fn pause(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(&session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status == TaskStatus::Paused {
@@ -827,7 +850,7 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(&session_id, &task.id, GoalResponse::Paused)
+                self.projection_response(ingress, &task.id, GoalResponse::Paused)
                     .await
             }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
@@ -840,7 +863,7 @@ impl GoalController {
         ingress: &GoalIngressContext,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(&session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status.is_terminal() {
@@ -861,10 +884,10 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(&session_id, &task.id, GoalResponse::Resumed)
+                self.projection_response(ingress, &task.id, GoalResponse::Resumed)
                     .await
             }
-            GoalTransitionResult::Stale => self.resume_stale_response(&session_id).await,
+            GoalTransitionResult::Stale => self.resume_stale_response(ingress).await,
             GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
         }
     }
@@ -872,8 +895,8 @@ impl GoalController {
     /// Resume has additional durable accounting predicates beyond `Paused`.
     /// If one changes between the pre-check and the CAS, return the canonical
     /// state rather than asking the operator to retry an unchanged condition.
-    async fn resume_stale_response(&self, session_id: &str) -> Result<GoalResponse> {
-        let Some(task) = self.current(session_id).await? else {
+    async fn resume_stale_response(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::Stale);
         };
         if task.status.is_terminal() {
@@ -884,7 +907,7 @@ impl GoalController {
 
     async fn cancel(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
-        let Some(task) = self.current(&session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status == TaskStatus::Cancelled {
@@ -908,26 +931,35 @@ impl GoalController {
             .await?
         {
             GoalTransitionResult::Applied => {
-                self.projection_response(&session_id, &task.id, GoalResponse::Cancelled)
+                self.projection_response(ingress, &task.id, GoalResponse::Cancelled)
                     .await
             }
             GoalTransitionResult::Stale | GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
         }
     }
 
-    async fn current(&self, session_id: &str) -> Result<Option<TaskRecord>> {
-        // Session binding is the lifecycle authority. Agent, route, and
-        // principal remain creation-time audit facts and policy inputs; a
-        // valid session can legitimately refresh those live ingress facts.
-        self.registry.current_goal_for_session(session_id).await
+    async fn current(&self, ingress: &GoalIngressContext) -> Result<Option<TaskRecord>> {
+        let session_id = ingress.session_key().durable_id();
+        let Some(task) = self.registry.current_goal_for_session(&session_id).await? else {
+            return Ok(None);
+        };
+        // Matrix history keys are filesystem-safe and therefore lossy. The
+        // exact authenticated MXID is the durable authority for an existing
+        // Matrix Goal, while a ZeroCode tui_id remains transient continuity.
+        if ingress.surface() == GoalSurface::Matrix
+            && task.principal_id.as_deref() != ingress.durable_principal_id()
+        {
+            return Ok(None);
+        }
+        Ok(Some(task))
     }
 
     async fn projection_for(
         &self,
-        session_id: &str,
+        ingress: &GoalIngressContext,
         task_id: &str,
     ) -> Result<Option<GoalStatusProjection>> {
-        let Some(task) = self.current(session_id).await? else {
+        let Some(task) = self.current(ingress).await? else {
             return Ok(None);
         };
         if task.id != task_id {
@@ -938,11 +970,11 @@ impl GoalController {
 
     async fn projection_response(
         &self,
-        session_id: &str,
+        ingress: &GoalIngressContext,
         task_id: &str,
         response: impl FnOnce(GoalStatusProjection) -> GoalResponse,
     ) -> Result<GoalResponse> {
-        let projection = self.projection_for(session_id, task_id).await?;
+        let projection = self.projection_for(ingress, task_id).await?;
         Ok(projection.map_or(GoalResponse::Stale, response))
     }
 
