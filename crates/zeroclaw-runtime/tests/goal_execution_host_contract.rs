@@ -655,6 +655,28 @@ async fn exact_driver_binding_and_typed_command_are_preserved() {
     assert_eq!(driver.binds.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
+    let ingress = matrix_ingress();
+    let submission = GoalExecutionHost::new()
+        .submit(
+            ingress.clone(),
+            recording_driver(&ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "private stop condition".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let debug = format!("{submission:?}");
+    assert!(debug.contains("surface: Matrix"));
+    assert!(debug.contains("command_kind: \"start\""));
+    assert!(!debug.contains("private stop condition"));
+    assert!(!debug.contains("@alice:example.org"));
+}
+
 #[test]
 fn identical_raw_ids_from_matrix_and_zerocode_are_not_the_same_session() {
     let matrix = GoalSessionKey::matrix("matrix_shared-id").unwrap();
@@ -828,6 +850,62 @@ async fn controller_distinguishes_active_goals_from_terminal_goals_with_unsettle
     };
     assert_eq!(terminal.status, TaskStatus::Cancelled);
     assert!(!terminal.resumable);
+}
+
+#[tokio::test]
+async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+    let host = GoalExecutionHost::new();
+
+    let start = host
+        .submit(
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the assigned task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
+        panic!("expected a started Goal");
+    };
+    assert_eq!(
+        store
+            .admit_pending_operation(
+                &started.task_id,
+                &ingress.session_key().durable_id(),
+                started.execution_epoch,
+                "operation-still-settling",
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    let pause = host
+        .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&settings, &pause).await.unwrap(),
+        GoalResponse::Paused(_)
+    ));
+
+    let resume = host
+        .submit(ingress, driver, GoalCommand::Resume)
+        .await
+        .unwrap();
+    let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
+        panic!("resume must project the durable non-resumable paused state");
+    };
+    assert_eq!(status.status, TaskStatus::Paused);
+    assert!(!status.resumable);
 }
 
 #[tokio::test]
