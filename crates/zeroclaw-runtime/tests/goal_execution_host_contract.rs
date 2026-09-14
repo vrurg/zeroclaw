@@ -26,11 +26,16 @@ struct RecordingDriver {
 }
 
 struct RecordingExecutionLease {
+    session_key: GoalSessionKey,
     delivered: Arc<AtomicUsize>,
 }
 
 #[async_trait]
 impl GoalSessionExecutionLease for RecordingExecutionLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
     fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
         Ok(Vec::new())
     }
@@ -80,7 +85,37 @@ impl GoalSessionDriver for ExecutionDriver {
     ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
         self.execution_acquires.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(RecordingExecutionLease {
+            session_key: self.binding.session_key().clone(),
             delivered: self.delivered.clone(),
+        }))
+    }
+}
+
+struct WrongExecutionLeaseDriver {
+    binding: GoalSessionBinding,
+    returned_session_key: GoalSessionKey,
+    execution_acquires: AtomicUsize,
+}
+
+#[async_trait]
+impl GoalSessionDriver for WrongExecutionLeaseDriver {
+    fn session_key(&self) -> &GoalSessionKey {
+        self.binding.session_key()
+    }
+
+    async fn bind(&self, _ingress: &GoalIngressContext) -> anyhow::Result<GoalSessionLease> {
+        Ok(GoalSessionLease::new(self.binding.clone(), ()))
+    }
+
+    async fn acquire_execution(
+        &self,
+        _ingress: &GoalIngressContext,
+        _scope: &GoalExecutionScope,
+    ) -> anyhow::Result<Box<dyn GoalSessionExecutionLease>> {
+        self.execution_acquires.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(RecordingExecutionLease {
+            session_key: self.returned_session_key.clone(),
+            delivered: Arc::new(AtomicUsize::new(0)),
         }))
     }
 }
@@ -151,12 +186,14 @@ impl LeaseDriver {
             anyhow::bail!("session replacement is already in progress");
         }
         Ok(ReconnectLease {
+            session_key: self.binding.session_key().clone(),
             available_for_reconnect: self.available_for_reconnect.clone(),
         })
     }
 }
 
 struct ReconnectLease {
+    session_key: GoalSessionKey,
     available_for_reconnect: Arc<AtomicUsize>,
 }
 
@@ -168,6 +205,10 @@ impl Drop for ReconnectLease {
 
 #[async_trait]
 impl GoalSessionExecutionLease for ReconnectLease {
+    fn session_key(&self) -> &GoalSessionKey {
+        &self.session_key
+    }
+
     fn canonical_history(&self) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
         Ok(Vec::new())
     }
@@ -675,6 +716,31 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
 }
 
 #[tokio::test]
+async fn execution_lease_must_match_trusted_ingress_after_revalidation() {
+    let ingress = matrix_ingress();
+    let driver = Arc::new(WrongExecutionLeaseDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        returned_session_key: GoalSessionKey::zero_code("wrong-session").unwrap(),
+        execution_acquires: AtomicUsize::new(0),
+    });
+    let scope = GoalExecutionScope::new("goal-1", ingress.session_key().durable_id(), 1).unwrap();
+    let settings = host_settings(true);
+    let host = GoalExecutionHost::new();
+    let submission = host
+        .submit(&settings, ingress, driver.clone(), GoalCommand::Status)
+        .await
+        .unwrap();
+
+    let error = match host.acquire_execution(&settings, submission, &scope).await {
+        Ok(_) => panic!("mismatched execution lease must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("lease session key"));
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
     let ingress = matrix_ingress();
     let driver = recording_driver(&ingress);
@@ -889,7 +955,7 @@ fn host_settings_rejects_a_blank_boot_id() {
         GoalHostSettings::new(
             true,
             ConfigGoalBudgetLimits {
-                token_limit: None,
+                token_limit: Some(100),
                 cost_limit_usd: None,
             },
             42,
@@ -897,6 +963,17 @@ fn host_settings_rejects_a_blank_boot_id() {
         )
         .is_err()
     );
+
+    let config = GoalConfig {
+        enabled: true,
+        default_token_limit: Some(0),
+        default_cost_limit_usd: Some(0.0),
+        verifier: GoalVerifierConfig {
+            model_provider: ModelProviderRef::new("openai.default"),
+            model: None,
+        },
+    };
+    assert!(GoalHostSettings::from_config(&config, 42, " \t\n").is_err());
 }
 
 #[test]
@@ -1342,6 +1419,26 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
         controller.submit(&enabled, &terminal_status).await.unwrap(),
         GoalResponse::Terminal(_)
     ));
+}
+
+#[tokio::test]
+async fn local_help_does_not_bind_a_live_session_when_goal_mode_is_enabled() {
+    let ingress = matrix_ingress();
+    let driver = recording_driver(&ingress);
+
+    let submission = GoalExecutionHost::new()
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver.clone(),
+            GoalCommand::Help,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(submission.command(), &GoalCommand::Help);
+    assert_eq!(driver.binds.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.execution_acquires.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
