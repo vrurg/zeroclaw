@@ -28,7 +28,7 @@ use zeroclaw_config::cost::{CostTracker, types::TokenUsage as CostTokenUsage};
 use super::{
     GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
     GoalOperationScope, GoalParentTurn, GoalResponse, GoalRuntime, GoalSessionDriver,
-    GoalSessionExecutionLease, GoalVerifierTurn,
+    GoalSessionExecutionLease, GoalSessionLease, GoalVerifierTurn,
 };
 use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
@@ -49,6 +49,36 @@ const MAX_VERIFIER_BLOCKER_MESSAGE_CHARS: usize = 2_000;
 pub enum GoalExecutionOutcome {
     Completed,
     VerifierBlocked,
+}
+
+/// A Goal command result whose surface lease remains held until the transport
+/// has finished the post-transition lifecycle work for that exact command.
+///
+/// The response is intentionally separate from the lease: an adapter may
+/// render or retire a supervisor while this value is alive, but a following
+/// command cannot enter the same session until it is dropped.
+pub struct GoalExecutionSubmission {
+    response: GoalResponse,
+    _lease: GoalSessionLease,
+}
+
+impl std::fmt::Debug for GoalExecutionSubmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoalExecutionSubmission")
+            .field("response", &self.response)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoalExecutionSubmission {
+    pub fn response(&self) -> &GoalResponse {
+        &self.response
+    }
+
+    pub fn into_response(self) -> GoalResponse {
+        self.response
+    }
 }
 
 /// Executes a Goal through the already validated session driver.
@@ -276,18 +306,18 @@ impl GoalExecutionSupervisor {
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
-    ) -> Result<GoalResponse> {
+    ) -> Result<GoalExecutionSubmission> {
         let _admission = match &self.restart_gate {
             Some(gate) => gate.admit(&command).await?,
             None => None,
         };
         let previous = self.scope_for_session(&ingress).await?;
-        let (response, execution) = self
+        let (response, execution, lease) = self
             .engine
             .runtime
             .submit(&settings, ingress, driver, command)
             .await?
-            .into_parts();
+            .into_parts_with_lease();
 
         if let Some(request) = execution {
             if let Some(scope) = previous.as_ref() {
@@ -304,10 +334,16 @@ impl GoalExecutionSupervisor {
         ) && let Some(scope) = previous.as_ref()
             && let Some(response) = self.drain_lifecycle_fence(scope).await?
         {
-            return Ok(response);
+            return Ok(GoalExecutionSubmission {
+                response,
+                _lease: lease,
+            });
         }
 
-        Ok(response)
+        Ok(GoalExecutionSubmission {
+            response,
+            _lease: lease,
+        })
     }
 
     /// Hard-dispose one trusted session's current Goal control state.

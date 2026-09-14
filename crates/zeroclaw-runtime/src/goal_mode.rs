@@ -615,6 +615,12 @@ impl GoalRuntimeSubmission {
     pub fn into_parts(self) -> (GoalResponse, Option<GoalExecutionRequest>) {
         (self.response, self.execution)
     }
+
+    pub(super) fn into_parts_with_lease(
+        self,
+    ) -> (GoalResponse, Option<GoalExecutionRequest>, GoalSessionLease) {
+        (self.response, self.execution, self.lease)
+    }
 }
 
 /// Exact controller-to-executor handoff for a newly running Goal epoch.
