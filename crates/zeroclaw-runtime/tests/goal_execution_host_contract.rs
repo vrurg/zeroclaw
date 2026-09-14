@@ -678,6 +678,33 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
 
     let ingress_debug = format!("{ingress:?}");
     assert!(!ingress_debug.contains("@alice:example.org"));
+    let scope_debug = format!(
+        "{:?}",
+        GoalExecutionScope::new(
+            "goal-1",
+            "matrix_room__room_example_org__alice_example_org",
+            1
+        )
+        .unwrap()
+    );
+    assert!(!scope_debug.contains("alice_example_org"));
+    let parent_debug = format!(
+        "{:?}",
+        GoalParentTurn {
+            objective: "private stop condition".into(),
+            working_history: Vec::new(),
+        }
+    );
+    assert!(!parent_debug.contains("private stop condition"));
+    let verifier_debug = format!(
+        "{:?}",
+        GoalVerifierTurn {
+            objective: "private stop condition".into(),
+            candidate: "private candidate".into(),
+        }
+    );
+    assert!(!verifier_debug.contains("private stop condition"));
+    assert!(!verifier_debug.contains("private candidate"));
 }
 
 #[test]
@@ -1243,6 +1270,80 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
     assert!(matches!(
         controller.submit(&settings, &replacement).await.unwrap(),
         GoalResponse::Started(_)
+    ));
+}
+
+#[tokio::test]
+async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normalization() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let shared_key = "matrix__r_example_org__a_b_example_org";
+    let first_ingress = GoalIngressContext::trusted(
+        GoalSessionKey::matrix(shared_key).unwrap(),
+        "main",
+        "matrix:primary",
+        GoalIngressPrincipal::Matrix {
+            raw_mxid: "@a.b:example.org".into(),
+        },
+    )
+    .unwrap();
+    let colliding_ingress = GoalIngressContext::trusted(
+        GoalSessionKey::matrix(shared_key).unwrap(),
+        "main",
+        "matrix:primary",
+        GoalIngressPrincipal::Matrix {
+            raw_mxid: "@a_b:example.org".into(),
+        },
+    )
+    .unwrap();
+    let host = GoalExecutionHost::new();
+
+    let first_start = host
+        .submit(
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the assigned task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.submit(&settings, &first_start).await.unwrap(),
+        GoalResponse::Started(_)
+    ));
+
+    let colliding_status = host
+        .submit(
+            colliding_ingress.clone(),
+            recording_driver(&colliding_ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &colliding_status)
+            .await
+            .unwrap(),
+        GoalResponse::NoCurrentGoal
+    ));
+    let colliding_cancel = host
+        .submit(
+            colliding_ingress.clone(),
+            recording_driver(&colliding_ingress),
+            GoalCommand::Cancel,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &colliding_cancel)
+            .await
+            .unwrap(),
+        GoalResponse::NoCurrentGoal
     ));
 }
 
