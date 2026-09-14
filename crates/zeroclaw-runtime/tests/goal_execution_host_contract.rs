@@ -772,6 +772,24 @@ fn trusted_ingress_rejects_invalid_or_cross_surface_authority() {
 }
 
 #[test]
+fn trusted_ingress_rejects_noncanonical_principal_identity() {
+    let session_key =
+        GoalSessionKey::matrix("matrix_room__room_example_org__alice_example_org").unwrap();
+
+    let error = GoalIngressContext::trusted(
+        session_key,
+        "main",
+        "matrix:primary",
+        GoalIngressPrincipal::Matrix {
+            raw_mxid: " @alice:example.org ".into(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("not canonical"));
+}
+
+#[test]
 fn host_settings_reject_invalid_semantic_default_limits() {
     for default_limits in [
         ConfigGoalBudgetLimits {
@@ -793,6 +811,22 @@ fn host_settings_reject_invalid_semantic_default_limits() {
     ] {
         assert!(GoalHostSettings::new(true, default_limits, 42, "test-boot").is_err());
     }
+}
+
+#[test]
+fn host_settings_rejects_a_blank_boot_id() {
+    assert!(
+        GoalHostSettings::new(
+            true,
+            ConfigGoalBudgetLimits {
+                token_limit: None,
+                cost_limit_usd: None,
+            },
+            42,
+            " \t\n",
+        )
+        .is_err()
+    );
 }
 
 #[test]
