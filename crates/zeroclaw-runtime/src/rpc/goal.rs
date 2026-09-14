@@ -63,17 +63,28 @@ impl ZeroCodeGoalSessionDriver {
             GoalSessionKey::ZeroCode { raw_session_id } => raw_session_id,
             GoalSessionKey::Matrix { .. } => unreachable!("ZeroCode key constructor is typed"),
         };
-        let snapshot = context
+        let session_generation = context
             .sessions
-            .goal_session_snapshot(raw_session_id)
+            .get_generation(raw_session_id)
             .await
             .context("ZeroCode Goal session is absent")?;
         ensure!(
-            snapshot.owner_tui_id.as_deref() == Some(tui_id.as_str()),
+            matches!(
+                context.sessions.session_owner_tui_id(raw_session_id).await,
+                Some(Some(owner)) if owner == tui_id
+            ),
             "ZeroCode Goal caller does not own the session"
         );
+        let agent_alias = context
+            .sessions
+            .get_agent_alias(raw_session_id)
+            .await
+            .context("ZeroCode Goal session has no agent")?;
         ensure!(
-            matches!(snapshot.chat_mode, crate::rpc::types::ChatMode::Chat),
+            matches!(
+                context.sessions.chat_mode(raw_session_id).await,
+                Some(crate::rpc::types::ChatMode::Chat)
+            ),
             "Goal Mode is unavailable for ACP sessions"
         );
         Ok(Self {
@@ -81,8 +92,8 @@ impl ZeroCodeGoalSessionDriver {
             outbound,
             connection_activity,
             session_key,
-            agent_alias: snapshot.agent_alias,
-            session_generation: snapshot.generation,
+            agent_alias,
+            session_generation,
             tui_id,
             command_lock: snapshot.goal_command,
         })
@@ -123,29 +134,40 @@ impl ZeroCodeGoalSessionDriver {
     }
 
     async fn revalidate_session(&self) -> Result<Arc<Mutex<Agent>>> {
-        let snapshot = self
+        ensure!(
+            self.context
+                .sessions
+                .get_generation(self.raw_session_id())
+                .await
+                == Some(self.session_generation),
+            "ZeroCode Goal session was replaced"
+        );
+        let agent = self
             .context
             .sessions
-            .goal_session_snapshot(self.raw_session_id())
+            .get_agent(self.raw_session_id())
             .await
             .context("ZeroCode Goal session is absent")?;
         ensure!(
-            snapshot.generation == self.session_generation,
-            "ZeroCode Goal session was replaced"
-        );
-        ensure!(
-            snapshot.agent_alias == self.agent_alias,
+            self.context
+                .sessions
+                .get_agent_alias(self.raw_session_id())
+                .await
+                .as_deref()
+                == Some(self.agent_alias.as_str()),
             "ZeroCode Goal session agent changed"
         );
         ensure!(
-            snapshot.owner_tui_id.as_deref() == Some(self.tui_id.as_str()),
+            matches!(
+                self.context
+                    .sessions
+                    .session_owner_tui_id(self.raw_session_id())
+                    .await,
+                Some(Some(owner)) if owner == self.tui_id
+            ),
             "ZeroCode Goal caller no longer owns the session"
         );
-        ensure!(
-            matches!(snapshot.chat_mode, crate::rpc::types::ChatMode::Chat),
-            "Goal Mode is unavailable for ACP sessions"
-        );
-        Ok(snapshot.agent)
+        Ok(agent)
     }
 }
 
@@ -169,7 +191,10 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         let guard = self.command_lock.clone().lock_owned().await;
         self.revalidate_session().await?;
         Ok(GoalSessionLease::new(
-            GoalSessionBinding::new(self.session_key.clone()),
+            GoalSessionBinding::new(
+                self.session_key.clone(),
+                self.session_generation.to_string(),
+            )?,
             guard,
         ))
     }
@@ -239,12 +264,14 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                 IsolatedTranscriptSource::Continuation(turn.working_history)
             }
         };
-        let outcome = self
-            .agent
-            .lock()
-            .await
-            .run_isolated_turn(source, directive)
-            .await?;
+        // The execution lease is the Goal-specific boundary. Keeping the
+        // child-admission scope here leaves Agent's isolated-turn primitive
+        // unchanged for ordinary callers and gives each future channel host
+        // the same explicit responsibility.
+        let mut agent = self.agent.lock().await;
+        let outcome =
+            crate::goal_mode::scope_goal_parent_turn(agent.run_isolated_turn(source, directive))
+                .await?;
         Ok(GoalParentTurnResult {
             candidate: outcome.response,
             working_history: outcome.working_history,

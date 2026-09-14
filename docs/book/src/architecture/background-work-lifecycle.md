@@ -62,9 +62,9 @@ originating alias for reads and mutations.
 
 ## Goal-mode target contract
 
-[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) accepts the task control plane as the future authority for goal lifecycle, ownership, route, principal, parent relation, and recovery eligibility. The repository contains goal storage and control-plane APIs, but production goal admission and execution are not yet wired end to end.
+[ADR-008](./decisions/ADR-008-goal-mode-control-plane-and-usage-accounting.md) anchors Goal Mode in the task control plane, which owns its lifecycle, ownership, route, principal, parent relation, and recovery eligibility. V1 admits explicit Matrix and ZeroCode commands through a trusted runtime gate, binds at most one Goal to a session, and supervises foreground execution through guarded task transitions.
 
-A background path may participate in goal mode only after it preserves the owning goal relationship and reports terminal state and model usage back to it. Until then, that path is ordinary background work rather than goal-mode execution.
+A child path may participate in Goal Mode only when it preserves the owning Goal relationship and reports terminal state and model usage back to it. V1 permits only foreground `delegate` and `spawn_subagent` work; background, detached, parallel, and recursive Goal-owned child work remain excluded.
 
 ## Change checklist
 

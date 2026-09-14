@@ -160,8 +160,13 @@ pub(crate) async fn call_provider(
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
-    admit_goal_operation_if_scoped(GoalOperationRequest::new(ctx.provider_name, active_model))
+    if crate::agent::cost::goal_operation_accounting_is_scoped() {
+        Box::pin(admit_goal_operation_if_scoped(GoalOperationRequest::new(
+            ctx.provider_name,
+            active_model,
+        )))
         .await?;
+    }
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();

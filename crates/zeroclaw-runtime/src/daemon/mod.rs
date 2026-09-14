@@ -336,7 +336,10 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        match prepare_reload_config().await {
+                        // `Config::load_or_init` has a large async state machine. Keep it
+                        // out of this long-lived signal-wait future so a reload request
+                        // cannot overflow a Tokio worker's stack.
+                        match Box::pin(prepare_reload_config()).await {
                             Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
                             Err(error) => {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
@@ -376,7 +379,9 @@ async fn wait_for_exit_signal(
                     }
                     if *reload_rx.borrow_and_update() {
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "Reload requested via /admin/reload");
-                        match prepare_reload_config().await {
+                        // See the non-ephemeral branch above: boxing keeps the large
+                        // configuration-load future out of this select loop's frame.
+                        match Box::pin(prepare_reload_config()).await {
                             Ok(config) => return Ok(DaemonExit::Reload(Box::new(config))),
                             Err(error) => {
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{error:#}")})), "Reload refused: prospective Goal policy could not be applied");
@@ -532,6 +537,29 @@ async fn classify_gateway_bind_outcome(
 }
 
 pub async fn run(
+    config: Config,
+    host: String,
+    port: u16,
+    registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    // `run` owns the daemon's complete component graph. Keep that graph's
+    // state machine off the caller's stack: reload preparation now includes
+    // the Goal policy cutover and otherwise makes a normal Tokio worker stack
+    // overflow in the gateway-triggered reload path.
+    Box::pin(run_inner(
+        config,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    ))
+    .await
+}
+
+async fn run_inner(
     mut config: Config,
     host: String,
     port: u16,
@@ -1054,8 +1082,14 @@ pub async fn run(
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
     let rpc_connection_count = socket_client_count.clone();
-    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
-    tokio::pin!(exit);
+    // Reload preparation carries configuration and policy-cutover state. Keep
+    // the signal waiter heap-pinned so the daemon supervisor future remains
+    // safe to poll on Tokio's normal worker stack.
+    let mut exit = Box::pin(wait_for_exit_signal(
+        reload_rx,
+        ephemeral,
+        socket_client_count,
+    ));
 
     let startup_result = if socket_required {
         let socket_startup = await_socket_startup(socket_startup_rx);

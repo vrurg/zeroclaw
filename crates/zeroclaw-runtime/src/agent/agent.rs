@@ -1317,11 +1317,9 @@ impl Agent {
                 turn_id: &turn_id,
                 sop_reassembly: None,
             });
-        let response = crate::goal_mode::scope_goal_parent_turn(
-            crate::agent::turn::scope_tool_protocol_prompts(
-                Arc::clone(&tool_protocol_prompts),
-                isolated_loop,
-            ),
+        let response = crate::agent::turn::scope_tool_protocol_prompts(
+            Arc::clone(&tool_protocol_prompts),
+            isolated_loop,
         )
         .await?;
 

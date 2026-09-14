@@ -16,6 +16,10 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: String,
     pub pause_reason: Option<String>,
+    #[serde(default)]
+    pub pause_description: Option<String>,
+    #[serde(default)]
+    pub blocker_messages: Vec<String>,
     pub resumable: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +44,30 @@ pub enum GoalResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionGoalResult {
     pub response: GoalResponse,
+}
+
+#[cfg(test)]
+mod goal_wire_tests {
+    use super::*;
+
+    #[test]
+    fn goal_status_projection_accepts_older_daemon_responses() {
+        let raw = serde_json::json!({
+            "task_id": "goal-1",
+            "status": "paused",
+            "execution_epoch": 4,
+            "token_limit": 12_000,
+            "cost_limit_usd": null,
+            "accounting_state": "complete",
+            "pause_reason": "needs_user_input",
+            "resumable": true
+        });
+
+        let projection: GoalStatusProjection = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(projection.pause_description, None);
+        assert!(projection.blocker_messages.is_empty());
+    }
 }
 
 // ── Initialize shapes ───────────────────────────────────────────

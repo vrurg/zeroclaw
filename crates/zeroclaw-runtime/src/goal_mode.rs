@@ -139,7 +139,7 @@ impl GoalIngressPrincipal {
             Self::Matrix { raw_mxid } => raw_mxid,
             Self::ZeroCode { tui_id } => tui_id,
         };
-        require_nonblank("Goal ingress principal", value)
+        required("Goal ingress principal", value.clone()).map(|_| ())
     }
 }
 
@@ -210,18 +210,26 @@ impl GoalIngressContext {
 
 /// Metadata about a live session returned by an already-selected driver.
 ///
-/// The paired [`GoalSessionLease`] owns the guard that keeps the session
-/// authoritative through a controller transition. The binding intentionally
-/// carries no independent freshness state.
+/// `freshness_token` is diagnostic metadata for the surface; it is not an
+/// execution fence. The paired [`GoalSessionLease`] owns the only guard that
+/// keeps the session authoritative through a controller transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalSessionBinding {
     session_key: GoalSessionKey,
+    freshness_token: String,
 }
 
 impl GoalSessionBinding {
     /// Build the live-session binding returned by a selected surface driver.
-    pub const fn new(session_key: GoalSessionKey) -> Self {
-        Self { session_key }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver's diagnostic freshness token is blank.
+    pub fn new(session_key: GoalSessionKey, freshness_token: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            session_key,
+            freshness_token: required("Goal session freshness token", freshness_token.into())?,
+        })
     }
 
     pub fn session_key(&self) -> &GoalSessionKey {
@@ -230,6 +238,10 @@ impl GoalSessionBinding {
 
     pub const fn surface(&self) -> GoalSurface {
         self.session_key.surface()
+    }
+
+    pub fn freshness_token(&self) -> &str {
+        &self.freshness_token
     }
 }
 
@@ -819,15 +831,10 @@ impl GoalRuntime {
 }
 
 fn required(name: &str, value: String) -> Result<String> {
-    require_nonblank(name, &value)?;
-    Ok(value.trim().to_owned())
-}
-
-fn require_nonblank(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{name} is blank");
     }
-    Ok(())
+    Ok(value.trim().to_owned())
 }
 
 fn canonical_session_key(name: &str, value: String) -> Result<String> {
@@ -922,11 +929,18 @@ pub struct GoalStatusProjection {
     pub cost_limit_usd: Option<f64>,
     pub accounting_state: GoalAccountingState,
     pub pause_reason: Option<GoalPauseReason>,
+    /// Controller-authored explanation for a paused Goal. This is display data
+    /// derived from the canonical Goal extension, not a second lifecycle fact.
+    pub pause_description: Option<String>,
+    /// Human-readable blocker summaries. The durable structured blocker kind
+    /// and payload remain control-plane data; adapters render only this narrow
+    /// operator-facing projection.
+    pub blocker_messages: Vec<String>,
     pub resumable: bool,
 }
 
 impl GoalStatusProjection {
-    fn from_parts(task: &TaskRecord, goal: &GoalTaskRecord) -> Self {
+    fn from_parts(task: &TaskRecord, goal: GoalTaskRecord) -> Self {
         Self {
             task_id: task.id.clone(),
             status: task.status,
@@ -935,6 +949,12 @@ impl GoalStatusProjection {
             cost_limit_usd: goal.effective_cost_limit_usd,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
+            pause_description: goal.pause_description,
+            blocker_messages: goal
+                .blockers
+                .into_iter()
+                .map(|blocker| blocker.message)
+                .collect(),
             resumable: task.status == TaskStatus::Paused
                 && goal.accounting_state == GoalAccountingState::Complete
                 && goal.pending_call_id.is_none(),
@@ -1004,7 +1024,7 @@ impl GoalController {
         {
             return Ok(GoalResponse::AlreadyActive);
         }
-        let limits = select_limits(settings.default_limits, selection);
+        let limits = select_limits(settings.default_limits, selection)?;
         let task = TaskRecord {
             id: Uuid::new_v4().to_string(),
             kind: TaskKind::Goal,
@@ -1226,18 +1246,21 @@ impl GoalController {
             .get_goal_task(&task.id)
             .await?
             .ok_or_else(|| anyhow::Error::msg("Goal task extension is missing"))?;
-        Ok(GoalStatusProjection::from_parts(task, &goal))
+        Ok(GoalStatusProjection::from_parts(task, goal))
     }
 }
 
-fn select_limits(defaults: GoalBudgetLimits, selection: GoalBudgetSelection) -> GoalBudgetLimits {
+fn select_limits(
+    defaults: GoalBudgetLimits,
+    selection: GoalBudgetSelection,
+) -> Result<GoalBudgetLimits> {
     match selection {
-        GoalBudgetSelection::Defaults => defaults,
-        GoalBudgetSelection::Limits(limits) => limits,
-        GoalBudgetSelection::Unlimited => GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => Ok(defaults),
+        GoalBudgetSelection::Limits(limits) => Ok(limits),
+        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        },
+        }),
     }
 }
 
@@ -1335,6 +1358,51 @@ mod tests {
         assert_eq!(
             messages[1].content,
             format!("Objective:\n{objective}\n\nCandidate:\n{candidate}")
+        );
+    }
+
+    #[test]
+    fn goal_status_projection_keeps_actionable_pause_details() {
+        let task = TaskRecord {
+            id: "goal-status".to_owned(),
+            kind: TaskKind::Goal,
+            agent: "main".to_owned(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".to_owned(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: Some("matrix.room".to_owned()),
+            delivered: false,
+            idem_key: None,
+            principal_id: Some("@user:example.test".to_owned()),
+            session_id: Some("matrix_session".to_owned()),
+            execution_epoch: 2,
+            started_at: "2026-09-11T00:00:00Z".to_owned(),
+            finished_at: None,
+        };
+        let goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            pause_description: Some("Choose the target environment.".to_owned()),
+            blockers: vec![crate::control_plane::GoalBlocker {
+                kind: crate::control_plane::GoalBlockerKind::NeedsUserInput,
+                message: "Which environment should receive the change?".to_owned(),
+                payload: None,
+            }],
+            ..GoalTaskRecord::default()
+        };
+
+        let projection = GoalStatusProjection::from_parts(&task, goal);
+
+        assert_eq!(
+            projection.pause_description.as_deref(),
+            Some("Choose the target environment.")
+        );
+        assert_eq!(
+            projection.blocker_messages,
+            ["Which environment should receive the change?"]
         );
     }
 

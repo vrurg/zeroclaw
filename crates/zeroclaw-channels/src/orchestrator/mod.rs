@@ -6214,15 +6214,18 @@ async fn process_channel_message_body(
     // Capture Goal command authority before mutable hooks. A hook can cancel
     // the message, but it cannot rewrite its principal, session, route, or
     // command before admission.
-    let parsed_goal_command =
-        is_matrix_channel_name(&msg.channel).then(|| parse_goal_command(&msg.content));
-    let goal_snapshot = match parsed_goal_command {
-        Some(Err(GoalCommandParseError::NotGoalCommand)) | None => None,
-        Some(parsed_goal_command) => Some((
+    let goal_snapshot = if is_matrix_channel_name(&msg.channel)
+        && !matches!(
+            parse_goal_command(&msg.content),
+            Err(GoalCommandParseError::NotGoalCommand)
+        ) {
+        Some((
             runtime_conversation_history_key(ctx.as_ref(), &msg),
             matrix_goal_message_snapshot(&msg),
-            parsed_goal_command,
-        )),
+            parse_goal_command(&msg.content),
+        ))
+    } else {
+        None
     };
     let logged_content = if goal_snapshot.is_some() {
         "<goal command>"
@@ -8149,25 +8152,162 @@ fn matrix_goal_message_snapshot(message: &ChannelMessage) -> ChannelMessage {
 }
 
 fn render_goal_response(response: &zeroclaw_runtime::goal_mode::GoalResponse) -> String {
-    use zeroclaw_runtime::goal_mode::GoalResponse;
-    let key = match response {
-        GoalResponse::Help => "goal-mode-help",
-        GoalResponse::Disabled => "goal-mode-disabled",
-        GoalResponse::Started(_) => "goal-mode-started",
-        GoalResponse::Status(_) => "goal-mode-status",
-        GoalResponse::Budget(_) => "goal-mode-budget",
-        GoalResponse::BudgetUpdated(_) => "goal-mode-budget-updated",
-        GoalResponse::Paused(_) => "goal-mode-paused",
-        GoalResponse::AlreadyPaused(_) => "goal-mode-already-paused",
-        GoalResponse::Resumed(_) => "goal-mode-resumed",
-        GoalResponse::Cancelled(_) => "goal-mode-cancelled",
-        GoalResponse::AlreadyCancelled(_) => "goal-mode-already-cancelled",
-        GoalResponse::NoCurrentGoal => "goal-mode-no-current",
-        GoalResponse::AlreadyActive => "goal-mode-already-active",
-        GoalResponse::Terminal(_) => "goal-mode-terminal",
-        GoalResponse::Stale => "goal-mode-stale",
+    use zeroclaw_runtime::goal_mode::{GoalResponse, GoalStatusProjection};
+    let (key, projection): (&str, Option<&GoalStatusProjection>) = match response {
+        GoalResponse::Help => ("goal-mode-help", None),
+        GoalResponse::Disabled => ("goal-mode-disabled", None),
+        GoalResponse::Started(projection) => ("goal-mode-started", Some(projection)),
+        GoalResponse::Status(projection) => ("goal-mode-status", Some(projection)),
+        GoalResponse::Budget(projection) => ("goal-mode-budget", Some(projection)),
+        GoalResponse::BudgetUpdated(projection) => ("goal-mode-budget-updated", Some(projection)),
+        GoalResponse::Paused(projection) => ("goal-mode-paused", Some(projection)),
+        GoalResponse::AlreadyPaused(projection) => ("goal-mode-already-paused", Some(projection)),
+        GoalResponse::Resumed(projection) => ("goal-mode-resumed", Some(projection)),
+        GoalResponse::Cancelled(projection) => ("goal-mode-cancelled", Some(projection)),
+        GoalResponse::AlreadyCancelled(projection) => {
+            ("goal-mode-already-cancelled", Some(projection))
+        }
+        GoalResponse::NoCurrentGoal => ("goal-mode-no-current", None),
+        GoalResponse::AlreadyActive => ("goal-mode-already-active", None),
+        GoalResponse::Terminal(projection) => ("goal-mode-terminal", Some(projection)),
+        GoalResponse::Stale => ("goal-mode-stale", None),
     };
-    channel_runtime_cli_string(key)
+    let mut message = channel_runtime_cli_string(key);
+    if let Some(projection) = projection {
+        message.push('\n');
+        message.push_str(&render_goal_projection(projection));
+    }
+    message
+}
+
+fn render_goal_projection(
+    projection: &zeroclaw_runtime::goal_mode::GoalStatusProjection,
+) -> String {
+    let token_limit = projection
+        .token_limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
+    let cost_limit = projection
+        .cost_limit_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-unlimited"));
+    let status = match projection.status {
+        zeroclaw_runtime::control_plane::TaskStatus::Running => "running",
+        zeroclaw_runtime::control_plane::TaskStatus::Paused => "paused",
+        zeroclaw_runtime::control_plane::TaskStatus::Completed => "completed",
+        zeroclaw_runtime::control_plane::TaskStatus::Failed => "failed",
+        zeroclaw_runtime::control_plane::TaskStatus::Cancelled => "cancelled",
+        zeroclaw_runtime::control_plane::TaskStatus::Lost => "lost",
+        zeroclaw_runtime::control_plane::TaskStatus::TimedOut => "timed_out",
+    };
+    let accounting = match projection.accounting_state {
+        zeroclaw_runtime::control_plane::GoalAccountingState::Complete => "complete",
+        zeroclaw_runtime::control_plane::GoalAccountingState::Missing => "missing",
+        zeroclaw_runtime::control_plane::GoalAccountingState::Invalid => "invalid",
+        zeroclaw_runtime::control_plane::GoalAccountingState::OutcomeUnknown => "outcome_unknown",
+    };
+    let pause_reason = projection
+        .pause_reason
+        .map(|reason| {
+            match reason {
+                zeroclaw_runtime::control_plane::GoalPauseReason::OperatorPaused => {
+                    "operator_paused"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::NeedsUserInput => {
+                    "needs_user_input"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::HumanEscalation => {
+                    "human_escalation"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::ExternalDependency => {
+                    "external_dependency"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::ProviderUnavailable => {
+                    "provider_unavailable"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::VerifierBlocked => {
+                    "verifier_blocked"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::BudgetExhausted => {
+                    "budget_exhausted"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::BudgetUnavailable => {
+                    "budget_unavailable"
+                }
+                zeroclaw_runtime::control_plane::GoalPauseReason::DaemonRestart => {
+                    "daemon_restarted"
+                }
+            }
+            .to_owned()
+        })
+        .unwrap_or_else(|| channel_runtime_cli_string("goal-mode-none"));
+    let resumable = channel_runtime_cli_string(if projection.resumable {
+        "goal-mode-yes"
+    } else {
+        "goal-mode-no"
+    });
+    let mut message = channel_runtime_cli_string_with_args(
+        "goal-mode-details",
+        &[
+            ("status", status),
+            ("epoch", &projection.execution_epoch.to_string()),
+            ("accounting", accounting),
+            ("resumable", &resumable),
+            ("token_limit", &token_limit),
+            ("cost_limit", &cost_limit),
+            ("pause_reason", &pause_reason),
+        ],
+    );
+    if let Some(description) = projection.pause_description.as_deref() {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-pause-description",
+            &[("description", description)],
+        ));
+    }
+    for blocker in &projection.blocker_messages {
+        message.push('\n');
+        message.push_str(&channel_runtime_cli_string_with_args(
+            "goal-mode-blocker",
+            &[("blocker", blocker)],
+        ));
+    }
+    message
+}
+
+#[cfg(test)]
+mod goal_response_render_tests {
+    use super::render_goal_response;
+    use zeroclaw_runtime::{
+        control_plane::{GoalAccountingState, GoalPauseReason, TaskStatus},
+        goal_mode::{GoalResponse, GoalStatusProjection},
+    };
+
+    #[test]
+    fn paused_goal_response_renders_controller_projection() {
+        let response = GoalResponse::Paused(GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: TaskStatus::Paused,
+            execution_epoch: 4,
+            token_limit: Some(12_000),
+            cost_limit_usd: None,
+            accounting_state: GoalAccountingState::Complete,
+            pause_reason: Some(GoalPauseReason::NeedsUserInput),
+            pause_description: Some("Select a target.".to_owned()),
+            blocker_messages: vec!["Which target should receive the change?".to_owned()],
+            resumable: true,
+        });
+
+        let rendered = render_goal_response(&response);
+
+        assert!(rendered.contains("Goal paused."));
+        assert!(rendered.contains("Status: paused"));
+        assert!(rendered.contains("token limit: 12000"));
+        assert!(rendered.contains("cost limit USD: unlimited"));
+        assert!(rendered.contains("pause reason: needs_user_input"));
+        assert!(rendered.contains("Details: Select a target."));
+        assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path

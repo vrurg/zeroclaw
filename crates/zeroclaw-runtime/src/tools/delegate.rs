@@ -1913,7 +1913,25 @@ impl Tool for DelegateTool {
             return self.execute_background(agent_name, prompt, &args).await;
         }
 
+        // Ordinary delegation preserves its original path. The Goal-only
+        // child fence is boxed so recursive non-Goal delegation does not
+        // inherit Goal execution state into its async frame.
+        if goal_scoped {
+            return Box::pin(self.execute_goal_sync(agent_name, prompt, &args)).await;
+        }
+
         // --- Synchronous delegation (original path) ---
+        self.execute_sync(agent_name, prompt, &args).await
+    }
+}
+
+impl DelegateTool {
+    async fn execute_goal_sync(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
         let _goal_child_guard = match crate::agent::goal_child_fence::admit_goal_child().await {
             Ok(guard) => guard,
             Err(error) => {
@@ -1925,13 +1943,11 @@ impl Tool for DelegateTool {
             }
         };
         crate::agent::goal_child_fence::scope_goal_child(
-            self.execute_sync(agent_name, prompt, &args),
+            self.execute_sync(agent_name, prompt, args),
         )
         .await
     }
-}
 
-impl DelegateTool {
     /// Original synchronous delegation path (extracted for reuse).
     async fn execute_sync(
         &self,
@@ -3814,8 +3830,10 @@ impl DelegateTool {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
-        let execution = tokio::time::timeout(
-            Duration::from_secs(agentic_timeout_secs),
+        // A bounded delegate may invoke another bounded delegate. Heap-pin
+        // the child loop at that recursive boundary so extensions to the
+        // shared turn path do not accumulate on the worker stack per hop.
+        let child_loop = Box::pin(
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
@@ -3884,6 +3902,7 @@ impl DelegateTool {
                 &crate::agent::AgentAttribution(agent_name)
             )),
         );
+        let execution = tokio::time::timeout(Duration::from_secs(agentic_timeout_secs), child_loop);
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE

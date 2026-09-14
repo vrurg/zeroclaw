@@ -235,7 +235,7 @@ pub(super) async fn dispose_matrix_goal(
     let slot = goal_supervisor_slot(&context.persist_locks, history_key);
     if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
         supervisor.dispose_session(history_key).await?;
-        clear_supervisor_slot_if_current(&slot, &supervisor).await;
+        *slot.lock().await = None;
         return Ok(());
     }
 
@@ -270,7 +270,6 @@ async fn clear_supervisor_slot_if_current(
         *slot = None;
     }
 }
-
 #[async_trait]
 impl GoalSessionDriver for MatrixGoalSessionDriver {
     fn surface(&self) -> GoalSurface {
@@ -290,7 +289,7 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             .take()
             .context("Matrix Goal command lease was already consumed")?;
         Ok(GoalSessionLease::new(
-            GoalSessionBinding::new(self.session_key.clone()),
+            GoalSessionBinding::new(self.session_key.clone(), self.message.id.clone())?,
             guard,
         ))
     }

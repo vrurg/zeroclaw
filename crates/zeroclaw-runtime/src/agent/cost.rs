@@ -547,17 +547,14 @@ pub(crate) fn billable_provider_attempts(
     })
 }
 
-pub(crate) async fn settle_provider_attempts(
+/// Settle provider attempts for an ordinary turn.
+///
+/// This is intentionally synchronous: ordinary agent loops must retain their
+/// pre-Goal execution frame and cost-accounting behavior.
+pub(crate) fn settle_provider_attempts(
     attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
     accepted_attempt: Option<usize>,
-) -> anyhow::Result<()> {
-    if let Some(accounting) = GOAL_OPERATION_ACCOUNTING
-        .try_with(Clone::clone)
-        .ok()
-        .flatten()
-    {
-        return accounting.settle(goal_operation_settlement(attempts)).await;
-    }
+) {
     for event in billable_provider_attempts(attempts) {
         let updates_context_window_fill = accepted_attempt == Some(event.index);
         let _ = record_tool_loop_cost_usage_inner(
@@ -567,7 +564,21 @@ pub(crate) async fn settle_provider_attempts(
             updates_context_window_fill,
         );
     }
-    Ok(())
+}
+
+/// Settle one Goal-scoped logical operation through its controller-owned
+/// accounting bridge. Callers must prove the Goal scope before invoking this.
+pub(crate) async fn settle_goal_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> anyhow::Result<()> {
+    let Some(accounting) = GOAL_OPERATION_ACCOUNTING
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    else {
+        anyhow::bail!("Goal accounting scope disappeared before operation settlement");
+    };
+    accounting.settle(goal_operation_settlement(attempts)).await
 }
 
 fn record_tool_loop_cost_usage_inner(
@@ -1073,9 +1084,7 @@ mod tests {
                     })
                     .await;
                 let report = scope.take();
-                settle_provider_attempts(report.attempts(), None)
-                    .await
-                    .unwrap();
+                settle_provider_attempts(report.attempts(), None);
             })
             .await;
 
@@ -1155,7 +1164,7 @@ mod tests {
                         .await;
                     scope.mark_logical_success();
                     let report = scope.take();
-                    settle_provider_attempts(report.attempts(), Some(0))
+                    settle_goal_provider_attempts(report.attempts())
                         .await
                         .unwrap();
                 },
@@ -1209,7 +1218,7 @@ mod tests {
                         .await;
                     scope.mark_logical_success();
                     let report = scope.take();
-                    settle_provider_attempts(report.attempts(), Some(0))
+                    settle_goal_provider_attempts(report.attempts())
                         .await
                         .unwrap();
                 },

@@ -50,8 +50,14 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        admit_goal_operation_if_scoped(GoalOperationRequest::new(self.provider_name, self.model))
+        let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
+        if goal_scoped {
+            Box::pin(admit_goal_operation_if_scoped(GoalOperationRequest::new(
+                self.provider_name,
+                self.model,
+            )))
             .await?;
+        }
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
@@ -67,8 +73,6 @@ impl ResolvedModelAccess<'_> {
         let accounting = scope.take();
 
         let attempts = accounting.attempts();
-        let goal_scoped = crate::agent::cost::goal_operation_accounting_is_scoped();
-
         let accepted_route = accounting.accepted_route().cloned();
         let (served_provider, served_model) = accepted_route
             .as_ref()
@@ -81,22 +85,22 @@ impl ResolvedModelAccess<'_> {
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
                 if response.is_semantically_empty_terminal() {
-                    crate::agent::cost::settle_provider_attempts(attempts, None).await?;
+                    if goal_scoped {
+                        Box::pin(crate::agent::cost::settle_goal_provider_attempts(attempts))
+                            .await?;
+                    } else {
+                        crate::agent::cost::settle_provider_attempts(attempts, None);
+                    }
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 if goal_scoped {
-                    crate::agent::cost::settle_provider_attempts(
-                        attempts,
-                        Some(attempts.len().saturating_sub(1)),
-                    )
-                    .await?;
+                    Box::pin(crate::agent::cost::settle_goal_provider_attempts(attempts)).await?;
                 } else {
                     crate::agent::cost::settle_provider_attempts(
                         &attempts[..attempts.len().saturating_sub(1)],
                         None,
-                    )
-                    .await?;
+                    );
                 }
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
@@ -110,7 +114,11 @@ impl ResolvedModelAccess<'_> {
                 Ok(response)
             }
             Err(error) => {
-                crate::agent::cost::settle_provider_attempts(attempts, None).await?;
+                if goal_scoped {
+                    Box::pin(crate::agent::cost::settle_goal_provider_attempts(attempts)).await?;
+                } else {
+                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                }
                 Err(error)
             }
         }

@@ -67,22 +67,78 @@ fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String
 fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
     use crate::wire::GoalResponse;
 
-    let key = match response {
-        GoalResponse::Help => "zc-goal-help",
-        GoalResponse::Disabled => "zc-goal-disabled",
-        GoalResponse::Started(_) => "zc-goal-started",
-        GoalResponse::Status(_) => "zc-goal-status",
-        GoalResponse::Budget(_) => "zc-goal-budget",
-        GoalResponse::BudgetUpdated(_) => "zc-goal-budget-updated",
-        GoalResponse::Paused(_) | GoalResponse::AlreadyPaused(_) => "zc-goal-paused",
-        GoalResponse::Resumed(_) => "zc-goal-resumed",
-        GoalResponse::Cancelled(_) | GoalResponse::AlreadyCancelled(_) => "zc-goal-cancelled",
-        GoalResponse::NoCurrentGoal => "zc-goal-none",
-        GoalResponse::AlreadyActive => "zc-goal-already-active",
-        GoalResponse::Terminal(_) => "zc-goal-terminal",
-        GoalResponse::Stale => "zc-goal-stale",
+    let (key, projection) = match response {
+        GoalResponse::Help => ("zc-goal-help", None),
+        GoalResponse::Disabled => ("zc-goal-disabled", None),
+        GoalResponse::Started(projection) => ("zc-goal-started", Some(projection)),
+        GoalResponse::Status(projection) => ("zc-goal-status", Some(projection)),
+        GoalResponse::Budget(projection) => ("zc-goal-budget", Some(projection)),
+        GoalResponse::BudgetUpdated(projection) => ("zc-goal-budget-updated", Some(projection)),
+        GoalResponse::Paused(projection) | GoalResponse::AlreadyPaused(projection) => {
+            ("zc-goal-paused", Some(projection))
+        }
+        GoalResponse::Resumed(projection) => ("zc-goal-resumed", Some(projection)),
+        GoalResponse::Cancelled(projection) | GoalResponse::AlreadyCancelled(projection) => {
+            ("zc-goal-cancelled", Some(projection))
+        }
+        GoalResponse::NoCurrentGoal => ("zc-goal-none", None),
+        GoalResponse::AlreadyActive => ("zc-goal-already-active", None),
+        GoalResponse::Terminal(projection) => ("zc-goal-terminal", Some(projection)),
+        GoalResponse::Stale => ("zc-goal-stale", None),
     };
-    crate::i18n::t(key)
+    let mut message = crate::i18n::t(key);
+    if let Some(projection) = projection {
+        message.push('\n');
+        message.push_str(&goal_projection_message(projection));
+    }
+    message
+}
+
+fn goal_projection_message(projection: &crate::wire::GoalStatusProjection) -> String {
+    let token_limit = projection
+        .token_limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let cost_limit = projection
+        .cost_limit_usd
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-unlimited"));
+    let pause_reason = projection
+        .pause_reason
+        .clone()
+        .unwrap_or_else(|| crate::i18n::t("zc-goal-none"));
+    let resumable = crate::i18n::t(if projection.resumable {
+        "zc-goal-yes"
+    } else {
+        "zc-goal-no"
+    });
+    let mut message = crate::i18n::t_args(
+        "zc-goal-details",
+        &[
+            ("status", &projection.status),
+            ("epoch", &projection.execution_epoch.to_string()),
+            ("accounting", &projection.accounting_state),
+            ("resumable", &resumable),
+            ("token_limit", &token_limit),
+            ("cost_limit", &cost_limit),
+            ("pause_reason", &pause_reason),
+        ],
+    );
+    if let Some(description) = projection.pause_description.as_deref() {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-pause-description",
+            &[("description", description)],
+        ));
+    }
+    for blocker in &projection.blocker_messages {
+        message.push('\n');
+        message.push_str(&crate::i18n::t_args(
+            "zc-goal-blocker",
+            &[("blocker", blocker)],
+        ));
+    }
+    message
 }
 
 /// The daemon serializes `SessionGoalUpdate` as an externally tagged enum.
@@ -9971,6 +10027,32 @@ mod tests {
             crate::todo_tracker::TodoTrackerSettings::default(),
         )));
         chat
+    }
+
+    #[test]
+    fn paused_goal_response_renders_controller_projection() {
+        let response = crate::wire::GoalResponse::Paused(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "paused".to_owned(),
+            execution_epoch: 4,
+            token_limit: Some(12_000),
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: Some("needs_user_input".to_owned()),
+            pause_description: Some("Select a target.".to_owned()),
+            blocker_messages: vec!["Which target should receive the change?".to_owned()],
+            resumable: true,
+        });
+
+        let rendered = goal_response_message(&response);
+
+        assert!(rendered.contains("Goal paused."));
+        assert!(rendered.contains("Status: paused"));
+        assert!(rendered.contains("token limit: 12000"));
+        assert!(rendered.contains("cost limit USD: unlimited"));
+        assert!(rendered.contains("pause reason: needs_user_input"));
+        assert!(rendered.contains("Details: Select a target."));
+        assert!(rendered.contains("Blocker: Which target should receive the change?"));
     }
 
     fn draw_todo_close(chat: &mut Chat) -> Rect {

@@ -963,7 +963,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
+                if crate::agent::cost::goal_operation_accounting_is_scoped() {
+                    Box::pin(crate::agent::cost::settle_goal_provider_attempts(&attempts)).await?;
+                } else {
+                    crate::agent::cost::settle_provider_attempts(&attempts, None);
+                }
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1018,7 +1022,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None).await?;
+            if crate::agent::cost::goal_operation_accounting_is_scoped() {
+                Box::pin(crate::agent::cost::settle_goal_provider_attempts(&attempts)).await?;
+            } else {
+                crate::agent::cost::settle_provider_attempts(&attempts, None);
+            }
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1079,17 +1087,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // response handling. Ordinary sessions retain their established split
         // path, where the accepted leaf updates context-window telemetry.
         if crate::agent::cost::goal_operation_accounting_is_scoped() {
-            crate::agent::cost::settle_provider_attempts(
-                &attempts,
-                Some(attempts.len().saturating_sub(1)),
-            )
-            .await?;
+            Box::pin(crate::agent::cost::settle_goal_provider_attempts(&attempts)).await?;
         } else {
             crate::agent::cost::settle_provider_attempts(
                 &attempts[..attempts.len().saturating_sub(1)],
                 None,
-            )
-            .await?;
+            );
         }
         record_accepted_chat_response(
             &ctx,
