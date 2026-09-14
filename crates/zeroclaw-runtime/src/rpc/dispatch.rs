@@ -30149,6 +30149,232 @@ mod tests {
         }
     }
 
+    async fn assert_external_cancel_supervisor_custody(queued_pause: bool) {
+        use connection_test_support::{GoalParentAdmissionCase, prepare_held_goal_parent_fixture};
+        use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = make_acp_test_config(&directory);
+        let data_dir = config.data_dir.clone();
+        let (mut context, _backend, _acp) = persistence_enforcement_ctx(config);
+        let (registry, parent) = prepare_held_goal_parent_fixture(
+            &mut context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+            GoalAdmissionFixture::OWNER,
+            GoalParentAdmissionCase::DirectResume,
+        )
+        .await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher =
+            RpcDispatcher::new(Arc::clone(&context), sender, "goal-cancel-test".into());
+        dispatcher.set_authenticated_for_test();
+        dispatcher.set_tui_id_for_test(Some(GoalAdmissionFixture::OWNER.into()));
+        let (value, resume) = dispatcher
+            .handle_session_goal(&json!({
+                "session_id": GoalAdmissionFixture::SESSION,
+                "command": "/goal resume",
+            }))
+            .await
+            .unwrap();
+        assert!(dispatcher.send_result(json!(1), value).await);
+        resume.after_response().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            parent.turn.started.notified(),
+        )
+        .await
+        .unwrap();
+        let owner = context
+            .goal_runtime
+            .supervisor(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let queued = if queued_pause {
+            let (value, submission) = dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "command": "/goal pause",
+                }))
+                .await
+                .unwrap();
+            assert_eq!(
+                submission.response(),
+                &GoalResponse::Queued(GoalQueuedControl::Pause)
+            );
+            assert!(dispatcher.send_result(json!(2), value).await);
+            Some(submission)
+        } else {
+            None
+        };
+        let key = GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let cancelling = dispatcher.spawn_handle();
+        let cancel = zeroclaw_spawn::spawn!(async move {
+            cancelling
+                .handle_session_cancel(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                != zeroclaw_api::task::TaskStatus::Paused
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        parent.turn.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["cancelled"], true);
+        let paused = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, zeroclaw_api::task::TaskStatus::Paused);
+        assert_eq!(
+            registry
+                .get_goal_task(&paused.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_reason,
+            Some(zeroclaw_goal::GoalPauseReason::OperatorPaused)
+        );
+        if let Some(queued) = queued {
+            assert!(Arc::ptr_eq(
+                &owner,
+                &context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .expect("queued custody must retain the resident supervisor")
+            ));
+            while receiver.try_recv().is_ok() {}
+            let error = queued
+                .after_response()
+                .await
+                .expect_err("fenced control must not apply");
+            let closed = error
+                .downcast_ref::<zeroclaw_goal::control::GoalDeferredClosed>()
+                .unwrap();
+            assert!(matches!(closed.response(), GoalResponse::AlreadyPaused(_)));
+            let frame: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                frame["params"]["lifecycle"]["session_id"],
+                GoalAdmissionFixture::SESSION
+            );
+            assert_eq!(
+                frame["params"]["lifecycle"]["response"],
+                serde_json::to_value(closed.response()).unwrap()
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "closed control publishes once"
+            );
+            let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+            let live: i64 = connection.query_row(
+                "SELECT count(*) FROM goal_control_intents WHERE session_id = ?1 AND state IN ('pending', 'claimed')",
+                [&key], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(live, 0);
+            let generation = context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            let lifecycle = context
+                .sessions
+                .lock_goal_lifecycle(GoalAdmissionFixture::SESSION, generation)
+                .await
+                .unwrap();
+            context
+                .goal_runtime
+                .dispose_session(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap();
+            drop(lifecycle);
+            assert!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                context
+                    .goal_runtime
+                    .supervisor(GoalAdmissionFixture::SESSION)
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            context
+                .sessions
+                .session_queue
+                .queue_depth(GoalAdmissionFixture::SESSION)
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn session_goal_external_cancel_retains_queued_control_custody() {
+        assert_external_cancel_supervisor_custody(true).await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_external_cancel_retires_idle_supervisor() {
+        assert_external_cancel_supervisor_custody(false).await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_external_cancel_without_worker_preserves_resident() {
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = &fixture.dispatcher.ctx;
+        let data_dir = context.config.read().data_dir.clone();
+        connection_test_support::install_paused_goal_control_fixture(
+            context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let owner = context
+            .goal_runtime
+            .supervisor(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        assert!(
+            !context
+                .goal_runtime
+                .pause_for_external_cancellation(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &owner,
+            &context
+                .goal_runtime
+                .supervisor(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+        ));
+        fixture.assert_no_provider_call();
+    }
+
     #[tokio::test]
     async fn session_goal_idle_pause_cleanup_preserves_a_pending_control_for_disposal() {
         use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
