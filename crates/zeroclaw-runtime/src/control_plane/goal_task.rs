@@ -348,8 +348,9 @@ pub trait GoalTaskRegistry: Send + Sync {
         goal: GoalTaskRecord,
     ) -> anyhow::Result<GoalTransitionResult>;
 
-    /// Fence a running Goal. A clean tool phase persists a resumable pause;
-    /// an in-flight, unpaired tool phase fails the Goal closed instead.
+    /// Fence a running Goal and persist its pause state. An operation already
+    /// admitted for the fenced epoch is allowed to settle; resume remains
+    /// unavailable until that settlement clears the pending-operation slot.
     async fn pause_session_goal(
         &self,
         task_id: &str,
@@ -381,6 +382,8 @@ pub trait GoalTaskRegistry: Send + Sync {
 
     /// Reserve the one durable pending-operation slot for the exact running
     /// Goal epoch. This is an execution fence, not a usage reservation.
+    /// Callers must settle the exact slot on every local completion path; an
+    /// unsettled slot remains fenced until recovery classifies it.
     async fn admit_pending_operation(
         &self,
         task_id: &str,
