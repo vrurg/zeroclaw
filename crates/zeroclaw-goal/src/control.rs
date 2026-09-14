@@ -687,7 +687,6 @@ pub trait GoalSessionExecutionLease: Send {
     /// Return the original projection error without rendering it. Acquisition
     /// proves session identity; history restoration has its own error boundary.
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
-
     /// Append an operator response to the same canonical session before a
     /// resumed Goal is allowed to issue its next parent turn.  Implementors
     /// must make this durable using the exact surface session that their
@@ -699,6 +698,12 @@ pub trait GoalSessionExecutionLease: Send {
     /// Return the producer's error unchanged without rendering it.
     async fn append_resume_response(&mut self, _response: String) -> Result<()> {
         bail!("Goal session driver cannot durably append a resume response")
+    }
+    /// Consume a surface-owned canonical prefix when it was already assembled
+    /// for this execution.  The default retains compatibility for drivers
+    /// whose canonical history remains in a shared session store.
+    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
+        self.canonical_history()
     }
     /// Run through ordinary execution and render every returned error through
     /// the surface's native, scrubbed error path before returning it.
