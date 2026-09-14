@@ -338,10 +338,10 @@ impl SqliteTaskStore {
                         )",
                 )
                 .context("prepare interrupted goal ownership query")?;
-            let rows = statement
-                .query_map(params![boot_id], row_to_record)
+            let mut rows = statement
+                .query(params![boot_id])
                 .context("query interrupted goal ownership")?;
-            collect_skipping_bad_rows(rows)
+            collect_skipping_bad_rows(&mut rows).context("decode interrupted goal ownership")?
         };
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS goal_recovery_candidates (
