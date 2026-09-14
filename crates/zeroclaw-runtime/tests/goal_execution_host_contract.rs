@@ -797,7 +797,7 @@ async fn exact_driver_binding_and_typed_command_are_preserved() {
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
-    let command = GoalCommand::Pause;
+    let command = GoalCommand::Pause { immediate: false };
 
     let submission = GoalExecutionHost::new()
         .submit(
@@ -1067,6 +1067,8 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         panic!("expected a started Goal");
     };
     assert_eq!(started.execution_epoch, 1);
+    assert_eq!(started.token_limit, Some(100));
+    assert_eq!(started.cost_limit_usd, Some(1.0));
     let stored_task = store
         .current_goal_for_session(&ingress.session_key().durable_id())
         .await
@@ -1091,7 +1093,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Pause,
+            GoalCommand::Pause { immediate: false },
         )
         .await
         .unwrap();
@@ -1105,7 +1107,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Resume,
+            GoalCommand::Resume { response: None },
         )
         .await
         .unwrap();
@@ -1246,7 +1248,7 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Pause,
+            GoalCommand::Pause { immediate: false },
         )
         .await
         .unwrap();
@@ -1260,7 +1262,7 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Resume,
+            GoalCommand::Resume { response: None },
         )
         .await
         .unwrap();
@@ -1285,7 +1287,12 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
     );
 
     let resume = host
-        .submit(&host_settings(true), ingress, driver, GoalCommand::Resume)
+        .submit(
+            &host_settings(true),
+            ingress,
+            driver,
+            GoalCommand::Resume { response: None },
+        )
         .await
         .unwrap();
     let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
@@ -1416,7 +1423,7 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Pause,
+            GoalCommand::Pause { immediate: false },
         )
         .await
         .unwrap();
@@ -1429,7 +1436,7 @@ async fn controller_projects_each_command_state_without_reinterpreting_the_store
             &host_settings(true),
             ingress.clone(),
             driver.clone(),
-            GoalCommand::Pause,
+            GoalCommand::Pause { immediate: false },
         )
         .await
         .unwrap();
@@ -1730,6 +1737,43 @@ async fn matrix_goal_control_requires_the_exact_raw_principal_after_key_normaliz
             .unwrap(),
         GoalResponse::Terminal(_)
     ));
+
+    let first_terminal_replacement = host
+        .submit(
+            &host_settings(true),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "replace the owner's terminal goal".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &first_terminal_replacement)
+            .await
+            .unwrap(),
+        GoalResponse::Started(_)
+    ));
+
+    let first_replacement_status = host
+        .submit(
+            &host_settings(true),
+            first_ingress.clone(),
+            recording_driver(&first_ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller
+            .submit(&settings, &first_replacement_status)
+            .await
+            .unwrap(),
+        GoalResponse::Status(_)
+    ));
 }
 
 #[tokio::test]
@@ -1838,7 +1882,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
             &host_settings(true),
             ingress,
             driver.clone(),
-            GoalCommand::Pause,
+            GoalCommand::Pause { immediate: false },
         )
         .await
         .unwrap();
