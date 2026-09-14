@@ -118,7 +118,7 @@ impl GoalIngressPrincipal {
             Self::Matrix { raw_mxid } => raw_mxid,
             Self::ZeroCode { tui_id } => tui_id,
         };
-        required("Goal ingress principal", value.clone()).map(|_| ())
+        require_nonblank("Goal ingress principal", value)
     }
 }
 
@@ -189,26 +189,18 @@ impl GoalIngressContext {
 
 /// Metadata about a live session returned by an already-selected driver.
 ///
-/// `freshness_token` is diagnostic metadata for the surface; it is not an
-/// execution fence. The paired [`GoalSessionLease`] owns the only guard that
-/// keeps the session authoritative through a controller transition.
+/// The paired [`GoalSessionLease`] owns the guard that keeps the session
+/// authoritative through a controller transition. The binding intentionally
+/// carries no independent freshness state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalSessionBinding {
     session_key: GoalSessionKey,
-    freshness_token: String,
 }
 
 impl GoalSessionBinding {
     /// Build the live-session binding returned by a selected surface driver.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the driver's diagnostic freshness token is blank.
-    pub fn new(session_key: GoalSessionKey, freshness_token: impl Into<String>) -> Result<Self> {
-        Ok(Self {
-            session_key,
-            freshness_token: required("Goal session freshness token", freshness_token.into())?,
-        })
+    pub const fn new(session_key: GoalSessionKey) -> Self {
+        Self { session_key }
     }
 
     pub fn session_key(&self) -> &GoalSessionKey {
@@ -217,10 +209,6 @@ impl GoalSessionBinding {
 
     pub const fn surface(&self) -> GoalSurface {
         self.session_key.surface()
-    }
-
-    pub fn freshness_token(&self) -> &str {
-        &self.freshness_token
     }
 }
 
@@ -525,10 +513,15 @@ impl GoalExecutionHost {
 }
 
 fn required(name: &str, value: String) -> Result<String> {
+    require_nonblank(name, &value)?;
+    Ok(value.trim().to_owned())
+}
+
+fn require_nonblank(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         bail!("{name} is blank");
     }
-    Ok(value.trim().to_owned())
+    Ok(())
 }
 
 fn canonical_session_key(name: &str, value: String) -> Result<String> {
@@ -707,7 +700,7 @@ impl GoalController {
         {
             return Ok(GoalResponse::AlreadyActive);
         }
-        let limits = select_limits(settings.default_limits, selection)?;
+        let limits = select_limits(settings.default_limits, selection);
         let task = TaskRecord {
             id: Uuid::new_v4().to_string(),
             kind: TaskKind::Goal,
@@ -933,17 +926,14 @@ impl GoalController {
     }
 }
 
-fn select_limits(
-    defaults: GoalBudgetLimits,
-    selection: GoalBudgetSelection,
-) -> Result<GoalBudgetLimits> {
+fn select_limits(defaults: GoalBudgetLimits, selection: GoalBudgetSelection) -> GoalBudgetLimits {
     match selection {
-        GoalBudgetSelection::Defaults => Ok(defaults),
-        GoalBudgetSelection::Limits(limits) => Ok(limits),
-        GoalBudgetSelection::Unlimited => Ok(GoalBudgetLimits {
+        GoalBudgetSelection::Defaults => defaults,
+        GoalBudgetSelection::Limits(limits) => limits,
+        GoalBudgetSelection::Unlimited => GoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
-        }),
+        },
     }
 }
 

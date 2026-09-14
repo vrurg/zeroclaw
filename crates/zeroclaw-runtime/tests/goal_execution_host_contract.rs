@@ -484,8 +484,7 @@ fn host_settings(enabled: bool) -> GoalHostSettings {
 
 fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
     Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     })
@@ -495,11 +494,7 @@ fn recording_driver(ingress: &GoalIngressContext) -> Arc<RecordingDriver> {
 async fn supplied_driver_must_match_the_trusted_ingress_before_binding() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(
-            GoalSessionKey::zero_code("wrong-session").unwrap(),
-            "fresh-connection",
-        )
-        .unwrap(),
+        binding: GoalSessionBinding::new(GoalSessionKey::zero_code("wrong-session").unwrap()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -536,8 +531,7 @@ async fn supplied_driver_surface_mismatch_is_rejected_before_binding() {
 async fn execution_scope_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -563,7 +557,7 @@ async fn execution_driver_key_mismatch_is_rejected_before_driver_acquisition() {
     let ingress = matrix_ingress();
     let other_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(other_key, "fresh-connection").unwrap(),
+        binding: GoalSessionBinding::new(other_key),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -611,7 +605,7 @@ async fn driver_returning_a_different_binding_is_rejected_after_binding() {
     let returned_key = GoalSessionKey::matrix("matrix_other_room").unwrap();
     let driver = Arc::new(WrongBindingDriver {
         advertised: ingress.session_key().clone(),
-        returned_binding: GoalSessionBinding::new(returned_key, "fresh-connection").unwrap(),
+        returned_binding: GoalSessionBinding::new(returned_key),
         binds: AtomicUsize::new(0),
     });
 
@@ -629,8 +623,7 @@ async fn matching_execution_scope_returns_a_working_session_lease() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
     });
@@ -702,8 +695,7 @@ async fn disabled_goal_mode_cannot_acquire_an_execution_lease() {
 async fn exact_driver_binding_and_typed_command_are_preserved() {
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -766,8 +758,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     .unwrap();
     let ingress = matrix_ingress();
     let driver = Arc::new(RecordingDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         binds: AtomicUsize::new(0),
         execution_acquires: AtomicUsize::new(0),
     });
@@ -912,8 +903,7 @@ async fn session_lease_blocks_reconnect_until_controller_returns() {
     .unwrap();
     let ingress = matrix_ingress();
     let driver = Arc::new(LeaseDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         available_for_reconnect: Arc::new(AtomicUsize::new(1)),
     });
 
@@ -956,8 +946,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     )
     .unwrap();
     let driver = Arc::new(LeaseDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         available_for_reconnect: reconnect_available,
     });
 
