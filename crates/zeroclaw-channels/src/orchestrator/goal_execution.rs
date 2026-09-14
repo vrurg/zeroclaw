@@ -3,7 +3,7 @@
 //! This module owns only live Matrix session mechanics. Durable lifecycle,
 //! accounting, and execution fencing remain in `zeroclaw-runtime`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
@@ -43,6 +43,11 @@ struct MatrixGoalSessionDriver {
     raw_mxid: String,
     route: String,
     message: ChannelMessage,
+    /// The per-session lifecycle boundary is acquired before selecting a
+    /// resident supervisor. `bind` transfers it to the runtime submission so
+    /// selection, durable transition, worker launch, and retirement remain
+    /// one serialized operation.
+    command_lease: Arc<Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>,
 }
 
 impl MatrixGoalSessionDriver {
@@ -52,6 +57,7 @@ impl MatrixGoalSessionDriver {
         raw_mxid: String,
         route: String,
         message: ChannelMessage,
+        command_lease: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<Self> {
         ensure!(
             message.channel.eq_ignore_ascii_case("matrix"),
@@ -67,6 +73,7 @@ impl MatrixGoalSessionDriver {
             raw_mxid,
             route,
             message,
+            command_lease: Arc::new(Mutex::new(Some(command_lease))),
         })
     }
 
@@ -102,6 +109,12 @@ pub(super) async fn submit_matrix_goal(
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
 ) -> Result<zeroclaw_runtime::goal_mode::GoalResponse> {
+    // Acquire this before reading durable state or selecting a supervisor.
+    // In particular, a terminal predecessor must be drained by the same
+    // serialized lifecycle operation before another command can install a
+    // successor supervisor for this session.
+    let command_lock = goal_command_lock(&context.persist_locks, &history_key);
+    let command_lease = command_lock.lock_owned().await;
     let route = format!(
         "matrix:{}:{}",
         original.channel_alias.as_deref().unwrap_or_default(),
@@ -113,6 +126,7 @@ pub(super) async fn submit_matrix_goal(
         original.sender.clone(),
         route.clone(),
         original,
+        command_lease,
     )?);
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
@@ -133,17 +147,28 @@ pub(super) async fn submit_matrix_goal(
     )?;
     let current = registry.current_goal_for_session(&history_key).await?;
     let supervisor_slot = goal_supervisor_slot(&context.persist_locks, &history_key);
+    let retired_scope = current
+        .as_ref()
+        .filter(|task| task.status.is_terminal())
+        .map(|task| {
+            GoalExecutionScope::new(task.id.clone(), history_key.clone(), task.execution_epoch)
+        })
+        .transpose()?;
+    let retired_supervisor = if retired_scope.is_some() {
+        supervisor_slot.lock().await.take()
+    } else {
+        None
+    };
+    if let (Some(retired_supervisor), Some(scope)) = (retired_supervisor, retired_scope) {
+        if retired_supervisor.owns_scope(&scope).await {
+            retired_supervisor
+                .drain(&scope)
+                .await
+                .context("drain terminal Matrix Goal worker before replacement")?;
+        }
+    }
     let supervisor = {
         let mut slot = supervisor_slot.lock().await;
-        if current
-            .as_ref()
-            .is_some_and(|task| task.status.is_terminal())
-        {
-            // A completed worker remains in the supervisor until drained. A
-            // successor must instead receive a fresh engine resolved from the
-            // current runtime configuration.
-            *slot = None;
-        }
         if let Some(supervisor) = slot.as_ref() {
             Arc::clone(supervisor)
         } else {
@@ -201,6 +226,11 @@ pub(super) async fn dispose_matrix_goal(
     context: &ChannelRuntimeContext,
     history_key: &str,
 ) -> Result<()> {
+    // `/new` shares the same lifecycle boundary as Goal commands. It must not
+    // clear a supervisor installed by a concurrent start while disposal was
+    // awaiting a durable fence or worker drain.
+    let command_lock = goal_command_lock(&context.persist_locks, history_key);
+    let _command_lease = command_lock.lock_owned().await;
     let slot = goal_supervisor_slot(&context.persist_locks, history_key);
     if let Some(supervisor) = slot.lock().await.as_ref().cloned() {
         supervisor.dispose_session(history_key).await?;
@@ -285,9 +315,12 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
 
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
         self.assert_ingress(ingress)?;
-        let guard = goal_command_lock(&self.context.persist_locks, &self.session_key.durable_id())
-            .lock_owned()
-            .await;
+        let guard = self
+            .command_lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .context("Matrix Goal command lease was already consumed")?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
             guard,
