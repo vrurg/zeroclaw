@@ -269,7 +269,7 @@ impl GoalSessionDriver for MatrixGoalSessionDriver {
             .lock_owned()
             .await;
         Ok(GoalSessionLease::new(
-            GoalSessionBinding::new(self.session_key.clone(), self.message.id.clone())?,
+            GoalSessionBinding::new(self.session_key.clone()),
             guard,
         ))
     }
