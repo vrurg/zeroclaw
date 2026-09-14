@@ -1786,7 +1786,7 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
 
     coordinator.reopen_for_generation().await;
     let resumed_driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "next-generation").unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: true,
@@ -1806,7 +1806,8 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .into_response(),
         GoalResponse::Started(_)
     ));
 
