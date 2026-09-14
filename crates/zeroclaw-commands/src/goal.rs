@@ -3,6 +3,23 @@
 /// Maximum accepted length of the declared success criterion.
 pub const MAX_GOAL_OBJECTIVE_CHARS: usize = 4096;
 
+/// Return whether a finite token budget is positive and can be represented by
+/// the canonical SQLite task plane.
+///
+/// This predicate is shared by command parsing and direct runtime admission so
+/// a typed command cannot accept a finite token value the grammar rejects.
+pub fn is_valid_finite_goal_token_limit(value: u64) -> bool {
+    value > 0 && value <= i64::MAX as u64
+}
+
+/// Return whether a finite cost budget is usable for Goal admission.
+///
+/// This predicate is shared by command parsing and direct runtime admission so
+/// a typed command cannot accept a finite cost value the grammar rejects.
+pub fn is_valid_finite_goal_cost_limit(value: f64) -> bool {
+    value.is_finite() && value > 0.0
+}
+
 /// A finite limit selected by a command. `None` means unlimited in that
 /// dimension; it is deliberately distinct from omitted command flags.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,7 +229,7 @@ fn parse_budget_selection(
                 let value = value
                     .parse::<u64>()
                     .map_err(|_| GoalCommandParseError::InvalidTokenLimit(value.to_string()))?;
-                if value == 0 || value > i64::MAX as u64 {
+                if !is_valid_finite_goal_token_limit(value) {
                     return Err(GoalCommandParseError::InvalidTokenLimit(value.to_string()));
                 }
                 token_limit = Some(value);
@@ -227,7 +244,7 @@ fn parse_budget_selection(
                 let value = value
                     .parse::<f64>()
                     .map_err(|_| GoalCommandParseError::InvalidCostLimit(value.to_string()))?;
-                if !value.is_finite() || value <= 0.0 {
+                if !is_valid_finite_goal_cost_limit(value) {
                     return Err(GoalCommandParseError::InvalidCostLimit(value.to_string()));
                 }
                 cost_limit_usd = Some(value);
