@@ -17132,6 +17132,28 @@ temperature = 0.3
         ));
     }
 
+    #[tokio::test]
+    async fn matrix_goal_help_does_not_construct_a_matrix_driver() {
+        // The caller has already parsed the local command. Help must not
+        // depend on ingress facts that only an execution-capable driver needs.
+        let mut message = channel_message("not-matrix", Some("primary"));
+        message.sender = "different-sender".to_owned();
+
+        let response = submit_matrix_goal(
+            router_test_ctx(),
+            "matrix_goal-help".to_owned(),
+            message,
+            zeroclaw_commands::goal::GoalCommand::Help,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            zeroclaw_runtime::goal_mode::GoalResponse::Help
+        ));
+    }
+
     #[cfg(feature = "channel-webhook")]
     async fn receive_webhook_test_message(
         alias: &str,

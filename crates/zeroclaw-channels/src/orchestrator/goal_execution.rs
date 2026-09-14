@@ -110,6 +110,11 @@ pub(super) async fn submit_matrix_goal(
     original: ChannelMessage,
     command: zeroclaw_commands::goal::GoalCommand,
 ) -> Result<zeroclaw_runtime::goal_mode::GoalResponse> {
+    // Help is local grammar. It must not require Matrix driver validation,
+    // runtime configuration, or a live control plane.
+    if matches!(command, zeroclaw_commands::goal::GoalCommand::Help) {
+        return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Help);
+    }
     // Acquire this before reading durable state or selecting a supervisor.
     // In particular, a terminal predecessor must be drained by the same
     // serialized lifecycle operation before another command can install a
@@ -129,12 +134,6 @@ pub(super) async fn submit_matrix_goal(
         original,
         command_lease,
     )?);
-    // Help is a local grammar response. Keep it available when the daemon has
-    // no active Goal control plane or its prospective Goal configuration is
-    // invalid, matching ZeroCode's pre-configuration Help behavior.
-    if matches!(command, zeroclaw_commands::goal::GoalCommand::Help) {
-        return Ok(zeroclaw_runtime::goal_mode::GoalResponse::Help);
-    }
     let control_plane = control_plane().context("Goal control plane is unavailable")?;
     let registry = control_plane.goal_store()?;
     let restart_coordinator = control_plane.goal_execution_restart();
