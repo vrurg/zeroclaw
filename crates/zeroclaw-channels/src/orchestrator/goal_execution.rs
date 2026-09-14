@@ -172,11 +172,11 @@ pub(super) async fn submit_matrix_goal(
             raw_mxid: driver.raw_mxid.clone(),
         },
     )?;
-    let response = supervisor
+    let submission = supervisor
         .submit(settings, ingress, driver, command)
         .await?;
     if matches!(
-        response,
+        submission.response(),
         zeroclaw_runtime::goal_mode::GoalResponse::Paused(_)
             | zeroclaw_runtime::goal_mode::GoalResponse::AlreadyPaused(_)
             | zeroclaw_runtime::goal_mode::GoalResponse::Cancelled(_)
@@ -188,7 +188,7 @@ pub(super) async fn submit_matrix_goal(
         // pricing instead of keeping a stale configuration snapshot.
         clear_supervisor_slot_if_current(&supervisor_slot, &supervisor).await;
     }
-    Ok(response)
+    Ok(submission.into_response())
 }
 
 /// Dispose a Matrix session's Goal before the channel resets its history.
@@ -254,11 +254,10 @@ pub(super) async fn dispose_matrix_goal(
 /// Clear a session's resident supervisor only if it is still the one that
 /// performed the lifecycle transition.
 ///
-/// Goal commands serialize their durable transition under the driver's command
-/// lease, but that lease is released before the transport receives the typed
-/// response. A subsequent command can therefore install a fresh supervisor
-/// before this function reacquires the process-local slot. Clearing the slot
-/// unconditionally would then orphan the successor's join handle.
+/// The submission lease remains held through this cleanup, so another Goal
+/// command cannot reuse or replace the supervisor while its predecessor is
+/// retiring. Pointer comparison additionally protects disposal and other
+/// lifecycle paths that do not own that command lease.
 async fn clear_supervisor_slot_if_current(
     slot: &Arc<
         tokio::sync::Mutex<Option<Arc<zeroclaw_runtime::goal_mode::GoalExecutionSupervisor>>>,
