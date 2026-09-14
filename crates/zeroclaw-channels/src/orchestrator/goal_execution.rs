@@ -614,4 +614,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn start_history_preserves_the_leading_canonical_user_slot() {
+        let input = goal_parent_turn_input(&GoalParentTurn {
+            kind: GoalParentTurnKind::Start,
+            objective: "Goal objective".to_owned(),
+            working_history: Vec::new(),
+        });
+        let history = input
+            .goal_start_transcript(
+                "system prompt",
+                vec![ChatMessage::user("earlier user message")],
+            )
+            .unwrap();
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "earlier user message");
+        assert_eq!(history[2].content, "Goal objective");
+    }
 }
