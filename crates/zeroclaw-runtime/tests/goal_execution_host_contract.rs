@@ -1869,22 +1869,20 @@ async fn restart_coordinator_refuses_new_execution_after_quiescence_begins() {
         parent_histories: Arc::new(Mutex::new(Vec::new())),
         parent_turn_kinds: Arc::new(Mutex::new(Vec::new())),
     });
-    assert!(matches!(
-        supervisor
-            .submit(
-                host_settings(true),
-                ingress.clone(),
-                resumed_driver,
-                GoalCommand::Start {
-                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
-                    objective: "finish the next generation task".into(),
-                },
-            )
-            .await
-            .unwrap()
-            .into_response(),
-        GoalResponse::Started(_)
-    ));
+    let response = supervisor
+        .submit(
+            host_settings(true),
+            ingress.clone(),
+            resumed_driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the next generation task".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .into_response();
+    assert!(matches!(response, GoalResponse::Started(_)));
 
     let scope = store
         .current_goal_for_session(&ingress.session_key().durable_id())

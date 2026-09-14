@@ -1024,6 +1024,7 @@ impl GoalExecutionEngine {
         lease: &mut dyn GoalSessionExecutionLease,
     ) -> Result<GoalExecutionOutcome> {
         let mut working_history = lease.take_canonical_history()?;
+        let operation = GoalOperationScope::new(scope.clone());
         loop {
             // The driver may return from a previously admitted parent call
             // after a pause, cancellation, or replacement fenced this epoch.
@@ -1032,11 +1033,11 @@ impl GoalExecutionEngine {
             self.exact_running_task(scope).await?;
             let parent = match lease
                 .run_parent_turn(
-                    &GoalOperationScope::new(scope.clone()),
+                    &operation,
                     GoalParentTurn {
                         kind: parent_turn_kind,
                         objective: objective.to_owned(),
-                        working_history: working_history.clone(),
+                        working_history: std::mem::take(&mut working_history),
                     },
                 )
                 .await
@@ -1065,7 +1066,7 @@ impl GoalExecutionEngine {
 
             let verifier = match lease
                 .run_verifier(
-                    &GoalOperationScope::new(scope.clone()),
+                    &operation,
                     GoalVerifierTurn {
                         objective: objective.to_owned(),
                         candidate: candidate.clone(),
