@@ -13,7 +13,7 @@ use super::task_registry::{
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 11;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 12;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -183,9 +183,9 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         .context("ensure terminal settlement schema")?;
         // Version 8 existed both as upstream terminal-settlement schema and as
         // a provisional Goal schema. Converge older databases through Goal's
-        // additive final schema, without recreating the superseded context
-        // uniqueness index on legacy rows that the final session index replaces.
-        goal::migrate_schema(&tx, 0, true)?;
+        // additive final schema; its session index replaces the superseded
+        // context uniqueness index without recreating it on legacy rows.
+        goal::converge_schema(&tx)?;
         tx.execute_batch(&format!(
             "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
         ))
