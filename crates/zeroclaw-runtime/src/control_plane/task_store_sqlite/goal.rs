@@ -893,6 +893,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start atomic goal policy revocation")?;
+        let finished_at = chrono::Utc::now().to_rfc3339();
         for target in targets {
             let updated = tx.execute(
                 "UPDATE tasks
@@ -906,7 +907,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     &target.task_id,
                     &target.session_id,
                     target.execution_epoch,
-                    chrono::Utc::now().to_rfc3339(),
+                    &finished_at,
                 ],
             )?;
             if updated == 0 {

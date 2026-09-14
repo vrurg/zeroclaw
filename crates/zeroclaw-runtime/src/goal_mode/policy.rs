@@ -9,8 +9,11 @@
 use anyhow::{Result, ensure};
 use zeroclaw_config::schema::Config;
 
-use crate::control_plane::{
-    GoalPolicyTarget, GoalTaskRegistry, GoalTransitionResult, TaskRecord, TaskStatus,
+use crate::{
+    control_plane::{
+        GoalPolicyTarget, GoalTaskRegistry, GoalTransitionResult, TaskRecord, TaskStatus,
+    },
+    goal_mode::GoalSessionKey,
 };
 
 /// Why a successor configuration revokes a currently nonterminal Goal.
@@ -53,8 +56,13 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
     let Some(route) = task.originator_route.as_deref() else {
         return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
     };
-    if route.starts_with("zerocode:") {
-        return Ok(GoalPolicyDecision::Keep);
+    if let Some(raw_session_id) = route.strip_prefix("zerocode:") {
+        return Ok(match GoalSessionKey::zero_code(raw_session_id) {
+            Ok(session_key) if session_key.durable_id() == target.session_id => {
+                GoalPolicyDecision::Keep
+            }
+            Ok(_) | Err(_) => revoked(target, GoalPolicyRevocation::UnsupportedRoute),
+        });
     }
     let Some((alias, reply_target)) = matrix_route(route) else {
         return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
@@ -65,11 +73,12 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
             GoalPolicyRevocation::MatrixChannelUnavailable,
         ));
     };
+    let required_channel = format!("matrix.{alias}");
     if !matrix.enabled
         || !agent
             .channels
             .iter()
-            .any(|channel| channel.as_str() == format!("matrix.{alias}"))
+            .any(|channel| channel.as_str() == required_channel)
         || reply_target.is_empty()
     {
         return Ok(revoked(
@@ -185,7 +194,11 @@ mod tests {
             delivered: false,
             idem_key: None,
             principal_id: None,
-            session_id: Some("matrix_session".into()),
+            session_id: Some(
+                route
+                    .strip_prefix("zerocode:")
+                    .map_or_else(|| "matrix_session".to_owned(), |raw| format!("rpc_{raw}")),
+            ),
             execution_epoch: 3,
             started_at: "2026-09-01T00:00:00Z".into(),
             finished_at: None,
@@ -250,6 +263,30 @@ mod tests {
         let successor = config();
         assert!(matches!(
             classify_goal_policy(&successor, &task("telegram:main:chat")).unwrap(),
+            GoalPolicyDecision::Revoke {
+                reason: GoalPolicyRevocation::UnsupportedRoute,
+                ..
+            }
+        ));
+
+        for route in [
+            "zerocode:",
+            "zerocode: padded",
+            "zerocode:local-session:extra",
+        ] {
+            assert!(matches!(
+                classify_goal_policy(&successor, &task(route)).unwrap(),
+                GoalPolicyDecision::Revoke {
+                    reason: GoalPolicyRevocation::UnsupportedRoute,
+                    ..
+                }
+            ));
+        }
+
+        let mut mismatched = task("zerocode:local-session");
+        mismatched.session_id = Some("rpc_other-session".to_owned());
+        assert!(matches!(
+            classify_goal_policy(&successor, &mismatched).unwrap(),
             GoalPolicyDecision::Revoke {
                 reason: GoalPolicyRevocation::UnsupportedRoute,
                 ..
