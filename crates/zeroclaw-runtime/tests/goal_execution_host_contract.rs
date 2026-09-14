@@ -5,6 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use zeroclaw_commands::goal::GoalCommand;
+use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
 use zeroclaw_runtime::control_plane::{
     GoalAccountingState, GoalPauseState, GoalTaskRecord, GoalTaskRegistry, GoalTransitionResult,
     SqliteTaskStore, TaskContinuationContext, TaskRecord, TaskStatus,
@@ -455,7 +456,7 @@ fn zerocode_ingress(agent: &str) -> GoalIngressContext {
 fn host_settings(enabled: bool) -> GoalHostSettings {
     GoalHostSettings::new(
         enabled,
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
         },
@@ -800,19 +801,19 @@ fn trusted_ingress_rejects_invalid_or_cross_principal_authority() {
 #[test]
 fn host_settings_reject_invalid_semantic_default_limits() {
     for default_limits in [
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: Some(0),
             cost_limit_usd: None,
         },
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: Some(i64::MAX as u64 + 1),
             cost_limit_usd: None,
         },
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: Some(-1.0),
         },
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: Some(f64::NAN),
         },
@@ -856,7 +857,7 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: Some(1.0),
         },
@@ -1194,7 +1195,7 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
     let controller = GoalController::new(store.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: Some(100),
             cost_limit_usd: None,
         },
@@ -1353,7 +1354,7 @@ async fn session_lease_blocks_reconnect_until_submission_is_settled() {
     let controller = GoalController::new(store as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         false,
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
         },
@@ -1402,7 +1403,7 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
     let controller = GoalController::new(registry.clone() as Arc<dyn GoalTaskRegistry>);
     let settings = GoalHostSettings::new(
         true,
-        zeroclaw_commands::goal::GoalBudgetLimits {
+        ConfigGoalBudgetLimits {
             token_limit: None,
             cost_limit_usd: None,
         },
