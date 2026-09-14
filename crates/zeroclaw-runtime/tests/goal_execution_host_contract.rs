@@ -675,6 +675,9 @@ async fn submission_debug_does_not_expose_goal_text_or_raw_principals() {
     assert!(debug.contains("command_kind: \"start\""));
     assert!(!debug.contains("private stop condition"));
     assert!(!debug.contains("@alice:example.org"));
+
+    let ingress_debug = format!("{ingress:?}");
+    assert!(!ingress_debug.contains("@alice:example.org"));
 }
 
 #[test]
@@ -693,6 +696,98 @@ fn matrix_history_key_must_already_use_the_canonical_session_form() {
     assert!(GoalSessionKey::matrix(raw).is_err());
     assert!(GoalSessionKey::matrix(" matrix_room").is_err());
     assert!(GoalSessionKey::zero_code(" same-session").is_err());
+}
+
+#[test]
+fn trusted_ingress_rejects_invalid_or_cross_principal_authority() {
+    let matrix_key =
+        GoalSessionKey::matrix("matrix_room__room_example_org__alice_example_org").unwrap();
+    let matrix_principal = GoalIngressPrincipal::Matrix {
+        raw_mxid: "@alice:example.org".into(),
+    };
+
+    assert!(
+        GoalIngressContext::trusted(
+            GoalSessionKey::matrix("matrix_room__room_example_org").unwrap(),
+            "main",
+            "matrix:primary",
+            matrix_principal.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(
+            GoalSessionKey::matrix("matrix_room__room_example_org__malice_example_org").unwrap(),
+            "main",
+            "matrix:primary",
+            matrix_principal.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(
+            GoalSessionKey::matrix("matrix_room_alice_example_org").unwrap(),
+            "main",
+            "matrix:primary",
+            matrix_principal.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(
+            matrix_key.clone(),
+            "",
+            "matrix:primary",
+            matrix_principal.clone(),
+        )
+        .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(matrix_key.clone(), "main", "", matrix_principal.clone(),)
+            .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(
+            matrix_key.clone(),
+            "main",
+            "matrix:primary",
+            GoalIngressPrincipal::Matrix {
+                raw_mxid: " ".into(),
+            },
+        )
+        .is_err()
+    );
+    assert!(
+        GoalIngressContext::trusted(
+            matrix_key,
+            "main",
+            "matrix:primary",
+            GoalIngressPrincipal::ZeroCode {
+                tui_id: "connection".into(),
+            },
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn host_settings_reject_invalid_semantic_default_limits() {
+    for default_limits in [
+        zeroclaw_commands::goal::GoalBudgetLimits {
+            token_limit: Some(0),
+            cost_limit_usd: None,
+        },
+        zeroclaw_commands::goal::GoalBudgetLimits {
+            token_limit: None,
+            cost_limit_usd: Some(-1.0),
+        },
+        zeroclaw_commands::goal::GoalBudgetLimits {
+            token_limit: None,
+            cost_limit_usd: Some(f64::NAN),
+        },
+    ] {
+        assert!(GoalHostSettings::new(true, default_limits, 42, "test-boot").is_err());
+    }
 }
 
 #[test]
@@ -761,6 +856,24 @@ async fn controller_uses_only_a_host_validated_submission_for_lifecycle_transiti
         panic!("expected a started Goal");
     };
     assert_eq!(started.execution_epoch, 1);
+    let stored_task = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("the started Goal must be current");
+    let stored_goal = store
+        .get_goal_task(&started.task_id)
+        .await
+        .unwrap()
+        .expect("the started Goal extension must exist");
+    assert_eq!(
+        stored_task.principal_id.as_deref(),
+        Some("@alice:example.org")
+    );
+    assert_eq!(
+        stored_goal.objective,
+        "stop when the implementation is complete"
+    );
 
     let pause = host
         .submit(ingress.clone(), driver.clone(), GoalCommand::Pause)
@@ -1073,10 +1186,16 @@ async fn same_zerocode_session_retains_goal_control_after_agent_alias_refresh() 
         )
         .await
         .unwrap();
-    assert!(matches!(
-        controller.submit(&settings, &start).await.unwrap(),
-        GoalResponse::Started(_)
-    ));
+    let GoalResponse::Started(started) = controller.submit(&settings, &start).await.unwrap() else {
+        panic!("expected a started Goal");
+    };
+    let stored_task = store
+        .current_goal_for_session("rpc_same-live-session")
+        .await
+        .unwrap()
+        .expect("the started Goal must be current");
+    assert_eq!(stored_task.id, started.task_id);
+    assert_eq!(stored_task.principal_id, None);
 
     let refreshed_ingress = zerocode_ingress("beta");
     let refreshed_driver = recording_driver(&refreshed_ingress);
