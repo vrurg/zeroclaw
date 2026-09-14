@@ -61,6 +61,10 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    /// Serializes Goal lifecycle commands for this exact live session. It is
+    /// session-owned so removal and same-ID replacement cannot leave a
+    /// daemon-lifetime lock entry behind.
+    goal_command: Arc<Mutex<()>>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -100,6 +104,7 @@ pub(crate) struct GoalSessionSnapshot {
     pub(crate) chat_mode: crate::rpc::types::ChatMode,
     pub(crate) owner_tui_id: Option<String>,
     pub(crate) generation: u64,
+    pub(crate) goal_command: Arc<Mutex<()>>,
 }
 
 impl RpcSession {
@@ -111,6 +116,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             agent: Arc::new(Mutex::new(agent)),
+            goal_command: Arc::new(Mutex::new(())),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
@@ -361,6 +367,7 @@ impl SessionStore {
                 chat_mode: session.chat_mode.clone(),
                 owner_tui_id: session.owner_tui_id.clone(),
                 generation: session.generation,
+                goal_command: Arc::clone(&session.goal_command),
             })
     }
 
@@ -1605,6 +1612,16 @@ mod tests {
         assert_eq!(first.owner_tui_id.as_deref(), Some("tui-first"));
         assert_eq!(first.chat_mode, ChatMode::Chat);
 
+        let first_goal_command = Arc::clone(&first.goal_command);
+        let reattached = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("reattached Goal session snapshot");
+        assert!(
+            Arc::ptr_eq(&first_goal_command, &reattached.goal_command),
+            "same live session must retain its Goal command lock"
+        );
+
         store
             .insert(
                 "goal".into(),
@@ -1621,6 +1638,10 @@ mod tests {
         assert_eq!(second.agent_alias, "second");
         assert_eq!(second.owner_tui_id.as_deref(), Some("tui-second"));
         assert_eq!(second.chat_mode, ChatMode::Acp);
+        assert!(
+            !Arc::ptr_eq(&first_goal_command, &second.goal_command),
+            "same-ID replacement must receive a fresh Goal command lock"
+        );
     }
 
     #[tokio::test]

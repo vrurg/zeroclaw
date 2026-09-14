@@ -46,6 +46,7 @@ pub struct ZeroCodeGoalSessionDriver {
     agent_alias: String,
     session_generation: u64,
     tui_id: String,
+    command_lock: Arc<Mutex<()>>,
 }
 
 impl ZeroCodeGoalSessionDriver {
@@ -83,6 +84,7 @@ impl ZeroCodeGoalSessionDriver {
             agent_alias: snapshot.agent_alias,
             session_generation: snapshot.generation,
             tui_id,
+            command_lock: snapshot.goal_command,
         })
     }
 
@@ -164,12 +166,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         let _connection_generation = self.connection_activity.as_ref();
         self.assert_ingress(ingress)?;
         self.revalidate_session().await?;
-        let lock = self
-            .context
-            .goal_runtime
-            .command_lock(self.raw_session_id())
-            .await;
-        let guard = lock.lock_owned().await;
+        let guard = self.command_lock.clone().lock_owned().await;
         self.revalidate_session().await?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
@@ -332,11 +329,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     }
 }
 
-/// ZeroCode's process-local Goal worker and command-lock registry.
+/// ZeroCode's process-local Goal worker registry.
 #[derive(Default)]
 pub struct RpcGoalRuntime {
     supervisors: Mutex<HashMap<String, Arc<GoalExecutionSupervisor>>>,
-    command_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl RpcGoalRuntime {
@@ -428,16 +424,6 @@ impl RpcGoalRuntime {
         }
         Ok(submission.into_response())
     }
-    /// Return the command lease for one raw RPC session identifier.
-    pub async fn command_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.command_locks.lock().await;
-        Arc::clone(
-            locks
-                .entry(session_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    }
-
     /// Return a resident supervisor for this session, if it has one.
     pub async fn supervisor(&self, session_id: &str) -> Option<Arc<GoalExecutionSupervisor>> {
         self.supervisors.lock().await.get(session_id).cloned()
