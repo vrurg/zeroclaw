@@ -81,7 +81,7 @@ fn goal_response_message(response: &crate::wire::GoalResponse) -> String {
         GoalResponse::Cancelled(projection) | GoalResponse::AlreadyCancelled(projection) => {
             ("zc-goal-cancelled", Some(projection))
         }
-        GoalResponse::NoCurrentGoal => ("zc-goal-none", None),
+        GoalResponse::NoCurrentGoal => ("zc-goal-no-current", None),
         GoalResponse::AlreadyActive => ("zc-goal-already-active", None),
         GoalResponse::Terminal(projection) => ("zc-goal-terminal", Some(projection)),
         GoalResponse::Stale => ("zc-goal-stale", None),
@@ -10053,6 +10053,24 @@ mod tests {
         assert!(rendered.contains("pause reason: needs_user_input"));
         assert!(rendered.contains("Details: Select a target."));
         assert!(rendered.contains("Blocker: Which target should receive the change?"));
+    }
+
+    #[test]
+    fn goal_projection_uses_none_for_an_absent_pause_reason() {
+        let response = crate::wire::GoalResponse::Status(crate::wire::GoalStatusProjection {
+            task_id: "goal-1".to_owned(),
+            status: "running".to_owned(),
+            execution_epoch: 1,
+            token_limit: None,
+            cost_limit_usd: None,
+            accounting_state: "complete".to_owned(),
+            pause_reason: None,
+            pause_description: None,
+            blocker_messages: Vec::new(),
+            resumable: true,
+        });
+
+        assert!(goal_response_message(&response).contains("pause reason: none"));
     }
 
     fn draw_todo_close(chat: &mut Chat) -> Rect {
@@ -20519,55 +20537,6 @@ mod tests {
 
     #[tokio::test]
     async fn goal_updates_require_one_canonical_variant_for_the_target_session() {
-        let (mut chat, _writer_rx) = test_chat();
-        chat.phase = ChatPhase::Active(Box::new(state()));
-        let (notif_tx, notif_rx) = broadcast::channel(4);
-        chat.notif_rx = notif_rx;
-
-        for params in [
-            serde_json::json!({
-                "verified_candidate": {
-                    "session_id": "sess-1",
-                    "candidate": "accepted result"
-                },
-                "completed": { "session_id": "sess-1" }
-            }),
-            serde_json::json!({
-                "verified_candidate": {
-                    "session_id": "other-session",
-                    "candidate": "must not be displayed"
-                }
-            }),
-            serde_json::json!({
-                "verified_candidate": {
-                    "session_id": "sess-1",
-                    "candidate": "accepted result"
-                }
-            }),
-            serde_json::json!({ "completed": { "session_id": "sess-1" } }),
-        ] {
-            notif_tx
-                .send(RpcNotification {
-                    method: "session/goal_update".to_string(),
-                    params,
-                })
-                .unwrap();
-        }
-
-        chat.drain_notifications();
-
-        let entries = active_state(&mut chat).entries();
-        assert_eq!(entries.len(), 2);
-        assert!(
-            matches!(&entries[0], ChatEntry::AgentMessage(text) if text.as_ref() == "accepted result")
-        );
-        assert!(
-            matches!(&entries[1], ChatEntry::SystemMessage(text) if text.as_ref() == crate::i18n::t("zc-goal-completed"))
-        );
-    }
-
-    #[test]
-    fn goal_updates_require_one_canonical_variant_for_the_target_session() {
         let (mut chat, _writer_rx) = test_chat();
         chat.phase = ChatPhase::Active(Box::new(state()));
         let (notif_tx, notif_rx) = broadcast::channel(4);
