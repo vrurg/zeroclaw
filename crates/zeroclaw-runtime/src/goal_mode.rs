@@ -530,22 +530,6 @@ impl GoalHostSettings {
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
     }
-
-    pub const fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    pub const fn default_limits(&self) -> &GoalBudgetLimits {
-        &self.default_limits
-    }
-
-    pub const fn owner_pid(&self) -> u32 {
-        self.owner_pid
-    }
-
-    pub fn owner_boot_id(&self) -> &str {
-        &self.owner_boot_id
-    }
 }
 
 /// Controller response before a transport renders it through Fluent.
@@ -612,26 +596,17 @@ impl GoalController {
     /// Apply a previously host-validated Goal submission through guarded
     /// durable transitions without consuming its exact driver proof.
     ///
-    /// The caller must keep `settings` current for this admission; a disabled
-    /// setting returns [`GoalResponse::Disabled`] without a lifecycle change.
+    /// The caller must keep `settings` current for this admission. Except for
+    /// local help, a disabled setting returns [`GoalResponse::Disabled`]
+    /// without a lifecycle change.
     pub async fn submit(
         &self,
         settings: &GoalHostSettings,
         submission: &GoalSubmission,
     ) -> Result<GoalResponse> {
-        // Keep the surface-owned lease through every guarded transition below.
-        // Dropping it any earlier would permit a reconnect to invalidate the
-        // binding between host admission and durable mutation.
-        let _lease = &submission.lease;
-
-        if matches!(submission.command, GoalCommand::Help) {
-            return Ok(GoalResponse::Help);
-        }
-        if !settings.enabled {
-            return Ok(GoalResponse::Disabled);
-        }
-
         match &submission.command {
+            GoalCommand::Help => Ok(GoalResponse::Help),
+            _ if !settings.enabled => Ok(GoalResponse::Disabled),
             GoalCommand::Start { budget, objective } => {
                 self.start(settings, submission.ingress(), *budget, objective.clone())
                     .await
@@ -644,7 +619,6 @@ impl GoalController {
             GoalCommand::Pause => self.pause(submission.ingress()).await,
             GoalCommand::Resume => self.resume(settings, submission.ingress()).await,
             GoalCommand::Cancel => self.cancel(submission.ingress()).await,
-            GoalCommand::Help => unreachable!("handled before controller dispatch"),
         }
     }
 
@@ -693,9 +667,21 @@ impl GoalController {
                 self.projection_response(&session_id, &task_id, GoalResponse::Started)
                     .await
             }
-            GoalTransitionResult::Stale => Ok(GoalResponse::AlreadyActive),
+            GoalTransitionResult::Stale => self.start_stale_response(&session_id).await,
             GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
         }
+    }
+
+    /// A failed start CAS has more than one durable cause. Reload before
+    /// presenting it: only a currently non-terminal Goal is actually active.
+    async fn start_stale_response(&self, session_id: &str) -> Result<GoalResponse> {
+        let Some(task) = self.current(session_id).await? else {
+            return Ok(GoalResponse::Stale);
+        };
+        if !task.status.is_terminal() {
+            return Ok(GoalResponse::AlreadyActive);
+        }
+        self.project(&task).await.map(GoalResponse::Terminal)
     }
 
     async fn status(&self, ingress: &GoalIngressContext, budget: bool) -> Result<GoalResponse> {
