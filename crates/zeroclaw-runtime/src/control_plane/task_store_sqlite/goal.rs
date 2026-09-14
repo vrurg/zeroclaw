@@ -315,7 +315,19 @@ impl SqliteTaskStore {
                 .prepare(
                     "SELECT * FROM tasks
                       WHERE kind = 'goal' AND session_id IS NOT NULL
-                        AND status IN ('running', 'paused') AND owner_boot_id != ?1",
+                        AND owner_boot_id != ?1
+                        AND (
+                            status IN ('running', 'paused')
+                            OR (
+                                status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
+                                AND EXISTS (
+                                    SELECT 1 FROM goal_tasks
+                                     WHERE task_id = tasks.id
+                                       AND (pending_call_id IS NOT NULL
+                                            OR pending_call_epoch IS NOT NULL)
+                                )
+                            )
+                        )",
                 )
                 .context("prepare interrupted goal ownership query")?;
             let rows = statement
@@ -396,6 +408,41 @@ impl SqliteTaskStore {
         )
         .context("classify interrupted goal accounting")?;
 
+        let cleared_terminal_pending = tx
+            .execute(
+                "UPDATE goal_tasks
+                    SET pending_call_id = NULL, pending_call_epoch = NULL
+                  WHERE task_id IN (
+                        SELECT id FROM tasks
+                         WHERE kind = 'goal' AND session_id IS NOT NULL
+                           AND status IN ('completed', 'failed', 'cancelled', 'lost', 'timed_out')
+                           AND owner_boot_id != ?1
+                           AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                       WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                         AND owner_boot_id = tasks.owner_boot_id)
+                  ) AND accounting_state = 'outcome_unknown'
+                    AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
+                params![boot_id],
+            )
+            .context("clear classified interrupted terminal goal operation")?;
+
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pending_call_id = NULL, pending_call_epoch = NULL
+              WHERE task_id IN (
+                    SELECT id FROM tasks
+                     WHERE kind = 'goal' AND session_id IS NOT NULL
+                       AND owner_boot_id != ?1
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
+                       AND status IN ('running', 'paused')
+              ) AND accounting_state = 'outcome_unknown'
+                AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
+            params![boot_id],
+        )
+        .context("clear classified interrupted goal operation")?;
+
         let failed_accounting = tx
             .execute(
                 "UPDATE tasks
@@ -429,22 +476,6 @@ impl SqliteTaskStore {
                 params![boot_id, &now],
             )
             .context("fail interrupted goal accounting")?;
-
-        tx.execute(
-            "UPDATE goal_tasks
-                SET pending_call_id = NULL, pending_call_epoch = NULL
-              WHERE task_id IN (
-                    SELECT id FROM tasks
-                     WHERE kind = 'goal' AND session_id IS NOT NULL
-                       AND owner_boot_id != ?1
-                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
-                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
-                                     AND owner_boot_id = tasks.owner_boot_id)
-              ) AND accounting_state = 'outcome_unknown'
-                AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
-            params![boot_id],
-        )
-        .context("clear classified interrupted goal operation")?;
 
         tx.execute(
             "UPDATE goal_tasks
@@ -502,7 +533,10 @@ impl SqliteTaskStore {
             )
             .context("fail exhausted goal epoch")?;
         tx.commit().context("commit goal boot reconciliation")?;
-        Ok((missing_extension + failed_accounting + paused + exhausted) as u64)
+        Ok(
+            (missing_extension + failed_accounting + cleared_terminal_pending + paused + exhausted)
+                as u64,
+        )
     }
 }
 
