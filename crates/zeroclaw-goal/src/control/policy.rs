@@ -9,7 +9,10 @@
 use anyhow::{Result, ensure};
 use zeroclaw_config::schema::Config;
 
-use crate::task::{GoalPolicyTarget, GoalTaskRegistry, GoalTransitionResult};
+use crate::{
+    control::GoalSessionKey,
+    task::{GoalPolicyTarget, GoalTaskRegistry, GoalTransitionResult},
+};
 use zeroclaw_api::task::{TaskKind, TaskRecord, TaskStatus};
 
 /// Why a successor configuration revokes a currently nonterminal Goal.
@@ -53,13 +56,12 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
         return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
     };
     if let Some(raw_session_id) = route.strip_prefix("zerocode:") {
-        let expected_session_id = format!("rpc_{raw_session_id}");
-        if !raw_session_id.is_empty()
-            && task.session_id.as_deref() == Some(expected_session_id.as_str())
-        {
-            return Ok(GoalPolicyDecision::Keep);
-        }
-        return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
+        return Ok(match GoalSessionKey::zero_code(raw_session_id) {
+            Ok(session_key) if session_key.durable_id() == target.session_id => {
+                GoalPolicyDecision::Keep
+            }
+            Ok(_) | Err(_) => revoked(target, GoalPolicyRevocation::UnsupportedRoute),
+        });
     }
     let Some((alias, reply_target)) = matrix_route(route) else {
         return Ok(revoked(target, GoalPolicyRevocation::UnsupportedRoute));
@@ -70,11 +72,12 @@ pub fn classify_goal_policy(config: &Config, task: &TaskRecord) -> Result<GoalPo
             GoalPolicyRevocation::MatrixChannelUnavailable,
         ));
     };
+    let required_channel = format!("matrix.{alias}");
     if !matrix.enabled
         || !agent
             .channels
             .iter()
-            .any(|channel| channel.as_str() == format!("matrix.{alias}"))
+            .any(|channel| channel.as_str() == required_channel)
         || reply_target.is_empty()
     {
         return Ok(revoked(
@@ -230,23 +233,6 @@ mod tests {
             classify_goal_policy(&successor, &task("zerocode:local-session")).unwrap(),
             GoalPolicyDecision::Keep
         );
-        assert!(matches!(
-            classify_goal_policy(&successor, &task("zerocode:")).unwrap(),
-            GoalPolicyDecision::Revoke {
-                reason: GoalPolicyRevocation::UnsupportedRoute,
-                ..
-            }
-        ));
-        let mut mismatched_zero_code = task("zerocode:local-session");
-        mismatched_zero_code.session_id = Some("rpc_other-session".into());
-        assert!(matches!(
-            classify_goal_policy(&successor, &mismatched_zero_code).unwrap(),
-            GoalPolicyDecision::Revoke {
-                reason: GoalPolicyRevocation::UnsupportedRoute,
-                ..
-            }
-        ));
-
         successor.channels.matrix.get_mut("main").unwrap().enabled = false;
         assert!(matches!(
             classify_goal_policy(&successor, &task("matrix:main:!room:example")).unwrap(),
@@ -277,6 +263,30 @@ mod tests {
         let successor = config();
         assert!(matches!(
             classify_goal_policy(&successor, &task("telegram:main:chat")).unwrap(),
+            GoalPolicyDecision::Revoke {
+                reason: GoalPolicyRevocation::UnsupportedRoute,
+                ..
+            }
+        ));
+
+        for route in [
+            "zerocode:",
+            "zerocode: padded",
+            "zerocode:local-session:extra",
+        ] {
+            assert!(matches!(
+                classify_goal_policy(&successor, &task(route)).unwrap(),
+                GoalPolicyDecision::Revoke {
+                    reason: GoalPolicyRevocation::UnsupportedRoute,
+                    ..
+                }
+            ));
+        }
+
+        let mut mismatched = task("zerocode:local-session");
+        mismatched.session_id = Some("rpc_other-session".to_owned());
+        assert!(matches!(
+            classify_goal_policy(&successor, &mismatched).unwrap(),
             GoalPolicyDecision::Revoke {
                 reason: GoalPolicyRevocation::UnsupportedRoute,
                 ..
