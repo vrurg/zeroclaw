@@ -462,6 +462,75 @@ async fn guarded_transitions_fence_stale_epochs_and_terminal_replacement() {
 }
 
 #[tokio::test]
+async fn replacement_rejects_an_existing_successor_id_without_deleting_terminal_goal() {
+    let store = SqliteTaskStore::new_in_memory().expect("initialize store");
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(
+                session_goal_task("terminal-goal", "collision-session"),
+                session_goal_extension("terminal-goal"),
+            )
+            .await
+            .expect("create session Goal"),
+        GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .finish_session_goal(
+                "terminal-goal",
+                "collision-session",
+                1,
+                TaskStatus::Completed,
+                None,
+            )
+            .await
+            .expect("finish session Goal"),
+        GoalTransitionResult::Applied
+    );
+
+    let colliding_task = TaskRecord {
+        id: "colliding-goal".into(),
+        kind: TaskKind::Delegate,
+        agent: "main".into(),
+        status: TaskStatus::Running,
+        owner_pid: 1,
+        owner_boot_id: "boot-a".into(),
+        heartbeat_at: None,
+        depth: 0,
+        parent_id: None,
+        originator_route: None,
+        delivered: false,
+        idem_key: None,
+        principal_id: None,
+        session_id: None,
+        execution_epoch: 0,
+        started_at: "2026-08-30T00:00:00Z".into(),
+        finished_at: None,
+    };
+    store
+        .create(colliding_task)
+        .await
+        .expect("insert collision");
+
+    let error = store
+        .create_or_replace_session_goal(
+            session_goal_task("colliding-goal", "collision-session"),
+            session_goal_extension("colliding-goal"),
+        )
+        .await
+        .expect_err("existing successor identity must be rejected");
+    assert!(error.to_string().contains("already exists"));
+
+    let current = store
+        .current_goal_for_session("collision-session")
+        .await
+        .expect("read terminal Goal")
+        .expect("terminal Goal remains current after rejected replacement");
+    assert_eq!(current.id, "terminal-goal");
+    assert_eq!(current.status, TaskStatus::Completed);
+}
+
+#[tokio::test]
 async fn pausing_a_goal_is_resumable_when_no_operation_is_pending() {
     let store = SqliteTaskStore::new_in_memory().expect("initialize store");
     assert_eq!(
