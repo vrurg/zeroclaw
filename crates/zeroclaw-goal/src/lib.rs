@@ -10,7 +10,7 @@ pub mod task;
 
 pub use control::{
     GoalController, GoalExecutionEngine, GoalExecutionHost, GoalExecutionOutcome,
-    GoalExecutionRequest, GoalExecutionScope, GoalHostSettings, GoalIngressContext,
+    GoalExecutionRequest, GoalExecutionScope, GoalExecutionSubmission, GoalHostSettings, GoalIngressContext,
     GoalIngressPrincipal, GoalParentTurn, GoalResponse, GoalRuntime, GoalRuntimeSubmission,
     GoalSessionBinding, GoalSessionDriver, GoalSessionExecutionLease, GoalSessionKey,
     GoalSessionLease, GoalStatusProjection, GoalSubmission, GoalSurface, GoalVerifierAttribution,
