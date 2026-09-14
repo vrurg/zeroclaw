@@ -581,7 +581,7 @@ mod tests {
             assert!(
                 directive
                     .content
-                    .contains(&format!("Turn kind: {expected}"))
+                    .contains(&format!("Turn kind (trusted runtime fact): {expected}"))
             );
         }
     }
