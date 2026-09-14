@@ -1237,6 +1237,14 @@ impl CostStorage {
                 "task usage cached input exceeds input tokens"
             );
             anyhow::ensure!(
+                record.usage.cache_creation_input_tokens
+                    <= record
+                        .usage
+                        .input_tokens
+                        .saturating_sub(record.usage.cached_input_tokens),
+                "task usage cache-write input exceeds uncached input tokens"
+            );
+            anyhow::ensure!(
                 record.usage.cost_usd.is_finite() && record.usage.cost_usd >= 0.0,
                 "task usage cost is not finite and non-negative"
             );
@@ -1672,6 +1680,35 @@ mod tests {
                 .get_strict_usage_totals_for_task_with_pricing("goal-a")
                 .is_err(),
             "Goal admission must reject a task ledger row whose total disagrees with its components"
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_reject_cache_writes_outside_uncached_input() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut usage =
+            TokenUsage::new_with_cache_write("test/model", 5, 4, 0, 1, 1.0, 1.0, 1.0, 1.0);
+        usage.cache_creation_input_tokens = 2;
+        let record = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            usage,
+        );
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .is_err(),
+            "Goal admission must reject a cache-write band outside the uncached input band"
         );
     }
 
