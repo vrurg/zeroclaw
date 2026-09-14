@@ -1309,7 +1309,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
             ],
         )?;
         if cleared == 0 {
-            return transition_failure(&tx, task_id, session_id);
+            return transition_failure(&tx, task_id);
         }
         tx.execute(
             "UPDATE tasks
