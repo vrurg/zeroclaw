@@ -452,7 +452,7 @@ impl GoalExecutionSupervisor {
     /// chooses which supervisors must be paused before it tears down their
     /// transports.
     pub async fn pause_for_restart(&self) -> Result<()> {
-        let scopes = {
+        let workers = {
             let workers = self.workers.lock().await;
             workers
                 .iter()
@@ -460,7 +460,8 @@ impl GoalExecutionSupervisor {
                 .collect::<Vec<_>>()
         };
 
-        for (session_id, worker) in scopes {
+        let mut scopes = Vec::with_capacity(workers.len());
+        for (session_id, worker) in workers {
             let worker = worker.lock().await;
             let scope = GoalExecutionScope::new(
                 worker.task_id.clone(),
@@ -496,7 +497,13 @@ impl GoalExecutionSupervisor {
                     | GoalTransitionResult::Missing => {}
                 }
             }
+            scopes.push(scope);
+        }
 
+        // Fence every resident epoch before waiting for any one worker. A
+        // long-running first operation must not leave later sessions Running
+        // and able to admit another operation during the restart cutover.
+        for scope in scopes {
             // A stale or terminal task can still retain a finished worker.
             // Consume it as well, so restart never leaves a process-local
             // executor behind after the durable lifecycle has moved on.
