@@ -349,7 +349,8 @@ impl RpcGoalRuntime {
             supervisor
                 .dispose_session(&GoalSessionKey::zero_code(session_id)?.durable_id())
                 .await?;
-            self.remove_supervisor(session_id).await;
+            self.remove_supervisor_if_current(session_id, &supervisor)
+                .await;
         } else if let Some(control_plane) = control_plane() {
             let registry = control_plane.goal_store()?;
             let durable_session_id = GoalSessionKey::zero_code(session_id)?.durable_id();
@@ -398,10 +399,9 @@ impl RpcGoalRuntime {
                     driver.agent_alias().to_owned(),
                     Arc::new(build_type_level_model_provider_pricing(&config)),
                 )?);
-                let supervisor = restart_coordinator.new_supervisor(engine).await;
-                self.install_supervisor(session_id.clone(), Arc::clone(&supervisor))
-                    .await;
-                supervisor
+                let candidate = restart_coordinator.new_supervisor(engine).await;
+                self.install_supervisor_if_absent(session_id.clone(), candidate)
+                    .await
             }
         };
         let ingress = GoalIngressContext::trusted(
@@ -412,20 +412,21 @@ impl RpcGoalRuntime {
                 tui_id: driver.tui_id.clone(),
             },
         )?;
-        let response = supervisor
+        let submission = supervisor
             .submit(settings, ingress, driver, command)
             .await?;
         if matches!(
-            response,
+            submission.response(),
             GoalResponse::Paused(_)
                 | GoalResponse::AlreadyPaused(_)
                 | GoalResponse::Cancelled(_)
                 | GoalResponse::AlreadyCancelled(_)
                 | GoalResponse::Terminal(_)
         ) {
-            self.remove_supervisor(&session_id).await;
+            self.remove_supervisor_if_current(&session_id, &supervisor)
+                .await;
         }
-        Ok(response)
+        Ok(submission.into_response())
     }
     /// Return the command lease for one raw RPC session identifier.
     pub async fn command_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
@@ -442,17 +443,36 @@ impl RpcGoalRuntime {
         self.supervisors.lock().await.get(session_id).cloned()
     }
 
-    /// Install the sole supervisor for one session.
-    pub async fn install_supervisor(
+    /// Atomically retain one supervisor for a session and return the resident
+    /// instance. A concurrent candidate was never used to launch work, so it
+    /// safely drops after losing this insertion race.
+    pub async fn install_supervisor_if_absent(
         &self,
         session_id: String,
         supervisor: Arc<GoalExecutionSupervisor>,
-    ) {
-        self.supervisors.lock().await.insert(session_id, supervisor);
+    ) -> Arc<GoalExecutionSupervisor> {
+        Arc::clone(
+            self.supervisors
+                .lock()
+                .await
+                .entry(session_id)
+                .or_insert(supervisor),
+        )
     }
 
-    /// Remove the resident supervisor after its worker has drained.
-    pub async fn remove_supervisor(&self, session_id: &str) {
-        self.supervisors.lock().await.remove(session_id);
+    /// Remove a supervisor only if it is still the instance that completed the
+    /// current lifecycle command.
+    pub async fn remove_supervisor_if_current(
+        &self,
+        session_id: &str,
+        supervisor: &Arc<GoalExecutionSupervisor>,
+    ) {
+        let mut supervisors = self.supervisors.lock().await;
+        if supervisors
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, supervisor))
+        {
+            supervisors.remove(session_id);
+        }
     }
 }
