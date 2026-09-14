@@ -575,10 +575,16 @@ impl GoalOperationAccounting for GoalOperationAccountant {
     }
 
     async fn settle(&self, settlement: GoalOperationSettlement) -> Result<()> {
-        let mut admitted = self.admitted.lock().await;
-        let operation = admitted
-            .take()
-            .context("Goal operation settled without a matching admission")?;
+        // The taken operation owns the shared permit until settlement finishes.
+        // Release this bookkeeping mutex before ledger I/O and SQLite work so
+        // cancellation/error paths can observe that no second settlement is
+        // eligible without blocking behind the durable write.
+        let operation = {
+            let mut admitted = self.admitted.lock().await;
+            admitted
+                .take()
+                .context("Goal operation settled without a matching admission")?
+        };
 
         let mut accounting_state = settlement.accounting_state;
         let mut events = Vec::with_capacity(settlement.events.len());
