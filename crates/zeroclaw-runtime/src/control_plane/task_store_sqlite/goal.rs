@@ -1029,6 +1029,13 @@ impl GoalTaskRegistry for SqliteTaskStore {
             if !current.status.is_terminal() {
                 return Ok(GoalTransitionResult::Stale);
             }
+            // The session key can be shared by distinct Matrix identities
+            // after compatibility normalization. A terminal predecessor is
+            // still an audit record for its exact durable principal, so only
+            // that principal may replace it.
+            if current.principal_id != task.principal_id {
+                return Ok(GoalTransitionResult::Stale);
+            }
             let settled = tx
                 .query_row(
                     "SELECT pending_call_id IS NULL AND pending_call_epoch IS NULL
