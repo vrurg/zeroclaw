@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
@@ -261,6 +261,8 @@ struct LeaseObservingRegistry {
     goal: GoalTaskRecord,
     reconnect_available: Arc<AtomicUsize>,
     pause_observed: AtomicUsize,
+    replacement_after_missing_goal: Option<TaskRecord>,
+    missing_goal_observed: AtomicBool,
 }
 
 impl LeaseObservingRegistry {
@@ -292,7 +294,18 @@ impl LeaseObservingRegistry {
             },
             reconnect_available,
             pause_observed: AtomicUsize::new(0),
+            replacement_after_missing_goal: None,
+            missing_goal_observed: AtomicBool::new(false),
         }
+    }
+
+    fn replaced_before_goal_read(ingress: &GoalIngressContext) -> Self {
+        let reconnect_available = Arc::new(AtomicUsize::new(1));
+        let mut registry = Self::running_for(ingress, reconnect_available);
+        let mut replacement = registry.task.clone();
+        replacement.id = "replacement-goal".to_owned();
+        registry.replacement_after_missing_goal = Some(replacement);
+        registry
     }
 
     fn assert_lease_is_held(&self) {
@@ -333,6 +346,10 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
 
     async fn get_goal_task(&self, task_id: &str) -> anyhow::Result<Option<GoalTaskRecord>> {
         assert_eq!(task_id, self.task.id);
+        if self.replacement_after_missing_goal.is_some() {
+            self.missing_goal_observed.store(true, Ordering::SeqCst);
+            return Ok(None);
+        }
         Ok(Some(self.goal.clone()))
     }
 
@@ -373,7 +390,13 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
         session_id: &str,
     ) -> anyhow::Result<Option<TaskRecord>> {
         assert_eq!(self.task.session_id.as_deref(), Some(session_id));
-        Ok(Some(self.task.clone()))
+        Ok(Some(
+            self.replacement_after_missing_goal
+                .as_ref()
+                .filter(|_| self.missing_goal_observed.load(Ordering::SeqCst))
+                .cloned()
+                .unwrap_or_else(|| self.task.clone()),
+        ))
     }
 
     async fn terminal_reason_for_session_goal(
@@ -1803,6 +1826,30 @@ async fn session_lease_stays_held_during_a_guarded_lifecycle_mutation() {
         driver.reconnect_is_allowed(),
         "the lease may release after the guarded lifecycle submission is settled"
     );
+}
+
+#[tokio::test]
+async fn projection_after_terminal_replacement_is_stale_not_corrupt() {
+    let ingress = matrix_ingress();
+    let registry = Arc::new(LeaseObservingRegistry::replaced_before_goal_read(&ingress));
+    let controller = GoalController::new(registry as Arc<dyn GoalTaskRegistry>);
+    let submission = GoalExecutionHost::new()
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            recording_driver(&ingress),
+            GoalCommand::Status,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        controller
+            .submit(&host_settings(true), &submission)
+            .await
+            .unwrap(),
+        GoalResponse::Stale
+    ));
 }
 
 #[tokio::test]
