@@ -588,8 +588,11 @@ impl GoalHostSettings {
 }
 
 fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
-    if limits.token_limit == Some(0) {
-        bail!("Goal default token limit must be positive when finite");
+    if limits
+        .token_limit
+        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+    {
+        bail!("Goal default token limit must be positive and SQLite-representable when finite");
     }
     if let Some(cost_limit_usd) = limits.cost_limit_usd
         && (!cost_limit_usd.is_finite() || cost_limit_usd <= 0.0)
