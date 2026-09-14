@@ -150,37 +150,37 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .context("begin control-plane schema migration")?;
-    add_column_if_missing(
-        &tx,
-        "tasks",
-        "session_id",
-        "ALTER TABLE tasks ADD COLUMN session_id TEXT",
-    )?;
-    add_column_if_missing(
-        &tx,
-        "tasks",
-        "execution_epoch",
-        "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
-    )?;
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
-                 task_id          TEXT PRIMARY KEY
-                                  REFERENCES tasks(id) ON DELETE CASCADE,
-                 owner_pid        INTEGER NOT NULL,
-                 owner_boot_id    TEXT NOT NULL,
-                 desired_status   TEXT NOT NULL,
-                 artifact_path    TEXT NOT NULL,
-                 artifact_ref     TEXT,
-                 artifact_sha256  TEXT NOT NULL,
-                 terminal_error   TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
-                ON terminal_settlement_intents(owner_pid, owner_boot_id);",
-    )
-    .context("ensure terminal settlement schema")?;
     if version < CONTROL_PLANE_SCHEMA_VERSION {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .context("begin control-plane schema migration")?;
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "session_id",
+            "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+        )?;
+        add_column_if_missing(
+            &tx,
+            "tasks",
+            "execution_epoch",
+            "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+        )?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+                     task_id          TEXT PRIMARY KEY
+                                      REFERENCES tasks(id) ON DELETE CASCADE,
+                     owner_pid        INTEGER NOT NULL,
+                     owner_boot_id    TEXT NOT NULL,
+                     desired_status   TEXT NOT NULL,
+                     artifact_path    TEXT NOT NULL,
+                     artifact_ref     TEXT,
+                     artifact_sha256  TEXT NOT NULL,
+                     terminal_error   TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
+                    ON terminal_settlement_intents(owner_pid, owner_boot_id);",
+        )
+        .context("ensure terminal settlement schema")?;
         // Version 8 existed both as upstream terminal-settlement schema and as
         // a provisional Goal schema. Converge older databases through Goal's
         // additive final schema, without recreating the superseded context
@@ -190,9 +190,9 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
             "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
         ))
         .context("mark final control-plane schema version")?;
+        tx.commit()
+            .context("commit control-plane schema migration")?;
     }
-    tx.commit()
-        .context("commit control-plane schema migration")?;
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -515,7 +515,7 @@ fn promote_settlement_record(
 /// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
 /// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
 /// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
-fn collect_skipping_bad_rows<I>(rows: I) -> Vec<TaskRecord>
+pub(super) fn collect_skipping_bad_rows<I>(rows: I) -> Vec<TaskRecord>
 where
     I: Iterator<Item = rusqlite::Result<TaskRecord>>,
 {
