@@ -698,7 +698,7 @@ impl GoalController {
             GoalCommand::Help => Ok(GoalResponse::Help),
             _ if !settings.enabled => Ok(GoalResponse::Disabled),
             GoalCommand::Start { budget, objective } => {
-                self.start(settings, submission.ingress(), *budget, objective.clone())
+                self.start(settings, submission.ingress(), *budget, objective)
                     .await
             }
             GoalCommand::Status => self.status(submission.ingress(), false).await,
@@ -717,11 +717,11 @@ impl GoalController {
         settings: &GoalHostSettings,
         ingress: &GoalIngressContext,
         selection: GoalBudgetSelection,
-        objective: String,
+        objective: &str,
     ) -> Result<GoalResponse> {
-        let session_id = ingress.session_key().durable_id();
-        validate_command_objective(&objective)?;
+        validate_command_objective(objective)?;
         let limits = select_limits(settings.default_limits, selection)?;
+        let session_id = ingress.session_key().durable_id();
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
             id: task_id.clone(),
@@ -744,7 +744,7 @@ impl GoalController {
         };
         let goal = GoalTaskRecord {
             task_id: task_id.clone(),
-            objective,
+            objective: objective.to_owned(),
             effective_token_limit: limits.token_limit,
             effective_cost_limit_usd: limits.cost_limit_usd,
             ..GoalTaskRecord::default()
