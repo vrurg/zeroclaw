@@ -146,10 +146,14 @@ impl GoalExecutionEngine {
                 )
                 .await
             {
-                Ok(candidate) if !candidate.trim().is_empty() => candidate,
-                Ok(_) => {
-                    self.fail(scope, "candidate_empty").await?;
-                    bail!("Goal parent returned an empty candidate");
+                Ok(candidate) => {
+                    self.require_complete_accounting(scope).await?;
+                    if !candidate.trim().is_empty() {
+                        candidate
+                    } else {
+                        self.fail(scope, "candidate_empty").await?;
+                        bail!("Goal parent returned an empty candidate");
+                    }
                 }
                 Err(error) => {
                     self.fail(scope, "parent_operation_failed").await?;
@@ -167,7 +171,10 @@ impl GoalExecutionEngine {
                 )
                 .await
             {
-                Ok(response) => response,
+                Ok(response) => {
+                    self.require_complete_accounting(scope).await?;
+                    response
+                }
                 Err(error) => {
                     self.fail(scope, "verifier_operation_failed").await?;
                     return Err(error).context("Goal verifier operation failed");
@@ -195,6 +202,22 @@ impl GoalExecutionEngine {
                 }
             }
         }
+    }
+
+    async fn require_complete_accounting(&self, scope: &GoalExecutionScope) -> Result<()> {
+        let goal = self
+            .registry
+            .get_goal_task(scope.task_id())
+            .await?
+            .context("Goal extension disappeared while settling accounting")?;
+        if goal.accounting_state == GoalAccountingState::Complete
+            && goal.pending_call_id.is_none()
+            && goal.pending_call_epoch.is_none()
+        {
+            return Ok(());
+        }
+        self.fail(scope, "accounting_missing_or_invalid").await?;
+        bail!("Goal accounting is incomplete")
     }
 
     async fn exact_running_task(
@@ -849,5 +872,62 @@ mod tests {
         let goal = store.get_goal_task(scope.task_id()).await.unwrap().unwrap();
         assert!(goal.pending_call_id.is_none());
         assert_eq!(goal.accounting_state, GoalAccountingState::Invalid);
+    }
+
+    #[tokio::test]
+    async fn incomplete_accounting_fails_instead_of_permitting_completion() {
+        let (store, accountant, scope, directory) = accountant_fixture().await;
+        accountant
+            .admit(GoalOperationRequest::new("primary", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "fallback".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(0, 0),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        let error = engine
+            .require_complete_accounting(&scope)
+            .await
+            .expect_err("incomplete accounting must block completion");
+        assert!(error.to_string().contains("incomplete"));
+        let current = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, TaskStatus::Failed);
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("accounting_missing_or_invalid")
+        );
     }
 }
