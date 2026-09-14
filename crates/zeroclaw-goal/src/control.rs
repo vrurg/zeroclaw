@@ -32,7 +32,7 @@ mod goal_execution;
 
 pub use goal_execution::{
     GoalExecutionEngine, GoalExecutionOutcome, GoalExecutionRestartCoordinator,
-    GoalExecutionSupervisor,
+    GoalExecutionSubmission, GoalExecutionSupervisor,
 };
 
 /// Compose transient verifier feedback as untrusted user-role input.
@@ -601,6 +601,13 @@ impl GoalSubmission {
     fn is_unavailable(&self) -> bool {
         matches!(self, Self(GoalSubmissionState::Unavailable { .. }))
     }
+
+    pub(super) fn into_admission_lease(self) -> Option<GoalSessionLease> {
+        match self.0 {
+            GoalSubmissionState::Unavailable { .. } => None,
+            GoalSubmissionState::Bound { lease, .. } => Some(lease),
+        }
+    }
 }
 
 /// The transport-neutral authority boundary for Goal admission.
@@ -697,6 +704,7 @@ impl GoalExecutionHost {
 pub struct GoalRuntimeSubmission {
     response: GoalResponse,
     execution: Option<GoalExecutionRequest>,
+    lease: Option<GoalSessionLease>,
 }
 
 impl GoalRuntimeSubmission {
@@ -706,6 +714,16 @@ impl GoalRuntimeSubmission {
 
     pub fn into_parts(self) -> (GoalResponse, Option<GoalExecutionRequest>) {
         (self.response, self.execution)
+    }
+
+    pub(super) fn into_parts_with_lease(
+        self,
+    ) -> (
+        GoalResponse,
+        Option<GoalExecutionRequest>,
+        Option<GoalSessionLease>,
+    ) {
+        (self.response, self.execution, self.lease)
     }
 }
 
@@ -775,8 +793,8 @@ impl GoalRuntime {
         };
         let submission = self.host.submit(settings, ingress, driver, command).await?;
         let response = self.controller.submit(settings, &submission).await?;
-        let execution = match &response {
-            GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => {
+        let (execution, lease) = match &response {
+            GoalResponse::Started(projection) | GoalResponse::Resumed(projection) => (
                 Some(GoalExecutionRequest {
                     scope: GoalExecutionScope::new(
                         projection.task_id.clone(),
@@ -785,13 +803,15 @@ impl GoalRuntime {
                     )?,
                     submission,
                     resume_response,
-                })
-            }
-            _ => None,
+                }),
+                None,
+            ),
+            _ => (None, submission.into_admission_lease()),
         };
         Ok(GoalRuntimeSubmission {
             response,
             execution,
+            lease,
         })
     }
 
