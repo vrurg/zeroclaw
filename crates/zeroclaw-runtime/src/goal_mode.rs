@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
-use zeroclaw_commands::goal::{GoalBudgetLimits, GoalBudgetSelection, GoalCommand};
+use zeroclaw_commands::goal::{
+    GoalBudgetLimits, GoalBudgetSelection, GoalCommand, MAX_GOAL_OBJECTIVE_CHARS,
+};
 use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
 
 use crate::control_plane::{
@@ -205,10 +207,6 @@ impl GoalIngressContext {
 
     pub fn route(&self) -> &str {
         &self.route
-    }
-
-    pub fn principal(&self) -> &GoalIngressPrincipal {
-        &self.principal
     }
 
     fn durable_principal_id(&self) -> Option<&str> {
@@ -722,6 +720,7 @@ impl GoalController {
         objective: String,
     ) -> Result<GoalResponse> {
         let session_id = ingress.session_key().durable_id();
+        validate_command_objective(&objective)?;
         let limits = select_limits(settings.default_limits, selection)?;
         let task_id = Uuid::new_v4().to_string();
         let task = TaskRecord {
@@ -771,9 +770,15 @@ impl GoalController {
         ingress: &GoalIngressContext,
         session_id: &str,
     ) -> Result<GoalResponse> {
-        let Some(task) = self.current(ingress, session_id).await? else {
+        let Some(task) = self.registry.current_goal_for_session(session_id).await? else {
             return Ok(GoalResponse::Stale);
         };
+        if !ingress_owns_task(ingress, &task) {
+            // A Matrix principal that does not own this persisted Goal must
+            // neither learn its state nor receive a retry-shaped response for
+            // an authorization conflict.
+            return Ok(GoalResponse::NoCurrentGoal);
+        }
         if !task.status.is_terminal() {
             return Ok(GoalResponse::AlreadyActive);
         }
@@ -961,9 +966,7 @@ impl GoalController {
         // Matrix history keys are filesystem-safe and therefore lossy. The
         // exact authenticated MXID is the durable authority for an existing
         // Matrix Goal, while a ZeroCode tui_id remains transient continuity.
-        if ingress.surface() == GoalSurface::Matrix
-            && task.principal_id.as_deref() != ingress.durable_principal_id()
-        {
+        if !ingress_owns_task(ingress, &task) {
             return Ok(None);
         }
         Ok(Some(task))
@@ -1005,6 +1008,11 @@ impl GoalController {
     }
 }
 
+fn ingress_owns_task(ingress: &GoalIngressContext, task: &TaskRecord) -> bool {
+    ingress.surface() != GoalSurface::Matrix
+        || task.principal_id.as_deref() == ingress.durable_principal_id()
+}
+
 fn select_limits(
     defaults: GoalBudgetLimits,
     selection: GoalBudgetSelection,
@@ -1042,6 +1050,20 @@ fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits>
         bail!("Goal finite budget limits are invalid");
     }
     Ok(limits)
+}
+
+fn validate_command_objective(objective: &str) -> Result<()> {
+    let mut has_non_whitespace = false;
+    for (index, character) in objective.chars().enumerate() {
+        if index == MAX_GOAL_OBJECTIVE_CHARS {
+            bail!("Goal objective exceeds the maximum length");
+        }
+        has_non_whitespace |= !character.is_whitespace();
+    }
+    if !has_non_whitespace {
+        bail!("Goal objective must not be blank");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1089,6 +1111,12 @@ mod tests {
             );
             assert!(select_budget_update_limits(GoalBudgetSelection::Limits(limits)).is_err());
         }
+    }
+
+    #[test]
+    fn typed_start_objective_cannot_bypass_semantic_validation() {
+        assert!(validate_command_objective(" \t\n").is_err());
+        assert!(validate_command_objective(&"a".repeat(MAX_GOAL_OBJECTIVE_CHARS + 1)).is_err());
     }
 
     #[test]
