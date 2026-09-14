@@ -29,7 +29,9 @@ fn session_goal_task(task_id: &str, session_id: &str) -> TaskRecord {
         kind: TaskKind::Goal,
         agent: "main".into(),
         status: TaskStatus::Running,
-        owner_pid: 1,
+        // Recovery tests must model a dead owner. A real PID 1 is live on
+        // supported hosts and must never be reclaimed merely for another boot.
+        owner_pid: 999_999,
         owner_boot_id: "boot-a".into(),
         heartbeat_at: None,
         depth: 0,
@@ -448,6 +450,20 @@ async fn guarded_transitions_fence_stale_epochs_and_terminal_replacement() {
             .await
             .expect("fence admitted operation"),
         GoalTransitionResult::Applied
+    );
+    assert_eq!(
+        store
+            .admit_pending_operation("goal-one", "session-one", 4, "operation-after-pause")
+            .await
+            .expect("reject post-pause operation admission"),
+        GoalTransitionResult::Stale
+    );
+    assert_eq!(
+        store
+            .resume_session_goal("goal-one", "session-one", 4, 2, "boot-new")
+            .await
+            .expect("reject resume with pending operation"),
+        GoalTransitionResult::Stale
     );
     assert_eq!(
         store
@@ -1110,6 +1126,38 @@ async fn boot_recovery_pauses_clean_goals_and_fails_unsettled_operations() {
 }
 
 #[tokio::test]
+async fn boot_recovery_does_not_fence_a_live_foreign_goal_owner() {
+    let store = SqliteTaskStore::new_in_memory().expect("initialize store");
+    let mut task = session_goal_task("live-owner", "live-owner-session");
+    task.owner_pid = std::process::id();
+    task.owner_boot_id = format!("zc-process-v1:{}:unknown:live", task.owner_pid);
+    assert_eq!(
+        store
+            .create_or_replace_session_goal(task, session_goal_extension("live-owner"))
+            .await
+            .expect("create live-owner Goal"),
+        GoalTransitionResult::Applied
+    );
+
+    assert_eq!(
+        store
+            .reconcile_goal_boot_state("foreign-boot")
+            .expect("reconcile foreign boot"),
+        0,
+        "a different boot id alone is not authority to fence a live owner"
+    );
+    assert_eq!(
+        store
+            .current_goal_for_session("live-owner-session")
+            .await
+            .expect("read live-owner Goal")
+            .expect("Goal remains current")
+            .status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
     let directory = tempfile::tempdir().expect("create temporary control-plane directory");
     let store = SqliteTaskStore::new(directory.path()).expect("initialize store");
@@ -1121,7 +1169,7 @@ async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
             "INSERT INTO tasks (
                  id, kind, agent, status, owner_pid, owner_boot_id, session_id,
                  execution_epoch, started_at
-             ) VALUES ('corrupt', 'goal', 'main', 'running', 1, 'boot-old', 'session-corrupt', 1, 'now')",
+             ) VALUES ('corrupt', 'goal', 'main', 'running', 999999, 'boot-old', 'session-corrupt', 1, 'now')",
             [],
         )
         .expect("insert corrupt Goal fixture");
@@ -1164,7 +1212,7 @@ async fn boot_recovery_fails_corrupt_session_goal_without_extension() {
             "INSERT INTO tasks (
                  id, kind, agent, status, owner_pid, owner_boot_id, session_id,
                  execution_epoch, started_at
-             ) VALUES ('corrupt-replace', 'goal', 'main', 'running', 1, 'boot-old',
+             ) VALUES ('corrupt-replace', 'goal', 'main', 'running', 999999, 'boot-old',
                        'session-replace', 1, 'now')",
             [],
         )
