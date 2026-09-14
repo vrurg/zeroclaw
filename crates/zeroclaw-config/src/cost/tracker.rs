@@ -255,6 +255,78 @@ impl CostTracker {
         )
     }
 
+    /// Persist ordered task-scoped usage events with their actual provider
+    /// routes in one ledger append and one durable sync. This is for one
+    /// already-admitted logical operation whose provider path surfaced more
+    /// than one billed event; it does not coalesce or reattribute events.
+    pub fn record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+        &self,
+        events: Vec<(TokenUsage, String)>,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+    ) -> Result<()> {
+        self.record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+            events,
+            agent_alias,
+            task_id,
+            File::sync_all,
+        )
+    }
+
+    fn record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+        &self,
+        events: Vec<(TokenUsage, String)>,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let track_per_agent = self.config.read().track_per_agent;
+        let effective_alias = track_per_agent
+            .then(|| agent_alias.map(str::to_string))
+            .flatten();
+        let mut records = Vec::with_capacity(events.len());
+        let mut totals = Vec::with_capacity(events.len());
+
+        for (usage, provider_ref) in events {
+            anyhow::ensure!(
+                !provider_ref.trim().is_empty(),
+                "Task-scoped usage provider reference must be nonblank"
+            );
+            anyhow::ensure!(
+                usage.cost_usd.is_finite() && usage.cost_usd >= 0.0,
+                "Token usage cost must be a finite, non-negative value"
+            );
+            totals.push((usage.cost_usd, usage.total_tokens));
+            records.push(CostRecord::with_attribution_and_provider(
+                &self.session_id,
+                effective_alias.clone(),
+                task_id.clone(),
+                Some(provider_ref),
+                usage,
+            ));
+        }
+
+        let mut storage = self.lock_storage();
+        let append_outcome = storage.add_records_with_sync(records, sync_file)?;
+
+        {
+            let mut session_totals = self.lock_session_totals();
+            let entry = session_totals.entry(effective_alias).or_default();
+            for (cost_usd, total_tokens) in totals {
+                entry.cost_usd += cost_usd;
+                entry.total_tokens += total_tokens;
+                entry.request_count += 1;
+            }
+        }
+
+        drop(storage);
+        append_outcome.into_result()
+    }
+
     fn record_usage_with_owned_task_attribution_inner(
         &self,
         usage: TokenUsage,
@@ -1134,6 +1206,63 @@ impl CostStorage {
         })
     }
 
+    fn add_records_with_sync(
+        &mut self,
+        records: Vec<CostRecord>,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<AppendOutcome> {
+        self.ensure_period_cache_current()?;
+        let mut encoded = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut encoded, record)?;
+            encoded.push(b'\n');
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!(
+                    "Failed to open cost storage at {}",
+                    self.path.display().to_string()
+                )
+            })?;
+        if let Err(error) = file.write_all(&encoded) {
+            // A short append may have reached the file but is not represented
+            // by process-local aggregates. Rebuild before any later summary
+            // rather than treating those aggregates as authoritative.
+            self.aggregates_current = false;
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to write cost records to {}",
+                    self.path.display().to_string()
+                )
+            });
+        }
+
+        for record in &records {
+            let timestamp = record.usage.timestamp.naive_utc();
+            if timestamp.date() == self.cached_day {
+                self.daily_cost_usd += record.usage.cost_usd;
+            }
+            if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
+                self.monthly_cost_usd += record.usage.cost_usd;
+            }
+        }
+
+        let sync_result = sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        });
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
+    }
+
     /// Get aggregated costs for current day and month.
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
         self.ensure_period_cache_current()?;
@@ -1293,6 +1422,7 @@ impl CostStorage {
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
@@ -1789,6 +1919,82 @@ mod tests {
         let record: CostRecord = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(record.task_id.as_deref(), Some("goal-a"));
         assert_eq!(record.provider_ref.as_deref(), Some("openai.fallback"));
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_retains_event_order_and_actual_routes() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        tracker
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+                vec![
+                    (
+                        TokenUsage::new("first-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                        "openai.primary".to_owned(),
+                    ),
+                    (
+                        TokenUsage::new("second-model", 3, 2, 0, 0.0, 0.0, 0.0),
+                        "openai.fallback".to_owned(),
+                    ),
+                ],
+                Some("agent-a"),
+                Some("goal-a".to_owned()),
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].usage.model, "first-model");
+        assert_eq!(records[0].provider_ref.as_deref(), Some("openai.primary"));
+        assert_eq!(records[1].usage.model, "second-model");
+        assert_eq!(records[1].provider_ref.as_deref(), Some("openai.fallback"));
+        assert_eq!(tracker.get_summary().unwrap().request_count, 2);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_syncs_once_after_every_event_is_appended() {
+        static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        fn count_sync(_: &File) -> std::io::Result<()> {
+            SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        SYNC_CALLS.store(0, Ordering::SeqCst);
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+                vec![
+                    (
+                        TokenUsage::new("first-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                        "openai.primary".to_owned(),
+                    ),
+                    (
+                        TokenUsage::new("second-model", 3, 2, 0, 0.0, 0.0, 0.0),
+                        "openai.fallback".to_owned(),
+                    ),
+                ],
+                Some("agent-a"),
+                Some("goal-a".to_owned()),
+                count_sync,
+            )
+            .unwrap();
+
+        assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
