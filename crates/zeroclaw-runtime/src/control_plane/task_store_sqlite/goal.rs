@@ -326,21 +326,30 @@ impl SqliteTaskStore {
         };
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS goal_recovery_candidates (
-                 task_id TEXT PRIMARY KEY
+                 task_id TEXT PRIMARY KEY,
+                 owner_pid INTEGER NOT NULL,
+                 owner_boot_id TEXT NOT NULL
              );
              DELETE FROM goal_recovery_candidates;",
         )
         .context("reset in-memory goal recovery candidates")?;
         {
             let mut insert = conn
-                .prepare("INSERT INTO goal_recovery_candidates (task_id) VALUES (?1)")
+                .prepare(
+                    "INSERT INTO goal_recovery_candidates (task_id, owner_pid, owner_boot_id)
+                     VALUES (?1, ?2, ?3)",
+                )
                 .context("prepare goal recovery candidate insert")?;
             for goal in recoverable_goals
                 .iter()
                 .filter(|goal| is_authoritative(goal))
             {
                 insert
-                    .execute(params![&goal.id])
+                    .execute(params![
+                        &goal.id,
+                        goal.owner_pid as i64,
+                        &goal.owner_boot_id
+                    ])
                     .context("record authoritative goal recovery candidate")?;
             }
         }
@@ -362,7 +371,9 @@ impl SqliteTaskStore {
                         END
                   WHERE kind = 'goal' AND session_id IS NOT NULL
                     AND owner_boot_id != ?1
-                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
                     AND status IN ('running', 'paused')
                     AND NOT EXISTS (
                         SELECT 1 FROM goal_tasks WHERE task_id = tasks.id
@@ -377,7 +388,9 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND owner_boot_id != ?1
-                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
               ) AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
         )
@@ -403,7 +416,9 @@ impl SqliteTaskStore {
                         END
                   WHERE kind = 'goal' AND session_id IS NOT NULL
                     AND owner_boot_id != ?1
-                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
                     AND status IN ('running', 'paused')
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
@@ -422,7 +437,9 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND owner_boot_id != ?1
-                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
               ) AND accounting_state = 'outcome_unknown'
                 AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)",
             params![boot_id],
@@ -436,7 +453,9 @@ impl SqliteTaskStore {
                     SELECT id FROM tasks
                      WHERE kind = 'goal' AND session_id IS NOT NULL
                        AND status = 'running' AND owner_boot_id != ?1
-                       AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                       AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                   WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                     AND owner_boot_id = tasks.owner_boot_id)
                        AND execution_epoch < 9223372036854775807
                 ) AND pending_call_id IS NULL AND pending_call_epoch IS NULL
                     AND accounting_state = 'complete'",
@@ -450,7 +469,9 @@ impl SqliteTaskStore {
                     SET status = 'paused', execution_epoch = execution_epoch + 1
                   WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                     AND owner_boot_id != ?1 AND execution_epoch < 9223372036854775807
-                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
@@ -468,7 +489,9 @@ impl SqliteTaskStore {
                         finished_at = COALESCE(finished_at, ?2)
                   WHERE kind = 'goal' AND session_id IS NOT NULL AND status = 'running'
                     AND owner_boot_id != ?1 AND execution_epoch = 9223372036854775807
-                    AND id IN (SELECT task_id FROM goal_recovery_candidates)
+                    AND EXISTS (SELECT 1 FROM goal_recovery_candidates
+                                WHERE task_id = tasks.id AND owner_pid = tasks.owner_pid
+                                  AND owner_boot_id = tasks.owner_boot_id)
                     AND EXISTS (
                         SELECT 1 FROM goal_tasks
                          WHERE task_id = tasks.id
