@@ -261,6 +261,10 @@ pub(super) fn migrate_schema(
                  BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
                  WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
                  BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
+             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_epoch_monotonic
+                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+                 WHEN OLD.kind = 'goal' AND NEW.execution_epoch < OLD.execution_epoch
+                 BEGIN SELECT RAISE(ABORT, 'goal task execution_epoch is monotonic'); END;
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_session_immutable
                  BEFORE UPDATE OF kind, session_id ON tasks FOR EACH ROW
                  WHEN OLD.kind = 'goal'
@@ -697,7 +701,7 @@ fn insert_goal_task_record(conn: &Connection, rec: GoalTaskRecord) -> Result<()>
              pause_reason, pause_description, blockers_json,
              pending_call_id, pending_call_epoch, accounting_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-         ON CONFLICT(task_id) DO NOTHING",
+        ",
         params![
             rec.task_id,
             rec.objective,
