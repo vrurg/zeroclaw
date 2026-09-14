@@ -7217,18 +7217,15 @@ async fn process_channel_message_body(
     // Capture Goal command authority before mutable hooks. A hook can cancel
     // the message, but it cannot rewrite its principal, session, route, or
     // command before admission.
-    let goal_snapshot = if is_matrix_channel_name(&msg.channel)
-        && !matches!(
-            parse_goal_command(&msg.content),
-            Err(GoalCommandParseError::NotGoalCommand)
-        ) {
-        Some((
+    let parsed_goal_command =
+        is_matrix_channel_name(&msg.channel).then(|| parse_goal_command(&msg.content));
+    let goal_snapshot = match parsed_goal_command {
+        Some(Err(GoalCommandParseError::NotGoalCommand)) | None => None,
+        Some(parsed_goal_command) => Some((
             runtime_conversation_history_key(ctx.as_ref(), &msg),
             msg.clone(),
-            parse_goal_command(&msg.content),
-        ))
-    } else {
-        None
+            parsed_goal_command,
+        )),
     };
     let logged_content = if goal_snapshot.is_some() {
         "<goal command>"
