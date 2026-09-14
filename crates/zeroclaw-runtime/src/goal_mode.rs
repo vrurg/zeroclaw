@@ -648,7 +648,6 @@ impl GoalExecutionRequest {
     pub const fn initial_turn_kind(&self) -> GoalParentTurnKind {
         self.initial_turn_kind
     }
-    }
 }
 
 /// Single runtime entry point for a typed Goal command.
