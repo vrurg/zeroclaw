@@ -369,6 +369,18 @@ pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.
     fn session_key(&self) -> &GoalSessionKey;
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
+
+    /// Append an operator response to the same canonical session before a
+    /// resumed Goal is allowed to issue its next parent turn.  Implementors
+    /// must make this durable using the exact surface session that their
+    /// foreground lease has already revalidated.
+    ///
+    /// The conservative default deliberately rejects the operation: silently
+    /// treating a resume response as process-local context would let it vanish
+    /// across a restart and break the session-continuity contract.
+    async fn append_resume_response(&mut self, _response: String) -> Result<()> {
+        bail!("Goal session driver cannot durably append a resume response")
+    }
     async fn run_parent_turn(
         &mut self,
         scope: &GoalExecutionScope,
@@ -477,8 +489,8 @@ fn goal_command_kind(command: &GoalCommand) -> &'static str {
         GoalCommand::Status => "status",
         GoalCommand::Budget => "budget",
         GoalCommand::SetBudget(_) => "budget_set",
-        GoalCommand::Pause => "pause",
-        GoalCommand::Resume => "resume",
+        GoalCommand::Pause { .. } => "pause",
+        GoalCommand::Resume { .. } => "resume",
         GoalCommand::Cancel => "cancel",
         GoalCommand::Help => "help",
     }
@@ -820,8 +832,8 @@ impl GoalController {
             GoalCommand::SetBudget(selection) => {
                 self.set_budget(submission.ingress(), *selection).await
             }
-            GoalCommand::Pause => self.pause(submission.ingress()).await,
-            GoalCommand::Resume => self.resume(settings, submission.ingress()).await,
+            GoalCommand::Pause { .. } => self.pause(submission.ingress()).await,
+            GoalCommand::Resume { .. } => self.resume(settings, submission.ingress()).await,
             GoalCommand::Cancel => self.cancel(submission.ingress()).await,
         }
     }
