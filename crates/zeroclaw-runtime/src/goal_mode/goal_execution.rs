@@ -487,15 +487,15 @@ impl GoalOperationAccountant {
         let agent_alias = self.agent_alias.clone();
         let task_id = self.scope.task_id().to_owned();
         tokio::task::spawn_blocking(move || {
-            for (event, usage) in events {
-                tracker.record_scoped_usage_with_owned_task_and_provider_attribution(
-                    usage,
-                    Some(&agent_alias),
-                    Some(task_id.clone()),
-                    event.provider_ref,
-                )?;
-            }
-            Ok::<(), anyhow::Error>(())
+            let events = events
+                .into_iter()
+                .map(|(event, usage)| (usage, event.provider_ref))
+                .collect();
+            tracker.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+                events,
+                Some(&agent_alias),
+                Some(task_id),
+            )
         })
         .await
         .context("join Goal ledger settlement")?
