@@ -63,6 +63,50 @@ where
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
 }
 
+/// Dispatch the one-model non-agentic delegate turn.
+///
+/// Ordinary delegation retains its historical string-returning provider path.
+/// A Goal-scoped child must instead enter the structured path so the enclosing
+/// Goal accountant can admit the operation and settle every actual Reliable
+/// attempt before the child result reaches the parent loop.
+async fn run_non_agentic_provider_call(
+    model_provider: &dyn ModelProvider,
+    provider_name: &str,
+    model: &str,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    temperature: Option<f64>,
+) -> anyhow::Result<String> {
+    if !crate::agent::cost::goal_operation_accounting_is_scoped() {
+        return ProviderDispatch::from_ref(model_provider)
+            .chat_with_system(system_prompt, prompt, model, temperature)
+            .await;
+    }
+
+    let mut messages = Vec::with_capacity(usize::from(system_prompt.is_some()) + 1);
+    if let Some(system_prompt) = system_prompt {
+        messages.push(ChatMessage::system(system_prompt));
+    }
+    messages.push(ChatMessage::user(prompt));
+    let response = ResolvedModelAccess {
+        model_provider,
+        provider_name,
+        model,
+        temperature,
+    }
+    .run_model_query(zeroclaw_providers::ChatRequest {
+        messages: &messages,
+        tools: None,
+        thinking: None,
+    })
+    .await?;
+    anyhow::ensure!(
+        !response.has_tool_calls(),
+        "non-agentic delegate provider response requested tools"
+    );
+    Ok(response.text.unwrap_or_default())
+}
+
 /// Serializable result of a background delegate task.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackgroundDelegateResult {
@@ -2156,10 +2200,16 @@ impl DelegateTool {
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
-        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            run_non_agentic_provider_call(
+                &*model_provider,
+                &provider_type,
+                &model,
+                system_prompt_ref,
+                &full_prompt,
+                temperature,
+            ),
         )
         .await;
 
@@ -4021,6 +4071,9 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::cost::{
+        GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationSettlement,
+    };
     use crate::control_plane::{
         ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     };
@@ -4043,6 +4096,83 @@ mod tests {
     };
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+
+    #[derive(Default)]
+    struct RecordingGoalOperationAccounting {
+        requests: parking_lot::Mutex<Vec<crate::agent::cost::GoalOperationRequest>>,
+        settlements: parking_lot::Mutex<Vec<GoalOperationSettlement>>,
+    }
+
+    #[async_trait]
+    impl GoalOperationAccounting for RecordingGoalOperationAccounting {
+        async fn admit(
+            &self,
+            request: crate::agent::cost::GoalOperationRequest,
+        ) -> anyhow::Result<()> {
+            self.requests.lock().push(request);
+            Ok(())
+        }
+
+        async fn settle(&self, settlement: GoalOperationSettlement) -> anyhow::Result<()> {
+            self.settlements.lock().push(settlement);
+            Ok(())
+        }
+    }
+
+    struct NonAgenticGoalAccountingProvider {
+        usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonAgenticGoalAccountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("Goal-scoped delegate must use the structured provider path")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            assert!(matches!(request.messages.len(), 1 | 2));
+            assert!(
+                request
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == "user")
+            );
+            if request.messages.len() == 2 {
+                assert_eq!(request.messages[0].role, "system");
+            }
+            Ok(ChatResponse {
+                text: Some("accounted delegate reply".to_owned()),
+                tool_calls: Vec::new(),
+                usage: self.usage.clone(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NonAgenticGoalAccountingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NonAgenticGoalAccountingProvider"
+        }
+    }
 
     fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
         TaskRecord {
@@ -7453,6 +7583,85 @@ mod tests {
         let error = result.error.as_deref().unwrap_or_default();
         assert_eq!(error, invalid_semantic_completion_error("delegate"));
         assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_non_agentic_delegate_uses_accounted_structured_provider_call() {
+        let accounting = Arc::new(RecordingGoalOperationAccounting::default());
+        let provider = NonAgenticGoalAccountingProvider {
+            usage: Some(zeroclaw_api::model_provider::TokenUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+        };
+
+        GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    let response = run_non_agentic_provider_call(
+                        &provider,
+                        "configured.delegate",
+                        "delegate-model",
+                        Some("delegate system prompt"),
+                        "delegate task",
+                        None,
+                    )
+                    .await
+                    .expect("Goal-scoped delegate must complete through the accounted path");
+                    assert_eq!(response, "accounted delegate reply");
+                },
+            )
+            .await;
+
+        let requests = accounting.requests.lock();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_provider, "configured.delegate");
+        assert_eq!(requests[0].model, "delegate-model");
+        drop(requests);
+
+        let settlements = accounting.settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].events.len(), 1);
+        assert_eq!(settlements[0].events[0].provider_ref, "configured.delegate");
+        assert_eq!(settlements[0].events[0].model, "delegate-model");
+    }
+
+    #[tokio::test]
+    async fn goal_scoped_non_agentic_delegate_settles_missing_usage_for_controller_failure() {
+        let accounting = Arc::new(RecordingGoalOperationAccounting::default());
+        let provider = NonAgenticGoalAccountingProvider { usage: None };
+
+        let response = GOAL_OPERATION_ACCOUNTING
+            .scope(
+                Some(Arc::clone(&accounting) as Arc<dyn GoalOperationAccounting>),
+                async {
+                    run_non_agentic_provider_call(
+                        &provider,
+                        "configured.delegate",
+                        "delegate-model",
+                        None,
+                        "delegate task",
+                        None,
+                    )
+                    .await
+                    .expect(
+                        "the provider result is handed to the controller with its missing usage",
+                    )
+                },
+            )
+            .await;
+
+        assert_eq!(response, "accounted delegate reply");
+        let settlements = accounting.settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert!(settlements[0].events.is_empty());
+        assert_eq!(
+            settlements[0].accounting_state,
+            crate::control_plane::GoalAccountingState::Missing
+        );
     }
 
     #[tokio::test]
