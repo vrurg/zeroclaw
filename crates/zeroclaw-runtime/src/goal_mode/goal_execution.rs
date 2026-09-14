@@ -1913,6 +1913,33 @@ mod tests {
         }
     }
 
+    /// Build the production engine with the deliberately disabled ordinary
+    /// tracker used by lifecycle tests. Goal accounting still opens and uses
+    /// its canonical ledger, so keeping this setup in one place avoids tests
+    /// accidentally exercising a different cost configuration.
+    fn execution_engine(
+        registry: Arc<dyn GoalTaskRegistry>,
+        directory: &TempDir,
+    ) -> GoalExecutionEngine {
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        GoalExecutionEngine::new(
+            GoalRuntime::new(registry),
+            tracker,
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap()
+    }
+
     /// A narrow registry double that replaces an exact Goal immediately after
     /// its unsettled operation has been durably classified. This is the
     /// lifecycle interleaving an executor can observe while unwinding: the
@@ -2335,23 +2362,7 @@ mod tests {
     #[tokio::test]
     async fn verifier_complete_with_missing_usage_fails_before_history_delivery() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
         let mut lease = MissingAccountingVerifierLease {
             store: Arc::clone(&store),
             scope: scope.clone(),
@@ -2402,23 +2413,7 @@ mod tests {
     #[tokio::test]
     async fn paused_parent_with_dirty_tool_batch_fails_in_the_production_loop() {
         let (store, _accountant, scope, directory) = accountant_fixture().await;
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
         let mut lease = PauseWithDirtyToolBatchLease {
             store: Arc::clone(&store),
             scope: scope.clone(),
@@ -2541,23 +2536,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2606,23 +2585,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2656,23 +2619,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2760,23 +2707,7 @@ mod tests {
                     ..GoalTaskRecord::default()
                 },
             });
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(registry),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(registry, &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2821,23 +2752,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2925,23 +2840,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
@@ -2991,23 +2890,7 @@ mod tests {
             GoalTransitionResult::Applied
         );
 
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                directory.path(),
-            )
-            .unwrap(),
-        );
-        let engine = GoalExecutionEngine::new(
-            GoalRuntime::new(store.clone()),
-            tracker,
-            "main",
-            Arc::new(HashMap::new()),
-        )
-        .unwrap();
+        let engine = execution_engine(store.clone(), &directory);
 
         engine
             .fail(&scope, "parent_operation_failed")
