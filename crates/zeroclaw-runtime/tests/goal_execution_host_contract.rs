@@ -1256,13 +1256,43 @@ async fn resume_projects_a_paused_goal_that_is_not_yet_resumable() {
     ));
 
     let resume = host
-        .submit(&host_settings(true), ingress, driver, GoalCommand::Resume)
+        .submit(
+            &host_settings(true),
+            ingress.clone(),
+            driver.clone(),
+            GoalCommand::Resume,
+        )
         .await
         .unwrap();
     let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
         panic!("resume must project the durable non-resumable paused state");
     };
     assert_eq!(status.status, TaskStatus::Paused);
+    assert!(!status.resumable);
+
+    assert_eq!(
+        store
+            .settle_pending_operation(
+                &started.task_id,
+                &ingress.session_key().durable_id(),
+                started.execution_epoch,
+                "operation-still-settling",
+                GoalAccountingState::Invalid,
+            )
+            .await
+            .unwrap(),
+        GoalTransitionResult::Applied
+    );
+
+    let resume = host
+        .submit(&host_settings(true), ingress, driver, GoalCommand::Resume)
+        .await
+        .unwrap();
+    let GoalResponse::Status(status) = controller.submit(&settings, &resume).await.unwrap() else {
+        panic!("incomplete accounting must project a durable non-resumable paused state");
+    };
+    assert_eq!(status.status, TaskStatus::Paused);
+    assert_eq!(status.accounting_state, GoalAccountingState::Invalid);
     assert!(!status.resumable);
 }
 
