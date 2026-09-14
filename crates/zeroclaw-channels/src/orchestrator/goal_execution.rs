@@ -372,6 +372,7 @@ impl MatrixGoalExecutionLease {
         &self,
         provider: &dyn zeroclaw_providers::ModelProvider,
         route: &ChannelRouteSelection,
+        directive: ChatMessage,
         canonical_history: Vec<ChatMessage>,
     ) -> Vec<ChatMessage> {
         let excluded_tools: &[String] =
@@ -409,10 +410,20 @@ impl MatrixGoalExecutionLease {
             target_channel,
             native_tool_specs_present,
         );
-        let mut history = vec![ChatMessage::system(system_prompt)];
-        history.extend(canonical_history);
-        history
+        goal_start_history(system_prompt, directive, canonical_history)
     }
+}
+
+fn goal_start_history(
+    system_prompt: String,
+    directive: ChatMessage,
+    canonical_history: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    let mut history = Vec::with_capacity(canonical_history.len() + 2);
+    history.push(ChatMessage::system(system_prompt));
+    history.push(directive);
+    history.extend(canonical_history);
+    history
 }
 
 fn goal_parent_directive(turn: &GoalParentTurn) -> ChatMessage {
@@ -454,12 +465,12 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         .await?;
         let directive = goal_parent_directive(&turn);
         let mut history = match turn.kind {
-            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => {
-                let mut history =
-                    self.initial_working_history(provider.as_ref(), &route, turn.working_history);
-                history.insert(1, directive);
-                history
-            }
+            GoalParentTurnKind::Start | GoalParentTurnKind::Resume => self.initial_working_history(
+                provider.as_ref(),
+                &route,
+                directive,
+                turn.working_history,
+            ),
             GoalParentTurnKind::Continue => {
                 let mut history = turn.working_history;
                 history.push(directive);
@@ -629,5 +640,19 @@ mod tests {
                     .contains(&format!("Turn kind: {expected}"))
             );
         }
+    }
+
+    #[test]
+    fn start_history_places_the_directive_before_canonical_history() {
+        let history = goal_start_history(
+            "system prompt".to_owned(),
+            ChatMessage::system("Goal directive"),
+            vec![ChatMessage::user("earlier user message")],
+        );
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].content, "system prompt");
+        assert_eq!(history[1].content, "Goal directive");
+        assert_eq!(history[2].content, "earlier user message");
     }
 }
