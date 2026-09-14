@@ -268,12 +268,14 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         _operation: &GoalOperationScope,
         turn: GoalVerifierTurn,
     ) -> Result<String> {
-        let config = self.context.config.read().clone();
-        let (provider, provider_name, model) = build_session_model_provider(
-            &config,
-            &config.goal.verifier.model_provider,
-            config.goal.verifier.model.as_deref(),
-        )?;
+        let (provider, provider_name, model) = {
+            let config = self.context.config.read();
+            build_session_model_provider(
+                &config,
+                &config.goal.verifier.model_provider,
+                config.goal.verifier.model.as_deref(),
+            )?
+        };
         let messages = vec![
             ChatMessage::system(
                 "Return only strict JSON: {\"decision\":\"complete|continue|blocked\",\"reason\":\"...\",\"blockers\":[...]}.",
