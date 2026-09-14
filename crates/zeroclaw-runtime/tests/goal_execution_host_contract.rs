@@ -561,8 +561,12 @@ impl GoalTaskRegistry for LeaseObservingRegistry {
 }
 
 fn matrix_ingress() -> GoalIngressContext {
+    matrix_ingress_with_session("matrix_room__room_example_org__alice_example_org")
+}
+
+fn matrix_ingress_with_session(session: &str) -> GoalIngressContext {
     GoalIngressContext::trusted(
-        GoalSessionKey::matrix("matrix_room__room_example_org__alice_example_org").unwrap(),
+        GoalSessionKey::matrix(session).unwrap(),
         "main",
         "matrix:primary",
         GoalIngressPrincipal::Matrix {
@@ -1369,6 +1373,80 @@ async fn cancelled_drain_keeps_the_worker_owned_for_a_later_lifecycle_retry() {
 }
 
 #[tokio::test]
+async fn concurrent_drains_consume_one_worker_without_repolling_its_join_handle() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+
+    supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    parent_started.notified().await;
+
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let scope = GoalExecutionScope::new(
+        current.id,
+        ingress.session_key().durable_id(),
+        current.execution_epoch,
+    )
+    .unwrap();
+
+    let first_supervisor = Arc::clone(&supervisor);
+    let first_scope = scope.clone();
+    let first = zeroclaw_spawn::spawn!(async move { first_supervisor.drain(&first_scope).await });
+    let second_supervisor = Arc::clone(&supervisor);
+    let second_scope = scope.clone();
+    let second =
+        zeroclaw_spawn::spawn!(async move { second_supervisor.drain(&second_scope).await });
+
+    release_parent.notify_one();
+    assert!(first.await.unwrap().is_err());
+    assert!(second.await.unwrap().is_err());
+    assert!(
+        !supervisor.owns_scope(&scope).await,
+        "both lifecycle waiters must observe the same completion without retaining the worker"
+    );
+}
+
+#[tokio::test]
 async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
@@ -1446,6 +1524,103 @@ async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
     assert_eq!(current.status, TaskStatus::Paused);
     assert_eq!(goal.pause_reason, Some(GoalPauseReason::DaemonRestart));
     assert!(goal.pending_call_id.is_none());
+}
+
+#[tokio::test]
+async fn restart_coordinator_fences_every_host_before_waiting_for_any_one_host() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let coordinator = Arc::new(GoalExecutionRestartCoordinator::new());
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor_a = coordinator
+        .new_supervisor(Arc::new(
+            runtime
+                .execution_engine(Arc::clone(&tracker), "main", Arc::default())
+                .unwrap(),
+        ))
+        .await;
+    let supervisor_b = coordinator
+        .new_supervisor(Arc::new(
+            runtime
+                .execution_engine(tracker, "main", Arc::default())
+                .unwrap(),
+        ))
+        .await;
+    let ingress_a = matrix_ingress_with_session("matrix_room__room_example_org__alice_a");
+    let ingress_b = matrix_ingress_with_session("matrix_room__room_example_org__alice_b");
+    let a_started = Arc::new(Notify::new());
+    let a_release = Arc::new(Notify::new());
+    let b_started = Arc::new(Notify::new());
+    let b_release = Arc::new(Notify::new());
+    let b_verifier_calls = Arc::new(AtomicUsize::new(0));
+    let driver_a = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress_a.session_key().clone()),
+        parent_started: Arc::clone(&a_started),
+        release_parent: Arc::clone(&a_release),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let driver_b = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress_b.session_key().clone()),
+        parent_started: Arc::clone(&b_started),
+        release_parent: Arc::clone(&b_release),
+        verifier_calls: Arc::clone(&b_verifier_calls),
+    });
+    for (supervisor, ingress, driver) in [
+        (Arc::clone(&supervisor_a), ingress_a.clone(), driver_a),
+        (Arc::clone(&supervisor_b), ingress_b.clone(), driver_b),
+    ] {
+        supervisor
+            .submit(
+                settings.clone(),
+                ingress,
+                driver,
+                GoalCommand::Start {
+                    budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                    objective: "finish the task".into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    a_started.notified().await;
+    b_started.notified().await;
+
+    let restarting = Arc::clone(&coordinator);
+    let mut restart = zeroclaw_spawn::spawn!(async move { restarting.quiesce_for_restart().await });
+    assert!(
+        timeout(Duration::from_millis(20), &mut restart)
+            .await
+            .is_err(),
+        "host A must still be draining"
+    );
+
+    b_release.notify_one();
+    tokio::task::yield_now().await;
+    let goal_b = store
+        .current_goal_for_session(&ingress_b.session_key().durable_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(goal_b.status, TaskStatus::Paused);
+    assert_eq!(
+        b_verifier_calls.load(Ordering::SeqCst),
+        0,
+        "a globally fenced host must not admit a verifier while another host drains"
+    );
+
+    a_release.notify_one();
+    restart.await.unwrap().unwrap();
 }
 
 #[tokio::test]
