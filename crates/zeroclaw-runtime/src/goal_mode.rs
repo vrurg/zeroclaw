@@ -896,7 +896,8 @@ impl GoalController {
         if !task.status.is_terminal() {
             return Ok(GoalResponse::AlreadyActive);
         }
-        self.project(&task).await.map(GoalResponse::Terminal)
+        self.projection_response_for_current(ingress, session_id, &task, GoalResponse::Terminal)
+            .await
     }
 
     async fn status(&self, ingress: &GoalIngressContext, budget: bool) -> Result<GoalResponse> {
@@ -904,7 +905,7 @@ impl GoalController {
         let Some(task) = self.current(ingress, &session_id).await? else {
             return Ok(GoalResponse::NoCurrentGoal);
         };
-        let Some(projection) = self.projection_for(ingress, &session_id, &task.id).await? else {
+        let Some(projection) = self.project_current(ingress, &session_id, &task).await? else {
             return Ok(GoalResponse::Stale);
         };
         if task.status.is_terminal() {
@@ -926,7 +927,14 @@ impl GoalController {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status.is_terminal() {
-            return self.project(&task).await.map(GoalResponse::Terminal);
+            return self
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::Terminal,
+                )
+                .await;
         }
         let limits = select_budget_update_limits(selection)?;
         match self
@@ -959,10 +967,24 @@ impl GoalController {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status == TaskStatus::Paused {
-            return self.project(&task).await.map(GoalResponse::AlreadyPaused);
+            return self
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::AlreadyPaused,
+                )
+                .await;
         }
         if task.status.is_terminal() {
-            return self.project(&task).await.map(GoalResponse::Terminal);
+            return self
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::Terminal,
+                )
+                .await;
         }
         match self
             .registry
@@ -996,7 +1018,14 @@ impl GoalController {
             return Ok(GoalResponse::NoCurrentGoal);
         };
         if task.status.is_terminal() {
-            return self.project(&task).await.map(GoalResponse::Terminal);
+            return self
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::Terminal,
+                )
+                .await;
         }
         if task.status != TaskStatus::Paused {
             return Ok(GoalResponse::AlreadyActive);
@@ -1033,9 +1062,12 @@ impl GoalController {
             return Ok(GoalResponse::Stale);
         };
         if task.status.is_terminal() {
-            return self.project(&task).await.map(GoalResponse::Terminal);
+            return self
+                .projection_response_for_current(ingress, session_id, &task, GoalResponse::Terminal)
+                .await;
         }
-        self.project(&task).await.map(GoalResponse::Status)
+        self.projection_response_for_current(ingress, session_id, &task, GoalResponse::Status)
+            .await
     }
 
     async fn cancel(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
@@ -1045,12 +1077,23 @@ impl GoalController {
         };
         if task.status == TaskStatus::Cancelled {
             return self
-                .project(&task)
-                .await
-                .map(GoalResponse::AlreadyCancelled);
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::AlreadyCancelled,
+                )
+                .await;
         }
         if task.status.is_terminal() {
-            return self.project(&task).await.map(GoalResponse::Terminal);
+            return self
+                .projection_response_for_current(
+                    ingress,
+                    &session_id,
+                    &task,
+                    GoalResponse::Terminal,
+                )
+                .await;
         }
         match self
             .registry
@@ -1100,8 +1143,17 @@ impl GoalController {
         if task.id != task_id {
             return Ok(None);
         }
+        self.project_current(ingress, session_id, &task).await
+    }
+
+    async fn project_current(
+        &self,
+        ingress: &GoalIngressContext,
+        session_id: &str,
+        task: &TaskRecord,
+    ) -> Result<Option<GoalStatusProjection>> {
         match self.registry.get_goal_task(&task.id).await? {
-            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(&task, &goal))),
+            Some(goal) => Ok(Some(GoalStatusProjection::from_parts(task, &goal))),
             None => {
                 // A terminal predecessor can be atomically replaced between
                 // the current-task read and extension read. Recheck only on
@@ -1128,13 +1180,17 @@ impl GoalController {
         Ok(projection.map_or(GoalResponse::Stale, response))
     }
 
-    async fn project(&self, task: &TaskRecord) -> Result<GoalStatusProjection> {
-        let goal = self
-            .registry
-            .get_goal_task(&task.id)
+    async fn projection_response_for_current(
+        &self,
+        ingress: &GoalIngressContext,
+        session_id: &str,
+        task: &TaskRecord,
+        response: impl FnOnce(GoalStatusProjection) -> GoalResponse,
+    ) -> Result<GoalResponse> {
+        Ok(self
+            .project_current(ingress, session_id, task)
             .await?
-            .ok_or_else(|| anyhow::Error::msg("Goal task extension is missing"))?;
-        Ok(GoalStatusProjection::from_parts(task, &goal))
+            .map_or(GoalResponse::Stale, response))
     }
 }
 
