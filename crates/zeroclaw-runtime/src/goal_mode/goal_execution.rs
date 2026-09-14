@@ -1383,15 +1383,11 @@ impl GoalExecutionEngine {
             }
         }
         if operation_resolved {
-            let current = self
-                .registry
-                .current_goal_for_session(scope.session_id())
-                .await?;
-            if current.as_ref().is_some_and(|current| {
-                current.id == scope.task_id() && current.status.is_terminal()
-            }) {
-                return Ok(());
-            }
+            // Settlement atomically terminalizes or preserves the exact task.
+            // A successor may now legitimately replace it, or disposal may
+            // remove it, before this executor returns; neither event should
+            // obscure the already-successful accounting classification.
+            return Ok(());
         }
         match self
             .registry
