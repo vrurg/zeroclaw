@@ -604,71 +604,20 @@ fn record_tool_loop_cost_usage_inner_with_live(
         .try_with(Clone::clone)
         .ok()
         .flatten()?;
-    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
-    let config_rates = normalized_rates(
-        pricing
-            .map(|map| resolve_rates_opt(map, model))
-            .unwrap_or_default(),
-    );
-
-    // Live-price FALLBACK fills only the dimensions config left unset; never
-    // fetches on this path (reads a cached snapshot, empty unless a provider
-    // opted into `live_pricing`).
-    let live = if let Some(live) = live_override {
-        // Cache writes are optional for completeness because they fall back
-        // to the ordinary input rate, but a cached live write rate must still
-        // be allowed to fill that absent dimension.
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
-    } else {
-        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
-            .then(|| live_pricing_for(model_provider_name, model))
-            .flatten()
-    };
-    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
-
-    // The catalog is the final per-dimension fallback, not an all-or-nothing
-    // replacement. Preserve every configured/live value (including an
-    // explicit free 0.0) and fill only the dimensions still absent.
-    if let Some((cat_in, cat_out, cat_cached)) =
-        crate::agent::pricing_catalog::global_pricing_rates(model)
-    {
-        rates = rates.or(ModelRates {
-            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
-            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
-            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
-            cache_write_per_mtok: None,
-        });
-    }
-
-    rates = normalized_rates(rates);
     let cache_creation_input_tokens = usage
         .cache_creation_input_tokens
         .unwrap_or(0)
         .min(input_tokens.saturating_sub(cached_input_tokens));
-    let unpriced = unpriced_usage(
-        rates,
-        input_tokens,
-        cached_input_tokens,
-        cache_creation_input_tokens,
-        output_tokens,
-    );
-    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
-    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
-    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
-    let write_rate = rates.cache_write_per_mtok.unwrap_or(0.0);
-    let mut cost_usage = CostTokenUsage::new_with_cache_write(
+    let (cost_usage, unpriced) = cost_usage_with_pricing_and_live(
+        &ctx.model_provider_pricing,
+        model_provider_name,
         model,
         input_tokens,
         cached_input_tokens,
         cache_creation_input_tokens,
         output_tokens,
-        input_rate,
-        cached_rate,
-        write_rate,
-        output_rate,
+        live_override,
     );
-    cost_usage.unpriced_tokens = unpriced.tokens;
-    cost_usage.pricing_available = unpriced.tokens == 0;
 
     if ctx.tracker.is_some() && unpriced.tokens > 0 {
         warn_once_missing_pricing(model_provider_name, model, &unpriced.dimensions);
@@ -725,6 +674,103 @@ fn record_tool_loop_cost_usage_inner_with_live(
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Convert actual provider usage into the canonical cost record shape using
+/// the same configured, live, and catalog pricing fallbacks as ordinary turns.
+///
+/// The caller owns structural validation. In particular, Goal Mode rejects
+/// malformed cache bands instead of relying on [`CostTokenUsage`] to clamp
+/// them. This helper only centralizes rate resolution and pricing provenance.
+pub(crate) fn cost_usage_with_pricing(
+    pricing: &ModelProviderPricing,
+    model_provider_name: &str,
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+) -> CostTokenUsage {
+    cost_usage_with_pricing_and_live(
+        pricing,
+        model_provider_name,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        None,
+    )
+    .0
+}
+
+fn cost_usage_with_pricing_and_live(
+    pricing: &ModelProviderPricing,
+    model_provider_name: &str,
+    model: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+    live_override: Option<ModelRates>,
+) -> (CostTokenUsage, UnpricedUsage) {
+    let config_rates = normalized_rates(
+        provider_pricing(pricing, model_provider_name)
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
+
+    // Live-price FALLBACK fills only the dimensions config left unset; never
+    // fetches on this path (reads a cached snapshot, empty unless a provider
+    // opted into `live_pricing`).
+    let live = if let Some(live) = live_override {
+        // Cache writes are optional for completeness because they fall back
+        // to the ordinary input rate, but a cached live write rate must still
+        // be allowed to fill that absent dimension.
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none()).then_some(live)
+    } else {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten()
+    };
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
+
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+            cache_write_per_mtok: None,
+        });
+    }
+
+    rates = normalized_rates(rates);
+    let unpriced = unpriced_usage(
+        rates,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+    );
+    let mut cost_usage = CostTokenUsage::new_with_cache_write(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+        rates.input_per_mtok.unwrap_or(0.0),
+        rates.cached_input_per_mtok.unwrap_or(0.0),
+        rates.cache_write_per_mtok.unwrap_or(0.0),
+        rates.output_per_mtok.unwrap_or(0.0),
+    );
+    cost_usage.unpriced_tokens = unpriced.tokens;
+    cost_usage.pricing_available = unpriced.tokens == 0;
+    (cost_usage, unpriced)
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,

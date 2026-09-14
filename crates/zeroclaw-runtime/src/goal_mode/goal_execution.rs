@@ -22,8 +22,7 @@ use super::{
 };
 use crate::agent::cost::{
     GOAL_OPERATION_ACCOUNTING, GoalOperationAccounting, GoalOperationRequest,
-    GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, provider_pricing,
-    resolve_rates_opt,
+    GoalOperationSettlement, GoalUsageEvent, ModelProviderPricing, cost_usage_with_pricing,
 };
 use crate::control_plane::{
     GoalAccountingState, GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState,
@@ -210,14 +209,31 @@ impl GoalExecutionEngine {
             .get_goal_task(scope.task_id())
             .await?
             .context("Goal extension disappeared while settling accounting")?;
-        if goal.accounting_state == GoalAccountingState::Complete
-            && goal.pending_call_id.is_none()
-            && goal.pending_call_epoch.is_none()
+        if goal.accounting_state != GoalAccountingState::Complete
+            || goal.pending_call_id.is_some()
+            || goal.pending_call_epoch.is_some()
         {
-            return Ok(());
+            self.fail(scope, "accounting_missing_or_invalid").await?;
+            bail!("Goal accounting is incomplete");
         }
-        self.fail(scope, "accounting_missing_or_invalid").await?;
-        bail!("Goal accounting is incomplete")
+
+        if goal.effective_cost_limit_usd.is_some() {
+            let tracker = Arc::clone(&self.tracker);
+            let task_id = scope.task_id().to_owned();
+            let pricing_complete = tokio::task::spawn_blocking(move || {
+                tracker
+                    .get_strict_usage_totals_for_task_with_pricing(&task_id)
+                    .map(|(_, _, pricing_complete)| pricing_complete)
+            })
+            .await
+            .context("join strict Goal usage lookup")?
+            .context("Goal accounting ledger is invalid")?;
+            if !pricing_complete {
+                self.fail(scope, "pricing_unavailable").await?;
+                bail!("Goal cost budget lacks complete pricing for actual provider usage");
+            }
+        }
+        Ok(())
     }
 
     async fn exact_running_task(
@@ -424,26 +440,6 @@ impl GoalOperationAccountant {
         .context("join strict Goal usage lookup")?
     }
 
-    fn pricing_for(
-        &self,
-        provider_ref: &str,
-        model: &str,
-    ) -> zeroclaw_providers::pricing::ModelRates {
-        provider_pricing(&self.pricing, provider_ref)
-            .map(|rates| resolve_rates_opt(rates, model))
-            .unwrap_or_default()
-    }
-
-    fn pricing_available_for_usage(
-        rates: zeroclaw_providers::pricing::ModelRates,
-        usage: &zeroclaw_providers::traits::TokenUsage,
-    ) -> bool {
-        rates.input_per_mtok.is_some()
-            && rates.output_per_mtok.is_some()
-            && (usage.cached_input_tokens.unwrap_or(0) == 0
-                || rates.cached_input_per_mtok.is_some())
-    }
-
     fn validated_cost_usage(&self, event: &GoalUsageEvent) -> Result<CostTokenUsage> {
         ensure!(
             !event.provider_ref.trim().is_empty() && !event.model.trim().is_empty(),
@@ -464,18 +460,21 @@ impl GoalOperationAccountant {
         );
         ensure!(input != 0 || output != 0, "Goal usage is all zero");
         ensure!(cached <= input, "Goal cached input exceeds input tokens");
+        let cache_creation = event.usage.cache_creation_input_tokens.unwrap_or(0);
+        ensure!(
+            cache_creation <= input.saturating_sub(cached),
+            "Goal cache-write input exceeds uncached input tokens"
+        );
 
-        let rates = self.pricing_for(&event.provider_ref, &event.model);
-        let mut usage = CostTokenUsage::new_with_cache(
-            event.model.clone(),
+        let usage = cost_usage_with_pricing(
+            &self.pricing,
+            &event.provider_ref,
+            &event.model,
             input,
             cached,
+            cache_creation,
             output,
-            rates.input_per_mtok.unwrap_or(0.0),
-            rates.cached_input_per_mtok.unwrap_or(0.0),
-            rates.output_per_mtok.unwrap_or(0.0),
         );
-        usage.pricing_available = Self::pricing_available_for_usage(rates, &event.usage);
         ensure!(
             usage.cost_usd.is_finite() && usage.cost_usd >= 0.0,
             "Goal usage cost is invalid"
@@ -535,17 +534,17 @@ impl GoalOperationAccounting for GoalOperationAccountant {
             self.pause_budget_exhausted().await?;
             bail!("Goal budget is exhausted");
         }
+        let configured_route_pricing = cost_usage_with_pricing(
+            &self.pricing,
+            &request.model_provider,
+            &request.model,
+            1,
+            0,
+            0,
+            1,
+        );
         if goal.effective_cost_limit_usd.is_some()
-            && (!pricing_complete
-                || !Self::pricing_available_for_usage(
-                    self.pricing_for(&request.model_provider, &request.model),
-                    &zeroclaw_providers::traits::TokenUsage {
-                        input_tokens: Some(1),
-                        output_tokens: Some(1),
-                        cached_input_tokens: None,
-                        cache_creation_input_tokens: None,
-                    },
-                ))
+            && (!pricing_complete || !configured_route_pricing.pricing_available)
         {
             bail!("Goal cost budget lacks complete pricing for the configured route");
         }
@@ -727,6 +726,17 @@ mod tests {
         GoalExecutionScope,
         TempDir,
     ) {
+        accountant_fixture_with_cost_limit(None).await
+    }
+
+    async fn accountant_fixture_with_cost_limit(
+        cost_limit_usd: Option<f64>,
+    ) -> (
+        Arc<SqliteTaskStore>,
+        GoalOperationAccountant,
+        GoalExecutionScope,
+        TempDir,
+    ) {
         let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
         let scope =
             GoalExecutionScope::new("goal-accounting", "matrix_goal-accounting", 1).unwrap();
@@ -752,6 +762,7 @@ mod tests {
         let goal = GoalTaskRecord {
             task_id: task.id.clone(),
             objective: "finish the work".to_owned(),
+            effective_cost_limit_usd: cost_limit_usd,
             ..GoalTaskRecord::default()
         };
         assert_eq!(
@@ -777,6 +788,7 @@ mod tests {
         provider_rates.insert("model.input".to_owned(), 1.0);
         provider_rates.insert("model.output".to_owned(), 2.0);
         provider_rates.insert("model.cached_input".to_owned(), 0.5);
+        provider_rates.insert("model.cache_write".to_owned(), 1.5);
         let pricing = Arc::new(HashMap::from([("fallback".to_owned(), provider_rates)]));
         let accountant = GoalOperationAccountant::new(
             store.clone() as Arc<dyn GoalTaskRegistry>,
@@ -820,6 +832,30 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(parsed, VerifierDecision::Blocked { .. }));
+    }
+
+    #[test]
+    fn accountant_preserves_cache_write_pricing_provenance() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_store, accountant, _scope, _directory) = runtime.block_on(accountant_fixture());
+        let event = GoalUsageEvent {
+            provider_ref: "fallback".to_owned(),
+            model: "model".to_owned(),
+            usage: zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(1_200),
+                output_tokens: Some(500),
+                cached_input_tokens: Some(200),
+                cache_creation_input_tokens: Some(300),
+            },
+        };
+
+        let usage = accountant.validated_cost_usage(&event).unwrap();
+
+        assert_eq!(usage.cache_creation_input_tokens, 300);
+        assert_eq!(usage.unpriced_tokens, 0);
+        assert!(usage.pricing_available);
+        let expected = (700.0 + 300.0 * 1.5 + 200.0 * 0.5 + 500.0 * 2.0) / 1_000_000.0;
+        assert!((usage.cost_usd - expected).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -934,6 +970,58 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("accounting_missing_or_invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_limited_goal_fails_after_settling_an_unpriced_actual_route() {
+        let (store, accountant, scope, directory) =
+            accountant_fixture_with_cost_limit(Some(1.0)).await;
+        accountant
+            .admit(GoalOperationRequest::new("fallback", "model"))
+            .await
+            .unwrap();
+        accountant
+            .settle(GoalOperationSettlement {
+                accounting_state: GoalAccountingState::Complete,
+                events: vec![GoalUsageEvent {
+                    provider_ref: "unpriced".to_owned(),
+                    model: "model".to_owned(),
+                    usage: usage(10, 5),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(store.clone()),
+            Arc::new(
+                CostTracker::new(
+                    zeroclaw_config::schema::CostConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                    directory.path(),
+                )
+                .unwrap(),
+            ),
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        let error = engine
+            .require_complete_accounting(&scope)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("complete pricing"));
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal(scope.task_id(), scope.session_id())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pricing_unavailable")
         );
     }
 }
