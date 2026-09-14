@@ -231,6 +231,10 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         Ok(self.canonical_history.clone())
     }
 
+    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
+        Ok(std::mem::take(&mut self.canonical_history))
+    }
+
     async fn run_parent_turn(
         &mut self,
         _operation: &GoalOperationScope,
