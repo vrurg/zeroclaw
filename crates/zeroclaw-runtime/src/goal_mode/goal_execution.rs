@@ -915,7 +915,7 @@ impl GoalExecutionEngine {
         mut parent_turn_kind: super::GoalParentTurnKind,
         lease: &mut dyn GoalSessionExecutionLease,
     ) -> Result<GoalExecutionOutcome> {
-        let mut working_history = lease.canonical_history()?;
+        let mut working_history = lease.take_canonical_history()?;
         loop {
             // The driver may return from a previously admitted parent call
             // after a pause, cancellation, or replacement fenced this epoch.

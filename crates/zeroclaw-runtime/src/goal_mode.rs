@@ -464,6 +464,12 @@ pub trait GoalSessionExecutionLease: Send {
     /// Exact live session retained by this foreground lease.
     fn session_key(&self) -> &GoalSessionKey;
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
+    /// Consume a surface-owned canonical prefix when it was already assembled
+    /// for this execution.  The default retains compatibility for drivers
+    /// whose canonical history remains in a shared session store.
+    fn take_canonical_history(&mut self) -> Result<Vec<ChatMessage>> {
+        self.canonical_history()
+    }
     async fn run_parent_turn(
         &mut self,
         operation: &GoalOperationScope,
