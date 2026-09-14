@@ -17,7 +17,7 @@ use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_k
 use zeroclaw_commands::goal::{
     GoalBudgetLimits, GoalBudgetSelection, GoalCommand, validate_goal_objective,
 };
-use zeroclaw_config::goal::GoalBudgetLimits as ConfigGoalBudgetLimits;
+use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
 
 use crate::control_plane::{
     GoalAccountingState, GoalPauseReason, GoalPauseState, GoalTaskRecord, GoalTaskRegistry,
@@ -425,26 +425,42 @@ impl GoalSessionLease {
     }
 }
 
-/// A validated Goal command whose live-session lease has not yet been settled.
+/// A Goal command admitted by the host for one controller decision.
 ///
-/// This is intentionally non-cloneable: duplicating it could allow a stale
-/// authority proof to outlive the session transition it protects.
-pub struct GoalSubmission {
-    ingress: GoalIngressContext,
-    command: GoalCommand,
-    /// The exact driver validated alongside `ingress`. Future execution must
-    /// retain this object rather than resolving a new driver from route or
-    /// session text after the durable lifecycle transition.
-    driver: Arc<dyn GoalSessionDriver>,
-    lease: GoalSessionLease,
+/// An unavailable submission intentionally carries no driver or session lease:
+/// disabled Goal Mode must not contend a channel's live-session guard merely
+/// to render a local disabled response. This is intentionally non-cloneable:
+/// duplicating a bound submission could allow a stale authority proof to
+/// outlive the session transition it protects.
+pub enum GoalSubmission {
+    Unavailable {
+        ingress: GoalIngressContext,
+        command: GoalCommand,
+    },
+    Bound {
+        ingress: GoalIngressContext,
+        command: GoalCommand,
+        /// The exact driver validated alongside `ingress`. Future execution
+        /// must retain this object rather than resolving a new driver from
+        /// route or session text after the durable lifecycle transition.
+        driver: Arc<dyn GoalSessionDriver>,
+        lease: GoalSessionLease,
+    },
 }
 
 impl std::fmt::Debug for GoalSubmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (ingress, command, admitted) = match self {
+            Self::Unavailable { ingress, command } => (ingress, command, false),
+            Self::Bound {
+                ingress, command, ..
+            } => (ingress, command, true),
+        };
         formatter
             .debug_struct("GoalSubmission")
-            .field("surface", &self.ingress.surface())
-            .field("command_kind", &goal_command_kind(&self.command))
+            .field("surface", &ingress.surface())
+            .field("command_kind", &goal_command_kind(command))
+            .field("admitted", &admitted)
             .finish()
     }
 }
@@ -464,11 +480,19 @@ fn goal_command_kind(command: &GoalCommand) -> &'static str {
 
 impl GoalSubmission {
     pub fn ingress(&self) -> &GoalIngressContext {
-        &self.ingress
+        match self {
+            Self::Unavailable { ingress, .. } | Self::Bound { ingress, .. } => ingress,
+        }
     }
 
     pub fn command(&self) -> &GoalCommand {
-        &self.command
+        match self {
+            Self::Unavailable { command, .. } | Self::Bound { command, .. } => command,
+        }
+    }
+
+    fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
     }
 }
 
@@ -488,10 +512,14 @@ impl GoalExecutionHost {
     /// driver; it must never resolve a value-equivalent replacement driver.
     pub async fn submit(
         &self,
+        settings: &GoalHostSettings,
         ingress: GoalIngressContext,
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalSubmission> {
+        if !settings.enabled {
+            return Ok(GoalSubmission::Unavailable { ingress, command });
+        }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
         }
@@ -501,7 +529,7 @@ impl GoalExecutionHost {
             bail!("Goal session binding does not match trusted ingress");
         }
 
-        Ok(GoalSubmission {
+        Ok(GoalSubmission::Bound {
             ingress,
             command,
             driver,
@@ -526,12 +554,15 @@ impl GoalExecutionHost {
         if !settings.enabled {
             bail!("Goal Mode is disabled");
         }
-        let GoalSubmission {
+        let GoalSubmission::Bound {
             ingress,
             driver,
             lease,
             ..
-        } = submission;
+        } = submission
+        else {
+            bail!("Goal submission was not admitted");
+        };
         if driver.session_key() != ingress.session_key() {
             bail!("Goal execution driver session key does not match trusted ingress");
         }
@@ -581,8 +612,10 @@ impl GoalHostSettings {
     /// Build settings resolved from the active Goal configuration for one
     /// controller admission.
     ///
-    /// Callers must resolve these from the current runtime configuration; this
-    /// value is not a long-lived policy snapshot.
+    /// This constructor accepts only finite defaults when enabled. Call
+    /// [`Self::from_config`] for an enabled configuration whose explicit zero
+    /// values mean unlimited; that path retains the operator's declaration
+    /// provenance before normalization.
     ///
     /// # Errors
     ///
@@ -595,6 +628,14 @@ impl GoalHostSettings {
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
+        if enabled
+            && default_limits.token_limit.is_none()
+            && default_limits.cost_limit_usd.is_none()
+        {
+            bail!(
+                "enabled Goal Mode unlimited defaults require validated configuration provenance"
+            );
+        }
         validate_default_limits(default_limits)?;
         let ConfigGoalBudgetLimits {
             token_limit,
@@ -602,6 +643,39 @@ impl GoalHostSettings {
         } = default_limits;
         Ok(Self {
             enabled,
+            default_limits: GoalBudgetLimits {
+                token_limit,
+                cost_limit_usd,
+            },
+            owner_pid,
+            owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
+        })
+    }
+
+    /// Resolve settings from the active configuration without losing whether
+    /// unlimited defaults were explicitly selected by the operator.
+    ///
+    /// This is the only construction path that permits an enabled Goal Mode
+    /// with both normalized default limits unlimited. It first runs
+    /// [`GoalConfig::effective_limits`], which requires both raw defaults to
+    /// have been declared even when they normalize from explicit zeroes.
+    pub fn from_config(
+        config: &GoalConfig,
+        owner_pid: u32,
+        owner_boot_id: impl Into<String>,
+    ) -> Result<Self> {
+        let ConfigGoalBudgetLimits {
+            token_limit,
+            cost_limit_usd,
+        } = config
+            .effective_limits()
+            .map_err(|error| Error::msg(format!("Goal configuration is invalid: {error:?}")))?;
+        validate_default_limits(ConfigGoalBudgetLimits {
+            token_limit,
+            cost_limit_usd,
+        })?;
+        Ok(Self {
+            enabled: config.enabled,
             default_limits: GoalBudgetLimits {
                 token_limit,
                 cost_limit_usd,
@@ -670,11 +744,21 @@ impl GoalStatusProjection {
             cost_limit_usd: goal.effective_cost_limit_usd,
             accounting_state: goal.accounting_state,
             pause_reason: goal.pause_reason,
-            resumable: task.status == TaskStatus::Paused
-                && goal.accounting_state == GoalAccountingState::Complete
-                && goal.pending_call_id.is_none(),
+            resumable: goal_is_resumable(task, goal),
         }
     }
+}
+
+/// Keep the renderer-facing resume hint aligned with the durable resume CAS.
+/// It is deliberately conservative: a paired pending operation and an
+/// exhausted epoch are both non-resumable even though the SQLite constraints
+/// normally make those combinations unreachable in a readable paused row.
+fn goal_is_resumable(task: &TaskRecord, goal: &GoalTaskRecord) -> bool {
+    task.status == TaskStatus::Paused
+        && task.execution_epoch < i64::MAX
+        && goal.accounting_state == GoalAccountingState::Complete
+        && goal.pending_call_id.is_none()
+        && goal.pending_call_epoch.is_none()
 }
 
 /// Transport-neutral lifecycle controller. Its input is opaque outside this
@@ -699,7 +783,13 @@ impl GoalController {
         settings: &GoalHostSettings,
         submission: &GoalSubmission,
     ) -> Result<GoalResponse> {
-        match &submission.command {
+        if submission.is_unavailable() {
+            return Ok(match submission.command() {
+                GoalCommand::Help => GoalResponse::Help,
+                _ => GoalResponse::Disabled,
+            });
+        }
+        match submission.command() {
             GoalCommand::Help => Ok(GoalResponse::Help),
             _ if !settings.enabled => Ok(GoalResponse::Disabled),
             GoalCommand::Start { budget, objective } => {
@@ -1125,5 +1215,43 @@ mod tests {
     fn zerocode_key_must_keep_the_existing_canonical_session_form() {
         assert!(GoalSessionKey::zero_code("same session").is_err());
         assert!(GoalSessionKey::zero_code("same-session").is_ok());
+    }
+
+    #[test]
+    fn resumable_projection_includes_every_durable_resume_precondition() {
+        let mut task = TaskRecord {
+            id: "goal-1".into(),
+            kind: TaskKind::Goal,
+            agent: "main".into(),
+            status: TaskStatus::Paused,
+            owner_pid: 1,
+            owner_boot_id: "boot".into(),
+            heartbeat_at: None,
+            depth: 0,
+            parent_id: None,
+            originator_route: None,
+            delivered: false,
+            idem_key: None,
+            principal_id: None,
+            session_id: Some("matrix_session".into()),
+            execution_epoch: 1,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+        };
+        let mut goal = GoalTaskRecord {
+            task_id: task.id.clone(),
+            objective: "stop when complete".into(),
+            ..GoalTaskRecord::default()
+        };
+
+        assert!(goal_is_resumable(&task, &goal));
+        goal.pending_call_id = Some("operation-1".into());
+        goal.pending_call_epoch = Some(1);
+        assert!(!goal_is_resumable(&task, &goal));
+
+        goal.pending_call_id = None;
+        goal.pending_call_epoch = None;
+        task.execution_epoch = i64::MAX;
+        assert!(!goal_is_resumable(&task, &goal));
     }
 }
