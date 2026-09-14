@@ -975,14 +975,8 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let rows = stmt
             .query_map([], row_to_record)
             .context("query nonterminal session goals for policy")?;
-        let mut goals = Vec::new();
-        for row in rows {
-            match row {
-                Ok(goal) => goals.push(goal),
-                Err(error) => log_unreadable_task_row(error),
-            }
-        }
-        Ok(goals)
+        rows.map(|row| row.context("decode nonterminal session Goal during policy classification"))
+            .collect()
     }
 
     async fn cancel_policy_targets(
@@ -1032,7 +1026,7 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 ],
             )?;
             if updated == 0 {
-                return transition_failure(&tx, &target.task_id, &target.session_id);
+                return transition_failure(&tx, &target.task_id);
             }
         }
         tx.commit()
@@ -2048,5 +2042,36 @@ mod tests {
                 Some("policy_revoked")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn policy_enumeration_fails_closed_on_an_unreadable_goal_row() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("unreadable-policy-goal", "main", 1, "boot-1");
+        task.kind = TaskKind::Goal;
+        task.session_id = Some("policy-session".to_owned());
+        assert_eq!(
+            store
+                .create_or_replace_session_goal(
+                    task,
+                    goal_record("unreadable-policy-goal", "finish work"),
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE tasks SET owner_pid = 'not-an-integer' WHERE id = ?1",
+                params!["unreadable-policy-goal"],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            store.list_nonterminal_session_goals().await.is_err(),
+            "a policy cutover must stop rather than silently leave an unreadable Goal active"
+        );
     }
 }
