@@ -364,6 +364,8 @@ impl fmt::Debug for GoalVerifierTurn {
 /// ledger authority; the later executor owns both around these calls.
 #[async_trait]
 pub trait GoalSessionExecutionLease: Send {
+    /// Exact live session retained by this foreground lease.
+    fn session_key(&self) -> &GoalSessionKey;
     fn canonical_history(&self) -> Result<Vec<ChatMessage>>;
     async fn run_parent_turn(
         &mut self,
@@ -428,11 +430,13 @@ impl GoalSessionLease {
 /// A Goal command admitted by the host for one controller decision.
 ///
 /// An unavailable submission intentionally carries no driver or session lease:
-/// disabled Goal Mode must not contend a channel's live-session guard merely
-/// to render a local disabled response. This is intentionally non-cloneable:
-/// duplicating a bound submission could allow a stale authority proof to
-/// outlive the session transition it protects.
-pub enum GoalSubmission {
+/// disabled Goal Mode and the local help command must not contend a channel's
+/// live-session guard. This is intentionally non-cloneable: duplicating a
+/// bound submission could allow a stale authority proof to outlive the session
+/// transition it protects.
+pub struct GoalSubmission(GoalSubmissionState);
+
+enum GoalSubmissionState {
     Unavailable {
         ingress: GoalIngressContext,
         command: GoalCommand,
@@ -450,9 +454,9 @@ pub enum GoalSubmission {
 
 impl std::fmt::Debug for GoalSubmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (ingress, command, admitted) = match self {
-            Self::Unavailable { ingress, command } => (ingress, command, false),
-            Self::Bound {
+        let (ingress, command, admitted) = match &self.0 {
+            GoalSubmissionState::Unavailable { ingress, command } => (ingress, command, false),
+            GoalSubmissionState::Bound {
                 ingress, command, ..
             } => (ingress, command, true),
         };
@@ -481,18 +485,20 @@ fn goal_command_kind(command: &GoalCommand) -> &'static str {
 impl GoalSubmission {
     pub fn ingress(&self) -> &GoalIngressContext {
         match self {
-            Self::Unavailable { ingress, .. } | Self::Bound { ingress, .. } => ingress,
+            Self(GoalSubmissionState::Unavailable { ingress, .. })
+            | Self(GoalSubmissionState::Bound { ingress, .. }) => ingress,
         }
     }
 
     pub fn command(&self) -> &GoalCommand {
         match self {
-            Self::Unavailable { command, .. } | Self::Bound { command, .. } => command,
+            Self(GoalSubmissionState::Unavailable { command, .. })
+            | Self(GoalSubmissionState::Bound { command, .. }) => command,
         }
     }
 
     fn is_unavailable(&self) -> bool {
-        matches!(self, Self::Unavailable { .. })
+        matches!(self, Self(GoalSubmissionState::Unavailable { .. }))
     }
 }
 
@@ -506,7 +512,8 @@ impl GoalExecutionHost {
     }
 
     /// Validate a typed command against the exact trusted driver supplied by
-    /// the caller. It does not mutate lifecycle state or start model work;
+    /// the caller. Local disabled/help responses return without binding; all
+    /// other commands do not mutate lifecycle state or start model work.
     /// [`GoalController`] borrows the returned submission for durable
     /// transitions. A later executor consumes it to acquire the same exact
     /// driver; it must never resolve a value-equivalent replacement driver.
@@ -517,8 +524,11 @@ impl GoalExecutionHost {
         driver: Arc<dyn GoalSessionDriver>,
         command: GoalCommand,
     ) -> Result<GoalSubmission> {
-        if !settings.enabled {
-            return Ok(GoalSubmission::Unavailable { ingress, command });
+        if !settings.enabled || matches!(command, GoalCommand::Help) {
+            return Ok(GoalSubmission(GoalSubmissionState::Unavailable {
+                ingress,
+                command,
+            }));
         }
         if driver.session_key() != ingress.session_key() {
             bail!("Goal session driver does not match trusted ingress");
@@ -529,12 +539,12 @@ impl GoalExecutionHost {
             bail!("Goal session binding does not match trusted ingress");
         }
 
-        Ok(GoalSubmission::Bound {
+        Ok(GoalSubmission(GoalSubmissionState::Bound {
             ingress,
             command,
             driver,
             lease,
-        })
+        }))
     }
 
     /// Acquire execution only through the same exact trusted driver boundary
@@ -554,12 +564,12 @@ impl GoalExecutionHost {
         if !settings.enabled {
             bail!("Goal Mode is disabled");
         }
-        let GoalSubmission::Bound {
+        let GoalSubmission(GoalSubmissionState::Bound {
             ingress,
             driver,
             lease,
             ..
-        } = submission
+        }) = submission
         else {
             bail!("Goal submission was not admitted");
         };
@@ -570,7 +580,11 @@ impl GoalExecutionHost {
             bail!("Goal execution scope session does not match trusted ingress");
         }
         drop(lease);
-        driver.acquire_execution(&ingress, scope).await
+        let lease = driver.acquire_execution(&ingress, scope).await?;
+        if lease.session_key() != ingress.session_key() {
+            bail!("Goal execution lease session key does not match trusted ingress");
+        }
+        Ok(lease)
     }
 }
 
