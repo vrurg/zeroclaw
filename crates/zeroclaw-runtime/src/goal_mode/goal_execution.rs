@@ -643,10 +643,28 @@ struct VerifierWireResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerifierWireBlocker {
-    kind: GoalBlockerKind,
+    kind: VerifierBlockerKind,
     message: String,
     #[serde(default)]
     payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifierBlockerKind {
+    NeedsUserInput,
+    HumanEscalation,
+    ExternalDependency,
+}
+
+impl From<VerifierBlockerKind> for GoalBlockerKind {
+    fn from(kind: VerifierBlockerKind) -> Self {
+        match kind {
+            VerifierBlockerKind::NeedsUserInput => Self::NeedsUserInput,
+            VerifierBlockerKind::HumanEscalation => Self::HumanEscalation,
+            VerifierBlockerKind::ExternalDependency => Self::ExternalDependency,
+        }
+    }
 }
 
 enum VerifierDecision {
@@ -696,18 +714,24 @@ fn parse_verifier_response(raw: &str) -> Result<VerifierDecision> {
             );
             Ok(VerifierDecision::Continue { reason })
         }
-        VerifierDecisionKind::Blocked => Ok(VerifierDecision::Blocked {
-            reason,
-            blockers: response
-                .blockers
-                .into_iter()
-                .map(|blocker| GoalBlocker {
-                    kind: blocker.kind,
-                    message: blocker.message,
-                    payload: blocker.payload,
-                })
-                .collect(),
-        }),
+        VerifierDecisionKind::Blocked => {
+            ensure!(
+                !response.blockers.is_empty(),
+                "blocked verifier response has no actionable blockers"
+            );
+            Ok(VerifierDecision::Blocked {
+                reason,
+                blockers: response
+                    .blockers
+                    .into_iter()
+                    .map(|blocker| GoalBlocker {
+                        kind: blocker.kind.into(),
+                        message: blocker.message,
+                        payload: blocker.payload,
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 
@@ -821,6 +845,14 @@ mod tests {
         .is_err());
         assert!(parse_verifier_response(
             r#"{"decision":"blocked","reason":"wait","blockers":[{"kind":"budget","message":"x","extra":true}]}"#
+        )
+        .is_err());
+        assert!(
+            parse_verifier_response(r#"{"decision":"blocked","reason":"wait","blockers":[]}"#)
+                .is_err()
+        );
+        assert!(parse_verifier_response(
+            r#"{"decision":"blocked","reason":"wait","blockers":[{"kind":"provider","message":"x"}]}"#
         )
         .is_err());
     }
