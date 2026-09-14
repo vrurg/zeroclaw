@@ -45,7 +45,10 @@ impl GoalSessionKey {
     ///
     /// Callers must pass the already-canonical Matrix key and must not
     /// pre-sanitize it. This preserves a one-to-one binding to the session
-    /// identity produced by the Matrix history owner.
+    /// identity produced by the Matrix history owner. That owner must scope
+    /// Goal-capable Matrix history to the raw sender; a room-wide or
+    /// reply-target-only history key would incorrectly let multiple principals
+    /// share one Goal control session.
     ///
     /// # Errors
     ///
@@ -389,11 +392,22 @@ impl std::fmt::Debug for GoalSubmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GoalSubmission")
-            .field("ingress", &self.ingress)
-            .field("command", &self.command)
-            .field("driver_session_key", self.driver.session_key())
-            .field("lease", &self.lease)
+            .field("surface", &self.ingress.surface())
+            .field("command_kind", &goal_command_kind(&self.command))
             .finish()
+    }
+}
+
+fn goal_command_kind(command: &GoalCommand) -> &'static str {
+    match command {
+        GoalCommand::Start { .. } => "start",
+        GoalCommand::Status => "status",
+        GoalCommand::Budget => "budget",
+        GoalCommand::SetBudget(_) => "budget_set",
+        GoalCommand::Pause => "pause",
+        GoalCommand::Resume => "resume",
+        GoalCommand::Cancel => "cancel",
+        GoalCommand::Help => "help",
     }
 }
 
@@ -794,8 +808,22 @@ impl GoalController {
                 self.projection_response(&session_id, &task.id, GoalResponse::Resumed)
                     .await
             }
-            GoalTransitionResult::Stale | GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
+            GoalTransitionResult::Stale => self.resume_stale_response(&session_id).await,
+            GoalTransitionResult::Missing => Ok(GoalResponse::Stale),
         }
+    }
+
+    /// Resume has additional durable accounting predicates beyond `Paused`.
+    /// If one changes between the pre-check and the CAS, return the canonical
+    /// state rather than asking the operator to retry an unchanged condition.
+    async fn resume_stale_response(&self, session_id: &str) -> Result<GoalResponse> {
+        let Some(task) = self.current(session_id).await? else {
+            return Ok(GoalResponse::Stale);
+        };
+        if task.status.is_terminal() {
+            return self.project(&task).await.map(GoalResponse::Terminal);
+        }
+        self.project(&task).await.map(GoalResponse::Status)
     }
 
     async fn cancel(&self, ingress: &GoalIngressContext) -> Result<GoalResponse> {
