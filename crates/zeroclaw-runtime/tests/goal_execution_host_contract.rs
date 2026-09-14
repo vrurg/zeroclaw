@@ -1270,6 +1270,104 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
 }
 
 #[tokio::test]
+async fn cancelled_drain_keeps_the_worker_owned_for_a_later_lifecycle_retry() {
+    let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+    let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
+    let settings = host_settings(true);
+    let ingress = matrix_ingress();
+    let parent_started = Arc::new(Notify::new());
+    let release_parent = Arc::new(Notify::new());
+    let driver = Arc::new(PausingExecutionDriver {
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
+        parent_started: Arc::clone(&parent_started),
+        release_parent: Arc::clone(&release_parent),
+        verifier_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let directory = TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap(),
+    );
+    let supervisor = Arc::new(GoalExecutionSupervisor::new(Arc::new(
+        runtime
+            .execution_engine(tracker, "main", Arc::default())
+            .unwrap(),
+    )));
+
+    supervisor
+        .submit(
+            settings,
+            ingress.clone(),
+            driver,
+            GoalCommand::Start {
+                budget: zeroclaw_commands::goal::GoalBudgetSelection::Defaults,
+                objective: "finish the task".into(),
+            },
+        )
+        .await
+        .unwrap();
+    parent_started.notified().await;
+
+    let current = store
+        .current_goal_for_session(&ingress.session_key().durable_id())
+        .await
+        .unwrap()
+        .expect("started Goal remains current while the parent turn is active");
+    let scope = GoalExecutionScope::new(
+        current.id,
+        ingress.session_key().durable_id(),
+        current.execution_epoch,
+    )
+    .unwrap();
+
+    let interrupted_supervisor = Arc::clone(&supervisor);
+    let interrupted_scope = scope.clone();
+    let mut interrupted =
+        zeroclaw_spawn::spawn!(
+            async move { interrupted_supervisor.drain(&interrupted_scope).await }
+        );
+    assert!(
+        timeout(Duration::from_millis(20), &mut interrupted)
+            .await
+            .is_err(),
+        "the first drain must wait for the admitted operation"
+    );
+    interrupted.abort();
+    let _ = interrupted.await;
+
+    assert!(
+        supervisor.owns_scope(&scope).await,
+        "cancelling a lifecycle waiter must not drop the worker handle"
+    );
+
+    let retry_supervisor = Arc::clone(&supervisor);
+    let retry_scope = scope.clone();
+    let mut retry =
+        zeroclaw_spawn::spawn!(async move { retry_supervisor.drain(&retry_scope).await });
+    assert!(
+        timeout(Duration::from_millis(20), &mut retry)
+            .await
+            .is_err(),
+        "the retained worker must still wait for its admitted operation"
+    );
+    release_parent.notify_one();
+    assert!(
+        retry.await.unwrap().is_err(),
+        "the test driver refuses delivery after the worker has settled"
+    );
+    assert!(
+        !supervisor.owns_scope(&scope).await,
+        "only the successful drain consumes the retained worker handle"
+    );
+}
+
+#[tokio::test]
 async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
     let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
     let runtime = GoalRuntime::new(store.clone() as Arc<dyn GoalTaskRegistry>);
