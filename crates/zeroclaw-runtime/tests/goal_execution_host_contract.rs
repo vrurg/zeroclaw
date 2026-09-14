@@ -841,8 +841,7 @@ async fn runtime_returns_exact_execution_handoff_only_for_a_running_goal() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
@@ -891,8 +890,7 @@ async fn execution_engine_completes_through_the_exact_runtime_handoff() {
     let ingress = matrix_ingress();
     let delivered = Arc::new(AtomicUsize::new(0));
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: delivered.clone(),
         complete_verifier: true,
@@ -950,8 +948,7 @@ async fn runtime_does_not_create_execution_for_read_only_goal_commands() {
     let settings = host_settings(true);
     let ingress = matrix_ingress();
     let driver = Arc::new(ExecutionDriver {
-        binding: GoalSessionBinding::new(ingress.session_key().clone(), "fresh-connection")
-            .unwrap(),
+        binding: GoalSessionBinding::new(ingress.session_key().clone()),
         execution_acquires: AtomicUsize::new(0),
         delivered: Arc::new(AtomicUsize::new(0)),
         complete_verifier: false,
