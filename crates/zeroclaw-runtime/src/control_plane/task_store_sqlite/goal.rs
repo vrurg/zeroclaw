@@ -790,11 +790,11 @@ impl GoalTaskRegistry for SqliteTaskStore {
               LIMIT 1",
             )
             .context("prepare latest active goal by agent")?;
-        let rows = stmt
-            .query_map(params![agent], row_to_record)
+        let mut rows = stmt
+            .query(params![agent])
             .context("query latest active goal by agent")?;
-        for row in rows {
-            match row {
+        while let Some(row) = rows.next().context("iterate latest active goal by agent")? {
+            match row_to_record(row) {
                 Ok(task) => return Ok(Some(task)),
                 Err(error) => log_unreadable_task_row(error),
             }
@@ -821,14 +821,14 @@ impl GoalTaskRegistry for SqliteTaskStore {
               LIMIT 1",
             )
             .context("prepare latest active goal by context")?;
-        let rows = stmt
-            .query_map(
-                params![agent, originator_route, principal_id],
-                row_to_record,
-            )
+        let mut rows = stmt
+            .query(params![agent, originator_route, principal_id])
             .context("query latest active goal by context")?;
-        for row in rows {
-            match row {
+        while let Some(row) = rows
+            .next()
+            .context("iterate latest active goal by context")?
+        {
+            match row_to_record(row) {
                 Ok(task) => return Ok(Some(task)),
                 Err(error) => log_unreadable_task_row(error),
             }
