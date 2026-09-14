@@ -113,7 +113,7 @@ impl ZeroCodeGoalSessionDriver {
             "Goal ingress agent is stale"
         );
         ensure!(
-            ingress.route() == format!("zerocode:{}", self.raw_session_id()),
+            ingress.route().strip_prefix("zerocode:") == Some(self.raw_session_id()),
             "Goal ingress route is stale"
         );
         match ingress.principal() {
@@ -166,7 +166,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
         let _connection_generation = self.connection_activity.as_ref();
         self.assert_ingress(ingress)?;
         self.revalidate_session().await?;
-        let guard = self.command_lock.clone().lock_owned().await;
+        let guard = Arc::clone(&self.command_lock).lock_owned().await;
         self.revalidate_session().await?;
         Ok(GoalSessionLease::new(
             GoalSessionBinding::new(self.session_key.clone()),
