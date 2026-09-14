@@ -91,7 +91,7 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         verify
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        11
+        12
     );
     let columns: Vec<String> = verify
         .prepare("PRAGMA table_info(tasks)")
@@ -111,6 +111,71 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         )
         .expect("retain terminal settlement table");
     assert_eq!(terminal_table, "terminal_settlement_intents");
+}
+
+#[test]
+fn migration_replaces_v11_epoch_guards_with_integer_domain_checks() {
+    let directory = tempfile::tempdir().expect("create temporary control-plane directory");
+    let store = SqliteTaskStore::new(directory.path()).expect("initialize current schema");
+    let database = directory.path().join("control_plane.db");
+    drop(store);
+
+    let connection = Connection::open(&database).expect("open v11 fixture database");
+    connection
+        .execute_batch(
+            "DROP TRIGGER trg_goal_tasks_require_epoch_insert;
+             DROP TRIGGER trg_goal_tasks_require_epoch_update;
+             DROP TRIGGER trg_goal_tasks_epoch_monotonic;
+             CREATE TRIGGER trg_goal_tasks_require_epoch_insert
+                 BEFORE INSERT ON tasks FOR EACH ROW
+                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
+                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
+             CREATE TRIGGER trg_goal_tasks_require_epoch_update
+                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
+                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
+             CREATE TRIGGER trg_goal_tasks_epoch_monotonic
+                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+                 WHEN OLD.kind = 'goal' AND NEW.execution_epoch < OLD.execution_epoch
+                 BEGIN SELECT RAISE(ABORT, 'goal task execution_epoch is monotonic'); END;
+             INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
+             ) VALUES ('malformed-v11-goal', 'goal', 'main', 'running', 1, 'boot-old',
+                       'session-malformed-v11', 'not-an-epoch', 'now');
+             INSERT INTO goal_tasks (task_id, objective)
+             VALUES ('malformed-v11-goal', 'legacy malformed epoch');
+             PRAGMA user_version = 11;",
+        )
+        .expect("write v11 epoch guard fixture");
+    drop(connection);
+
+    SqliteTaskStore::new(directory.path()).expect("migrate v11 epoch guards");
+    let verify = Connection::open(&database).expect("open migrated v12 database");
+    let migrated: (String, String, i64) = verify
+        .query_row(
+            "SELECT status, error, execution_epoch FROM tasks WHERE id = 'malformed-v11-goal'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read fail-closed malformed v11 Goal");
+    assert_eq!(migrated.0, "failed");
+    assert_eq!(migrated.1, "goal_invalid_execution_epoch");
+    assert_eq!(migrated.2, 1);
+    let error = verify
+        .execute(
+            "INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
+             ) VALUES ('goal-text-epoch', 'goal', 'main', 'running', 1, 'boot-a',
+                       'session-text-epoch', 'not-an-epoch', 'now')",
+            [],
+        )
+        .expect_err("v12 must replace v11 epoch guards");
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::ConstraintViolation)
+    );
 }
 
 #[test]
@@ -936,6 +1001,17 @@ async fn sqlite_guards_session_binding_pending_pairing_and_goal_state_domains() 
     );
     assert_constraint(
         connection.execute(
+            "INSERT INTO tasks (
+                 id, kind, agent, status, owner_pid, owner_boot_id, session_id,
+                 execution_epoch, started_at
+             ) VALUES ('goal-text-epoch', 'goal', 'main', 'running', 1, 'boot-a',
+                       'text-epoch-session', 'not-an-epoch', 'now')",
+            [],
+        ),
+        "raw SQL must reject a noninteger Goal execution epoch on insert",
+    );
+    assert_constraint(
+        connection.execute(
             "UPDATE tasks SET session_id = 'other-session' WHERE id = 'goal-raw-one'",
             [],
         ),
@@ -967,6 +1043,13 @@ async fn sqlite_guards_session_binding_pending_pairing_and_goal_state_domains() 
             [],
         ),
         "raw SQL must not rewind a session Goal execution epoch",
+    );
+    assert_constraint(
+        connection.execute(
+            "UPDATE tasks SET execution_epoch = 'not-an-epoch' WHERE id = 'goal-raw-one'",
+            [],
+        ),
+        "raw SQL must reject a noninteger Goal execution epoch on update",
     );
     connection
         .execute(
@@ -1053,7 +1136,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
     assert_eq!(
-        schema_version, 11,
+        schema_version, 12,
         "migration records the final control-plane schema"
     );
     let running: (String, Option<String>, Option<String>) = verify

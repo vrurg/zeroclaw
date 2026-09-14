@@ -47,100 +47,61 @@ fn reject_session_goal_legacy_mutation(conn: &Connection, task_id: &str) -> Resu
     Ok(())
 }
 
-pub(super) fn migrate_schema(
-    conn: &Connection,
-    version: i64,
-    skip_superseded_context_index: bool,
-) -> Result<()> {
-    if version < 1 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS goal_tasks (
-                 task_id        TEXT PRIMARY KEY
-                                REFERENCES tasks(id) ON DELETE CASCADE,
-                 objective      TEXT NOT NULL
-             );
-             PRAGMA user_version = 1;",
-        )
-        .context("apply control-plane schema v1")?;
-    }
-    if version < 2 {
-        add_column_if_missing(
-            conn,
-            "goal_tasks",
-            "effective_token_limit",
-            "ALTER TABLE goal_tasks ADD COLUMN effective_token_limit INTEGER",
-        )?;
-        add_column_if_missing(
-            conn,
-            "goal_tasks",
-            "effective_cost_limit_usd",
-            "ALTER TABLE goal_tasks ADD COLUMN effective_cost_limit_usd REAL",
-        )?;
-        conn.execute_batch("PRAGMA user_version = 2;")
-            .context("mark control-plane schema v2")?;
-    }
-    if version < 3 {
-        add_column_if_missing(
-            conn,
-            "goal_tasks",
-            "pause_reason",
-            "ALTER TABLE goal_tasks ADD COLUMN pause_reason TEXT",
-        )?;
-        add_column_if_missing(
-            conn,
-            "goal_tasks",
-            "pause_description",
-            "ALTER TABLE goal_tasks ADD COLUMN pause_description TEXT",
-        )?;
-        add_column_if_missing(
-            conn,
-            "goal_tasks",
-            "blockers_json",
-            "ALTER TABLE goal_tasks ADD COLUMN blockers_json TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        conn.execute_batch("PRAGMA user_version = 3;")
-            .context("mark control-plane schema v3")?;
-    }
-    if version < 4 && !skip_superseded_context_index {
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_goal_context
-                ON tasks(
-                    agent,
-                    COALESCE(originator_route, ''),
-                    COALESCE(principal_id, '')
-                )
-                WHERE kind = 'goal'
-                  AND status NOT IN ('completed','failed','cancelled','lost','timed_out');
-             PRAGMA user_version = 4;",
-        )
-        .context("apply control-plane schema v4")?;
-    }
-    if version < 5 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS task_continuation_contexts (
-                 task_id      TEXT PRIMARY KEY
-                              REFERENCES tasks(id) ON DELETE CASCADE,
-                 context_json TEXT NOT NULL
-             );
-             PRAGMA user_version = 5;",
-        )
-        .context("apply control-plane schema v5")?;
-    }
-    if version < 6 {
-        conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_goal_kind
-                BEFORE INSERT ON goal_tasks
-                FOR EACH ROW
-                WHEN COALESCE((SELECT kind FROM tasks WHERE id = NEW.task_id), '') != 'goal'
-                BEGIN
-                    SELECT RAISE(ABORT, 'goal_tasks.task_id must reference TaskKind::Goal');
-                END;
-             PRAGMA user_version = 6;",
-        )
-        .context("apply control-plane schema v6")?;
-    }
-    if version < 7 {
-        conn.execute_batch(
+pub(super) fn converge_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS goal_tasks (
+             task_id        TEXT PRIMARY KEY
+                            REFERENCES tasks(id) ON DELETE CASCADE,
+             objective      TEXT NOT NULL
+         );",
+    )
+    .context("ensure Goal control table")?;
+    add_column_if_missing(
+        conn,
+        "goal_tasks",
+        "effective_token_limit",
+        "ALTER TABLE goal_tasks ADD COLUMN effective_token_limit INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "goal_tasks",
+        "effective_cost_limit_usd",
+        "ALTER TABLE goal_tasks ADD COLUMN effective_cost_limit_usd REAL",
+    )?;
+    add_column_if_missing(
+        conn,
+        "goal_tasks",
+        "pause_reason",
+        "ALTER TABLE goal_tasks ADD COLUMN pause_reason TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "goal_tasks",
+        "pause_description",
+        "ALTER TABLE goal_tasks ADD COLUMN pause_description TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "goal_tasks",
+        "blockers_json",
+        "ALTER TABLE goal_tasks ADD COLUMN blockers_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_continuation_contexts (
+             task_id      TEXT PRIMARY KEY
+                          REFERENCES tasks(id) ON DELETE CASCADE,
+             context_json TEXT NOT NULL
+         );
+         CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_goal_kind
+             BEFORE INSERT ON goal_tasks
+             FOR EACH ROW
+             WHEN COALESCE((SELECT kind FROM tasks WHERE id = NEW.task_id), '') != 'goal'
+             BEGIN
+                 SELECT RAISE(ABORT, 'goal_tasks.task_id must reference TaskKind::Goal');
+             END;",
+    )
+    .context("ensure Goal control tables and ownership guard")?;
+    conn.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_effective_limits_insert
                 BEFORE INSERT ON goal_tasks
                 FOR EACH ROW
@@ -186,38 +147,75 @@ pub(super) fn migrate_schema(
                 )
                 BEGIN
                     SELECT RAISE(ABORT, 'task_continuation_contexts.task_id must reference a goal task');
-                END;
-             PRAGMA user_version = 7;",
+                END;",
         )
-        .context("apply control-plane schema v7")?;
+        .context("ensure Goal limit and continuation guards")?;
+    for (column, sql) in [
+        (
+            "pending_call_id",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_call_id TEXT",
+        ),
+        (
+            "pending_call_epoch",
+            "ALTER TABLE goal_tasks ADD COLUMN pending_call_epoch INTEGER",
+        ),
+        (
+            "accounting_state",
+            "ALTER TABLE goal_tasks ADD COLUMN accounting_state TEXT NOT NULL DEFAULT 'complete'",
+        ),
+    ] {
+        add_column_if_missing(conn, "goal_tasks", column, sql)?;
     }
-    if version < 8 {
-        for (column, sql) in [
-            (
-                "pending_call_id",
-                "ALTER TABLE goal_tasks ADD COLUMN pending_call_id TEXT",
-            ),
-            (
-                "pending_call_epoch",
-                "ALTER TABLE goal_tasks ADD COLUMN pending_call_epoch INTEGER",
-            ),
-            (
-                "accounting_state",
-                "ALTER TABLE goal_tasks ADD COLUMN accounting_state TEXT NOT NULL DEFAULT 'complete'",
-            ),
-        ] {
-            add_column_if_missing(conn, "goal_tasks", column, sql)?;
-        }
-        // Blank legacy bindings cannot become current session identities. Clear
-        // them before installing the immutable binding guard below.
-        conn.execute(
-            "UPDATE tasks SET session_id = NULL
+    // Replace the v11 epoch guards before normalizing legacy rows. Otherwise,
+    // SQLite's storage-class ordering makes an old guard treat TEXT -> INTEGER
+    // repair as a rewind.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS trg_goal_tasks_require_epoch_insert;
+         DROP TRIGGER IF EXISTS trg_goal_tasks_require_epoch_update;
+         DROP TRIGGER IF EXISTS trg_goal_tasks_epoch_monotonic;
+         CREATE TRIGGER trg_goal_tasks_require_epoch_insert
+             BEFORE INSERT ON tasks FOR EACH ROW
+             WHEN NEW.kind = 'goal'
+                  AND (typeof(NEW.execution_epoch) != 'integer' OR NEW.execution_epoch < 1)
+             BEGIN SELECT RAISE(ABORT, 'goal tasks require integer execution_epoch >= 1'); END;
+         CREATE TRIGGER trg_goal_tasks_require_epoch_update
+             BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+             WHEN NEW.kind = 'goal'
+                  AND (typeof(NEW.execution_epoch) != 'integer' OR NEW.execution_epoch < 1)
+             BEGIN SELECT RAISE(ABORT, 'goal tasks require integer execution_epoch >= 1'); END;",
+    )
+    .context("replace Goal epoch guards before legacy normalization")?;
+    // Blank legacy bindings cannot become current session identities. Clear
+    // them before installing the immutable binding guard below.
+    conn.execute(
+        "UPDATE tasks SET session_id = NULL
              WHERE kind = 'goal' AND session_id IS NOT NULL AND length(trim(session_id)) = 0",
-            [],
-        )
-        .context("normalize blank legacy goal session bindings")?;
-        conn.execute(
-            "UPDATE tasks SET status = 'failed',
+        [],
+    )
+    .context("normalize blank legacy goal session bindings")?;
+    conn.execute(
+        "UPDATE tasks
+            SET execution_epoch = 1,
+                status = CASE
+                    WHEN status IN ('running', 'paused') THEN 'failed'
+                    ELSE status
+                END,
+                error = CASE
+                    WHEN status IN ('running', 'paused')
+                    THEN COALESCE(error, 'goal_invalid_execution_epoch')
+                    ELSE error
+                END,
+                finished_at = CASE
+                    WHEN status IN ('running', 'paused')
+                    THEN COALESCE(finished_at, ?1)
+                    ELSE finished_at
+                END
+          WHERE kind = 'goal' AND typeof(execution_epoch) != 'integer'",
+        params![chrono::Utc::now().to_rfc3339()],
+    )
+    .context("fail Goal rows with malformed legacy execution epochs")?;
+    conn.execute(
+        "UPDATE tasks SET status = 'failed',
                     error = COALESCE(error, CASE
                         WHEN session_id IS NULL THEN 'legacy_goal_missing_session'
                         ELSE 'legacy_goal_missing_objective'
@@ -229,17 +227,24 @@ pub(super) fn migrate_schema(
                     WHERE goal_tasks.task_id = tasks.id
                       AND length(trim(goal_tasks.objective)) > 0
                ))",
-            params![chrono::Utc::now().to_rfc3339()],
-        )
-        .context("reconcile legacy goals without V1 identity or objective")?;
-        conn.execute(
-            "UPDATE tasks SET execution_epoch = 1
+        params![chrono::Utc::now().to_rfc3339()],
+    )
+    .context("reconcile legacy goals without V1 identity or objective")?;
+    conn.execute(
+        "UPDATE tasks SET execution_epoch = 1
              WHERE kind = 'goal' AND session_id IS NOT NULL
                AND length(trim(session_id)) > 0 AND execution_epoch < 1",
-            [],
-        )
-        .context("normalize legacy session-bound goal execution epochs")?;
-        conn.execute_batch(
+        [],
+    )
+    .context("normalize legacy session-bound goal execution epochs")?;
+    conn.execute_batch(
+        "CREATE TRIGGER trg_goal_tasks_epoch_monotonic
+             BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
+             WHEN OLD.kind = 'goal' AND NEW.execution_epoch < OLD.execution_epoch
+             BEGIN SELECT RAISE(ABORT, 'goal task execution_epoch is monotonic'); END;",
+    )
+    .context("install Goal epoch monotonicity guard after legacy normalization")?;
+    conn.execute_batch(
             "DROP INDEX IF EXISTS idx_tasks_active_goal_context;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_goal_tasks_current_session
                  ON tasks(session_id) WHERE kind = 'goal' AND session_id IS NOT NULL;
@@ -253,18 +258,6 @@ pub(super) fn migrate_schema(
                  WHEN NEW.kind = 'goal'
                       AND (NEW.session_id IS NULL OR length(trim(NEW.session_id)) = 0)
                  BEGIN SELECT RAISE(ABORT, 'goal tasks require a nonblank session_id'); END;
-             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_epoch_insert
-                 BEFORE INSERT ON tasks FOR EACH ROW
-                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
-                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
-             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_require_epoch_update
-                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
-                 WHEN NEW.kind = 'goal' AND NEW.execution_epoch < 1
-                 BEGIN SELECT RAISE(ABORT, 'goal tasks require execution_epoch >= 1'); END;
-             CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_epoch_monotonic
-                 BEFORE UPDATE OF execution_epoch ON tasks FOR EACH ROW
-                 WHEN OLD.kind = 'goal' AND NEW.execution_epoch < OLD.execution_epoch
-                 BEGIN SELECT RAISE(ABORT, 'goal task execution_epoch is monotonic'); END;
              CREATE TRIGGER IF NOT EXISTS trg_goal_tasks_session_immutable
                  BEFORE UPDATE OF kind, session_id ON tasks FOR EACH ROW
                  WHEN OLD.kind = 'goal'
@@ -300,9 +293,8 @@ pub(super) fn migrate_schema(
                  BEFORE UPDATE OF accounting_state ON goal_tasks FOR EACH ROW
                  WHEN NEW.accounting_state NOT IN ('complete', 'missing', 'invalid', 'outcome_unknown')
                  BEGIN SELECT RAISE(ABORT, 'goal accounting state is invalid'); END;",
-        )
-        .context("apply control-plane schema v8")?;
-    }
+    )
+    .context("ensure session-bound Goal control guards")?;
     // New and provisional v8 databases both need the immutable-objective
     // guard. Existing provisional `success_criteria` columns remain ignored.
     conn.execute_batch(
@@ -312,7 +304,7 @@ pub(super) fn migrate_schema(
              WHEN NEW.objective IS NOT OLD.objective
              BEGIN SELECT RAISE(ABORT, 'goal objective is immutable'); END;",
     )
-    .context("apply immutable goal objective guard")?;
+    .context("ensure immutable Goal objective guard")?;
     Ok(())
 }
 
