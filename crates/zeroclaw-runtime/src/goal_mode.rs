@@ -7,7 +7,7 @@
 //! guarded durable lifecycle transitions; later stages add execution,
 //! accounting, and transport adapters behind those boundaries.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -34,10 +34,19 @@ pub enum GoalSurface {
 /// supplies the raw RPC session identifier, which is namespaced as `rpc_` for
 /// the durable task-plane binding. The variants prevent an adapter from
 /// mistaking a route-shaped string for a different transport's session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum GoalSessionKey {
     Matrix { history_key: String },
     ZeroCode { raw_session_id: String },
+}
+
+impl fmt::Debug for GoalSessionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalSessionKey")
+            .field("surface", &self.surface())
+            .finish()
+    }
 }
 
 impl GoalSessionKey {
@@ -102,10 +111,19 @@ impl GoalSessionKey {
 
 /// Immutable source identity captured by the trusted adapter. It is never a
 /// hook-mutable generic channel field and `tui_id` is never durable identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum GoalIngressPrincipal {
     Matrix { raw_mxid: String },
     ZeroCode { tui_id: String },
+}
+
+impl fmt::Debug for GoalIngressPrincipal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalIngressPrincipal")
+            .field("surface", &self.surface())
+            .finish()
+    }
 }
 
 impl GoalIngressPrincipal {
@@ -126,12 +144,21 @@ impl GoalIngressPrincipal {
 }
 
 /// Trusted authority supplied alongside a parsed [`GoalCommand`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GoalIngressContext {
     session_key: GoalSessionKey,
     agent: String,
     route: String,
     principal: GoalIngressPrincipal,
+}
+
+impl fmt::Debug for GoalIngressContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GoalIngressContext")
+            .field("surface", &self.surface())
+            .finish()
+    }
 }
 
 impl GoalIngressContext {
@@ -154,6 +181,17 @@ impl GoalIngressContext {
             bail!("Goal ingress principal does not match the session surface");
         }
         principal.validate()?;
+        if let (GoalSessionKey::Matrix { history_key }, GoalIngressPrincipal::Matrix { raw_mxid }) =
+            (&session_key, &principal)
+        {
+            let canonical_sender = sanitize_session_key(raw_mxid);
+            let sender_is_final_component = history_key
+                .strip_suffix(&canonical_sender)
+                .is_some_and(|prefix| prefix.ends_with('_'));
+            if !sender_is_final_component {
+                bail!("Matrix Goal history key is not scoped to the raw sender");
+            }
+        }
         Ok(Self {
             session_key,
             agent: required("Goal ingress agent", agent.into())?,
@@ -530,13 +568,16 @@ impl GoalHostSettings {
     ///
     /// # Errors
     ///
-    /// Returns an error if the owner boot ID is blank.
+    /// Returns an error if the owner boot ID is blank or a semantic default
+    /// limit is invalid. Configuration loading must normalize an explicit
+    /// unlimited default to `None` before constructing this value.
     pub fn new(
         enabled: bool,
         default_limits: GoalBudgetLimits,
         owner_pid: u32,
         owner_boot_id: impl Into<String>,
     ) -> Result<Self> {
+        validate_default_limits(default_limits)?;
         Ok(Self {
             enabled,
             default_limits,
@@ -544,6 +585,18 @@ impl GoalHostSettings {
             owner_boot_id: required("Goal owner boot id", owner_boot_id.into())?,
         })
     }
+}
+
+fn validate_default_limits(limits: GoalBudgetLimits) -> Result<()> {
+    if limits.token_limit == Some(0) {
+        bail!("Goal default token limit must be positive when finite");
+    }
+    if let Some(cost_limit_usd) = limits.cost_limit_usd
+        && (!cost_limit_usd.is_finite() || cost_limit_usd <= 0.0)
+    {
+        bail!("Goal default cost limit must be finite and positive when finite");
+    }
+    Ok(())
 }
 
 /// Controller response before a transport renders it through Fluent.
