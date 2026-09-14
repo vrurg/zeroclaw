@@ -11,8 +11,8 @@ use crate::control_plane::goal_task::{
 use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
 use super::{
-    SqliteTaskStore, add_column_if_missing, insert_task_record, log_unreadable_task_row,
-    row_to_record, status_to_db,
+    SqliteTaskStore, add_column_if_missing, collect_skipping_bad_rows, insert_task_record,
+    log_unreadable_task_row, row_to_record, status_to_db,
 };
 
 fn transition_failure(conn: &Connection, task_id: &str) -> Result<GoalTransitionResult> {
@@ -341,8 +341,7 @@ impl SqliteTaskStore {
             let rows = statement
                 .query_map(params![boot_id], row_to_record)
                 .context("query interrupted goal ownership")?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .context("decode interrupted goal ownership")?
+            collect_skipping_bad_rows(rows)
         };
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS goal_recovery_candidates (
