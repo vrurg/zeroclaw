@@ -534,7 +534,7 @@ impl GoalSessionExecutionLease for MatrixGoalExecutionLease {
         .await?;
         let messages = vec![
             ChatMessage::system(
-                "Return only strict JSON: {\\\"decision\\\":\\\"complete|continue|blocked\\\",\\\"reason\\\":\\\"...\\\",\\\"blockers\\\":[...]}.",
+                "Return only strict JSON. Schema: {\\\"decision\\\":\\\"complete|continue|blocked\\\",\\\"reason\\\":\\\"nonempty bounded explanation\\\",\\\"blockers\\\":[{\\\"kind\\\":\\\"needs_user_input|human_escalation|external_dependency\\\",\\\"message\\\":\\\"nonempty bounded explanation\\\",\\\"payload\\\":optional}]}. Complete and continue require blockers: []; blocked requires one or more blockers. Do not emit any other keys or blocker kinds.",
             ),
             ChatMessage::user(format!(
                 "Objective:\n{}\n\nCandidate:\n{}",
