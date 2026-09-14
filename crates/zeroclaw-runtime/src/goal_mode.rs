@@ -1427,7 +1427,7 @@ mod tests {
         };
 
         assert!(
-            !GoalStatusProjection::from_parts(&task, &goal).resumable,
+            !GoalStatusProjection::from_parts(&task, goal).resumable,
             "the status response must not advertise a transition storage rejects"
         );
     }

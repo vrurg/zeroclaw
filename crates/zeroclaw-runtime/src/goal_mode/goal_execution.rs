@@ -1915,6 +1915,205 @@ mod tests {
         }
     }
 
+    /// A narrow registry double that replaces an exact Goal immediately after
+    /// its unsettled operation has been durably classified. This is the
+    /// lifecycle interleaving an executor can observe while unwinding: the
+    /// predecessor is settled, then a new command may replace it before the
+    /// old executor returns.
+    struct ReplaceAfterUnsettledResolutionRegistry {
+        inner: Arc<SqliteTaskStore>,
+        successor: TaskRecord,
+        successor_goal: GoalTaskRecord,
+    }
+
+    #[async_trait]
+    impl GoalTaskRegistry for ReplaceAfterUnsettledResolutionRegistry {
+        async fn latest_active_goal_for_agent(&self, _agent: &str) -> Result<Option<TaskRecord>> {
+            panic!("unexpected legacy agent lookup")
+        }
+
+        async fn latest_active_goal_for_context(
+            &self,
+            _agent: &str,
+            _originator_route: Option<&str>,
+            _principal_id: Option<&str>,
+        ) -> Result<Option<TaskRecord>> {
+            panic!("unexpected legacy context lookup")
+        }
+
+        async fn latest_active_goal_id_for_context(
+            &self,
+            _agent: &str,
+            _originator_route: Option<&str>,
+            _principal_id: Option<&str>,
+        ) -> Result<Option<String>> {
+            panic!("unexpected legacy context-id lookup")
+        }
+
+        async fn get_goal_task(&self, task_id: &str) -> Result<Option<GoalTaskRecord>> {
+            self.inner.get_goal_task(task_id).await
+        }
+
+        async fn update_goal_limits(
+            &self,
+            _task_id: &str,
+            _token_limit: Option<u64>,
+            _cost_limit_usd: Option<f64>,
+        ) -> Result<()> {
+            panic!("unexpected legacy limits update")
+        }
+
+        async fn update_goal_pause(
+            &self,
+            _task_id: &str,
+            _pause: Option<GoalPauseState>,
+        ) -> Result<()> {
+            panic!("unexpected legacy pause update")
+        }
+
+        async fn set_continuation_context(
+            &self,
+            _task_id: &str,
+            _context: Option<crate::control_plane::TaskContinuationContext>,
+        ) -> Result<()> {
+            panic!("unexpected continuation update")
+        }
+
+        async fn get_continuation_context(
+            &self,
+            _task_id: &str,
+        ) -> Result<Option<crate::control_plane::TaskContinuationContext>> {
+            panic!("unexpected continuation lookup")
+        }
+
+        async fn current_goal_for_session(&self, session_id: &str) -> Result<Option<TaskRecord>> {
+            self.inner.current_goal_for_session(session_id).await
+        }
+
+        async fn terminal_reason_for_session_goal(
+            &self,
+            task_id: &str,
+            session_id: &str,
+        ) -> Result<Option<String>> {
+            self.inner
+                .terminal_reason_for_session_goal(task_id, session_id)
+                .await
+        }
+
+        async fn create_or_replace_session_goal(
+            &self,
+            _task: TaskRecord,
+            _goal: GoalTaskRecord,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected create-or-replace")
+        }
+
+        async fn pause_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _pause: GoalPauseState,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected pause")
+        }
+
+        async fn resume_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _owner_pid: u32,
+            _owner_boot_id: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected resume")
+        }
+
+        async fn finish_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _status: TaskStatus,
+            _error: Option<String>,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected terminal transition")
+        }
+
+        async fn admit_pending_operation(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _pending_call_id: &str,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected operation admission")
+        }
+
+        async fn settle_pending_operation(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _admitted_epoch: i64,
+            _pending_call_id: &str,
+            _accounting_state: GoalAccountingState,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected operation settlement")
+        }
+
+        async fn resolve_unsettled_operation(
+            &self,
+            task_id: &str,
+            session_id: &str,
+            expected_epoch: i64,
+            admitted_epoch: i64,
+            pending_call_id: &str,
+        ) -> Result<GoalTransitionResult> {
+            let result = self
+                .inner
+                .resolve_unsettled_operation(
+                    task_id,
+                    session_id,
+                    expected_epoch,
+                    admitted_epoch,
+                    pending_call_id,
+                )
+                .await?;
+            if result == GoalTransitionResult::Applied {
+                assert_eq!(
+                    self.inner
+                        .create_or_replace_session_goal(
+                            self.successor.clone(),
+                            self.successor_goal.clone(),
+                        )
+                        .await?,
+                    GoalTransitionResult::Applied
+                );
+            }
+            Ok(result)
+        }
+
+        async fn update_session_goal_limits(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+            _token_limit: Option<u64>,
+            _cost_limit_usd: Option<f64>,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected session limits update")
+        }
+
+        async fn delete_session_goal(
+            &self,
+            _task_id: &str,
+            _session_id: &str,
+            _expected_epoch: i64,
+        ) -> Result<GoalTransitionResult> {
+            panic!("unexpected deletion")
+        }
+    }
+
     struct MissingAccountingVerifierLease {
         store: Arc<SqliteTaskStore>,
         scope: GoalExecutionScope,
@@ -2522,6 +2721,77 @@ mod tests {
                 .await
                 .unwrap(),
             GoalTransitionResult::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_failure_is_not_rejected_when_a_successor_replaces_it() {
+        let (store, _accountant, scope, directory) = accountant_fixture().await;
+        assert_eq!(
+            store
+                .admit_pending_operation(
+                    scope.task_id(),
+                    scope.session_id(),
+                    scope.execution_epoch(),
+                    "ledger-write-failed",
+                )
+                .await
+                .unwrap(),
+            GoalTransitionResult::Applied
+        );
+        let predecessor = store
+            .current_goal_for_session(scope.session_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let successor = TaskRecord {
+            id: "goal-accounting-successor-race".to_owned(),
+            status: TaskStatus::Running,
+            execution_epoch: 1,
+            started_at: "2026-09-05T00:01:00Z".to_owned(),
+            finished_at: None,
+            ..predecessor
+        };
+        let registry: Arc<dyn GoalTaskRegistry> =
+            Arc::new(ReplaceAfterUnsettledResolutionRegistry {
+                inner: Arc::clone(&store),
+                successor: successor.clone(),
+                successor_goal: GoalTaskRecord {
+                    task_id: successor.id.clone(),
+                    objective: "finish the replacement work".to_owned(),
+                    ..GoalTaskRecord::default()
+                },
+            });
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                directory.path(),
+            )
+            .unwrap(),
+        );
+        let engine = GoalExecutionEngine::new(
+            GoalRuntime::new(registry),
+            tracker,
+            "main",
+            Arc::new(HashMap::new()),
+        )
+        .unwrap();
+
+        engine
+            .fail(&scope, "parent_operation_failed")
+            .await
+            .expect("the settled predecessor must not be re-fenced after replacement");
+
+        assert_eq!(
+            store
+                .current_goal_for_session(scope.session_id())
+                .await
+                .unwrap()
+                .map(|current| current.id),
+            Some(successor.id)
         );
     }
 
