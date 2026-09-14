@@ -15,7 +15,8 @@ use chrono::Utc;
 use uuid::Uuid;
 use zeroclaw_api::{model_provider::ChatMessage, session_keys::sanitize_session_key};
 use zeroclaw_commands::goal::{
-    GoalBudgetLimits, GoalBudgetSelection, GoalCommand, validate_goal_objective,
+    GoalBudgetLimits, GoalBudgetSelection, GoalCommand, is_valid_finite_goal_cost_limit,
+    is_valid_finite_goal_token_limit, validate_goal_objective,
 };
 use zeroclaw_config::goal::{GoalBudgetLimits as ConfigGoalBudgetLimits, GoalConfig};
 
@@ -707,12 +708,12 @@ impl GoalHostSettings {
 fn validate_default_limits(limits: ConfigGoalBudgetLimits) -> Result<()> {
     if limits
         .token_limit
-        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+        .is_some_and(|limit| !is_valid_finite_goal_token_limit(limit))
     {
         bail!("Goal default token limit must be positive and SQLite-representable when finite");
     }
     if let Some(cost_limit_usd) = limits.cost_limit_usd
-        && (!cost_limit_usd.is_finite() || cost_limit_usd <= 0.0)
+        && !is_valid_finite_goal_cost_limit(cost_limit_usd)
     {
         bail!("Goal default cost limit must be finite and positive when finite");
     }
@@ -1154,10 +1155,10 @@ fn select_budget_update_limits(selection: GoalBudgetSelection) -> Result<GoalBud
 fn validate_command_limits(limits: GoalBudgetLimits) -> Result<GoalBudgetLimits> {
     if limits
         .token_limit
-        .is_some_and(|limit| limit == 0 || limit > i64::MAX as u64)
+        .is_some_and(|limit| !is_valid_finite_goal_token_limit(limit))
         || limits
             .cost_limit_usd
-            .is_some_and(|cost| !cost.is_finite() || cost <= 0.0)
+            .is_some_and(|cost| !is_valid_finite_goal_cost_limit(cost))
         || (limits.token_limit.is_none() && limits.cost_limit_usd.is_none())
     {
         bail!("Goal finite budget limits are invalid");
