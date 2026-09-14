@@ -632,7 +632,7 @@ struct ChannelRuntimeContext {
     /// Per-conversation-history-key process-local locks. These serialize
     /// persistence mutations and Matrix foreground model work without creating
     /// a second session, identity, or authorization store.
-    persist_locks: Arc<std::sync::Mutex<HashMap<String, ConversationLocks>>>,
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<ConversationLocks>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
