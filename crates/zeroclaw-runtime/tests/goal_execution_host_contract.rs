@@ -1226,7 +1226,8 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .into_response(),
         GoalResponse::Started(_)
     ));
     parent_started.notified().await;
@@ -1254,7 +1255,7 @@ async fn supervisor_pause_waits_for_the_admitted_parent_to_settle() {
 
     release_parent.notify_one();
     assert!(matches!(
-        pause.await.unwrap().unwrap(),
+        pause.await.unwrap().unwrap().into_response(),
         GoalResponse::Paused(_)
     ));
     assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
@@ -1414,7 +1415,8 @@ async fn supervisor_restart_pause_waits_for_the_admitted_parent_to_settle() {
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .into_response(),
         GoalResponse::Started(_)
     ));
     parent_started.notified().await;
@@ -1665,7 +1667,7 @@ async fn supervisor_pause_fails_closed_when_the_drained_operation_remains_pendin
         .expect_err("pause must wait for the admitted operation to drain");
     release_parent.notify_one();
 
-    let response = pause.await.unwrap().unwrap();
+    let response = pause.await.unwrap().unwrap().into_response();
     assert!(matches!(response, GoalResponse::Terminal(_)));
     let current = store
         .current_goal_for_session(&ingress.session_key().durable_id())

@@ -564,6 +564,12 @@ impl GoalRuntimeSubmission {
         drop(lease);
         (response, execution)
     }
+
+    pub(super) fn into_parts_with_lease(
+        self,
+    ) -> (GoalResponse, Option<GoalExecutionRequest>, GoalSessionLease) {
+        (self.response, self.execution, self.lease)
+    }
 }
 
 /// Exact controller-to-executor handoff for a newly running Goal epoch.
